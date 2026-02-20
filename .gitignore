@@ -1,0 +1,7 @@
+# Build artifacts
+build/
+pg_wait_tracer
+
+# Generated files
+include/vmlinux.h
+include/pg_wait_tracer.skel.h
