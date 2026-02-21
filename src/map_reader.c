@@ -5,9 +5,19 @@
 
 #include <string.h>
 #include <stdio.h>
+#include <stdbool.h>
+#include <time.h>
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 #include "pg_wait_tracer.skel.h"
+
+/* Must match bpf_ktime_get_ns() clock source (CLOCK_MONOTONIC). */
+static uint64_t now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
 
 void pgwt_accum_init(struct pgwt_accumulator *acc)
 {
@@ -179,6 +189,90 @@ int pgwt_read_maps(struct pgwt_daemon *d)
             tm->db_time_ns += total;
 
         key = next_key;
+    }
+
+    /* Account for open intervals: backends currently sitting in a wait
+     * state have accumulated no data via on_watchpoint if there were no
+     * state transitions. Read state_map to capture ongoing waits.
+     *
+     * Only add open intervals for (PID, event) combinations that have
+     * no data in wait_stats yet. This avoids double-counting for
+     * backends that ARE producing watchpoint fires (their accumulated
+     * closed intervals in wait_stats are already accurate). */
+    int state_fd = bpf_map__fd(d->skel->maps.state_map);
+    uint32_t skey = 0, snext;
+    struct pgwt_pid_state sval;
+    uint64_t now = now_ns();
+
+    while (bpf_map_get_next_key(state_fd, &skey, &snext) == 0) {
+        if (bpf_map_lookup_elem(state_fd, &snext, &sval) == 0) {
+            uint64_t open_ns = now - sval.last_ts;
+            uint32_t we = sval.last_event;
+
+            /* Skip if wait_stats already has data for this (PID, event) */
+            struct pgwt_agg_key check_key = { .pid = snext, .wait_event = we };
+            struct pgwt_agg_value check_vals[MAX_CPUS];
+            bool has_closed_data = false;
+            if (bpf_map_lookup_elem(stats_fd, &check_key, check_vals) == 0) {
+                for (int cpu = 0; cpu < nr_cpus && cpu < MAX_CPUS; cpu++) {
+                    if (check_vals[cpu].count > 0) {
+                        has_closed_data = true;
+                        break;
+                    }
+                }
+            }
+
+            if (open_ns > 0 && !has_closed_data) {
+                /* Per-PID accumulation */
+                struct pgwt_pid_accum *pa = get_or_create_pid(&d->accum, snext);
+                if (pa) {
+                    struct pgwt_event_stats *es = get_or_create_event(pa, we);
+                    if (es) {
+                        es->count += 1;
+                        es->total_ns += open_ns;
+                        if (open_ns < es->min_ns) es->min_ns = open_ns;
+                        if (open_ns > es->max_ns) es->max_ns = open_ns;
+                    }
+                    if (we == 0) {
+                        pa->cpu_time_ns += open_ns;
+                    } else if (!pgwt_is_idle_event(we)) {
+                        pa->wait_time_ns += open_ns;
+                    }
+                    if (!pgwt_is_idle_event(we))
+                        pa->db_time_ns += open_ns;
+                }
+
+                /* System-wide accumulation */
+                struct pgwt_event_stats *se = get_or_create_system_event(&d->accum, we);
+                if (se) {
+                    se->count += 1;
+                    se->total_ns += open_ns;
+                    if (open_ns < se->min_ns) se->min_ns = open_ns;
+                    if (open_ns > se->max_ns) se->max_ns = open_ns;
+                }
+
+                /* Time model by class */
+                struct pgwt_time_model *tm = &d->accum.tm;
+                if (we == 0) {
+                    tm->cpu_time_ns += open_ns;
+                } else {
+                    int cls = WE_CLASS(we);
+                    switch (cls) {
+                    case PG_WAIT_IO:        tm->io_time_ns += open_ns; break;
+                    case PG_WAIT_LWLOCK:    tm->lwlock_time_ns += open_ns; break;
+                    case PG_WAIT_LOCK:      tm->lock_time_ns += open_ns; break;
+                    case PG_WAIT_BUFFERPIN: tm->bufferpin_time_ns += open_ns; break;
+                    case PG_WAIT_CLIENT:    tm->client_time_ns += open_ns; break;
+                    case PG_WAIT_IPC:       tm->ipc_time_ns += open_ns; break;
+                    case PG_WAIT_TIMEOUT:   tm->timeout_time_ns += open_ns; break;
+                    case PG_WAIT_ACTIVITY:  tm->activity_time_ns += open_ns; break;
+                    }
+                }
+                if (!pgwt_is_idle_event(we))
+                    tm->db_time_ns += open_ns;
+            }
+        }
+        skey = snext;
     }
 
     return 0;

@@ -96,22 +96,22 @@ static const char *io_events[] = {
 #define IO_EVENTS_MAX 80
 
 /* ── Lock Events (class 0x03) ────────────────────────────── */
-/* Lock types use a separate numbering (LOCKTAG enum), 1-indexed */
+/* Lock types match LockTagType enum, 0-indexed */
 static const char *lock_events[] = {
-    [1]  = "relation",
-    [2]  = "extend",
-    [3]  = "frozenid",
-    [4]  = "page",
-    [5]  = "tuple",
-    [6]  = "transactionid",
-    [7]  = "virtualxid",
-    [8]  = "spectoken",
-    [9]  = "object",
-    [10] = "userlock",
-    [11] = "advisory",
-    [12] = "applytransaction",
+    [0]  = "relation",
+    [1]  = "extend",
+    [2]  = "frozenid",
+    [3]  = "page",
+    [4]  = "tuple",
+    [5]  = "transactionid",
+    [6]  = "virtualxid",
+    [7]  = "spectoken",
+    [8]  = "object",
+    [9]  = "userlock",
+    [10] = "advisory",
+    [11] = "applytransaction",
 };
-#define LOCK_EVENTS_MAX 12
+#define LOCK_EVENTS_MAX 11
 
 /* ── Timeout Events (class 0x09, 10 events, 0-indexed) ──── */
 static const char *timeout_events[] = {
@@ -341,14 +341,6 @@ static const char *lookup0(const char **tbl, int max, int id)
     return NULL;
 }
 
-/* 1-indexed lookup (for Lock events) */
-static const char *lookup1(const char **tbl, int max, int id)
-{
-    if (id >= 1 && id <= max && tbl[id])
-        return tbl[id];
-    return NULL;
-}
-
 const char *pgwt_class_name(uint32_t wei)
 {
     if (wei == 0) return "CPU";
@@ -379,7 +371,7 @@ const char *pgwt_event_name(uint32_t wei)
         name = lookup0(io_events, IO_EVENTS_MAX, id);
         return name ? name : "unknown_io";
     case PG_WAIT_LOCK:
-        name = lookup1(lock_events, LOCK_EVENTS_MAX, id);
+        name = lookup0(lock_events, LOCK_EVENTS_MAX, id);
         return name ? name : "unknown_lock";
     case PG_WAIT_TIMEOUT:
         name = lookup0(timeout_events, TIMEOUT_EVENTS_MAX, id);

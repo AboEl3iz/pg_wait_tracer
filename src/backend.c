@@ -11,6 +11,8 @@
 #include <dirent.h>
 #include <stdlib.h>
 #include <time.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 #include "pg_wait_tracer.skel.h"
@@ -130,9 +132,36 @@ int pgwt_scan_existing_backends(struct pgwt_daemon *d)
         be->attach_ts = now_ns();
         pgwt_parse_cmdline(pid, &be->meta);
 
+        /* Pre-initialize BPF state_map so the first watchpoint fire
+         * ACCUMULATES the current wait state instead of just initializing.
+         * Without this, backends already in a wait (e.g. Lock:relation)
+         * would lose their initial interval because on_watchpoint treats
+         * the first fire as state_map initialization. */
+        {
+            char mem_path[64];
+            snprintf(mem_path, sizeof(mem_path), "/proc/%d/mem", pid);
+            int mem_fd = open(mem_path, O_RDONLY);
+            if (mem_fd >= 0) {
+                uint32_t current_wei = 0;
+                if (pread(mem_fd, &current_wei, sizeof(current_wei), ptr) ==
+                    sizeof(current_wei)) {
+                    int state_fd = bpf_map__fd(d->skel->maps.state_map);
+                    struct pgwt_pid_state init_state = {
+                        .last_event = current_wei,
+                        .last_ts = be->attach_ts,
+                    };
+                    uint32_t pid_key = pid;
+                    bpf_map_update_elem(state_fd, &pid_key, &init_state,
+                                        BPF_NOEXIST);
+                }
+                close(mem_fd);
+            }
+        }
+
         if (d->verbose)
-            fprintf(stderr, "INFO: attached to PID %d (%s)\n",
-                    pid, pgwt_backend_type_name(be->meta.backend_type));
+            fprintf(stderr, "INFO: attached to PID %d (%s), watchpoint at 0x%lx\n",
+                    pid, pgwt_backend_type_name(be->meta.backend_type),
+                    (unsigned long)ptr);
         count++;
     }
     closedir(proc);

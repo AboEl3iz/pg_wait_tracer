@@ -59,16 +59,16 @@ static void test_io_events(void)
 
 static void test_lock_events(void)
 {
-    printf("--- Lock Events (1-indexed) ---\n");
-    CHECK_NAME(WEI(PG_WAIT_LOCK, 1),  "Lock:relation");
-    CHECK_NAME(WEI(PG_WAIT_LOCK, 2),  "Lock:extend");
-    CHECK_NAME(WEI(PG_WAIT_LOCK, 4),  "Lock:page");
-    CHECK_NAME(WEI(PG_WAIT_LOCK, 5),  "Lock:tuple");
-    CHECK_NAME(WEI(PG_WAIT_LOCK, 6),  "Lock:transactionid");
-    CHECK_NAME(WEI(PG_WAIT_LOCK, 7),  "Lock:virtualxid");
-    CHECK_NAME(WEI(PG_WAIT_LOCK, 11), "Lock:advisory");
-    CHECK_NAME(WEI(PG_WAIT_LOCK, 12), "Lock:applytransaction");
-    CHECK(strcmp(pgwt_class_name(WEI(PG_WAIT_LOCK, 1)), "Lock") == 0,
+    printf("--- Lock Events (0-indexed, matches LockTagType) ---\n");
+    CHECK_NAME(WEI(PG_WAIT_LOCK, 0),  "Lock:relation");
+    CHECK_NAME(WEI(PG_WAIT_LOCK, 1),  "Lock:extend");
+    CHECK_NAME(WEI(PG_WAIT_LOCK, 3),  "Lock:page");
+    CHECK_NAME(WEI(PG_WAIT_LOCK, 4),  "Lock:tuple");
+    CHECK_NAME(WEI(PG_WAIT_LOCK, 5),  "Lock:transactionid");
+    CHECK_NAME(WEI(PG_WAIT_LOCK, 6),  "Lock:virtualxid");
+    CHECK_NAME(WEI(PG_WAIT_LOCK, 10), "Lock:advisory");
+    CHECK_NAME(WEI(PG_WAIT_LOCK, 11), "Lock:applytransaction");
+    CHECK(strcmp(pgwt_class_name(WEI(PG_WAIT_LOCK, 0)), "Lock") == 0,
           "class_name for Lock");
 }
 
@@ -180,10 +180,10 @@ static void test_unknown_fallbacks(void)
     pgwt_event_full_name(WEI(PG_WAIT_IO, 999), buf, sizeof(buf));
     CHECK(strstr(buf, "unknown") != NULL,
           "IO:999 should contain 'unknown', got \"%s\"", buf);
-    /* Lock id=0 (invalid for 1-indexed) */
-    pgwt_event_full_name(WEI(PG_WAIT_LOCK, 0), buf, sizeof(buf));
+    /* Lock id=99 (out of range) */
+    pgwt_event_full_name(WEI(PG_WAIT_LOCK, 99), buf, sizeof(buf));
     CHECK(strstr(buf, "unknown") != NULL,
-          "Lock:0 should contain 'unknown', got \"%s\"", buf);
+          "Lock:99 should contain 'unknown', got \"%s\"", buf);
     /* Unknown class */
     pgwt_event_full_name(WEI(0xFF, 0), buf, sizeof(buf));
     CHECK(strstr(buf, "Unknown") != NULL || strstr(buf, "unknown") != NULL,
