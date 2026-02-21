@@ -47,6 +47,21 @@ def psql(sql, timeout=10):
     return result.stdout.strip()
 
 
+def cleanup_stale_backends():
+    """Terminate leftover client backends from previous tests to avoid contamination."""
+    try:
+        psql("SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+             "WHERE pid != pg_backend_pid() AND datname = 'postgres' "
+             "AND backend_type = 'client backend' AND state != 'active'")
+        # Also kill any backends stuck in pg_sleep from previous tests
+        psql("SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+             "WHERE pid != pg_backend_pid() AND datname = 'postgres' "
+             "AND query LIKE '%pg_sleep%'")
+    except subprocess.TimeoutExpired:
+        pass
+    time.sleep(1)  # let backends exit and BPF cleanup
+
+
 def parse_system_events(output):
     """Parse system_event view into list of dicts."""
     events = []
@@ -320,6 +335,8 @@ def main():
         sys.exit(1)
 
     print(f"=== test_deterministic (postmaster PID {pm_pid}) ===")
+
+    cleanup_stale_backends()
 
     test_pg_sleep_exact_count(pm_pid)
     test_lock_wait_duration(pm_pid)

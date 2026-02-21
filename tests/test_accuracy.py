@@ -149,6 +149,13 @@ def test_pg_sleep_duration(pm_pid):
     # Kill the long pg_sleep session
     psql_proc.terminate()
     psql_proc.wait()
+    # Ensure the backend is fully terminated in PostgreSQL
+    try:
+        psql("SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+             "WHERE pid != pg_backend_pid() AND query LIKE '%pg_sleep%'")
+    except subprocess.TimeoutExpired:
+        pass
+    time.sleep(1)
 
     events = parse_system_events(output)
 
