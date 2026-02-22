@@ -4,24 +4,24 @@
 
 - **Linux kernel** >= 5.8 (BPF ring buffer, CO-RE)
 - **Architecture**: x86_64, aarch64
-- **PostgreSQL**: 14, 15, 16, 17, 18
-- **Tested on**: Ubuntu 22.04/24.04, Oracle Linux 9, RHEL 9
+- **PostgreSQL**: 17, 18 (full support); 14–16 (limited — see Troubleshooting)
+- **Tested on**: Ubuntu 22.04/24.04, Rocky Linux 9, Oracle Linux 9, RHEL 9
 
 ## Prerequisites
 
 ### 1. Build Dependencies
 
-#### Oracle Linux 9 / RHEL 9 / AlmaLinux 9
+#### Rocky Linux 9 / RHEL 9 / AlmaLinux 9 / Oracle Linux 9
 
 ```bash
-# Enable CRB (CodeReady Builder) repo for development packages
-sudo dnf config-manager --set-enabled ol9_codeready_builder  # Oracle Linux
-# sudo dnf config-manager --set-enabled crb                  # RHEL/AlmaLinux
+# Enable CRB (CodeReady Builder) repo — required for libbpf-devel
+sudo dnf config-manager --set-enabled crb                        # Rocky/RHEL/AlmaLinux
+# sudo dnf config-manager --set-enabled ol9_codeready_builder    # Oracle Linux
 
-# Core build tools
-sudo dnf install -y gcc clang llvm make
+# Core build tools (tar may be missing on minimal installs)
+sudo dnf install -y gcc clang llvm make tar
 
-# BPF toolchain
+# BPF toolchain (libbpf-devel requires CRB repo enabled above)
 sudo dnf install -y bpftool libbpf-devel
 
 # ELF and compression libraries
@@ -56,44 +56,44 @@ ls /sys/kernel/btf/vmlinux
 ```
 
 If missing, install the BTF-enabled kernel:
+- **Rocky Linux 9 / RHEL 9 / AlmaLinux 9**: Enabled by default
 - **Oracle Linux 9**: `sudo dnf install -y kernel-uek` (UEK7+ has BTF)
 - **Ubuntu**: Enabled by default on 22.04+
-- **RHEL 9**: Enabled by default
 
 ### 3. PostgreSQL
 
-#### Oracle Linux 9
+#### Rocky Linux 9 / RHEL 9 / Oracle Linux 9
 
 ```bash
-# Install PostgreSQL repo
+# Install PGDG repository
 sudo dnf install -y https://download.postgresql.org/pub/repos/yum/reporpms/EL-9-x86_64/pgdg-redhat-repo-latest.noarch.rpm
 
-# Install PostgreSQL 16 (or 17, 18)
-sudo dnf install -y postgresql16-server postgresql16-contrib
+# Install PostgreSQL 17 (or 18)
+sudo dnf install -y postgresql17-server postgresql17-contrib
 
 # Initialize and start
-sudo /usr/pgsql-16/bin/postgresql-16-setup initdb
-sudo systemctl enable --now postgresql-16
+sudo /usr/pgsql-17/bin/postgresql-17-setup initdb
+sudo systemctl enable --now postgresql-17
 
 # (Optional) Debug symbols for query_event view
-sudo dnf install -y postgresql16-debuginfo
+sudo dnf install -y postgresql17-debuginfo
 ```
 
 #### Ubuntu / Debian
 
 ```bash
-# Install PostgreSQL 16 (or 17, 18)
-sudo apt install -y postgresql-16 postgresql-contrib-16
+# Install PostgreSQL 17 (or 18)
+sudo apt install -y postgresql-17 postgresql-contrib-17
 
 # (Optional) Debug symbols for query_event view
-sudo apt install -y postgresql-16-dbgsym
+sudo apt install -y postgresql-17-dbgsym
 ```
 
 ### 4. Test Dependencies (optional)
 
 ```bash
 # Python 3 (for integration tests)
-# Oracle Linux 9:
+# Rocky/RHEL/Oracle Linux 9:
 sudo dnf install -y python3
 
 # Ubuntu:
@@ -143,14 +143,19 @@ sudo tests/run_all.sh --pid 12345
 
 ### "symbol 'my_wait_event_info' not found"
 
-The postgres binary must be compiled with symbols (not stripped). Verify:
+The postgres binary must export the `my_wait_event_info` symbol. Verify:
 
 ```bash
-nm /usr/lib/postgresql/16/bin/postgres | grep my_wait_event_info
+# Check dynamic symbol table (works even on stripped binaries)
+readelf -s --dyn-syms /usr/pgsql-17/bin/postgres | grep my_wait_event_info
+
+# Or via nm (requires non-stripped binary)
+nm /usr/pgsql-17/bin/postgres | grep my_wait_event_info
 ```
 
-If empty, you may need the `-debuginfo` or `-dbgsym` package, or a postgres build
-that preserves the symbol table.
+PGDG-packaged binaries are typically stripped but retain dynamic symbols (`readelf`
+will find them). If neither works, you may need a postgres build that preserves
+the symbol table.
 
 ### "st_query_id offset not found"
 
@@ -170,7 +175,7 @@ Ensure running as root (`sudo`) or with `CAP_SYS_PTRACE` + `CAP_SYS_ADMIN`.
 ### "bpftool: command not found"
 
 ```bash
-# Oracle Linux / RHEL:
+# Rocky / RHEL / Oracle Linux:
 sudo dnf install -y bpftool
 
 # Ubuntu (bpftool is in linux-tools):
@@ -179,5 +184,16 @@ sudo apt install -y linux-tools-$(uname -r)
 
 ### Kernel BTF missing (`/sys/kernel/btf/vmlinux` not found)
 
-The kernel must be compiled with `CONFIG_DEBUG_INFO_BTF=y`. Oracle Linux UEK7+
-and Ubuntu 22.04+ have this by default. Older kernels may need an upgrade.
+The kernel must be compiled with `CONFIG_DEBUG_INFO_BTF=y`. Rocky Linux 9,
+RHEL 9, Oracle Linux UEK7+, and Ubuntu 22.04+ have this by default. Older
+kernels may need an upgrade.
+
+### PostgreSQL version compatibility
+
+pg_wait_tracer uses a hardware watchpoint on the `my_wait_event_info` global
+variable to trace wait events. PostgreSQL 17+ writes wait events through
+`*my_wait_event_info` (global pointer dereference), which the watchpoint captures.
+PostgreSQL 14–16 writes directly to `MyProc->wait_event_info` (PGPROC struct field),
+bypassing the global pointer. As a result, **full wait event tracing requires
+PostgreSQL 17 or later**. On PG14–16 the tracer will start but will not capture
+wait events correctly.
