@@ -9,3 +9,4 @@ include/pg_wait_tracer.skel.h
 # Test binaries
 tests/test_wait_event
 tests/test_cmdline
+tests/__pycache__/
