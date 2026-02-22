@@ -24,10 +24,6 @@ typedef uint64_t u64;
 #define MAX_EVENTS_PER_PID   256
 #define MAX_CPUS             128
 
-/* ── Query ID ────────────────────────────────────────────── */
-/* offsetof(PgBackendStatus, st_query_id) for PG18 on x86_64 */
-#define PGWT_ST_QUERY_ID_OFFSET  424
-
 /* ── BPF Map Structs ──────────────────────────────────────── */
 
 /* Per-PID state in state_map */

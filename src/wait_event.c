@@ -1,7 +1,10 @@
-/* wait_event.c — Wait event decode tables for PostgreSQL 18
+/* wait_event.c — Wait event decode tables for PostgreSQL 14+
  *
- * PG18 auto-generates enums alphabetically (case-insensitive) within each
- * class, starting from 0. Tables here must match that ordering exactly.
+ * PG17+ auto-generates enums alphabetically (case-insensitive) within each
+ * class, starting from 0. PG16 and earlier use manually-ordered enums.
+ *
+ * Tables here cover PG17 and PG18. For PG16 and earlier, events that don't
+ * match the current table gracefully fall back to numeric display ("IO:id=N").
  */
 #include "wait_event.h"
 #include "pg_wait_tracer.h"
@@ -9,8 +12,11 @@
 #include <stdio.h>
 #include <string.h>
 
-/* ── IO Events (class 0x0A, 81 events, 0-indexed, alphabetical) ── */
-static const char *io_events[] = {
+/* PG major version, set by pgwt_init_event_names() */
+static int pg_version = 18;
+
+/* ── IO Events PG18 (class 0x0A, 81 events, 0-indexed, alphabetical) ── */
+static const char *io_events_pg18[] = {
     [0]  = "AioIoCompletion",
     [1]  = "AioIoUringExecution",
     [2]  = "AioIoUringSubmit",
@@ -93,7 +99,97 @@ static const char *io_events[] = {
     [79] = "WalSyncMethodAssign",
     [80] = "WalWrite",
 };
-#define IO_EVENTS_MAX 80
+#define IO_EVENTS_PG18_MAX 80
+
+/* ── IO Events PG17 (class 0x0A, 77 events, 0-indexed, alphabetical) ──
+ * PG17 uses the same alphabetical ordering as PG18 but lacks 4 events
+ * added in PG18: AioIoCompletion, AioIoUringExecution, AioIoUringSubmit,
+ * CopyFileCopy. This shifts all subsequent indices. */
+static const char *io_events_pg17[] = {
+    [0]  = "BasebackupRead",
+    [1]  = "BasebackupSync",
+    [2]  = "BasebackupWrite",
+    [3]  = "BufFileRead",
+    [4]  = "BufFileTruncate",
+    [5]  = "BufFileWrite",
+    [6]  = "ControlFileRead",
+    [7]  = "ControlFileSync",
+    [8]  = "ControlFileSyncUpdate",
+    [9]  = "ControlFileWrite",
+    [10] = "ControlFileWriteUpdate",
+    [11] = "CopyFileRead",
+    [12] = "CopyFileWrite",
+    [13] = "DataFileExtend",
+    [14] = "DataFileFlush",
+    [15] = "DataFileImmediateSync",
+    [16] = "DataFilePrefetch",
+    [17] = "DataFileRead",
+    [18] = "DataFileSync",
+    [19] = "DataFileTruncate",
+    [20] = "DataFileWrite",
+    [21] = "DsmAllocate",
+    [22] = "DsmFillZeroWrite",
+    [23] = "LockFileAddToDataDirRead",
+    [24] = "LockFileAddToDataDirSync",
+    [25] = "LockFileAddToDataDirWrite",
+    [26] = "LockFileCreateRead",
+    [27] = "LockFileCreateSync",
+    [28] = "LockFileCreateWrite",
+    [29] = "LockFileReCheckDataDirRead",
+    [30] = "LogicalRewriteCheckpointSync",
+    [31] = "LogicalRewriteMappingSync",
+    [32] = "LogicalRewriteMappingWrite",
+    [33] = "LogicalRewriteSync",
+    [34] = "LogicalRewriteTruncate",
+    [35] = "LogicalRewriteWrite",
+    [36] = "RelationMapRead",
+    [37] = "RelationMapReplace",
+    [38] = "RelationMapWrite",
+    [39] = "ReorderBufferRead",
+    [40] = "ReorderBufferWrite",
+    [41] = "ReorderLogicalMappingRead",
+    [42] = "ReplicationSlotRead",
+    [43] = "ReplicationSlotRestoreSync",
+    [44] = "ReplicationSlotSync",
+    [45] = "ReplicationSlotWrite",
+    [46] = "SlruFlushSync",
+    [47] = "SlruRead",
+    [48] = "SlruSync",
+    [49] = "SlruWrite",
+    [50] = "SnapbuildRead",
+    [51] = "SnapbuildSync",
+    [52] = "SnapbuildWrite",
+    [53] = "TimelineHistoryFileSync",
+    [54] = "TimelineHistoryFileWrite",
+    [55] = "TimelineHistoryRead",
+    [56] = "TimelineHistorySync",
+    [57] = "TimelineHistoryWrite",
+    [58] = "TwophaseFileRead",
+    [59] = "TwophaseFileSync",
+    [60] = "TwophaseFileWrite",
+    [61] = "VersionFileSync",
+    [62] = "VersionFileWrite",
+    [63] = "WalSenderTimelineHistoryRead",
+    [64] = "WalBootstrapSync",
+    [65] = "WalBootstrapWrite",
+    [66] = "WalCopyRead",
+    [67] = "WalCopySync",
+    [68] = "WalCopyWrite",
+    [69] = "WalInitSync",
+    [70] = "WalInitWrite",
+    [71] = "WalRead",
+    [72] = "WalSummaryRead",
+    [73] = "WalSummaryWrite",
+    [74] = "WalSync",
+    [75] = "WalSyncMethodAssign",
+    [76] = "WalWrite",
+};
+#define IO_EVENTS_PG17_MAX 76
+
+/* Active IO event table pointer (set by pgwt_init_event_names).
+ * Default to PG18 tables in case init is not called. */
+static const char **io_events = io_events_pg18;
+static int io_events_max = IO_EVENTS_PG18_MAX;
 
 /* ── Lock Events (class 0x03) ────────────────────────────── */
 /* Lock types match LockTagType enum, 0-indexed */
@@ -331,12 +427,30 @@ static const char *lwlock_tranches[] = {
 };
 #define LWLOCK_TRANCHES_MAX 94
 
+/* ── Initialization ──────────────────────────────────────── */
+
+void pgwt_init_event_names(int pg_major)
+{
+    pg_version = pg_major;
+    switch (pg_major) {
+    case 17:
+        io_events = io_events_pg17;
+        io_events_max = IO_EVENTS_PG17_MAX;
+        break;
+    default:
+        /* PG18+ and fallback for unknown versions */
+        io_events = io_events_pg18;
+        io_events_max = IO_EVENTS_PG18_MAX;
+        break;
+    }
+}
+
 /* ── Decode Functions ─────────────────────────────────────── */
 
 /* 0-indexed lookup */
 static const char *lookup0(const char **tbl, int max, int id)
 {
-    if (id >= 0 && id <= max && tbl[id])
+    if (tbl && id >= 0 && id <= max && tbl[id])
         return tbl[id];
     return NULL;
 }
@@ -368,32 +482,32 @@ const char *pgwt_event_name(uint32_t wei)
 
     switch (cls) {
     case PG_WAIT_IO:
-        name = lookup0(io_events, IO_EVENTS_MAX, id);
-        return name ? name : "unknown_io";
+        name = lookup0(io_events, io_events_max, id);
+        return name ? name : NULL;
     case PG_WAIT_LOCK:
         name = lookup0(lock_events, LOCK_EVENTS_MAX, id);
-        return name ? name : "unknown_lock";
+        return name ? name : NULL;
     case PG_WAIT_TIMEOUT:
         name = lookup0(timeout_events, TIMEOUT_EVENTS_MAX, id);
-        return name ? name : "unknown_timeout";
+        return name ? name : NULL;
     case PG_WAIT_ACTIVITY:
         name = lookup0(activity_events, ACTIVITY_EVENTS_MAX, id);
-        return name ? name : "unknown_activity";
+        return name ? name : NULL;
     case PG_WAIT_CLIENT:
         name = lookup0(client_events, CLIENT_EVENTS_MAX, id);
-        return name ? name : "unknown_client";
+        return name ? name : NULL;
     case PG_WAIT_IPC:
         name = lookup0(ipc_events, IPC_EVENTS_MAX, id);
-        return name ? name : "unknown_ipc";
+        return name ? name : NULL;
     case PG_WAIT_LWLOCK:
         name = lookup0(lwlock_tranches, LWLOCK_TRANCHES_MAX, id);
-        return name ? name : "unknown_lwlock";
+        return name ? name : NULL;
     case PG_WAIT_BUFFERPIN:
         return "BufferPin";
     case PG_WAIT_EXTENSION:
         return "Extension";
     default:
-        return "unknown";
+        return NULL;
     }
 }
 
@@ -405,19 +519,12 @@ void pgwt_event_full_name(uint32_t wei, char *buf, size_t bufsz)
     }
 
     const char *cls = pgwt_class_name(wei);
-    int id = WE_EVENT(wei);
+    const char *ev = pgwt_event_name(wei);
 
-    /* For LWLock with unknown tranche, show numeric ID */
-    if (WE_CLASS(wei) == PG_WAIT_LWLOCK) {
-        const char *name = lookup0(lwlock_tranches, LWLOCK_TRANCHES_MAX, id);
-        if (name)
-            snprintf(buf, bufsz, "%s:%s", cls, name);
-        else
-            snprintf(buf, bufsz, "%s:id=%d", cls, id);
-        return;
-    }
-
-    snprintf(buf, bufsz, "%s:%s", cls, pgwt_event_name(wei));
+    if (ev)
+        snprintf(buf, bufsz, "%s:%s", cls, ev);
+    else
+        snprintf(buf, bufsz, "%s:id=%d", cls, WE_EVENT(wei));
 }
 
 int pgwt_is_idle_event(uint32_t wei)

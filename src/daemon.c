@@ -97,6 +97,7 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
     d->skel->rodata->target_postmaster_pid = d->postmaster_pid;
     d->skel->rodata->my_wait_ptr_addr = d->my_wait_ptr_addr;
     d->skel->rodata->my_be_entry_addr = d->my_be_entry_addr;
+    d->skel->rodata->st_query_id_offset = d->st_query_id_offset;
 
     /* Load BPF programs (runs verifier) */
     err = pg_wait_tracer_bpf__load(d->skel);

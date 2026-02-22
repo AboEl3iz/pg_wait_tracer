@@ -176,23 +176,24 @@ static void test_unknown_fallbacks(void)
 {
     printf("--- Unknown / Out-of-Range ---\n");
     char buf[128];
-    /* IO out of range */
+    /* IO out of range → numeric fallback "IO:id=999" */
     pgwt_event_full_name(WEI(PG_WAIT_IO, 999), buf, sizeof(buf));
-    CHECK(strstr(buf, "unknown") != NULL,
-          "IO:999 should contain 'unknown', got \"%s\"", buf);
-    /* Lock id=99 (out of range) */
+    CHECK(strstr(buf, "id=999") != NULL,
+          "IO:999 should contain 'id=999', got \"%s\"", buf);
+    /* Lock id=99 (out of range) → numeric fallback "Lock:id=99" */
     pgwt_event_full_name(WEI(PG_WAIT_LOCK, 99), buf, sizeof(buf));
-    CHECK(strstr(buf, "unknown") != NULL,
-          "Lock:99 should contain 'unknown', got \"%s\"", buf);
+    CHECK(strstr(buf, "id=99") != NULL,
+          "Lock:99 should contain 'id=99', got \"%s\"", buf);
     /* Unknown class */
     pgwt_event_full_name(WEI(0xFF, 0), buf, sizeof(buf));
-    CHECK(strstr(buf, "Unknown") != NULL || strstr(buf, "unknown") != NULL,
-          "class 0xFF should be unknown, got \"%s\"", buf);
+    CHECK(strstr(buf, "Unknown") != NULL || strstr(buf, "id=") != NULL,
+          "class 0xFF should be unknown or numeric, got \"%s\"", buf);
 }
 
 int main(void)
 {
     printf("=== test_wait_event ===\n");
+    pgwt_init_event_names(18);
     test_cpu();
     test_io_events();
     test_lock_events();

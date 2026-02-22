@@ -1,4 +1,5 @@
-/* discovery.c — Postmaster PID, ELF symbol offset, /proc helpers */
+/* discovery.c — Postmaster PID, ELF symbol offset, /proc helpers,
+ *                PG version detection, st_query_id offset detection */
 #include "discovery.h"
 
 #include <stdio.h>
@@ -7,6 +8,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <sys/utsname.h>
 #include <libelf.h>
 #include <gelf.h>
 
@@ -141,4 +143,119 @@ uint64_t pgwt_read_pointer(pid_t pid, uint64_t addr)
         val = 0;
     close(fd);
     return val;
+}
+
+/* ── PG Version Detection ─────────────────────────────────── */
+
+int pgwt_detect_pg_version(const char *pg_binary)
+{
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "%s --version 2>/dev/null", pg_binary);
+
+    FILE *fp = popen(cmd, "r");
+    if (!fp) {
+        fprintf(stderr, "WARN: cannot run '%s --version'\n", pg_binary);
+        return 0;
+    }
+
+    char line[256];
+    int major = 0;
+    if (fgets(line, sizeof(line), fp)) {
+        /* Format: "postgres (PostgreSQL) 18.2" or "postgres (PostgreSQL) 14.12" */
+        char *p = strstr(line, "PostgreSQL");
+        if (p) {
+            p += strlen("PostgreSQL");
+            /* Skip ") " or just whitespace */
+            while (*p && (*p == ')' || *p == ' '))
+                p++;
+            major = atoi(p);
+        }
+    }
+    pclose(fp);
+
+    if (major < 1 || major > 99) {
+        fprintf(stderr, "WARN: cannot parse PG version from '%s'\n", line);
+        return 0;
+    }
+    return major;
+}
+
+/* ── st_query_id Offset Detection ─────────────────────────── */
+
+/* Tier 1: Try DWARF debug info via readelf */
+static int detect_offset_dwarf(const char *pg_binary)
+{
+    /* Try the binary itself first, then the detached debug info.
+     * Debian/Ubuntu: /usr/lib/debug/.build-id/XX/YYYY.debug
+     * We let readelf handle the debug link automatically. */
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd),
+             "readelf --debug-dump=info '%s' 2>/dev/null | awk '"
+             "/DW_TAG_structure_type/ { s=0 } "
+             "/DW_AT_name.*PgBackendStatus/ { s=1 } "
+             "s && /DW_AT_name.*st_query_id/ { "
+             "  while ((getline line) > 0) { "
+             "    if (line ~ /DW_AT_data_member_location/) { "
+             "      match(line, /[0-9]+$/); "
+             "      if (RSTART>0) { print substr(line,RSTART,RLENGTH); exit } "
+             "    } "
+             "    if (line ~ /DW_TAG_/) break "
+             "  } "
+             "}'",
+             pg_binary);
+
+    FILE *fp = popen(cmd, "r");
+    if (!fp)
+        return 0;
+
+    char buf[64];
+    int offset = 0;
+    if (fgets(buf, sizeof(buf), fp))
+        offset = atoi(buf);
+    pclose(fp);
+
+    return offset;
+}
+
+/* Tier 2: Known offsets for common PG versions on x86_64 */
+static int detect_offset_known(int pg_major)
+{
+    struct utsname un;
+    if (uname(&un) != 0)
+        return 0;
+
+    int is_x86_64 = (strcmp(un.machine, "x86_64") == 0);
+
+    if (is_x86_64) {
+        switch (pg_major) {
+        case 18: return 424;
+        case 17: return 424;
+        /* PG14-16: st_query_id offset needs verification.
+         * Return 0 for now — DWARF detection is preferred. */
+        default: return 0;
+        }
+    }
+    /* ARM64 and other architectures: rely on DWARF */
+    return 0;
+}
+
+int pgwt_detect_query_id_offset(const char *pg_binary, int pg_major)
+{
+    if (pg_major < 14) {
+        /* st_query_id was added in PG14 */
+        return 0;
+    }
+
+    /* Tier 1: DWARF debug symbols */
+    int offset = detect_offset_dwarf(pg_binary);
+    if (offset > 0)
+        return offset;
+
+    /* Tier 2: Known offset table */
+    offset = detect_offset_known(pg_major);
+    if (offset > 0)
+        return offset;
+
+    /* Tier 3: Not available */
+    return 0;
 }

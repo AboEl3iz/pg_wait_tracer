@@ -5,6 +5,11 @@
 #include <stdint.h>
 #include <stddef.h>
 
+/* Initialize event name tables for the given PG major version.
+ * Must be called before any event name lookup functions.
+ * Falls back to PG18 tables for unknown versions. */
+void pgwt_init_event_names(int pg_major);
+
 /* Returns class name: "IO", "LWLock", "Lock", "CPU", etc. */
 const char *pgwt_class_name(uint32_t wait_event_info);
 

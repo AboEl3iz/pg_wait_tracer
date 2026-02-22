@@ -1,6 +1,7 @@
 /* pg_wait_tracer.c — Main entry point: argument parsing, discovery, startup */
 #include "daemon.h"
 #include "discovery.h"
+#include "wait_event.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -136,7 +137,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* Discover my_wait_event_info address */
+    /* Discover postgres binary and version */
     char binary[256];
     if (pgwt_find_pg_binary(pm_pid, binary, sizeof(binary)) != 0) {
         fprintf(stderr, "FATAL: cannot resolve postgres binary for PID %d\n", pm_pid);
@@ -145,6 +146,18 @@ int main(int argc, char **argv)
     }
     if (d->verbose)
         fprintf(stderr, "INFO: postgres binary: %s\n", binary);
+
+    /* Detect PostgreSQL major version */
+    d->pg_major_version = pgwt_detect_pg_version(binary);
+    if (d->pg_major_version == 0) {
+        fprintf(stderr, "WARN: cannot detect PostgreSQL version, assuming PG18\n");
+        d->pg_major_version = 18;
+    } else if (d->verbose) {
+        fprintf(stderr, "INFO: detected PostgreSQL %d\n", d->pg_major_version);
+    }
+
+    /* Initialize version-aware event name tables */
+    pgwt_init_event_names(d->pg_major_version);
 
     uint64_t sym_offset = pgwt_find_symbol_offset(binary, "my_wait_event_info");
     if (sym_offset == 0) {
@@ -191,6 +204,26 @@ int main(int argc, char **argv)
         if (d->verbose)
             fprintf(stderr, "INFO: MyBEEntry VA: 0x%lx\n",
                     (unsigned long)d->my_be_entry_addr);
+    }
+
+    /* Detect st_query_id offset for query_event view */
+    d->st_query_id_offset = pgwt_detect_query_id_offset(binary, d->pg_major_version);
+    if (d->st_query_id_offset > 0) {
+        if (d->verbose)
+            fprintf(stderr, "INFO: st_query_id offset: %d (PG%d)\n",
+                    d->st_query_id_offset, d->pg_major_version);
+    } else {
+        if (d->view == PGWT_VIEW_QUERY_EVENT) {
+            fprintf(stderr, "FATAL: st_query_id offset not found for PG%d — "
+                    "query_event view unavailable\n"
+                    "  Hint: install postgresql-%d-dbgsym for DWARF-based detection\n",
+                    d->pg_major_version, d->pg_major_version);
+            free(d);
+            return 1;
+        }
+        if (d->verbose)
+            fprintf(stderr, "INFO: st_query_id offset not available — "
+                    "query_event view disabled\n");
     }
 
     /* Init daemon: load BPF, attach tracepoints, scan backends */

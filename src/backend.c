@@ -147,14 +147,14 @@ int pgwt_scan_existing_backends(struct pgwt_daemon *d)
                     sizeof(current_wei)) {
                     /* Read current query_id from MyBEEntry->st_query_id */
                     uint64_t current_qid = 0;
-                    if (d->my_be_entry_addr) {
+                    if (d->my_be_entry_addr && d->st_query_id_offset > 0) {
                         uint64_t be_ptr = 0;
                         if (pread(mem_fd, &be_ptr, sizeof(be_ptr),
                                   d->my_be_entry_addr) == sizeof(be_ptr)
                             && be_ptr
                             && pread(mem_fd, &current_qid,
                                      sizeof(current_qid),
-                                     be_ptr + PGWT_ST_QUERY_ID_OFFSET)
+                                     be_ptr + d->st_query_id_offset)
                                != sizeof(current_qid))
                             current_qid = 0;
                     }

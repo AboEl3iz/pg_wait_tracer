@@ -18,6 +18,7 @@
 volatile const u32 target_postmaster_pid = 0;
 volatile const u64 my_wait_ptr_addr = 0;
 volatile const u64 my_be_entry_addr = 0;  /* address of MyBEEntry global */
+volatile const u32 st_query_id_offset = 0; /* offsetof(PgBackendStatus, st_query_id) */
 
 /* ── Maps ─────────────────────────────────────────────────── */
 
@@ -111,13 +112,13 @@ static __always_inline void accumulate(u32 pid, u32 event, u64 duration_ns)
  * Double-dereference: my_be_entry_addr → PgBackendStatus* → st_query_id. */
 static __always_inline u64 read_query_id(void)
 {
-    if (!my_be_entry_addr) return 0;
+    if (!my_be_entry_addr || !st_query_id_offset) return 0;
     u64 be_entry = 0;
     bpf_probe_read_user(&be_entry, sizeof(be_entry), (void *)my_be_entry_addr);
     if (!be_entry) return 0;
     u64 qid = 0;
     bpf_probe_read_user(&qid, sizeof(qid),
-                         (void *)(be_entry + PGWT_ST_QUERY_ID_OFFSET));
+                         (void *)(be_entry + st_query_id_offset));
     return qid;
 }
 

@@ -20,4 +20,14 @@ uint64_t pgwt_find_load_base(pid_t pid, const char *binary_basename);
 /* Read an 8-byte pointer from /proc/<pid>/mem at addr. Returns 0 on error. */
 uint64_t pgwt_read_pointer(pid_t pid, uint64_t addr);
 
+/* Detect PostgreSQL major version from the postgres binary.
+ * Runs "<binary> --version" and parses "postgres (PostgreSQL) XX.Y".
+ * Returns major version (e.g. 14, 15, 16, 17, 18) or 0 on error. */
+int pgwt_detect_pg_version(const char *pg_binary);
+
+/* Detect st_query_id offset in PgBackendStatus.
+ * Tries: 1) DWARF debug info, 2) known offset table.
+ * Returns offset in bytes, or 0 if unavailable. */
+int pgwt_detect_query_id_offset(const char *pg_binary, int pg_major);
+
 #endif /* PGWT_DISCOVERY_H */
