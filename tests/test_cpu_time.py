@@ -201,10 +201,20 @@ def test_cpu_time_model(pm_pid):
     check(cpu_ms > 0,
           f"CPU Time = {cpu_ms:.1f}ms > 0")
 
-    wait_sum = sum(v for k, v in model.items() if k.startswith('Wait:'))
-    check(cpu_ms > wait_sum,
-          f"CPU Time {cpu_ms:.1f}ms > Wait sum {wait_sum:.1f}ms "
-          f"(compute-heavy query)")
+    # CPU should be significant: > 5000ms for the compute-heavy query
+    check(cpu_ms > 5000,
+          f"CPU Time {cpu_ms:.1f}ms > 5000ms (compute-heavy query)")
+
+    # CPU should be a major component of DB Time (> 25%).
+    # We don't check CPU > total waits because system-wide time_model
+    # includes background processes (checkpointer, pg_wait_sampling, etc.)
+    # whose waits accumulate independently of our compute workload.
+    db_time = model.get('DB Time', 0)
+    if db_time > 0:
+        cpu_pct = cpu_ms / db_time * 100
+        check(cpu_pct > 25,
+              f"CPU Time is {cpu_pct:.1f}% of DB Time "
+              f"(expected > 25% for compute-heavy query)")
 
 
 def main():
@@ -240,6 +250,8 @@ def main():
         sys.exit(1)
 
     print(f"=== test_cpu_time (postmaster PID {pm_pid}) ===")
+
+    cleanup()
 
     test_cpu_system_event(pm_pid)
     test_cpu_time_model(pm_pid)
