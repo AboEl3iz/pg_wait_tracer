@@ -101,6 +101,58 @@ done:
     return result;
 }
 
+/* Get the ELF base virtual address (lowest PT_LOAD p_vaddr).
+ * For PIE (ET_DYN) this is typically 0; for non-PIE (ET_EXEC) it's
+ * the actual load address (e.g. 0x400000). */
+static uint64_t elf_base_vaddr(const char *binary)
+{
+    if (elf_version(EV_CURRENT) == EV_NONE)
+        return 0;
+
+    int fd = open(binary, O_RDONLY);
+    if (fd < 0)
+        return 0;
+
+    Elf *elf = elf_begin(fd, ELF_C_READ, NULL);
+    if (!elf) {
+        close(fd);
+        return 0;
+    }
+
+    uint64_t base = UINT64_MAX;
+    size_t phnum = 0;
+    elf_getphdrnum(elf, &phnum);
+    for (size_t i = 0; i < phnum; i++) {
+        GElf_Phdr phdr;
+        if (gelf_getphdr(elf, i, &phdr) == NULL)
+            continue;
+        if (phdr.p_type == PT_LOAD && phdr.p_vaddr < base)
+            base = phdr.p_vaddr;
+    }
+
+    elf_end(elf);
+    close(fd);
+    return (base == UINT64_MAX) ? 0 : base;
+}
+
+uint64_t pgwt_resolve_symbol(const char *binary, const char *symbol,
+                             pid_t pid, const char *binary_basename)
+{
+    uint64_t sym_val = pgwt_find_symbol_offset(binary, symbol);
+    if (sym_val == 0)
+        return 0;
+
+    uint64_t load_base = pgwt_find_load_base(pid, binary_basename);
+    if (load_base == 0)
+        return 0;
+
+    uint64_t elf_base = elf_base_vaddr(binary);
+    /* Runtime VA = sym_value - elf_base_vaddr + runtime_load_base
+     * For PIE:     elf_base=0, so VA = sym_value + load_base
+     * For non-PIE: elf_base=load_base (e.g. both 0x400000), so VA = sym_value */
+    return sym_val - elf_base + load_base;
+}
+
 uint64_t pgwt_find_load_base(pid_t pid, const char *binary_basename)
 {
     char path[64];

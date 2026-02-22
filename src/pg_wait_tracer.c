@@ -159,31 +159,20 @@ int main(int argc, char **argv)
     /* Initialize version-aware event name tables */
     pgwt_init_event_names(d->pg_major_version);
 
-    uint64_t sym_offset = pgwt_find_symbol_offset(binary, "my_wait_event_info");
-    if (sym_offset == 0) {
-        fprintf(stderr, "FATAL: symbol 'my_wait_event_info' not found in %s\n", binary);
-        free(d);
-        return 1;
-    }
-    if (d->verbose)
-        fprintf(stderr, "INFO: my_wait_event_info offset: 0x%lx\n", sym_offset);
-
     /* Extract basename for /proc/pid/maps matching */
     const char *base = strrchr(binary, '/');
     base = base ? base + 1 : binary;
 
-    uint64_t load_base = pgwt_find_load_base(pm_pid, base);
-    if (load_base == 0) {
-        fprintf(stderr, "FATAL: cannot find load base for '%s' in PID %d maps\n",
-                base, pm_pid);
+    d->my_wait_ptr_addr = pgwt_resolve_symbol(binary, "my_wait_event_info",
+                                               pm_pid, base);
+    if (d->my_wait_ptr_addr == 0) {
+        fprintf(stderr, "FATAL: cannot resolve 'my_wait_event_info' in %s (PID %d)\n",
+                binary, pm_pid);
         free(d);
         return 1;
     }
-
-    d->my_wait_ptr_addr = load_base + sym_offset;
     if (d->verbose)
-        fprintf(stderr, "INFO: my_wait_event_info VA: 0x%lx (base=0x%lx + offset=0x%lx)\n",
-                d->my_wait_ptr_addr, load_base, sym_offset);
+        fprintf(stderr, "INFO: my_wait_event_info VA: 0x%lx\n", d->my_wait_ptr_addr);
 
     /* Verify pointer is readable */
     uint64_t ptr_val = pgwt_read_pointer(pm_pid, d->my_wait_ptr_addr);
@@ -191,19 +180,18 @@ int main(int argc, char **argv)
         fprintf(stderr, "INFO: my_wait_event_info value (postmaster): 0x%lx\n", ptr_val);
 
     /* Discover MyBEEntry address (for query_id attribution) */
-    uint64_t be_sym_offset = pgwt_find_symbol_offset(binary, "MyBEEntry");
-    if (be_sym_offset == 0) {
+    d->my_be_entry_addr = pgwt_resolve_symbol(binary, "MyBEEntry",
+                                               pm_pid, base);
+    if (d->my_be_entry_addr == 0) {
         if (d->view == PGWT_VIEW_QUERY_EVENT) {
             fprintf(stderr, "FATAL: symbol 'MyBEEntry' not found — query_event view unavailable\n");
             free(d);
             return 1;
         }
         fprintf(stderr, "WARN: symbol 'MyBEEntry' not found — query_event view disabled\n");
-    } else {
-        d->my_be_entry_addr = load_base + be_sym_offset;
-        if (d->verbose)
-            fprintf(stderr, "INFO: MyBEEntry VA: 0x%lx\n",
-                    (unsigned long)d->my_be_entry_addr);
+    } else if (d->verbose) {
+        fprintf(stderr, "INFO: MyBEEntry VA: 0x%lx\n",
+                (unsigned long)d->my_be_entry_addr);
     }
 
     /* Detect st_query_id offset for query_event view */
