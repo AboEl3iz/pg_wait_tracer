@@ -1,18 +1,34 @@
 #!/bin/bash
 # run_all.sh — Master test runner for pg_wait_tracer
-# Usage: sudo tests/run_all.sh [--pid POSTMASTER_PID]
+# Usage: sudo tests/run_all.sh [--pid POSTMASTER_PID] [--pg-version N]
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+source "$SCRIPT_DIR/testutil.sh"
 
 PM_PID=""
+PG_VERSION=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --pid) PM_PID="$2"; shift 2 ;;
-        *) echo "Usage: $0 [--pid POSTMASTER_PID]"; exit 1 ;;
+        --pg-version) PG_VERSION="$2"; shift 2 ;;
+        *) echo "Usage: $0 [--pid POSTMASTER_PID] [--pg-version N]"; exit 1 ;;
     esac
 done
+
+# Auto-detect postmaster PID if not provided
+if [[ -z "$PM_PID" ]] && pgrep -x postgres > /dev/null 2>&1; then
+    if [[ -n "$PG_VERSION" ]]; then
+        PM_PID=$(find_postmaster --pg-version "$PG_VERSION")
+    else
+        PM_PID=$(find_postmaster)
+    fi
+    if [[ -n "$PM_PID" ]]; then
+        local_ver=$(readlink /proc/$PM_PID/exe 2>/dev/null | grep -oP 'postgresql/\K\d+(?=/)' || true)
+        echo "Auto-detected postmaster PID $PM_PID (PostgreSQL ${local_ver:-unknown})"
+    fi
+fi
 
 PID_ARG=""
 if [[ -n "$PM_PID" ]]; then

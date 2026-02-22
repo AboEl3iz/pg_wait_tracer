@@ -5,6 +5,7 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TRACER="$SCRIPT_DIR/../pg_wait_tracer"
+source "$SCRIPT_DIR/testutil.sh"
 
 PM_PID=""
 while [[ $# -gt 0 ]]; do
@@ -15,7 +16,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$PM_PID" ]]; then
-    PM_PID=$(pgrep -x postgres | head -1)
+    PM_PID=$(find_postmaster)
 fi
 
 echo "=== test_cli ==="

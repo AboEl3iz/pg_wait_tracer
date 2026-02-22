@@ -16,6 +16,9 @@ import re
 import time
 import argparse
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from testutil import find_postmaster
+
 TRACER = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                       "pg_wait_tracer")
 STRIP_ANSI = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
@@ -378,22 +381,9 @@ def main():
 
     pm_pid = args.pid
     if not pm_pid:
-        # Find PostgreSQL 18 postmaster (skip PG16 and other versions)
-        result = subprocess.run(["pgrep", "-x", "postgres"],
-                                capture_output=True, text=True)
-        for pid_str in result.stdout.strip().split('\n'):
-            if not pid_str:
-                continue
-            pid = int(pid_str)
-            try:
-                exe = os.readlink(f"/proc/{pid}/exe")
-                if "/18/" in exe:
-                    pm_pid = pid
-                    break
-            except OSError:
-                continue
+        pm_pid = find_postmaster()
     if not pm_pid:
-        print("ERROR: cannot find PostgreSQL 18 postmaster PID")
+        print("ERROR: cannot find PostgreSQL postmaster PID")
         sys.exit(1)
 
     print(f"=== test_accuracy (postmaster PID {pm_pid}) ===")

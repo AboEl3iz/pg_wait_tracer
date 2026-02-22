@@ -5,6 +5,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TRACER="$SCRIPT_DIR/../pg_wait_tracer"
+source "$SCRIPT_DIR/testutil.sh"
 RUNS=3
 DURATION=30
 CLIENTS=4
@@ -20,7 +21,7 @@ done
 
 # Auto-detect postmaster PID
 if [[ -z "$PM_PID" ]]; then
-    PM_PID=$(pgrep -x postgres | head -1)
+    PM_PID=$(find_postmaster)
     if [[ -z "$PM_PID" ]]; then
         echo "ERROR: cannot find postmaster PID (pass --pid)"
         exit 1

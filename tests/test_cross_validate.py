@@ -11,6 +11,9 @@ import re
 import time
 import argparse
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from testutil import find_postmaster
+
 TRACER = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                       "pg_wait_tracer")
 STRIP_ANSI = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
@@ -34,26 +37,6 @@ def check(cond, msg):
         tests_failed += 1
         print(f"  FAIL: {msg}")
 
-
-def get_postmaster_pid():
-    """Find postmaster PID from pg_stat_activity."""
-    result = subprocess.run(
-        ["psql", "-U", "postgres", "-tAc",
-         "SELECT pg_backend_pid()"],
-        capture_output=True, text=True, timeout=5
-    )
-    if result.returncode != 0:
-        return None
-    # Get postmaster PID from /proc
-    backend_pid = int(result.stdout.strip())
-    try:
-        with open(f"/proc/{backend_pid}/status") as f:
-            for line in f:
-                if line.startswith("PPid:"):
-                    return int(line.split()[1])
-    except (FileNotFoundError, PermissionError):
-        pass
-    return None
 
 
 def get_pg_backends():
@@ -245,9 +228,9 @@ def main():
 
     pm_pid = args.pid
     if not pm_pid:
-        pm_pid = get_postmaster_pid()
+        pm_pid = find_postmaster()
     if not pm_pid:
-        print("ERROR: cannot find postmaster PID (pass --pid or ensure PG is running)")
+        print("ERROR: cannot find PostgreSQL postmaster PID")
         sys.exit(1)
 
     print(f"=== test_cross_validate (postmaster PID {pm_pid}) ===")
