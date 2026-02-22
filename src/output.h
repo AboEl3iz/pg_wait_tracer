@@ -9,5 +9,6 @@ void pgwt_print_time_model(struct pgwt_daemon *d);
 void pgwt_print_system_event(struct pgwt_daemon *d);
 void pgwt_print_session_event(struct pgwt_daemon *d);
 void pgwt_print_histogram(struct pgwt_daemon *d);
+void pgwt_print_query_event(struct pgwt_daemon *d);
 
 #endif /* PGWT_OUTPUT_H */

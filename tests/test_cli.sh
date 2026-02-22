@@ -80,7 +80,7 @@ if [[ -n "$PM_PID" ]]; then
     fi
 
     # All 4 views work
-    for view in time_model system_event session_event; do
+    for view in time_model system_event session_event query_event; do
         timeout 10 "$TRACER" --pid "$PM_PID" --interval 1 --duration 2 \
             --view "$view" > /dev/null 2>&1
         rc=$?

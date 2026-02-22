@@ -87,6 +87,24 @@ static struct pgwt_event_stats *get_or_create_system_event(struct pgwt_accumulat
     return se;
 }
 
+static struct pgwt_query_event_stats *get_or_create_query_event(
+    struct pgwt_accumulator *acc, uint64_t query_id, uint32_t we)
+{
+    for (int i = 0; i < acc->num_query_events; i++) {
+        if (acc->query_events[i].query_id == query_id &&
+            acc->query_events[i].wait_event == we)
+            return &acc->query_events[i];
+    }
+    if (acc->num_query_events >= MAX_QUERY_EVENTS)
+        return NULL;
+    struct pgwt_query_event_stats *qe = &acc->query_events[acc->num_query_events++];
+    memset(qe, 0, sizeof(*qe));
+    qe->query_id = query_id;
+    qe->wait_event = we;
+    qe->min_ns = UINT64_MAX;
+    return qe;
+}
+
 int pgwt_read_maps(struct pgwt_daemon *d)
 {
     int stats_fd = bpf_map__fd(d->skel->maps.wait_stats);
@@ -104,6 +122,7 @@ int pgwt_read_maps(struct pgwt_daemon *d)
         d->accum.pids[i].wait_time_ns = 0;
     }
     d->accum.num_system_events = 0;
+    d->accum.num_query_events = 0;
     memset(&d->accum.tm, 0, sizeof(d->accum.tm));
 
     /* Iterate all entries in wait_stats PERCPU_HASH */
@@ -270,9 +289,58 @@ int pgwt_read_maps(struct pgwt_daemon *d)
                 }
                 if (!pgwt_is_idle_event(we))
                     tm->db_time_ns += open_ns;
+
+                /* Query-level open interval */
+                if (sval.last_query_id != 0) {
+                    struct pgwt_query_event_stats *qe =
+                        get_or_create_query_event(&d->accum, sval.last_query_id, we);
+                    if (qe) {
+                        qe->count += 1;
+                        qe->total_ns += open_ns;
+                        if (open_ns < qe->min_ns) qe->min_ns = open_ns;
+                        if (open_ns > qe->max_ns) qe->max_ns = open_ns;
+                    }
+                }
             }
         }
         skey = snext;
+    }
+
+    /* ── Read query_wait_stats PERCPU_HASH ────────────────────── */
+    int qstats_fd = bpf_map__fd(d->skel->maps.query_wait_stats);
+    struct pgwt_query_agg_key qkey = {}, qnext;
+    struct pgwt_agg_value qvalues[MAX_CPUS];
+
+    while (bpf_map_get_next_key(qstats_fd, &qkey, &qnext) == 0) {
+        if (bpf_map_lookup_elem(qstats_fd, &qnext, qvalues) != 0) {
+            qkey = qnext;
+            continue;
+        }
+
+        /* Sum across all CPUs */
+        uint64_t count = 0, total = 0, min_v = UINT64_MAX, max_v = 0;
+
+        for (int cpu = 0; cpu < nr_cpus && cpu < MAX_CPUS; cpu++) {
+            count += qvalues[cpu].count;
+            total += qvalues[cpu].total_ns;
+            if (qvalues[cpu].count > 0 && qvalues[cpu].min_ns < min_v)
+                min_v = qvalues[cpu].min_ns;
+            if (qvalues[cpu].max_ns > max_v)
+                max_v = qvalues[cpu].max_ns;
+        }
+        if (min_v == UINT64_MAX) min_v = 0;
+        if (count == 0) { qkey = qnext; continue; }
+
+        struct pgwt_query_event_stats *qe =
+            get_or_create_query_event(&d->accum, qnext.query_id, qnext.wait_event);
+        if (qe) {
+            qe->count += count;
+            qe->total_ns += total;
+            if (min_v < qe->min_ns) qe->min_ns = min_v;
+            if (max_v > qe->max_ns) qe->max_ns = max_v;
+        }
+
+        qkey = qnext;
     }
 
     return 0;

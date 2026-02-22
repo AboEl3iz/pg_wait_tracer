@@ -42,6 +42,17 @@ struct pgwt_time_model {
     uint64_t activity_time_ns;
 };
 
+/* Per-(query_id, event) stats */
+struct pgwt_query_event_stats {
+    uint64_t query_id;
+    uint32_t wait_event;
+    uint64_t count;
+    uint64_t total_ns;
+    uint64_t min_ns;
+    uint64_t max_ns;
+};
+#define MAX_QUERY_EVENTS  4096
+
 /* Full accumulator state */
 struct pgwt_accumulator {
     /* Current snapshot */
@@ -55,6 +66,10 @@ struct pgwt_accumulator {
     /* System-wide event aggregation */
     struct pgwt_event_stats system_events[4096];
     int num_system_events;
+
+    /* Query-level event aggregation */
+    struct pgwt_query_event_stats query_events[MAX_QUERY_EVENTS];
+    int num_query_events;
 };
 
 /* Forward */

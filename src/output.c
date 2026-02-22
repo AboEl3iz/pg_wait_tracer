@@ -317,3 +317,70 @@ void pgwt_print_histogram(struct pgwt_daemon *d)
     }
     printf("\n");
 }
+
+/* ── Query Event View ────────────────────────────────────── */
+
+/* qsort comparator: sort query events by total_ns descending */
+static int cmp_query_event_total(const void *a, const void *b)
+{
+    const struct pgwt_query_event_stats *qa = a;
+    const struct pgwt_query_event_stats *qb = b;
+    if (qb->total_ns > qa->total_ns) return 1;
+    if (qb->total_ns < qa->total_ns) return -1;
+    return 0;
+}
+
+void pgwt_print_query_event(struct pgwt_daemon *d)
+{
+    struct pgwt_accumulator *acc = &d->accum;
+
+    printf("\033[2J\033[H");
+    printf("%s\n", LINE);
+    printf("pg_wait_tracer — Query Events (cumulative)    Backends: %d\n",
+           count_active_backends(d));
+    printf("%s\n\n", LINE);
+
+    if (acc->num_query_events == 0) {
+        printf("  (no query data yet — ensure compute_query_id = on/auto)\n\n");
+        return;
+    }
+
+    /* Copy and sort */
+    struct pgwt_query_event_stats sorted[MAX_QUERY_EVENTS];
+    int n = acc->num_query_events;
+    if (n > MAX_QUERY_EVENTS) n = MAX_QUERY_EVENTS;
+    memcpy(sorted, acc->query_events, n * sizeof(sorted[0]));
+    qsort(sorted, n, sizeof(sorted[0]), cmp_query_event_total);
+
+    uint64_t db = acc->tm.db_time_ns;
+
+    printf("  %-20s %-26s %12s %14s %10s %12s %9s\n",
+           "query_id", "Wait Event", "Total Waits", "Total (ms)",
+           "Avg (us)", "Max (us)", "% DB");
+    printf("  %-20s %-26s %12s %14s %10s %12s %9s\n",
+           DASH + 60, DASH + 54, DASH + 68, DASH + 66,
+           DASH + 70, DASH + 68, DASH + 71);
+
+    int shown = 0;
+    for (int i = 0; i < n && shown < 30; i++) {
+        if (sorted[i].count == 0) continue;
+        if (pgwt_is_idle_event(sorted[i].wait_event)) continue;
+
+        char name[64];
+        pgwt_event_full_name(sorted[i].wait_event, name, sizeof(name));
+
+        double avg_us = sorted[i].count ?
+            ns_to_us(sorted[i].total_ns) / sorted[i].count : 0;
+
+        printf("  %20ld %-26s %12lu %14.1f %10.1f %12.1f %8.1f%%\n",
+               (int64_t)sorted[i].query_id,
+               name,
+               (unsigned long)sorted[i].count,
+               ns_to_ms(sorted[i].total_ns),
+               avg_us,
+               ns_to_us(sorted[i].max_ns),
+               db ? 100.0 * sorted[i].total_ns / db : 0);
+        shown++;
+    }
+    printf("\n");
+}

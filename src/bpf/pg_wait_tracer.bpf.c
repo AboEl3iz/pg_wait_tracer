@@ -17,6 +17,7 @@
 /* ── Constants from userspace (set before load via .rodata) ── */
 volatile const u32 target_postmaster_pid = 0;
 volatile const u64 my_wait_ptr_addr = 0;
+volatile const u64 my_be_entry_addr = 0;  /* address of MyBEEntry global */
 
 /* ── Maps ─────────────────────────────────────────────────── */
 
@@ -37,6 +38,14 @@ struct {
     __type(key, struct pgwt_agg_key);
     __type(value, struct pgwt_agg_value);
 } wait_stats SEC(".maps");
+
+/* Per-(query_id, event) aggregation */
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_HASH);
+    __uint(max_entries, 65536);
+    __type(key, struct pgwt_query_agg_key);
+    __type(value, struct pgwt_agg_value);
+} query_wait_stats SEC(".maps");
 
 /* Ring buffer for lifecycle events — pollable via epoll */
 struct {
@@ -98,6 +107,51 @@ static __always_inline void accumulate(u32 pid, u32 event, u64 duration_ns)
     }
 }
 
+/* Read the current query_id from PgBackendStatus via MyBEEntry.
+ * Double-dereference: my_be_entry_addr → PgBackendStatus* → st_query_id. */
+static __always_inline u64 read_query_id(void)
+{
+    if (!my_be_entry_addr) return 0;
+    u64 be_entry = 0;
+    bpf_probe_read_user(&be_entry, sizeof(be_entry), (void *)my_be_entry_addr);
+    if (!be_entry) return 0;
+    u64 qid = 0;
+    bpf_probe_read_user(&qid, sizeof(qid),
+                         (void *)(be_entry + PGWT_ST_QUERY_ID_OFFSET));
+    return qid;
+}
+
+/* Accumulate duration into query_wait_stats map (keyed by query_id + event) */
+static __always_inline void accumulate_query(u64 query_id, u32 event, u64 duration_ns)
+{
+    if (query_id == 0) return;  /* skip non-query backends */
+
+    struct pgwt_query_agg_key key = { .query_id = query_id, .wait_event = event };
+    u32 bucket = duration_to_bucket(duration_ns);
+
+    struct pgwt_agg_value *val = bpf_map_lookup_elem(&query_wait_stats, &key);
+    if (val) {
+        val->count++;
+        val->total_ns += duration_ns;
+        if (duration_ns < val->min_ns)
+            val->min_ns = duration_ns;
+        if (duration_ns > val->max_ns)
+            val->max_ns = duration_ns;
+        if (bucket < HISTOGRAM_BUCKETS)
+            val->histogram[bucket]++;
+    } else {
+        struct pgwt_agg_value new_val = {};
+        new_val.count = 1;
+        new_val.total_ns = duration_ns;
+        new_val.min_ns = duration_ns;
+        new_val.max_ns = duration_ns;
+        __builtin_memset(new_val.histogram, 0, sizeof(new_val.histogram));
+        if (bucket < HISTOGRAM_BUCKETS)
+            new_val.histogram[bucket] = 1;
+        bpf_map_update_elem(&query_wait_stats, &key, &new_val, BPF_ANY);
+    }
+}
+
 /* Read the current wait_event_info value via double-dereference.
  * my_wait_ptr_addr → pointer → uint32 value.
  * Works for all backends: each runs in its own address space. */
@@ -123,19 +177,24 @@ int on_watchpoint(struct bpf_perf_event_data *ctx)
     u64 now = bpf_ktime_get_ns();
     u32 new_event = read_wait_event();
 
+    u64 cur_query_id = read_query_id();
+
     struct pgwt_pid_state *st = bpf_map_lookup_elem(&state_map, &pid);
     if (st) {
         /* Accumulate duration of PREVIOUS state */
         u64 duration = now - st->last_ts;
         accumulate(pid, st->last_event, duration);
+        accumulate_query(st->last_query_id, st->last_event, duration);
         /* Transition to new state */
         st->last_event = new_event;
         st->last_ts = now;
+        st->last_query_id = cur_query_id;
     } else {
         /* First event for this PID — initialize, no accumulation */
         struct pgwt_pid_state new_st = {
             .last_event = new_event,
             .last_ts = now,
+            .last_query_id = cur_query_id,
         };
         bpf_map_update_elem(&state_map, &pid, &new_st, BPF_ANY);
     }
@@ -208,6 +267,7 @@ int on_exit(struct trace_event_raw_sched_process_template *ctx)
     u64 now = bpf_ktime_get_ns();
     u64 duration = now - st->last_ts;
     accumulate(pid, st->last_event, duration);
+    accumulate_query(st->last_query_id, st->last_event, duration);
 
     /* Notify daemon */
     struct pgwt_lifecycle_event *ev;

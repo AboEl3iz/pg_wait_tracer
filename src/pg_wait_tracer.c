@@ -21,7 +21,7 @@ static void usage(const char *prog)
         "  -i, --interval <SEC>  Refresh interval in seconds (default: 5)\n"
         "  -d, --duration <SEC>  Run for N seconds then exit (default: unlimited)\n"
         "  -V, --view <VIEW>     Output view: time_model (default), system_event,\n"
-        "                        session_event, histogram\n"
+        "                        session_event, histogram, query_event\n"
         "  -e, --event <NAME>    Event filter for histogram view (e.g. IO:DataFileRead)\n"
         "  -P, --pid-filter <PID> Show detail for specific backend PID (session_event)\n"
         "  -v, --verbose         Verbose output to stderr\n"
@@ -41,6 +41,7 @@ static enum pgwt_view parse_view(const char *s)
     if (strcmp(s, "system_event") == 0)   return PGWT_VIEW_SYSTEM_EVENT;
     if (strcmp(s, "session_event") == 0)  return PGWT_VIEW_SESSION_EVENT;
     if (strcmp(s, "histogram") == 0)      return PGWT_VIEW_HISTOGRAM;
+    if (strcmp(s, "query_event") == 0)    return PGWT_VIEW_QUERY_EVENT;
     fprintf(stderr, "ERROR: unknown view '%s'\n", s);
     exit(1);
 }
@@ -175,6 +176,22 @@ int main(int argc, char **argv)
     uint64_t ptr_val = pgwt_read_pointer(pm_pid, d->my_wait_ptr_addr);
     if (d->verbose)
         fprintf(stderr, "INFO: my_wait_event_info value (postmaster): 0x%lx\n", ptr_val);
+
+    /* Discover MyBEEntry address (for query_id attribution) */
+    uint64_t be_sym_offset = pgwt_find_symbol_offset(binary, "MyBEEntry");
+    if (be_sym_offset == 0) {
+        if (d->view == PGWT_VIEW_QUERY_EVENT) {
+            fprintf(stderr, "FATAL: symbol 'MyBEEntry' not found — query_event view unavailable\n");
+            free(d);
+            return 1;
+        }
+        fprintf(stderr, "WARN: symbol 'MyBEEntry' not found — query_event view disabled\n");
+    } else {
+        d->my_be_entry_addr = load_base + be_sym_offset;
+        if (d->verbose)
+            fprintf(stderr, "INFO: MyBEEntry VA: 0x%lx\n",
+                    (unsigned long)d->my_be_entry_addr);
+    }
 
     /* Init daemon: load BPF, attach tracepoints, scan backends */
     if (pgwt_daemon_init(d) != 0) {

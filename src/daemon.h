@@ -20,6 +20,7 @@ enum pgwt_view {
     PGWT_VIEW_SYSTEM_EVENT,
     PGWT_VIEW_SESSION_EVENT,
     PGWT_VIEW_HISTOGRAM,
+    PGWT_VIEW_QUERY_EVENT,
 };
 
 struct pgwt_daemon {
@@ -35,6 +36,7 @@ struct pgwt_daemon {
     /* Configuration */
     pid_t       postmaster_pid;
     uint64_t    my_wait_ptr_addr;
+    uint64_t    my_be_entry_addr; /* address of MyBEEntry (for query_id) */
     int         interval;         /* seconds */
     int         duration;         /* seconds, 0 = unlimited */
     enum pgwt_view view;

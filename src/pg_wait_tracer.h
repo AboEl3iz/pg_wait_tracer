@@ -24,18 +24,30 @@ typedef uint64_t u64;
 #define MAX_EVENTS_PER_PID   256
 #define MAX_CPUS             128
 
+/* ── Query ID ────────────────────────────────────────────── */
+/* offsetof(PgBackendStatus, st_query_id) for PG18 on x86_64 */
+#define PGWT_ST_QUERY_ID_OFFSET  424
+
 /* ── BPF Map Structs ──────────────────────────────────────── */
 
 /* Per-PID state in state_map */
 struct pgwt_pid_state {
     u32 last_event;     /* previous wait_event_info value (0 = on CPU) */
     u64 last_ts;        /* ktime_ns of last transition */
+    u64 last_query_id;  /* query_id active during last_event */
 };
 
 /* Key for wait_stats map */
 struct pgwt_agg_key {
     u32 pid;
     u32 wait_event;     /* full wait_event_info; 0 = CPU */
+};
+
+/* Key for query_wait_stats map */
+struct pgwt_query_agg_key {
+    u64 query_id;       /* PG query fingerprint hash */
+    u32 wait_event;
+    u32 _pad;           /* alignment */
 };
 
 /* Value for wait_stats map */

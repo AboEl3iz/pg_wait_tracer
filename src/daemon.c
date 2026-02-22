@@ -63,6 +63,9 @@ static void handle_timer(struct pgwt_daemon *d)
     case PGWT_VIEW_HISTOGRAM:
         pgwt_print_histogram(d);
         break;
+    case PGWT_VIEW_QUERY_EVENT:
+        pgwt_print_query_event(d);
+        break;
     }
     fflush(stdout);
 }
@@ -93,6 +96,7 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
     /* Set rodata constants before loading */
     d->skel->rodata->target_postmaster_pid = d->postmaster_pid;
     d->skel->rodata->my_wait_ptr_addr = d->my_wait_ptr_addr;
+    d->skel->rodata->my_be_entry_addr = d->my_be_entry_addr;
 
     /* Load BPF programs (runs verifier) */
     err = pg_wait_tracer_bpf__load(d->skel);
