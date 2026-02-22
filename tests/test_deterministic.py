@@ -91,26 +91,30 @@ def parse_system_events(output):
 # ── Test 1: pg_sleep exact count ───────────────────────────────
 
 def test_pg_sleep_exact_count(pm_pid):
-    """Execute N × pg_sleep(1) in a loop. Verify exact count and total duration.
+    """Execute N × pg_sleep(2) in a loop. Verify exact count and total duration.
 
     Start DO block BEFORE the tracer so the initial scan finds the backend
     already in PgSleep.  This avoids the race window in fork detection →
     watchpoint setup that causes flakiness under suite load.
 
+    Using SLEEP_EACH_S=2 gives the tracer 1.5s after startup before the
+    first PgSleep→CPU transition fires — enough time for BPF load and
+    watchpoint setup even under load.
+
     Timeline:
-      t=0    start psql: DO block (5×pg_sleep(1)) + pg_sleep(60)
-      t=0.5  start tracer (interval=8, duration=14)
+      t=0    start psql: DO block (5×pg_sleep(2)) + pg_sleep(60)
+      t=0.5  start tracer (interval=14, duration=18)
       t=0.5  initial scan finds backend in PgSleep, sets watchpoint
-      t=1    first PgSleep→CPU transition fires watchpoint
+      t=2    first PgSleep→CPU transition fires watchpoint (1.5s margin)
       ...    each pg_sleep transition fires watchpoint
-      t=5    DO block done, pg_sleep(60) keeps backend alive
-      t=8.5  timer tick → PgSleep count=5, total≈4500ms
-      t=14.5 tracer exits, kill psql
+      t=10   DO block done, pg_sleep(60) keeps backend alive
+      t=14.5 timer tick → PgSleep count=5, total≈9500ms
+      t=18.5 tracer exits, kill psql
     """
     print("--- Test 1: pg_sleep Exact Count ---")
 
     N = 5
-    SLEEP_EACH_S = 1
+    SLEEP_EACH_S = 2
 
     # Start deterministic workload BEFORE tracer:
     #   -c "DO block" executes 5×pg_sleep(1) → ~5s of Timeout:PgSleep
@@ -130,14 +134,14 @@ def test_pg_sleep_exact_count(pm_pid):
     # Start tracer — initial scan finds backend in PgSleep
     tracer = subprocess.Popen(
         [TRACER, "--pid", str(pm_pid),
-         "--interval", "8", "--duration", "14",
+         "--interval", "14", "--duration", "18",
          "--view", "system_event"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE
     )
 
     # Wait for tracer to finish
     try:
-        stdout, stderr = tracer.communicate(timeout=25)
+        stdout, stderr = tracer.communicate(timeout=30)
     except subprocess.TimeoutExpired:
         tracer.kill()
         stdout, _ = tracer.communicate()
@@ -167,17 +171,17 @@ def test_pg_sleep_exact_count(pm_pid):
     check(ev['count'] == N,
           f"count = {ev['count']} (expected exactly {N})")
 
-    # Total ≈ 4500ms (5000ms minus ~0.5s before attachment)
-    # Use generous tolerance: 3500-6000ms
-    check(3500 <= ev['total_ms'] <= 6000,
+    # Total ≈ 9500ms (10000ms minus ~0.5s before attachment)
+    # Use generous tolerance: 7000-12000ms
+    check(7000 <= ev['total_ms'] <= 12000,
           f"total = {ev['total_ms']:.1f}ms "
-          f"(expected {N * SLEEP_EACH_S * 1000}ms ±1500ms)")
+          f"(expected {N * SLEEP_EACH_S * 1000}ms ±3000ms)")
 
-    # Avg should be close to 1s (first sleep is shorter due to partial capture)
-    check(ev['avg_us'] > 500000,
-          f"avg = {ev['avg_us']:.0f}us (expected ≈ 1000000us)")
+    # Avg should be close to 2s (first sleep is shorter due to partial capture)
+    check(ev['avg_us'] > 1000000,
+          f"avg = {ev['avg_us']:.0f}us (expected ≈ {SLEEP_EACH_S * 1e6:.0f}us)")
 
-    # Max should be close to 1s (single sleep, no outliers)
+    # Max should be close to 2s (single sleep, no outliers)
     check(ev['max_us'] < SLEEP_EACH_S * 1.5e6,
           f"max = {ev['max_us']:.0f}us (expected < {SLEEP_EACH_S * 1.5e6:.0f}us)")
 
