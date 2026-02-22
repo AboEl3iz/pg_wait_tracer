@@ -39,6 +39,7 @@ struct pgwt_time_model {
     uint64_t client_time_ns;
     uint64_t ipc_time_ns;
     uint64_t timeout_time_ns;
+    uint64_t extension_time_ns;
     uint64_t activity_time_ns;
 };
 

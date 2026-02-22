@@ -201,6 +201,7 @@ int pgwt_read_maps(struct pgwt_daemon *d)
             case PG_WAIT_CLIENT:    tm->client_time_ns += total; break;
             case PG_WAIT_IPC:       tm->ipc_time_ns += total; break;
             case PG_WAIT_TIMEOUT:   tm->timeout_time_ns += total; break;
+            case PG_WAIT_EXTENSION: tm->extension_time_ns += total; break;
             case PG_WAIT_ACTIVITY:  tm->activity_time_ns += total; break;
             }
         }
@@ -284,6 +285,7 @@ int pgwt_read_maps(struct pgwt_daemon *d)
                     case PG_WAIT_CLIENT:    tm->client_time_ns += open_ns; break;
                     case PG_WAIT_IPC:       tm->ipc_time_ns += open_ns; break;
                     case PG_WAIT_TIMEOUT:   tm->timeout_time_ns += open_ns; break;
+                    case PG_WAIT_EXTENSION: tm->extension_time_ns += open_ns; break;
                     case PG_WAIT_ACTIVITY:  tm->activity_time_ns += open_ns; break;
                     }
                 }

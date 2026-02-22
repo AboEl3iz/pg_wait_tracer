@@ -73,6 +73,11 @@ if [[ $(id -u) -eq 0 ]] && pgrep -x postgres > /dev/null 2>&1; then
     run_test "test_accuracy" python3 "$SCRIPT_DIR/test_accuracy.py" $PID_ARG
     run_test "test_deterministic" python3 "$SCRIPT_DIR/test_deterministic.py" $PID_ARG
     run_test "test_overhead" bash "$SCRIPT_DIR/test_overhead.sh" $PID_ARG
+    run_test "test_client_wait" python3 "$SCRIPT_DIR/test_client_wait.py" $PID_ARG
+    run_test "test_cpu_time" python3 "$SCRIPT_DIR/test_cpu_time.py" $PID_ARG
+    run_test "test_lwlock" python3 "$SCRIPT_DIR/test_lwlock.py" $PID_ARG
+    run_test "test_query_event" python3 "$SCRIPT_DIR/test_query_event.py" $PID_ARG
+    run_test "test_cross_pg_wait_sampling" python3 "$SCRIPT_DIR/test_cross_pg_wait_sampling.py" $PID_ARG
 else
     if [[ $(id -u) -ne 0 ]]; then
         skip_test "test_lifecycle" "requires root"
@@ -80,12 +85,22 @@ else
         skip_test "test_accuracy" "requires root"
         skip_test "test_deterministic" "requires root"
         skip_test "test_overhead" "requires root"
+        skip_test "test_client_wait" "requires root"
+        skip_test "test_cpu_time" "requires root"
+        skip_test "test_lwlock" "requires root"
+        skip_test "test_query_event" "requires root"
+        skip_test "test_cross_pg_wait_sampling" "requires root"
     else
         skip_test "test_lifecycle" "PostgreSQL not running"
         skip_test "test_cross_validate" "PostgreSQL not running"
         skip_test "test_accuracy" "PostgreSQL not running"
         skip_test "test_deterministic" "PostgreSQL not running"
         skip_test "test_overhead" "PostgreSQL not running"
+        skip_test "test_client_wait" "PostgreSQL not running"
+        skip_test "test_cpu_time" "PostgreSQL not running"
+        skip_test "test_lwlock" "PostgreSQL not running"
+        skip_test "test_query_event" "PostgreSQL not running"
+        skip_test "test_cross_pg_wait_sampling" "PostgreSQL not running"
     fi
 fi
 

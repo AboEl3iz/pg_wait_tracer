@@ -67,6 +67,7 @@ void pgwt_print_time_model(struct pgwt_daemon *d)
         {"Wait: IPC",       tm->ipc_time_ns},
         {"Wait: BufferPin", tm->bufferpin_time_ns},
         {"Wait: Timeout",   tm->timeout_time_ns},
+        {"Wait: Extension", tm->extension_time_ns},
     };
     int nclasses = sizeof(classes) / sizeof(classes[0]);
 
