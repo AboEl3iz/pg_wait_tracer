@@ -12,6 +12,11 @@ like Oracle ASH. Need to support real DBA investigation workflows.
 - 3 configurable time windows (not just delta+cumulative)
 - `--count N` flag for exact snapshot control
 - Prometheus: skip for now, `--format json` first
+- CLI-first, daemon mode later (future phase)
+- Auto-discover PG instance when only one cluster is running
+- Semi-interactive "top-like" active sessions view (--sort flag, no ncurses)
+- No query text initially — cmdline parsing only for backend info
+- Query text from shared memory: future phase
 
 ---
 
@@ -188,7 +193,134 @@ DBA reads: "Distribution is stable across windows — no latency shift."
 
 ---
 
-## 5. Filtering
+## 5. Auto-Discovery of PostgreSQL Instance
+
+Currently `--pid` or `--pgdata` is required. For ad-hoc DBA use, auto-detect the
+PostgreSQL postmaster when neither is specified:
+
+```
+# Auto-detect: finds the single running postmaster
+sudo pg_wait_tracer
+
+# Explicit PID (unchanged)
+sudo pg_wait_tracer --pid 12345
+
+# Via PGDATA (unchanged)
+sudo pg_wait_tracer --pgdata /var/lib/pgsql/17/data
+```
+
+**Algorithm** (port from `tests/testutil.sh:find_postmaster()`):
+1. `pgrep -x postgres` → list candidate PIDs
+2. Filter children: skip PIDs whose parent comm is also "postgres"
+3. If exactly 1 postmaster → use it automatically
+4. If multiple postmasters → list them with version + PGDATA and FATAL:
+   ```
+   Multiple PostgreSQL instances found:
+     PID 1234  PG17  /var/lib/pgsql/17/data
+     PID 5678  PG18  /var/lib/pgsql/18/data
+   Use --pid <PID> or --pgdata <DIR> to select one.
+   ```
+5. If none found → FATAL: "No running PostgreSQL instance found"
+
+**Version detection**: extract from exe path (`/usr/pgsql-17/bin/postgres` or
+`/usr/lib/postgresql/17/bin/postgres`) via `readlink /proc/PID/exe`.
+
+**PGDATA detection**: read `/proc/PID/environ` for `PGDATA=`, or parse cmdline
+for `-D` flag.
+
+**Do we need both `--pid` and `--pgdata`?** Keep both:
+- `--pid` for multi-instance hosts (direct, unambiguous)
+- `--pgdata` for systemd integration and scripts (reads `postmaster.pid`)
+- Auto-detect for the common single-instance ad-hoc case
+
+---
+
+## 6. Active Sessions View (`--view active`)
+
+A "top-like" refreshing view of currently active backends. This is what a DBA
+opens first to see what's happening right now.
+
+```bash
+sudo pg_wait_tracer --view active
+sudo pg_wait_tracer --view active --sort wait_time
+sudo pg_wait_tracer --view active --sort db_time
+```
+
+```
+════════════════════════════════════════════════════════════════════════════════
+pg_wait_tracer — Active Sessions    Backends: 12/100    Uptime: 32m 15s
+════════════════════════════════════════════════════════════════════════════════
+
+  PID      State       Wait Event          Wait (ms)   DB Time (ms)  Backend Type
+  ────────────────────────────────────────────────────────────────────────────────
+  34521    waiting     Lock:Transaction     8923.1       12450.3      client backend
+  34587    waiting     IO:DataFileRead         3.2        8234.1      client backend
+  34602    on cpu      —                       —          5123.4      client backend
+  34534    waiting     LWLock:WALInsert        0.8        4892.1      client backend
+  34498    waiting     Client:ClientRead    1234.5        3421.2      client backend
+  34612    idle        —                       —             —        client backend
+  34701    active      —                       —             —        autovacuum worker
+  34702    active      —                       —             —        wal writer
+```
+
+**Columns:**
+- **PID**: Backend OS PID
+- **State**: `on cpu` | `waiting` | `idle` (from BPF tracing state)
+- **Wait Event**: Current wait event (if waiting), `—` otherwise
+- **Wait (ms)**: How long in current wait state (from BPF timestamp delta)
+- **DB Time (ms)**: Total DB Time for this backend (cumulative)
+- **Backend Type**: From cmdline parsing (`client backend`, `autovacuum worker`,
+  `wal writer`, `checkpointer`, `bgwriter`, `walreceiver`, etc.)
+
+**Sorting** (`--sort` flag):
+```
+--sort wait_time     Sort by current wait duration (default)
+--sort db_time       Sort by cumulative DB Time
+--sort pid           Sort by PID
+--sort event         Sort by wait event name
+```
+
+**Semi-interactive**: Not full ncurses. Refreshes with screen clear (TUI mode),
+supports `--sort` flag on command line. No runtime key bindings for now.
+
+**Backend info from cmdline**: PostgreSQL writes the backend type into
+`/proc/PID/cmdline` (e.g., `postgres: autovacuum worker`). Parse this for the
+Backend Type column. No query text — just type identification.
+
+**Future**: Read query text from shared memory (`PgBackendStatus.st_activity`)
+for an additional column showing the current SQL statement.
+
+---
+
+## 7. Session Event Windowing
+
+**Summary mode** (default `--view session_event`): Shows only the latest interval.
+No time windows — the per-backend snapshot is already interval-sized and useful as-is.
+
+**Detail mode** (`--view session_event --pid-filter <PID>`): Shows time windows
+for a single backend. This is for deep-diving one specific problematic session.
+
+```bash
+sudo pg_wait_tracer --view session_event --pid-filter 34521 --window 5s,1m,5m
+```
+```
+════════════════════════════════════════════════════════════════════════════════
+pg_wait_tracer — Session Detail: PID 34521    Backend: client backend
+════════════════════════════════════════════════════════════════════════════════
+
+  Wait Event              Last 5s    %     Last 1m    %     Last 5m    %
+  ──────────────────────────────────────────────────────────────────────────
+  Lock:Transaction         4921.3  96.8%    8923.1  51.2%   12450.3  28.1%
+  IO:DataFileRead            98.2   1.9%    5234.1  30.0%   18234.1  41.2%
+  CPU                        64.1   1.3%    3271.8  18.8%   13621.2  30.7%
+```
+
+DBA reads: "PID 34521 is currently stuck on Lock:Transaction (96.8% of last 5s),
+but historically it was mostly doing DataFileRead (41.2% of last 5m)."
+
+---
+
+## 8. Filtering
 
 ### `--class` filter
 ```
@@ -208,7 +340,7 @@ DBA reads: "Distribution is stable across windows — no latency shift."
 
 ---
 
-## 6. `--format` flag
+## 9. `--format` flag
 
 ```
 --format tui       Screen-clearing interactive (default for terminal)
@@ -223,7 +355,7 @@ Auto-detect: `isatty(stdout)` → tui, else → text.
 
 ---
 
-## 7. `--count N` flag
+## 10. `--count N` flag
 
 ```
 --count 1    One-shot: collect for one interval, print, exit
@@ -232,17 +364,20 @@ Auto-detect: `isatty(stdout)` → tui, else → text.
 
 ---
 
-## 8. Full CLI Summary
+## 11. Full CLI Summary
 
 ```
-Usage: pg_wait_tracer --pid <PID> [OPTIONS]
+Usage: pg_wait_tracer [OPTIONS]
 
-Target:
+Target (auto-detect if omitted, single instance):
   -p, --pid <PID>         Postmaster PID
   -D, --pgdata <DIR>      PGDATA directory (reads postmaster.pid)
 
+Views:
+  -V, --view <VIEW>       time_model | system_event | session_event |
+                           histogram | query_event | active
+
 Output control:
-  -V, --view <VIEW>       time_model | system_event | session_event | histogram | query_event
   -f, --format <FMT>      tui | text | json | csv  (default: auto-detect)
   -i, --interval <SEC>    Refresh interval (default: 5)
   -d, --duration <SEC>    Stop after N seconds
@@ -256,6 +391,7 @@ Filters:
   -C, --class <CLASS>     Filter by wait class (system_event)
       --min-pct <N>       Hide events below N% of DB Time
       --top <N>           Top events per class in time_model (default: 3)
+      --sort <COL>        Sort column for active view (wait_time|db_time|pid|event)
 
 Other:
   -v, --verbose           Verbose output to stderr
@@ -264,45 +400,83 @@ Other:
 
 ---
 
-## 9. Implementation Order
+## 12. Implementation Order
 
 | Phase | What | Effort |
 |-------|------|--------|
-| **Phase 1** | Snapshot ring buffer + `--window` + `--count` + `--format` infrastructure | Medium |
-| **Phase 2** | Enhanced time_model with event hierarchy (subcategories) | Medium |
-| **Phase 3** | Multi-window time_model (side-by-side columns) | Medium |
-| **Phase 4** | Multi-window system_event (3 sections) | Small |
-| **Phase 5** | ASH-like query_event (--event filter, --query-id filter) | Medium |
-| **Phase 6** | Multi-window histogram | Small |
-| **Phase 7** | Text format (no screen clear, timestamps) | Small |
-| **Phase 8** | JSON format | Medium |
-| **Phase 9** | CSV format | Small |
-| **Phase 10** | Filtering (--class, --min-pct, --top) | Small |
-| **Phase 11** | Update README + tests | Medium |
+| **Phase 1** | Auto-discovery + `--count` + `--format` infrastructure + TTY auto-detect | Medium |
+| **Phase 2** | Snapshot ring buffer + `--window` parsing + delta computation | Medium |
+| **Phase 3** | Enhanced time_model with event hierarchy (subcategories) | Medium |
+| **Phase 4** | Multi-window time_model (side-by-side columns) | Medium |
+| **Phase 5** | Multi-window system_event (3 sections) | Small |
+| **Phase 6** | ASH-like query_event (--event filter, --query-id filter) | Medium |
+| **Phase 7** | Multi-window histogram | Small |
+| **Phase 8** | Active sessions view (--view active, --sort, cmdline parsing) | Medium |
+| **Phase 9** | Session event windowing (--pid-filter with windows) | Small |
+| **Phase 10** | Text format (no screen clear, timestamps) | Small |
+| **Phase 11** | JSON format | Medium |
+| **Phase 12** | CSV format | Small |
+| **Phase 13** | Filtering (--class, --min-pct, --top) | Small |
+| **Phase 14** | Update README + tests | Medium |
 
 ---
 
-## 10. Files to Modify
+## 13. Files to Modify
 
 | File | Changes |
 |------|---------|
-| `src/pg_wait_tracer.h` | Format/window enums, new CLI field structs |
-| `src/pg_wait_tracer.c` | Parse all new flags, TTY auto-detect |
-| `src/daemon.h` | format, count, windows[], ring_buffer, query_id filter to pgwt_daemon |
-| `src/daemon.c` | Snapshot per tick, count exit, format dispatch |
+| `src/pg_wait_tracer.h` | Format/window/sort enums, new CLI field structs, auto-detect flag |
+| `src/pg_wait_tracer.c` | Parse all new flags, TTY auto-detect, postmaster auto-discovery |
+| `src/daemon.h` | format, count, windows[], ring_buffer, query_id filter, sort to pgwt_daemon |
+| `src/daemon.c` | Snapshot per tick, count exit, format dispatch, active sessions collect |
 | `src/map_reader.h` | Snapshot struct, ring buffer, window delta functions |
 | `src/map_reader.c` | Snapshot save, window delta computation |
-| `src/output.h` | Format-aware signatures |
-| `src/output.c` | Event hierarchy in time_model, multi-window columns/sections, ASH query modes, histogram windows, conditional screen clear, text format |
+| `src/output.h` | Format-aware signatures, active sessions output |
+| `src/output.c` | Event hierarchy in time_model, multi-window columns/sections, ASH query modes, histogram windows, active sessions view, session detail windows, conditional screen clear, text format |
+| `src/cmdline.c` | **New** — Parse /proc/PID/cmdline for backend type |
+| `src/cmdline.h` | **New** — Backend type enum and parser |
 | `src/output_json.c` | **New** — JSON formatter |
 | `src/output_csv.c` | **New** — CSV formatter |
 | `Makefile` | Add new .c files |
 
 ---
 
-## 11. Verification
+## 14. Future: Daemon Mode
+
+After the CLI is feature-complete, add a daemon mode for continuous monitoring:
+
+**Architecture:**
+```
+pg_wait_tracer --daemon          # background process, BPF tracing + ring buffer
+pg_wait_tracer --view time_model # CLI client, connects to daemon via Unix socket
+```
+
+- Daemon runs as a long-lived process, maintains the ring buffer and BPF programs
+- CLI client connects to daemon, requests specific views with filters
+- Avoids re-attaching BPF probes for every ad-hoc query
+- Multiple CLI clients can connect simultaneously
+- PG extension wrapper: a thin SQL interface that talks to the daemon
+
+**Benefits:**
+- Start with PostgreSQL (systemd companion service)
+- No BPF attach/detach overhead for each investigation
+- Foundation for Prometheus exporter (daemon exposes metrics endpoint)
+- PG extension can expose views like `pg_wait_tracer_time_model()`
+
+**Protocol**: Simple request/response over Unix domain socket. Client sends view
+name + filters as JSON, daemon responds with JSON data. CLI client formats output.
+
+**Not in scope for Phase 1-14** — this is a separate future project after the CLI
+redesign is complete and validated.
+
+---
+
+## 15. Verification
 
 ```bash
+# Auto-detect single instance
+sudo ./pg_wait_tracer
+
 # Current behavior unchanged
 sudo ./pg_wait_tracer --pid 12345
 
@@ -311,6 +485,13 @@ sudo ./pg_wait_tracer --pid 12345 --view time_model
 
 # Multi-window
 sudo ./pg_wait_tracer --pid 12345 --window 5s,1m,5m
+
+# Active sessions (top-like)
+sudo ./pg_wait_tracer --view active
+sudo ./pg_wait_tracer --view active --sort db_time
+
+# Session detail with windows
+sudo ./pg_wait_tracer --view session_event --pid-filter 34521 --window 5s,1m,5m
 
 # ASH-like: which queries cause DataFileRead?
 sudo ./pg_wait_tracer --pid 12345 --view query_event --event IO:DataFileRead
@@ -326,6 +507,10 @@ sudo ./pg_wait_tracer --pid 12345 --format json --count 1 --interval 10
 
 # Pipe to file (auto text format)
 sudo ./pg_wait_tracer --pid 12345 --count 5 > output.log
+
+# Multiple instances: auto-detect fails, shows list
+sudo ./pg_wait_tracer
+# → "Multiple PostgreSQL instances found: ..."
 
 # Existing tests
 sudo tests/run_all.sh
