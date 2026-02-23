@@ -91,16 +91,66 @@ sudo apt install -y postgresql-17-dbgsym
 
 ### 4. Test Dependencies (optional)
 
+Running the full test suite requires additional packages and PostgreSQL configuration.
+
+#### Packages
+
 ```bash
-# Python 3 (for integration tests)
 # Rocky/RHEL/Oracle Linux 9:
-sudo dnf install -y python3
+sudo dnf install -y python3 bc
 
 # Ubuntu:
-sudo apt install -y python3
+sudo apt install -y python3 bc
 
-# pgbench (included in postgresql-contrib)
-# pg_wait_sampling extension (for cross-validation tests, optional)
+# pgbench is included in postgresql-contrib (already installed above)
+```
+
+#### PostgreSQL Configuration
+
+Tests connect as `postgres` user via `psql` and `pgbench`. On a fresh install
+running tests as root, you need to allow local connections without a password:
+
+```bash
+# Find pg_hba.conf and switch local auth from peer to trust (test use only)
+# Rocky/RHEL: /var/lib/pgsql/17/data/pg_hba.conf
+# Ubuntu:     /etc/postgresql/17/main/pg_hba.conf
+sudo sed -i 's/^local\s\+all\s\+all\s\+peer/local   all             all                                     trust/' \
+    /var/lib/pgsql/17/data/pg_hba.conf    # adjust path for your OS/version
+sudo systemctl reload postgresql-17
+```
+
+Enable extensions and settings used by tests:
+
+```bash
+psql -U postgres -c "ALTER SYSTEM SET compute_query_id = 'on'"
+psql -U postgres -c "ALTER SYSTEM SET max_parallel_workers_per_gather = 4"
+sudo systemctl restart postgresql-17
+```
+
+Initialize pgbench with enough data for parallel query tests (IPC events):
+
+```bash
+pgbench -U postgres -i -s 50 postgres    # ~5 million rows in pgbench_accounts
+```
+
+#### Optional: pg_wait_sampling (for cross-validation tests)
+
+The `test_cross_pg_wait_sampling` and Extension event tests require pg_wait_sampling.
+These tests are **gracefully skipped** if the extension is not installed.
+
+```bash
+# Rocky/RHEL/Oracle Linux 9 (PG17 example):
+sudo dnf install -y pg_wait_sampling_17
+
+# Ubuntu (PG17 example):
+sudo apt install -y postgresql-17-pg-wait-sampling
+```
+
+Add to shared_preload_libraries and restart:
+
+```bash
+psql -U postgres -c "ALTER SYSTEM SET shared_preload_libraries = 'pg_stat_statements, pg_wait_sampling'"
+sudo systemctl restart postgresql-17
 ```
 
 ## Build
