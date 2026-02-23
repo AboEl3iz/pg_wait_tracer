@@ -4,9 +4,10 @@ Real-time PostgreSQL wait event tracer using BPF hardware watchpoints.
 
 pg_wait_tracer attaches to a running PostgreSQL cluster and captures every
 wait event transition across all backends with nanosecond precision. It
-requires no PostgreSQL patches, no extensions, and no restarts. CPU overhead
-is near zero (<0.5% in benchmarks) because all aggregation happens in-kernel
-via BPF maps — only summary statistics are copied to userspace.
+requires no PostgreSQL patches, no extensions, and no restarts. All
+aggregation happens in-kernel via BPF maps — only summary statistics are
+copied to userspace. Typical TPS overhead is under 5% in pgbench benchmarks
+(up to ~13% under heavy write contention).
 
 ## Quick Start
 
@@ -423,7 +424,7 @@ No data is copied per-event — only aggregated summaries are read.
 This design means:
 - **No PostgreSQL patches or extensions required** — works with stock binaries
 - **No sampling** — every event transition is captured exactly
-- **Near-zero overhead** — BPF runs in nanoseconds, no context switches
+- **Low overhead** — BPF runs in nanoseconds, typically <5% TPS impact
 - **No lock contention** — per-CPU maps avoid cache-line bouncing
 
 ## Requirements
