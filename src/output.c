@@ -25,6 +25,20 @@ static int count_active_backends(struct pgwt_daemon *d)
     return n;
 }
 
+/* Print view separator: TUI clears screen, text prints timestamp */
+static void print_view_start(struct pgwt_daemon *d)
+{
+    if (d->format == PGWT_FMT_TUI) {
+        printf("\033[2J\033[H");
+    } else if (d->format == PGWT_FMT_TEXT) {
+        time_t now = time(NULL);
+        struct tm *t = localtime(&now);
+        printf("\n--- %04d-%02d-%02d %02d:%02d:%02d ---\n",
+               t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
+               t->tm_hour, t->tm_min, t->tm_sec);
+    }
+}
+
 void pgwt_print_header(struct pgwt_daemon *d)
 {
     fprintf(stderr, "pg_wait_tracer v0.1 — postmaster PID %d\n",
@@ -39,7 +53,7 @@ void pgwt_print_time_model(struct pgwt_daemon *d)
 {
     struct pgwt_time_model *tm = &d->accum.tm;
 
-    printf("\033[2J\033[H");  /* clear screen */
+    print_view_start(d);
     printf("%s\n", LINE);
     printf("pg_wait_tracer — Time Model    Backends: %d    Interval: %ds\n",
            count_active_backends(d), d->interval);
@@ -110,7 +124,7 @@ void pgwt_print_system_event(struct pgwt_daemon *d)
 {
     struct pgwt_accumulator *acc = &d->accum;
 
-    printf("\033[2J\033[H");
+    print_view_start(d);
     printf("%s\n", LINE);
     printf("pg_wait_tracer — System Events (cumulative)    Backends: %d\n",
            count_active_backends(d));
@@ -163,7 +177,7 @@ void pgwt_print_session_event(struct pgwt_daemon *d)
 {
     struct pgwt_accumulator *acc = &d->accum;
 
-    printf("\033[2J\033[H");
+    print_view_start(d);
     printf("%s\n", LINE);
     printf("pg_wait_tracer — Session Summary    Backends: %d\n",
            count_active_backends(d));
@@ -264,7 +278,7 @@ static const char *bucket_labels[] = {
 
 void pgwt_print_histogram(struct pgwt_daemon *d)
 {
-    printf("\033[2J\033[H");
+    print_view_start(d);
     printf("%s\n", LINE);
     printf("pg_wait_tracer — Event Histogram\n");
     printf("%s\n\n", LINE);
@@ -335,7 +349,7 @@ void pgwt_print_query_event(struct pgwt_daemon *d)
 {
     struct pgwt_accumulator *acc = &d->accum;
 
-    printf("\033[2J\033[H");
+    print_view_start(d);
     printf("%s\n", LINE);
     printf("pg_wait_tracer — Query Events (cumulative)    Backends: %d\n",
            count_active_backends(d));

@@ -68,6 +68,10 @@ static void handle_timer(struct pgwt_daemon *d)
         break;
     }
     fflush(stdout);
+
+    d->tick++;
+    if (d->count > 0 && d->tick >= d->count)
+        d->running = false;
 }
 
 static void handle_signal(struct pgwt_daemon *d)

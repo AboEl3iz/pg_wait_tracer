@@ -4,6 +4,7 @@
 
 #include <sys/types.h>
 #include <stdint.h>
+#include <stdbool.h>
 
 /* Find postmaster PID from pgdata/postmaster.pid. Returns 0 on error. */
 pid_t pgwt_find_postmaster_pid(const char *pgdata);
@@ -35,5 +36,11 @@ int pgwt_detect_pg_version(const char *pg_binary);
  * Tries: 1) DWARF debug info, 2) known offset table.
  * Returns offset in bytes, or 0 if unavailable. */
 int pgwt_detect_query_id_offset(const char *pg_binary, int pg_major);
+
+/* Auto-discover a running PostgreSQL postmaster.
+ * Scans /proc for postgres processes, filters children.
+ * Returns PID if exactly one postmaster found, 0 otherwise.
+ * On multiple instances, prints a list to stderr. */
+pid_t pgwt_auto_discover_postmaster(bool verbose);
 
 #endif /* PGWT_DISCOVERY_H */

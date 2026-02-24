@@ -311,3 +311,121 @@ int pgwt_detect_query_id_offset(const char *pg_binary, int pg_major)
     /* Tier 3: Not available */
     return 0;
 }
+
+/* ── Postmaster Auto-Discovery ───────────────────────────── */
+
+#include <dirent.h>
+#include <stdbool.h>
+
+/* Read /proc/<pid>/comm into buf. Returns 0 on success. */
+static int read_proc_comm(pid_t pid, char *buf, size_t bufsz)
+{
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/comm", pid);
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    if (!fgets(buf, bufsz, f)) { fclose(f); return -1; }
+    fclose(f);
+    /* Strip trailing newline */
+    char *nl = strchr(buf, '\n');
+    if (nl) *nl = '\0';
+    return 0;
+}
+
+/* Extract PG version from exe path.
+ * Patterns: /usr/pgsql-17/bin/postgres, /usr/lib/postgresql/17/bin/postgres */
+static int version_from_exe(const char *exe)
+{
+    const char *p;
+
+    /* PGDG RPM: /usr/pgsql-17/bin/postgres */
+    p = strstr(exe, "pgsql-");
+    if (p) return atoi(p + 6);
+
+    /* Debian/Ubuntu: /usr/lib/postgresql/17/bin/postgres */
+    p = strstr(exe, "postgresql/");
+    if (p) return atoi(p + 11);
+
+    return 0;
+}
+
+pid_t pgwt_auto_discover_postmaster(bool verbose)
+{
+    DIR *proc = opendir("/proc");
+    if (!proc) {
+        fprintf(stderr, "Cannot open /proc: %s\n", strerror(errno));
+        return 0;
+    }
+
+    struct { pid_t pid; int version; char exe[256]; } candidates[16];
+    int ncand = 0;
+
+    struct dirent *ent;
+    while ((ent = readdir(proc)) != NULL && ncand < 16) {
+        pid_t pid = atoi(ent->d_name);
+        if (pid <= 0)
+            continue;
+
+        /* Check if this is a postgres process */
+        char comm[64];
+        if (read_proc_comm(pid, comm, sizeof(comm)) != 0)
+            continue;
+        if (strcmp(comm, "postgres") != 0)
+            continue;
+
+        /* Read ppid from /proc/<pid>/stat (field 4) */
+        char stat_path[64];
+        snprintf(stat_path, sizeof(stat_path), "/proc/%d/stat", pid);
+        FILE *f = fopen(stat_path, "r");
+        if (!f) continue;
+
+        int stat_pid, ppid;
+        char stat_comm[256];
+        char state;
+        int ok = fscanf(f, "%d %255s %c %d", &stat_pid, stat_comm, &state, &ppid);
+        fclose(f);
+        if (ok != 4) continue;
+
+        /* If parent is also postgres, this is a child — skip */
+        char parent_comm[64];
+        if (ppid > 0 && read_proc_comm(ppid, parent_comm, sizeof(parent_comm)) == 0) {
+            if (strcmp(parent_comm, "postgres") == 0)
+                continue;
+        }
+
+        /* This is a postmaster. Get exe path and version. */
+        char exe[256];
+        if (pgwt_find_pg_binary(pid, exe, sizeof(exe)) != 0)
+            continue;
+
+        int ver = version_from_exe(exe);
+
+        candidates[ncand].pid = pid;
+        candidates[ncand].version = ver;
+        snprintf(candidates[ncand].exe, sizeof(candidates[ncand].exe), "%s", exe);
+        ncand++;
+    }
+    closedir(proc);
+
+    if (ncand == 0) {
+        fprintf(stderr, "No running PostgreSQL instance found\n");
+        return 0;
+    }
+
+    if (ncand == 1) {
+        if (verbose)
+            fprintf(stderr, "INFO: auto-discovered postmaster PID %d (PG%d) %s\n",
+                    candidates[0].pid, candidates[0].version, candidates[0].exe);
+        return candidates[0].pid;
+    }
+
+    /* Multiple postmasters found — list them */
+    fprintf(stderr, "Multiple PostgreSQL instances found:\n");
+    for (int i = 0; i < ncand; i++) {
+        fprintf(stderr, "  PID %-8d PG%-4d %s\n",
+                candidates[i].pid,
+                candidates[i].version,
+                candidates[i].exe);
+    }
+    return 0;
+}

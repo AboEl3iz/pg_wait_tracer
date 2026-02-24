@@ -23,6 +23,14 @@ enum pgwt_view {
     PGWT_VIEW_QUERY_EVENT,
 };
 
+/* Output formats */
+enum pgwt_format {
+    PGWT_FMT_TUI = 0,   /* screen-clearing interactive (default for TTY) */
+    PGWT_FMT_TEXT,       /* no screen clear, timestamp per interval (default for pipe) */
+    PGWT_FMT_JSON,       /* JSONL — one JSON object per interval (future) */
+    PGWT_FMT_CSV,        /* flat rows, one per event per interval (future) */
+};
+
 struct pgwt_daemon {
     /* BPF */
     struct pg_wait_tracer_bpf *skel;
@@ -45,6 +53,10 @@ struct pgwt_daemon {
     bool        verbose;
     int         pg_major_version;   /* 14, 15, 16, 17, or 18 */
     int         st_query_id_offset; /* 0 = not available */
+    enum pgwt_format format;         /* output format (TUI/TEXT/JSON/CSV) */
+    int         count;               /* max intervals, 0 = unlimited */
+    int         tick;                /* current interval number */
+    uint64_t    query_id_filter;     /* filter query_event to one query, 0 = no filter */
 
     /* State */
     struct pgwt_backend_table backends;

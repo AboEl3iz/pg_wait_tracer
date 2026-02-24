@@ -13,26 +13,35 @@
 static void usage(const char *prog)
 {
     fprintf(stderr,
-        "Usage: %s --pid <POSTMASTER_PID> [OPTIONS]\n"
-        "       %s --pgdata <PGDATA_DIR>   [OPTIONS]\n"
+        "Usage: %s [OPTIONS]\n"
         "\n"
-        "Options:\n"
+        "Target (auto-detect if omitted for single instance):\n"
         "  -p, --pid <PID>       Postmaster PID\n"
         "  -D, --pgdata <DIR>    PGDATA directory (reads postmaster.pid)\n"
+        "\n"
+        "Output control:\n"
+        "  -V, --view <VIEW>     time_model (default), system_event, session_event,\n"
+        "                        histogram, query_event\n"
+        "  -f, --format <FMT>    tui | text (default: auto-detect TTY)\n"
         "  -i, --interval <SEC>  Refresh interval in seconds (default: 5)\n"
         "  -d, --duration <SEC>  Run for N seconds then exit (default: unlimited)\n"
-        "  -V, --view <VIEW>     Output view: time_model (default), system_event,\n"
-        "                        session_event, histogram, query_event\n"
-        "  -e, --event <NAME>    Event filter for histogram view (e.g. IO:DataFileRead)\n"
-        "  -P, --pid-filter <PID> Show detail for specific backend PID (session_event)\n"
+        "  -n, --count <N>       Print N intervals then exit\n"
+        "\n"
+        "Filters:\n"
+        "  -e, --event <NAME>    Event filter (histogram: required; query_event: by event)\n"
+        "  -P, --pid-filter <PID> Show detail for specific backend (session_event)\n"
+        "  -Q, --query-id <ID>   Filter query_event to one query\n"
+        "\n"
+        "Other:\n"
         "  -v, --verbose         Verbose output to stderr\n"
         "  -h, --help            Show this help\n"
         "\n"
         "Examples:\n"
-        "  sudo %s --pid 12345\n"
-        "  sudo %s --pgdata /var/lib/postgresql/18/main --view system_event\n"
-        "  sudo %s --pid 12345 --view histogram --event IO:DataFileRead\n"
-        "  sudo %s --pid 12345 --view session_event --pid-filter 12400\n",
+        "  sudo %s                                           # auto-detect instance\n"
+        "  sudo %s --pid 12345 --count 1                     # one-shot\n"
+        "  sudo %s --view system_event --count 5             # 5 intervals\n"
+        "  sudo %s --view histogram --event IO:DataFileRead\n"
+        "  sudo %s --count 10 | cat                          # text mode (piped)\n",
         prog, prog, prog, prog, prog, prog);
 }
 
@@ -47,14 +56,27 @@ static enum pgwt_view parse_view(const char *s)
     exit(1);
 }
 
+static enum pgwt_format parse_format(const char *s)
+{
+    if (strcmp(s, "tui") == 0)   return PGWT_FMT_TUI;
+    if (strcmp(s, "text") == 0)  return PGWT_FMT_TEXT;
+    if (strcmp(s, "json") == 0)  return PGWT_FMT_JSON;
+    if (strcmp(s, "csv") == 0)   return PGWT_FMT_CSV;
+    fprintf(stderr, "ERROR: unknown format '%s' (use: tui, text, json, csv)\n", s);
+    exit(1);
+}
+
 static struct option long_opts[] = {
     {"pid",        required_argument, NULL, 'p'},
     {"pgdata",     required_argument, NULL, 'D'},
     {"interval",   required_argument, NULL, 'i'},
     {"duration",   required_argument, NULL, 'd'},
     {"view",       required_argument, NULL, 'V'},
+    {"format",     required_argument, NULL, 'f'},
+    {"count",      required_argument, NULL, 'n'},
     {"event",      required_argument, NULL, 'e'},
     {"pid-filter", required_argument, NULL, 'P'},
+    {"query-id",   required_argument, NULL, 'Q'},
     {"verbose",    no_argument,       NULL, 'v'},
     {"help",       no_argument,       NULL, 'h'},
     {NULL, 0, NULL, 0},
@@ -76,22 +98,30 @@ int main(int argc, char **argv)
 
     pid_t pm_pid = 0;
     const char *pgdata = NULL;
+    bool format_set = false;
     int opt;
 
-    while ((opt = getopt_long(argc, argv, "p:D:i:d:V:e:P:vh", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:D:i:d:V:f:n:e:P:Q:vh", long_opts, NULL)) != -1) {
         switch (opt) {
         case 'p': pm_pid = atoi(optarg); break;
         case 'D': pgdata = optarg; break;
         case 'i': d->interval = atoi(optarg); break;
         case 'd': d->duration = atoi(optarg); break;
         case 'V': d->view = parse_view(optarg); break;
+        case 'f': d->format = parse_format(optarg); format_set = true; break;
+        case 'n': d->count = atoi(optarg); break;
         case 'e': d->event_filter = optarg; break;
         case 'P': d->pid_filter = atoi(optarg); break;
+        case 'Q': d->query_id_filter = strtoull(optarg, NULL, 10); break;
         case 'v': d->verbose = true; break;
         case 'h': usage(argv[0]); free(d); return 0;
         default:  usage(argv[0]); free(d); return 1;
         }
     }
+
+    /* TTY auto-detect: tui for terminal, text for pipe */
+    if (!format_set)
+        d->format = isatty(STDOUT_FILENO) ? PGWT_FMT_TUI : PGWT_FMT_TEXT;
 
     /* Resolve postmaster PID */
     if (pm_pid == 0 && pgdata) {
@@ -104,10 +134,13 @@ int main(int argc, char **argv)
         }
     }
     if (pm_pid == 0) {
-        fprintf(stderr, "FATAL: must specify --pid or --pgdata\n\n");
-        usage(argv[0]);
-        free(d);
-        return 1;
+        /* Auto-discover: find single running PostgreSQL instance */
+        pm_pid = pgwt_auto_discover_postmaster(d->verbose);
+        if (pm_pid == 0) {
+            fprintf(stderr, "\nUse --pid <PID> or --pgdata <DIR>\n");
+            free(d);
+            return 1;
+        }
     }
 
     /* Verify postmaster is alive */

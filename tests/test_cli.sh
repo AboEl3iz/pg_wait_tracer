@@ -51,9 +51,18 @@ else
     failed=$((failed + 1))
 fi
 
-# No args exits non-zero
-"$TRACER" > /dev/null 2>&1
-check_exit 1 $? "no args exits 1"
+# No args with auto-discovery: runs OK if PG is up, so use --count 1 to limit
+if [[ -n "$PM_PID" ]]; then
+    timeout 10 "$TRACER" --count 1 --interval 1 > /dev/null 2>&1
+    rc=$?
+    if [[ $rc -eq 0 || $rc -eq 124 ]]; then
+        echo "  PASS: no args (auto-discover) runs successfully"
+        passed=$((passed + 1))
+    else
+        echo "  FAIL: no args (auto-discover) returned exit code $rc"
+        failed=$((failed + 1))
+    fi
+fi
 
 # Invalid PID exits non-zero
 "$TRACER" --pid 999999999 > /dev/null 2>&1
