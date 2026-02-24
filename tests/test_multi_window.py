@@ -11,6 +11,7 @@ Tests:
   7. query_event Mode A multi-window: section headers, column headers, data rows
   8. query_event Mode B multi-window: --event filter with % Event column
   9. query_event Mode C multi-window: --query-id filter with % Query column
+ 10. histogram multi-window: side-by-side columns, progressive population, pct sums
 
 Requires: root, running PostgreSQL 18, pgbench initialized,
           compute_query_id = on/auto.
@@ -777,6 +778,113 @@ def test_query_event_mode_c(pm_pid):
         check(False, "query_event Mode C: cannot check CPU*")
 
 
+# ── Test 10: histogram multi-window ──────────────────────────
+
+def parse_histogram_row(line):
+    """Parse a histogram row: bucket_label  count  pct%  [count  pct%  ...]
+
+    Bucket labels are known strings like '<1', '1-  2', '>=16K'.
+    We detect a histogram row by finding count/pct pairs in the line.
+    """
+    line = line.strip()
+    # Must start with a bucket-like char (digit, <, >)
+    if not line or line[0] not in '<>=0123456789':
+        return None
+    # Extract all numeric (count pct%) pairs from the whole line
+    values = []
+    for wm in re.finditer(r'(\d+)\s+([\d.]+)%', line):
+        values.append({
+            'count': int(wm.group(1)),
+            'pct': float(wm.group(2)),
+        })
+    # Also check for '-' entries (not-yet-valid windows)
+    has_dash = bool(re.search(r'\s+-\s+-', line))
+    if not values and not has_dash:
+        return None
+    return {'values': values, 'has_dash': has_dash}
+
+
+def test_histogram_multi(pm_pid):
+    """Verify multi-window histogram has side-by-side columns."""
+    print("--- Test 10: histogram multi-window ---")
+
+    pgbench = subprocess.Popen(
+        ["pgbench", "-U", "postgres", "-d", "postgres",
+         "-c", "4", "-T", "25"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+
+    time.sleep(3)
+
+    output = run_tracer(pm_pid, interval=1, count=5, windows="1s,3s",
+                        view="histogram",
+                        extra_args=["--event", "IO:WalSync"])
+
+    pgbench.wait()
+
+    # Column headers present
+    check("Bucket(us)" in output,
+          "histogram multi-window contains 'Bucket(us)' column")
+    check("Last 1s" in output,
+          "histogram multi-window contains 'Last 1s' column")
+    check("Last 3s" in output,
+          "histogram multi-window contains 'Last 3s' column")
+
+    # Event name in header
+    check("IO:WalSync" in output,
+          "histogram multi-window shows event name")
+
+    # No Cumulative column (that's only in single-window mode)
+    cum_count = output.count("Cumulative")
+    check(cum_count == 0,
+          f"histogram multi-window has no Cumulative column (found {cum_count})")
+
+    # No ASCII bar (only in single-window mode)
+    bar_count = output.count("####")
+    check(bar_count == 0,
+          f"histogram multi-window has no ASCII bar (found {bar_count})")
+
+    # Progressive population: find a tick where first window has data,
+    # second shows '-'
+    ticks = split_ticks(output)
+    check(len(ticks) >= 3,
+          f"histogram got {len(ticks)} ticks (expected >= 3)")
+
+    # Last tick should have data in both windows
+    if len(ticks) >= 4:
+        last_tick = ticks[-1]
+        # Look for at least one row with two count/pct pairs
+        has_both = False
+        for line in last_tick.split('\n'):
+            row = parse_histogram_row(line)
+            if row and len(row['values']) >= 2:
+                has_both = True
+                break
+        check(has_both,
+              "histogram last tick has data in both windows")
+
+    # Percentages in each window should sum to ~100%
+    if len(ticks) >= 4:
+        last_tick = ticks[-1]
+        # Collect all pct values for the first window
+        pct_sums = [0.0, 0.0]
+        for line in last_tick.split('\n'):
+            row = parse_histogram_row(line)
+            if row:
+                for wi, v in enumerate(row['values']):
+                    if wi < 2:
+                        pct_sums[wi] += v['pct']
+
+        if pct_sums[0] > 0:
+            check(80 < pct_sums[0] < 120,
+                  f"histogram window 1 percentages sum to {pct_sums[0]:.1f}% "
+                  f"(expected ~100%)")
+        if pct_sums[1] > 0:
+            check(80 < pct_sums[1] < 120,
+                  f"histogram window 2 percentages sum to {pct_sums[1]:.1f}% "
+                  f"(expected ~100%)")
+
+
 # ── Main ─────────────────────────────────────────────────────
 
 def main():
@@ -810,6 +918,7 @@ def main():
     test_query_event_mode_a(pm_pid)
     test_query_event_mode_b(pm_pid)
     test_query_event_mode_c(pm_pid)
+    test_histogram_multi(pm_pid)
 
     print(f"\n{tests_passed}/{tests_run} tests passed")
     sys.exit(0 if tests_failed == 0 else 1)

@@ -37,7 +37,7 @@ sudo ./pg_wait_tracer --window 5s,1m,5m --count 3
 | `--interval <SEC>` | `-i` | 5 | Refresh interval in seconds (minimum 1) |
 | `--duration <SEC>` | `-d` | unlimited | Stop after N seconds |
 | `--count <N>` | `-n` | unlimited | Print N intervals then exit |
-| `--window <W1,W2,W3>` | `-w` | — | Time windows for time_model/system_event/query_event, e.g. `5s,1m,5m` (first must equal interval) |
+| `--window <W1,W2,W3>` | `-w` | — | Time windows for all views, e.g. `5s,1m,5m` (first must equal interval) |
 | `--view <VIEW>` | `-V` | `time_model` | Output view (see below) |
 | `--format <FMT>` | `-f` | auto-detect | Output format: `tui` (terminal), `text` (pipe) |
 | `--event <NAME>` | `-e` | — | Event filter (histogram: required; query_event: by event) |
@@ -352,6 +352,48 @@ pg_wait_tracer — Event Histogram
   reads hit cache while others go to disk.
 - A **heavy tail** (significant counts in 1K+ us buckets) indicates storage
   latency spikes — check disk I/O saturation.
+
+#### Multi-window mode
+
+With `--window`, the histogram shows side-by-side columns — one per window — so
+you can see how latency distribution changes over time:
+
+```bash
+sudo ./pg_wait_tracer --view histogram --event IO:DataFileRead --window 5s,1m,5m
+```
+
+```
+════════════════════════════════════════════════════════════════════════════════
+pg_wait_tracer — Event Histogram    Backends: 12    Interval: 5s
+════════════════════════════════════════════════════════════════════════════════
+
+  Event: IO:DataFileRead
+
+  Bucket(us)              Last 5s              Last 1m              Last 5m
+  ---------- -------------------- -------------------- --------------------
+       <1          12      1.5%        123      1.3%        612      0.7%
+    1-  2          45      5.5%        512      5.3%       4312      5.1%
+    2-  4         183     22.3%       2132     22.0%      18234     21.5%
+    4-  8         210     25.6%       2505     25.8%      22123     26.1%
+    8- 16         153     18.6%       1843     19.0%      16234     19.2%
+   16- 32          98     11.9%       1234     12.7%      10812     12.8%
+   32- 64          54      6.6%        623      6.4%       5234      6.2%
+   64-128          31      3.8%        378      3.9%       3123      3.7%
+  128-256          17      2.1%        198      2.0%       1812      2.1%
+  256-512           9      1.1%         95      1.0%        812      1.0%
+  512-1K            5      0.6%         42      0.4%        412      0.5%
+   1K- 2K           3      0.4%         18      0.2%        198      0.2%
+  >=16K             1      0.1%          1      0.0%         12      0.0%
+  Total            821                9704               83930
+```
+
+**Reading this output:**
+
+- Compare distributions across windows: a stable distribution means no latency
+  shift. A widening distribution in shorter windows means things are getting worse.
+- **Cumulative and ASCII bar** are only shown in single-window mode.
+- Shorter windows fill first. Longer windows show `-` until enough history
+  accumulates.
 
 ---
 

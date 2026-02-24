@@ -599,15 +599,94 @@ static const char *bucket_labels[] = {
     " 2K- 4K",  " 4K- 8K",  " 8K-16K",  ">=16K  ",
 };
 
+static void print_histogram_multi(struct pgwt_daemon *d)
+{
+    int nw = d->num_windows;
+    struct pgwt_snapshot deltas[PGWT_MAX_WINDOWS];
+    int valid[PGWT_MAX_WINDOWS] = {0};
+
+    for (int w = 0; w < nw; w++) {
+        int ticks = d->windows[w] / d->interval;
+        valid[w] = (pgwt_ring_delta(&d->ring, ticks, &deltas[w]) == 0);
+    }
+
+    /* Find matching event in each delta */
+    struct pgwt_snap_event *targets[PGWT_MAX_WINDOWS] = {NULL};
+    for (int w = 0; w < nw; w++) {
+        if (!valid[w]) continue;
+        for (int i = 0; i < deltas[w].num_events; i++) {
+            char name[64];
+            pgwt_event_full_name(deltas[w].events[i].wait_event,
+                                 name, sizeof(name));
+            if (strcmp(name, d->event_filter) == 0) {
+                targets[w] = &deltas[w].events[i];
+                break;
+            }
+        }
+    }
+
+    /* Column headers: Bucket(us) | <per-window: count  %>  ... */
+    printf("  %-10s", "Bucket(us)");
+    for (int w = 0; w < nw; w++) {
+        char label[16];
+        format_window_label(d->windows[w], label, sizeof(label));
+        /* Right-align "Last Xs" in a 20-char field (count 10 + pct 10) */
+        printf(" %20s", label);
+    }
+    printf("\n  ");
+    for (int i = 0; i < 10; i++) putchar('-');
+    for (int w = 0; w < nw; w++) {
+        printf(" ");
+        for (int i = 0; i < 20; i++) putchar('-');
+    }
+    printf("\n");
+
+    /* Bucket rows */
+    for (int b = 0; b < HISTOGRAM_BUCKETS; b++) {
+        printf("  %s", bucket_labels[b]);
+        for (int w = 0; w < nw; w++) {
+            if (!valid[w] || !targets[w]) {
+                printf(" %10s %9s", "-", "-");
+            } else {
+                uint64_t cnt = targets[w]->histogram[b];
+                double pct = targets[w]->count ?
+                    100.0 * cnt / targets[w]->count : 0;
+                printf(" %10lu %8.1f%%",
+                       (unsigned long)cnt, pct);
+            }
+        }
+        printf("\n");
+    }
+
+    /* Totals row */
+    printf("  %-10s", "Total");
+    for (int w = 0; w < nw; w++) {
+        if (!valid[w] || !targets[w]) {
+            printf(" %10s %9s", "-", "-");
+        } else {
+            printf(" %10lu %8s",
+                   (unsigned long)targets[w]->count, "");
+        }
+    }
+    printf("\n\n");
+}
+
 void pgwt_print_histogram(struct pgwt_daemon *d)
 {
     print_view_start(d);
     printf("%s\n", LINE);
-    printf("pg_wait_tracer — Event Histogram\n");
+    printf("pg_wait_tracer — Event Histogram    Backends: %d    Interval: %ds\n",
+           count_active_backends(d), d->interval);
     printf("%s\n\n", LINE);
 
     if (!d->event_filter || !d->event_filter[0]) {
         printf("  Use --event \"IO:DataFileRead\" to select an event.\n\n");
+        return;
+    }
+
+    if (d->num_windows > 0 && d->ring.slots) {
+        printf("  Event: %s\n\n", d->event_filter);
+        print_histogram_multi(d);
         return;
     }
 

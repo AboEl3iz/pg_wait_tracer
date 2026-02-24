@@ -174,6 +174,25 @@ if [[ -n "$PM_PID" ]]; then
         failed=$((failed + 1))
     fi
 
+    # --window histogram output contains side-by-side columns
+    output=$(timeout 15 "$TRACER" --pid "$PM_PID" --view histogram \
+        --event Client:ClientRead --window 1s,3s --interval 1 --count 4 \
+        2>/dev/null || true)
+    if echo "$output" | grep -q "Last 1s"; then
+        echo "  PASS: --window histogram contains 'Last 1s' column"
+        passed=$((passed + 1))
+    else
+        echo "  FAIL: --window histogram missing 'Last 1s' column"
+        failed=$((failed + 1))
+    fi
+    if echo "$output" | grep -q "Bucket(us)"; then
+        echo "  PASS: --window histogram contains 'Bucket(us)' column"
+        passed=$((passed + 1))
+    else
+        echo "  FAIL: --window histogram missing 'Bucket(us)' column"
+        failed=$((failed + 1))
+    fi
+
     # query_event Mode B header (no workload — just verify header text)
     output=$(timeout 15 "$TRACER" --pid "$PM_PID" --view query_event \
         --event Client:ClientRead --interval 1 --count 2 2>/dev/null || true)
