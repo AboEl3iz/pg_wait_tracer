@@ -148,8 +148,10 @@ def test_activity(pm_pid):
 
     # Activity must NOT be included in DB Time (verify via consistency)
     db_time = model.get('DB Time', 0)
-    cpu_time = model.get('CPU Time', 0)
-    wait_sum = sum(v for k, v in model.items() if k.startswith('Wait:'))
+    cpu_time = model.get('CPU', 0)
+    WAIT_CLASSES = {'IO', 'LWLock', 'Lock', 'Client', 'IPC',
+                    'BufferPin', 'Timeout', 'Extension'}
+    wait_sum = sum(v for k, v in model.items() if k in WAIT_CLASSES)
     reconstructed = cpu_time + wait_sum
     if db_time > 0:
         error_pct = abs(reconstructed - db_time) / db_time * 100
@@ -305,8 +307,8 @@ def test_extension(pm_pid):
     output2 = STRIP_ANSI.sub('', stdout2.decode('utf-8', errors='replace'))
     model = parse_time_model(output2)
 
-    check('Wait: Extension' in model,
-          f"Wait: Extension in time_model (keys: {list(model.keys())})")
+    check('Extension' in model,
+          f"Extension in time_model (keys: {list(model.keys())})")
 
 
 # ── Test 4: BufferPin events ─────────────────────────────────

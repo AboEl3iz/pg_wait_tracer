@@ -51,7 +51,8 @@ void pgwt_print_header(struct pgwt_daemon *d)
 
 void pgwt_print_time_model(struct pgwt_daemon *d)
 {
-    struct pgwt_time_model *tm = &d->accum.tm;
+    struct pgwt_accumulator *acc = &d->accum;
+    struct pgwt_time_model *tm = &acc->tm;
 
     print_view_start(d);
     printf("%s\n", LINE);
@@ -69,19 +70,19 @@ void pgwt_print_time_model(struct pgwt_daemon *d)
     printf("  %-36s %12s %10s\n", DASH + 44, DASH + 68, DASH + 70);
 
     printf("  %-36s %12.1f %9.1f%%\n", "DB Time", ns_to_ms(db), 100.0);
-    printf("    %-34s %12.1f %9.1f%%\n", "CPU Time", ns_to_ms(tm->cpu_time_ns),
+    printf("    %-34s %12.1f %9.1f%%\n", "CPU", ns_to_ms(tm->cpu_time_ns),
            db ? 100.0 * tm->cpu_time_ns / db : 0);
 
     /* Wait classes, sorted by size */
-    struct { const char *name; uint64_t ns; } classes[] = {
-        {"Wait: IO",        tm->io_time_ns},
-        {"Wait: LWLock",    tm->lwlock_time_ns},
-        {"Wait: Lock",      tm->lock_time_ns},
-        {"Wait: Client",    tm->client_time_ns},
-        {"Wait: IPC",       tm->ipc_time_ns},
-        {"Wait: BufferPin", tm->bufferpin_time_ns},
-        {"Wait: Timeout",   tm->timeout_time_ns},
-        {"Wait: Extension", tm->extension_time_ns},
+    struct { const char *name; uint64_t ns; uint32_t class_id; } classes[] = {
+        {"IO",        tm->io_time_ns,        PG_WAIT_IO},
+        {"LWLock",    tm->lwlock_time_ns,    PG_WAIT_LWLOCK},
+        {"Lock",      tm->lock_time_ns,      PG_WAIT_LOCK},
+        {"Client",    tm->client_time_ns,    PG_WAIT_CLIENT},
+        {"IPC",       tm->ipc_time_ns,       PG_WAIT_IPC},
+        {"BufferPin", tm->bufferpin_time_ns, PG_WAIT_BUFFERPIN},
+        {"Timeout",   tm->timeout_time_ns,   PG_WAIT_TIMEOUT},
+        {"Extension", tm->extension_time_ns, PG_WAIT_EXTENSION},
     };
     int nclasses = sizeof(classes) / sizeof(classes[0]);
 
@@ -94,11 +95,53 @@ void pgwt_print_time_model(struct pgwt_daemon *d)
                 classes[j] = tmp;
             }
 
+#define MAX_SUB_EVENTS 3
+#define MIN_DB_PCT     1.0
+
     for (int i = 0; i < nclasses; i++) {
         if (classes[i].ns == 0) continue;
         printf("    %-34s %12.1f %9.1f%%\n", classes[i].name,
                ns_to_ms(classes[i].ns), 100.0 * classes[i].ns / db);
+
+        /* Find top sub-events for this class */
+        struct { uint32_t we; uint64_t total_ns; } top[MAX_SUB_EVENTS];
+        int ntop = 0;
+
+        for (int j = 0; j < acc->num_system_events; j++) {
+            struct pgwt_event_stats *ev = &acc->system_events[j];
+            if (ev->count == 0) continue;
+            if (WE_CLASS(ev->wait_event) != classes[i].class_id) continue;
+            if (100.0 * ev->total_ns / db < MIN_DB_PCT) continue;
+
+            /* Insert into top[], sorted desc by total_ns, cap at MAX_SUB_EVENTS */
+            int pos = ntop;
+            for (int k = 0; k < ntop; k++) {
+                if (ev->total_ns > top[k].total_ns) {
+                    pos = k;
+                    break;
+                }
+            }
+            if (pos < MAX_SUB_EVENTS) {
+                int tail = ntop < MAX_SUB_EVENTS ? ntop : MAX_SUB_EVENTS - 1;
+                for (int k = tail; k > pos; k--)
+                    top[k] = top[k - 1];
+                top[pos].we = ev->wait_event;
+                top[pos].total_ns = ev->total_ns;
+                if (ntop < MAX_SUB_EVENTS)
+                    ntop++;
+            }
+        }
+
+        for (int t = 0; t < ntop; t++) {
+            char name[64];
+            pgwt_event_full_name(top[t].we, name, sizeof(name));
+            printf("      %-32s %12.1f %9.1f%%\n", name,
+                   ns_to_ms(top[t].total_ns), 100.0 * top[t].total_ns / db);
+        }
     }
+
+#undef MAX_SUB_EVENTS
+#undef MIN_DB_PCT
 
     if (tm->activity_time_ns > 0) {
         printf("\n  %-36s %12.1f %10s\n", "(Activity/Idle — excluded from DB Time)",

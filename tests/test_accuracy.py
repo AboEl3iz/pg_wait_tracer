@@ -93,8 +93,9 @@ def parse_time_model(output):
     for line in output.split('\n'):
         line = line.strip()
         # Match: "DB Time                 25088.6     100.0%"
-        # or:    "CPU Time                 5498.6      21.9%"
-        # or:    "Wait: IO                 3262.8      13.0%"
+        # or:    "CPU                      5498.6      21.9%"
+        # or:    "IO                       3262.8      13.0%"
+        # or:    "IO:DataFileRead           621.2      12.2%"
         m = re.match(r'^(.+?)\s{2,}([\d.]+)\s+[\d.]+%', line)
         if m:
             name = m.group(1).strip()
@@ -242,7 +243,7 @@ def test_db_time_sanity(pm_pid):
         return
 
     db_time_ms = model['DB Time']
-    cpu_time_ms = model.get('CPU Time', 0)
+    cpu_time_ms = model.get('CPU', 0)
 
     # Sanity: DB Time must be positive and meaningful
     check(db_time_ms > 1000,
@@ -254,11 +255,11 @@ def test_db_time_sanity(pm_pid):
     check(db_time_ms < theoretical_max_ms,
           f"DB Time {db_time_ms:.0f}ms < theoretical max {theoretical_max_ms:.0f}ms")
 
-    # Internal consistency: DB Time = CPU Time + sum of all Wait classes
-    wait_sum = 0
-    for key, val in model.items():
-        if key.startswith('Wait:'):
-            wait_sum += val
+    # Internal consistency: DB Time = CPU + sum of all Wait classes
+    # (class-level names only, not sub-events which contain ':')
+    WAIT_CLASSES = {'IO', 'LWLock', 'Lock', 'Client', 'IPC',
+                    'BufferPin', 'Timeout', 'Extension'}
+    wait_sum = sum(v for k, v in model.items() if k in WAIT_CLASSES)
 
     reconstructed = cpu_time_ms + wait_sum
     if db_time_ms > 0:
@@ -270,7 +271,7 @@ def test_db_time_sanity(pm_pid):
 
     # CPU Time should be > 0
     check(cpu_time_ms > 0,
-          f"CPU Time = {cpu_time_ms:.0f}ms (should be > 0)")
+          f"CPU = {cpu_time_ms:.0f}ms (should be > 0)")
 
     # % should sum to ~100%
     if db_time_ms > 0:

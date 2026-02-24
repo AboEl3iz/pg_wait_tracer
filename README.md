@@ -58,16 +58,22 @@ per interval, no screen clearing).
 
 ### time_model (default)
 
-System-wide time accounting. Shows how backends spend their time, broken down
-by CPU and each wait class. This is the starting point for any investigation.
+System-wide time accounting with event hierarchy. Shows how backends spend their
+time, broken down by CPU and each wait class, with the top individual events
+shown as indented subcategories under each class. This is the starting point
+for any investigation.
 
 **Columns:**
 
 | Column | Description |
 |--------|-------------|
-| Stat Name | Time category |
+| Stat Name | Time category (class or individual event) |
 | Time (ms) | Duration in the interval |
 | % DB Time | Fraction of total DB Time |
+
+**Event hierarchy:** Each wait class shows the top 3 individual events that
+contribute >= 1% of DB Time, indented beneath the class total. CPU has no
+sub-events (it is not a wait class). Classes with 0 time are hidden.
 
 **Example:**
 
@@ -79,12 +85,18 @@ pg_wait_tracer — Time Model    Backends: 12    Interval: 5s
   Stat Name                           Time (ms) % DB Time
   ────────────────────────────────────────────────────────────────────────────
   DB Time                            25088.6     100.0%
-    CPU Time                          5498.6      21.9%
-    Wait: IO                          3262.8      13.0%
-    Wait: Lock                        2104.3       8.4%
-    Wait: LWLock                      1823.2       7.3%
-    Wait: Client                       882.1       3.5%
-    Wait: Timeout                      450.0       1.8%
+    CPU                               5498.6      21.9%
+    IO                                3262.8      13.0%
+      IO:DataFileRead                 2534.1      10.1%
+      IO:DataFileWrite                 312.4       1.2%
+    Lock                              2104.3       8.4%
+      Lock:Transaction                1980.1       7.9%
+    LWLock                            1823.2       7.3%
+      LWLock:WALInsert                1312.3       5.2%
+      LWLock:BufferContent             410.8       1.6%
+    Client                             882.1       3.5%
+      Client:ClientRead                882.1       3.5%
+    Timeout                            450.0       1.8%
 
   (Activity/Idle — excluded from DB Time)    12560.4       —
 ```
@@ -93,10 +105,14 @@ pg_wait_tracer — Time Model    Backends: 12    Interval: 5s
 
 - **DB Time** is the total non-idle time across all backends. With 12 backends
   over a 5-second interval, the maximum is 60,000 ms (12 x 5000).
-- **CPU Time at 21.9%** means backends spent most of their active time waiting,
+- **CPU at 21.9%** means backends spent most of their active time waiting,
   not computing. The system is wait-bound.
-- **IO at 13.0%** is the largest wait class — investigate with `system_event`
-  view to see which specific IO events dominate.
+- **IO at 13.0%** — and you can immediately see that **DataFileRead at 10.1%**
+  is the dominant IO event. No need to switch to `system_event` view.
+- **Lock at 8.4%** — the sub-event shows it's almost entirely Transaction
+  locks (7.9%), meaning queries are blocked by other uncommitted transactions.
+- Small events below 1% of DB Time are hidden to avoid clutter. Use
+  `system_event` view for the full event list.
 - **Activity/Idle** is shown separately and excluded from DB Time. Idle backends
   contribute nothing to DB Time.
 
@@ -318,15 +334,15 @@ pg_wait_tracer — Query Events (cumulative)    Backends: 12
 **DB Time** is the total non-idle wall-clock time across all backends:
 
 ```
-DB Time = CPU Time
-        + IO Time
-        + LWLock Time
-        + Lock Time
-        + BufferPin Time
-        + Client Time
-        + IPC Time
-        + Timeout Time
-        + Extension Time
+DB Time = CPU
+        + IO
+        + LWLock
+        + Lock
+        + BufferPin
+        + Client
+        + IPC
+        + Timeout
+        + Extension
 ```
 
 Activity (idle) events are explicitly excluded. A backend sitting idle between
@@ -336,11 +352,11 @@ With N backends over an interval of T seconds, the theoretical maximum DB Time
 is `N x T x 1000` ms. For example, 12 backends over 5 seconds = 60,000 ms max.
 If DB Time is much lower than this maximum, most backends are idle.
 
-**CPU Time** is the complement of wait time. It represents the time a backend
-was actively running on a CPU core, not blocked on any resource.
+**CPU** is the complement of wait time. It represents the time a backend was
+actively running on a CPU core, not blocked on any resource.
 
 ```
-CPU% = CPU Time / DB Time x 100
+CPU% = CPU / DB Time x 100
 ```
 
 A healthy OLTP workload typically shows CPU% between 30-70%. Below 30% means
