@@ -18,7 +18,7 @@ const char *pgwt_class_name(uint32_t wait_event_info);
 const char *pgwt_event_name(uint32_t wait_event_info);
 
 /* Writes "class:event" (e.g. "IO:DataFileRead") to buf.
- * For event=0, writes "CPU". */
+ * For event=0, writes "CPU*" (asterisk: not all CPU time is instrumented). */
 void pgwt_event_full_name(uint32_t wait_event_info, char *buf, size_t bufsz);
 
 /* Returns true if this event class represents idle waits

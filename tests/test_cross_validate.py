@@ -19,7 +19,7 @@ TRACER = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))
 STRIP_ANSI = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
 
 VALID_CLASSES = {
-    "CPU", "IO", "LWLock", "Lock", "BufferPin",
+    "CPU*", "IO", "LWLock", "Lock", "BufferPin",
     "Activity", "Client", "Extension", "IPC", "Timeout",
 }
 
@@ -179,7 +179,7 @@ def test_event_decode(pm_pid):
 
     # Check all event classes are valid
     for ev in events:
-        if ev == "CPU":
+        if ev == "CPU*":
             continue
         cls = ev.split(':')[0]
         check(cls in VALID_CLASSES,
@@ -206,7 +206,7 @@ def test_wait_event_cross_check(pm_pid):
     events = parse_system_events(tracer_output)
 
     for ev in events:
-        if ev == "CPU":
+        if ev == "CPU*":
             continue
         # Normalize: tracer uses "Lock:tuple" but PG catalog uses "Lock:tuple"
         check(ev in pg_events,

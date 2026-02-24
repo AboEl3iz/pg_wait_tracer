@@ -243,7 +243,7 @@ def test_db_time_sanity(pm_pid):
         return
 
     db_time_ms = model['DB Time']
-    cpu_time_ms = model.get('CPU', 0)
+    cpu_time_ms = model.get('CPU*', 0)
 
     # Sanity: DB Time must be positive and meaningful
     check(db_time_ms > 1000,

@@ -85,7 +85,7 @@ pg_wait_tracer — Time Model    Backends: 12    Interval: 5s
   Stat Name                           Time (ms) % DB Time
   ────────────────────────────────────────────────────────────────────────────
   DB Time                            25088.6     100.0%
-    CPU                               5498.6      21.9%
+    CPU*                              5498.6      21.9%
     IO                                3262.8      13.0%
       IO:DataFileRead                 2534.1      10.1%
       IO:DataFileWrite                 312.4       1.2%
@@ -105,8 +105,9 @@ pg_wait_tracer — Time Model    Backends: 12    Interval: 5s
 
 - **DB Time** is the total non-idle time across all backends. With 12 backends
   over a 5-second interval, the maximum is 60,000 ms (12 x 5000).
-- **CPU at 21.9%** means backends spent most of their active time waiting,
-  not computing. The system is wait-bound.
+- **CPU\*** means time when no PostgreSQL wait event was set. This is mostly
+  CPU execution, but may include uninstrumented code paths. The asterisk
+  indicates it is an approximation.
 - **IO at 13.0%** — and you can immediately see that **DataFileRead at 10.1%**
   is the dominant IO event. No need to switch to `system_event` view.
 - **Lock at 8.4%** — the sub-event shows it's almost entirely Transaction
@@ -127,7 +128,7 @@ identify which specific events consume the most time.
 
 | Column | Description |
 |--------|-------------|
-| Wait Event | Event name as `Class:Event` (e.g. `IO:DataFileRead`) or `CPU` |
+| Wait Event | Event name as `Class:Event` (e.g. `IO:DataFileRead`) or `CPU*` |
 | Total Waits | Number of occurrences |
 | Total (ms) | Cumulative duration |
 | Avg (us) | Average duration per occurrence |
@@ -143,7 +144,7 @@ pg_wait_tracer — System Events (cumulative)    Backends: 12
 
   Wait Event                 Total Waits     Total (ms)   Avg (us)     Max (us)    % DB
   ────────────────────────────────────────────────────────────────────────────────────────
-  CPU                           43460        5498.6      126.5     10630.2   21.9%
+  CPU*                          43460        5498.6      126.5     10630.2   21.9%
   IO:DataFileRead                8234        3262.8      396.2     45623.1   13.0%
   Lock:Transaction                567        2104.3     3712.2    892100.5    8.4%
   LWLock:WALInsert               4812        1823.2      378.9      8934.2    7.3%
@@ -318,7 +319,7 @@ pg_wait_tracer — Query Events (cumulative)    Backends: 12
 
 | Class | Description | Included in DB Time |
 |-------|-------------|:---:|
-| **CPU** | Backend running on CPU (not waiting) | Yes |
+| **CPU\*** | No wait event set (mostly CPU execution, see note below) | Yes |
 | **IO** | Storage I/O: reads, writes, syncs, extends | Yes |
 | **LWLock** | Lightweight locks: WAL, buffers, proc array, etc. | Yes |
 | **Lock** | Heavy locks: row, table, transaction, advisory | Yes |
@@ -334,7 +335,7 @@ pg_wait_tracer — Query Events (cumulative)    Backends: 12
 **DB Time** is the total non-idle wall-clock time across all backends:
 
 ```
-DB Time = CPU
+DB Time = CPU*
         + IO
         + LWLock
         + Lock
@@ -352,11 +353,13 @@ With N backends over an interval of T seconds, the theoretical maximum DB Time
 is `N x T x 1000` ms. For example, 12 backends over 5 seconds = 60,000 ms max.
 If DB Time is much lower than this maximum, most backends are idle.
 
-**CPU** is the complement of wait time. It represents the time a backend was
-actively running on a CPU core, not blocked on any resource.
+**CPU\*** is the time when `wait_event_info = 0` (NULL) in PostgreSQL — no wait
+event was set. This is mostly CPU execution time, but may also include code
+paths that PostgreSQL does not instrument with wait events. The asterisk is
+a reminder that this is not a precise CPU measurement.
 
 ```
-CPU% = CPU / DB Time x 100
+CPU% = CPU* / DB Time x 100
 ```
 
 A healthy OLTP workload typically shows CPU% between 30-70%. Below 30% means

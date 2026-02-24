@@ -149,7 +149,7 @@ def test_cross_validate(pm_pid, profile_period_ms):
     for e in sampling_events[:5]:
         name = e['name']
         if name == 'CPU:on-cpu':
-            name = 'CPU'
+            name = 'CPU*'
         sampling_names.append(name)
     sampling_top5 = set(sampling_names)
 
@@ -227,7 +227,7 @@ def test_time_estimate(pm_pid, profile_period_ms):
     for e in sampling_events:
         name = e['name']
         if name == 'CPU:on-cpu':
-            name = 'CPU'
+            name = 'CPU*'
         sampling_by_name[name] = e
 
     # Find top shared event

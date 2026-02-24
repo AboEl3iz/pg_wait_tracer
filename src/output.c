@@ -70,7 +70,7 @@ void pgwt_print_time_model(struct pgwt_daemon *d)
     printf("  %-36s %12s %10s\n", DASH + 44, DASH + 68, DASH + 70);
 
     printf("  %-36s %12.1f %9.1f%%\n", "DB Time", ns_to_ms(db), 100.0);
-    printf("    %-34s %12.1f %9.1f%%\n", "CPU", ns_to_ms(tm->cpu_time_ns),
+    printf("    %-34s %12.1f %9.1f%%\n", "CPU*", ns_to_ms(tm->cpu_time_ns),
            db ? 100.0 * tm->cpu_time_ns / db : 0);
 
     /* Wait classes, sorted by size */

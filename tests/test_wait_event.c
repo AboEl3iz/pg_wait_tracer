@@ -28,7 +28,7 @@ static int tests_passed = 0;
 static void test_cpu(void)
 {
     printf("--- CPU ---\n");
-    CHECK_NAME(0, "CPU");
+    CHECK_NAME(0, "CPU*");
     CHECK(strcmp(pgwt_class_name(0), "CPU") == 0,
           "class_name(0) expected CPU");
     CHECK(strcmp(pgwt_event_name(0), "CPU") == 0,

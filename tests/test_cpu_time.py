@@ -142,7 +142,7 @@ def test_cpu_system_event(pm_pid):
     output = STRIP_ANSI.sub('', stdout.decode('utf-8', errors='replace'))
     events = parse_system_events(output)
 
-    cpu_ev = [e for e in events if e['name'] == 'CPU']
+    cpu_ev = [e for e in events if e['name'] == 'CPU*']
 
     check(len(cpu_ev) > 0,
           f"CPU event found (events: {[e['name'] for e in events]})")
@@ -201,7 +201,7 @@ def test_cpu_time_model(pm_pid):
     model = parse_time_model(output)
     print(f"  time_model: {model}")
 
-    cpu_ms = model.get('CPU', 0)
+    cpu_ms = model.get('CPU*', 0)
     check(cpu_ms > 0,
           f"CPU = {cpu_ms:.1f}ms > 0")
 

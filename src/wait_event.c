@@ -514,7 +514,7 @@ const char *pgwt_event_name(uint32_t wei)
 void pgwt_event_full_name(uint32_t wei, char *buf, size_t bufsz)
 {
     if (wei == 0) {
-        snprintf(buf, bufsz, "CPU");
+        snprintf(buf, bufsz, "CPU*");
         return;
     }
 

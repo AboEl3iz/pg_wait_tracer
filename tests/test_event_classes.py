@@ -148,7 +148,7 @@ def test_activity(pm_pid):
 
     # Activity must NOT be included in DB Time (verify via consistency)
     db_time = model.get('DB Time', 0)
-    cpu_time = model.get('CPU', 0)
+    cpu_time = model.get('CPU*', 0)
     WAIT_CLASSES = {'IO', 'LWLock', 'Lock', 'Client', 'IPC',
                     'BufferPin', 'Timeout', 'Extension'}
     wait_sum = sum(v for k, v in model.items() if k in WAIT_CLASSES)
