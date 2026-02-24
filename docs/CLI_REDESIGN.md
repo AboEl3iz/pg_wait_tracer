@@ -418,6 +418,7 @@ Other:
 | **Phase 12** | CSV format | Small |
 | **Phase 13** | Filtering (--class, --min-pct, --top) | Small |
 | **Phase 14** | Update README + tests | Medium |
+| **Phase 15** | Recording & replay (`--record`, `--replay`, `--from`, `--to`) | Medium |
 
 ---
 
@@ -437,11 +438,93 @@ Other:
 | `src/cmdline.h` | **New** — Backend type enum and parser |
 | `src/output_json.c` | **New** — JSON formatter |
 | `src/output_csv.c` | **New** — CSV formatter |
+| `src/recording.c` | **New** — Snapshot recording and replay |
+| `src/recording.h` | **New** — Recording file format and API |
 | `Makefile` | Add new .c files |
 
 ---
 
-## 14. Future: Daemon Mode
+## 14. Future: Recording & Replay (SAR-like Time Travel)
+
+Record snapshots to disk for offline analysis. Like `sar -o`/`sar -f`, the DBA can
+capture a performance recording during a problem window, then analyze it later — or
+share it with another DBA for review.
+
+### Recording Mode
+
+```bash
+# Record snapshots to a binary file (runs like normal, also writes to disk)
+sudo pg_wait_tracer --record perf_issue.pgwt --interval 5 --duration 3600
+
+# Record with specific views' data (all snapshot data is always recorded)
+sudo pg_wait_tracer --record overnight.pgwt --interval 5
+```
+
+Each tick writes one `pgwt_snapshot` (time_model + system_events + query_events) plus
+a timestamp header to the file. File format:
+
+```
+[file header: magic, version, interval, PG version, start time]
+[snapshot 0: timestamp + pgwt_snapshot]
+[snapshot 1: timestamp + pgwt_snapshot]
+...
+```
+
+File size: ~15KB per snapshot. At 5s interval: 720 snapshots/hour = ~10.8MB/hour.
+24 hours = ~260MB. Acceptable for investigation recordings.
+
+### Replay Mode
+
+```bash
+# Replay entire recording with default view
+sudo pg_wait_tracer --replay perf_issue.pgwt
+
+# Replay a specific time range
+sudo pg_wait_tracer --replay perf_issue.pgwt --from "2025-01-15 14:00" --to "14:05"
+
+# Replay with specific view and windows
+sudo pg_wait_tracer --replay perf_issue.pgwt --from "14:00" --to "14:30" \
+    --view query_event --window 5s,1m,5m
+
+# One-shot summary of a time range
+sudo pg_wait_tracer --replay perf_issue.pgwt --from "14:00" --to "14:05" --count 1
+```
+
+Replay loads snapshots from file into the ring buffer, then renders views using the
+same delta logic as live mode. `--from`/`--to` select the time range. Without them,
+replays from start to end.
+
+### Key Design Points
+
+- **Same views, same code**: Replay populates the ring buffer from file instead of
+  from BPF maps. All output functions (`pgwt_print_*`) work unchanged.
+- **No BPF needed for replay**: Replay is read-only, no root required for viewing.
+- **Delta computation reuse**: `pgwt_ring_delta()` already computes arbitrary deltas.
+  Replay just needs to load the right snapshots into the ring.
+- **Active sessions not replayable**: The active view shows real-time per-backend state
+  from BPF state_map, which is not captured in snapshots. Recording could optionally
+  store per-backend state too (future extension).
+
+### New CLI Flags
+
+```
+--record <FILE>     Write snapshots to file while tracing
+--replay <FILE>     Replay from recorded file (no BPF, no root needed for viewing)
+--from <TIME>       Start time for replay (ISO 8601 or HH:MM)
+--to <TIME>         End time for replay
+```
+
+### Implementation Approach
+
+1. Define binary file format with header (magic, version, interval, metadata)
+2. In `handle_timer()`, after ring push, also write snapshot to file if recording
+3. New `pgwt_replay_load()` that reads file, populates ring buffer for time range
+4. Replay main loop: step through snapshots, render view per tick (or single summary)
+5. File ~200-300 lines: `src/recording.c` / `src/recording.h`
+
+---
+
+## 15. Future: Daemon Mode (not in Phase 1-15)
 
 After the CLI is feature-complete, add a daemon mode for continuous monitoring:
 
@@ -466,12 +549,12 @@ pg_wait_tracer --view time_model # CLI client, connects to daemon via Unix socke
 **Protocol**: Simple request/response over Unix domain socket. Client sends view
 name + filters as JSON, daemon responds with JSON data. CLI client formats output.
 
-**Not in scope for Phase 1-14** — this is a separate future project after the CLI
+**Not in scope for Phase 1-15** — this is a separate future project after the CLI
 redesign is complete and validated.
 
 ---
 
-## 15. Verification
+## 16. Verification
 
 ```bash
 # Auto-detect single instance
@@ -511,6 +594,11 @@ sudo ./pg_wait_tracer --pid 12345 --count 5 > output.log
 # Multiple instances: auto-detect fails, shows list
 sudo ./pg_wait_tracer
 # → "Multiple PostgreSQL instances found: ..."
+
+# Recording & replay (SAR-like)
+sudo ./pg_wait_tracer --record /tmp/perf.pgwt --interval 5 --count 10
+./pg_wait_tracer --replay /tmp/perf.pgwt
+./pg_wait_tracer --replay /tmp/perf.pgwt --from "14:00" --to "14:05" --view query_event
 
 # Existing tests
 sudo tests/run_all.sh
