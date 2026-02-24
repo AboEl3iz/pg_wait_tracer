@@ -208,16 +208,17 @@ def test_cpu_time_model(pm_pid):
     check(cpu_ms > 5000,
           f"CPU Time {cpu_ms:.1f}ms > 5000ms (compute-heavy query)")
 
-    # CPU should be a major component of DB Time (> 25%).
-    # We don't check CPU > total waits because system-wide time_model
-    # includes background processes (checkpointer, pg_wait_sampling, etc.)
-    # whose waits accumulate independently of our compute workload.
+    # CPU should be a visible component of DB Time (> 15%).
+    # Threshold is intentionally low because system-wide time_model includes
+    # background processes (checkpointer, etc.) and extensions like
+    # pg_wait_sampling that add Extension:Extension events on every backend,
+    # diluting CPU% significantly.
     db_time = model.get('DB Time', 0)
     if db_time > 0:
         cpu_pct = cpu_ms / db_time * 100
-        check(cpu_pct > 25,
+        check(cpu_pct > 15,
               f"CPU Time is {cpu_pct:.1f}% of DB Time "
-              f"(expected > 25% for compute-heavy query)")
+              f"(expected > 15% for compute-heavy query)")
 
 
 def main():

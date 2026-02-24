@@ -1,0 +1,56 @@
+#cloud-config
+# Rocky Linux 9 + PostgreSQL 18 test VM provisioning
+#
+# Usage with Hetzner CLI:
+#   hcloud server create --name rocky9-pg18-test \
+#     --type cpx22 --image rocky-9 --location nbg1 \
+#     --ssh-key <KEY_ID> --user-data-from-file tests/cloud-init-rocky9-pg18.yaml
+#
+# Usage with curl:
+#   USERDATA=$(cat tests/cloud-init-rocky9-pg18.yaml)
+#   jq -n --arg ud "$USERDATA" '{name:"test", server_type:"cpx22",
+#     image:"rocky-9", location:"nbg1", ssh_keys:[KEY_ID], user_data:$ud}' \
+#     | curl -s -X POST https://api.hetzner.cloud/v1/servers \
+#       -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d @-
+
+runcmd:
+  # Repos
+  - dnf install -y epel-release
+  - dnf install -y https://download.postgresql.org/pub/repos/yum/reporpms/EL-9-x86_64/pgdg-redhat-repo-latest.noarch.rpm
+  - dnf config-manager --set-enabled crb
+
+  # Build tools
+  - dnf install -y gcc clang llvm make tar bpftool libbpf-devel elfutils-libelf-devel zlib-devel elfutils git python3 bc
+
+  # PostgreSQL 18 + extensions
+  - dnf install -y postgresql18-server postgresql18-contrib pg_wait_sampling_18
+
+  # Init cluster
+  - /usr/pgsql-18/bin/postgresql-18-setup initdb
+  - systemctl enable postgresql-18 --now
+
+  # Auth: trust for local connections (test VM only)
+  - sed -i 's/ident/trust/g; s/peer/trust/g' /var/lib/pgsql/18/data/pg_hba.conf
+
+  # Configure PG
+  - sudo -u postgres /usr/pgsql-18/bin/psql -c "ALTER SYSTEM SET compute_query_id = on"
+  - sudo -u postgres /usr/pgsql-18/bin/psql -c "ALTER SYSTEM SET max_parallel_workers_per_gather = 2"
+  - sudo -u postgres /usr/pgsql-18/bin/psql -c "ALTER SYSTEM SET pg_stat_statements.track = 'all'"
+  - sudo -u postgres /usr/pgsql-18/bin/psql -c "ALTER SYSTEM SET pg_wait_sampling.profile_period = 10"
+
+  # shared_preload_libraries (written directly to avoid ALTER SYSTEM quoting issues)
+  - echo "shared_preload_libraries = 'pg_stat_statements, pg_wait_sampling'" >> /var/lib/pgsql/18/data/postgresql.auto.conf
+
+  # Restart to load shared libraries
+  - systemctl restart postgresql-18
+  - sleep 2
+
+  # Create extensions
+  - sudo -u postgres /usr/pgsql-18/bin/psql -c "CREATE EXTENSION IF NOT EXISTS pg_stat_statements"
+  - sudo -u postgres /usr/pgsql-18/bin/psql -c "CREATE EXTENSION IF NOT EXISTS pg_wait_sampling"
+
+  # pgbench init (scale 10 = 1M rows)
+  - sudo -u postgres /usr/pgsql-18/bin/pgbench -i -s 10 postgres
+
+  # PATH for interactive use
+  - echo 'export PATH=/usr/pgsql-18/bin:$PATH' >> /root/.bashrc
