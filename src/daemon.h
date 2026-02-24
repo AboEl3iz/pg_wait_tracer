@@ -5,6 +5,7 @@
 #include "pg_wait_tracer.h"
 #include "backend.h"
 #include "map_reader.h"
+#include "snapshot.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -57,6 +58,12 @@ struct pgwt_daemon {
     int         count;               /* max intervals, 0 = unlimited */
     int         tick;                /* current interval number */
     uint64_t    query_id_filter;     /* filter query_event to one query, 0 = no filter */
+
+    /* Time windows */
+#define PGWT_MAX_WINDOWS 3
+    int         num_windows;                    /* 0 = no windowing */
+    int         windows[PGWT_MAX_WINDOWS];      /* window sizes in seconds */
+    struct pgwt_ring ring;                       /* snapshot ring buffer */
 
     /* State */
     struct pgwt_backend_table backends;

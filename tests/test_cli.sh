@@ -76,6 +76,18 @@ check_exit 1 $? "invalid view exits non-zero"
 "$TRACER" --pid "${PM_PID:-1}" --interval 0 > /dev/null 2>&1
 check_exit 1 $? "interval 0 exits non-zero"
 
+# --window validation: first window must equal interval
+"$TRACER" --window 10s,1m,5m --interval 5 > /dev/null 2>&1
+check_exit 1 $? "--window first != interval exits non-zero"
+
+# --window validation: windows must be increasing
+"$TRACER" --window 5s,5m,1m > /dev/null 2>&1
+check_exit 1 $? "--window non-increasing exits non-zero"
+
+# --window validation: invalid suffix
+"$TRACER" --window abc > /dev/null 2>&1
+check_exit 1 $? "--window invalid value exits non-zero"
+
 # Valid args with --duration 1 runs and exits cleanly
 if [[ -n "$PM_PID" ]]; then
     timeout 10 "$TRACER" --pid "$PM_PID" --interval 1 --duration 2 \
@@ -106,6 +118,18 @@ if [[ -n "$PM_PID" ]]; then
     # Histogram requires --event
     "$TRACER" --pid "$PM_PID" --view histogram > /dev/null 2>&1
     check_exit 1 $? "histogram without --event exits non-zero"
+
+    # --window with valid args works
+    timeout 10 "$TRACER" --pid "$PM_PID" --window 1s,5s --interval 1 --count 2 \
+        > /dev/null 2>&1
+    rc=$?
+    if [[ $rc -eq 0 || $rc -eq 124 ]]; then
+        echo "  PASS: --window with valid args works"
+        passed=$((passed + 1))
+    else
+        echo "  FAIL: --window with valid args returned exit code $rc"
+        failed=$((failed + 1))
+    fi
 else
     echo "  SKIP: no running PG (pass --pid to test valid args)"
 fi

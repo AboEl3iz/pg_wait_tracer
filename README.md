@@ -23,6 +23,9 @@ sudo ./pg_wait_tracer --count 1 --interval 10
 
 # Pipe to file (auto-switches to text format with timestamps)
 sudo ./pg_wait_tracer --count 5 > output.log
+
+# Time windows (infrastructure for multi-window views, future phases)
+sudo ./pg_wait_tracer --window 5s,1m,5m --count 3
 ```
 
 ## CLI Reference
@@ -34,6 +37,7 @@ sudo ./pg_wait_tracer --count 5 > output.log
 | `--interval <SEC>` | `-i` | 5 | Refresh interval in seconds (minimum 1) |
 | `--duration <SEC>` | `-d` | unlimited | Stop after N seconds |
 | `--count <N>` | `-n` | unlimited | Print N intervals then exit |
+| `--window <W1,W2,W3>` | `-w` | — | Time windows, e.g. `5s,1m,5m` (first must equal interval) |
 | `--view <VIEW>` | `-V` | `time_model` | Output view (see below) |
 | `--format <FMT>` | `-f` | auto-detect | Output format: `tui` (terminal), `text` (pipe) |
 | `--event <NAME>` | `-e` | — | Event filter (histogram: required; query_event: by event) |

@@ -50,6 +50,9 @@ static void handle_timer(struct pgwt_daemon *d)
 
     pgwt_read_maps(d);
 
+    if (d->ring.slots)
+        pgwt_ring_push(&d->ring, &d->accum);
+
     switch (d->view) {
     case PGWT_VIEW_TIME_MODEL:
         pgwt_print_time_model(d);
@@ -89,6 +92,18 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
     /* Init backend table and accumulator */
     pgwt_backend_init(&d->backends);
     pgwt_accum_init(&d->accum);
+
+    /* Init ring buffer for windowed analysis */
+    if (d->num_windows > 0) {
+        int cap = d->windows[d->num_windows - 1] / d->interval + 1;
+        if (pgwt_ring_init(&d->ring, cap) != 0) {
+            fprintf(stderr, "FATAL: cannot allocate snapshot ring buffer (%d slots)\n", cap);
+            return -1;
+        }
+        if (d->verbose)
+            fprintf(stderr, "INFO: ring buffer: %d slots (%.1f MB)\n",
+                    cap, (double)cap * sizeof(struct pgwt_snapshot) / 1e6);
+    }
 
     /* Open and configure BPF skeleton */
     d->skel = pg_wait_tracer_bpf__open();
@@ -252,6 +267,7 @@ int pgwt_daemon_run(struct pgwt_daemon *d)
 
 void pgwt_daemon_cleanup(struct pgwt_daemon *d)
 {
+    pgwt_ring_free(&d->ring);
     pgwt_close_all_backends(&d->backends);
 
     if (d->rb) {

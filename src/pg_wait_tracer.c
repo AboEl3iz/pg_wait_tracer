@@ -26,6 +26,7 @@ static void usage(const char *prog)
         "  -i, --interval <SEC>  Refresh interval in seconds (default: 5)\n"
         "  -d, --duration <SEC>  Run for N seconds then exit (default: unlimited)\n"
         "  -n, --count <N>       Print N intervals then exit\n"
+        "  -w, --window <W1,W2,W3>  Time windows, e.g. 5s,1m,5m (first = interval)\n"
         "\n"
         "Filters:\n"
         "  -e, --event <NAME>    Event filter (histogram: required; query_event: by event)\n"
@@ -41,8 +42,9 @@ static void usage(const char *prog)
         "  sudo %s --pid 12345 --count 1                     # one-shot\n"
         "  sudo %s --view system_event --count 5             # 5 intervals\n"
         "  sudo %s --view histogram --event IO:DataFileRead\n"
+        "  sudo %s --window 5s,1m,5m --count 3                 # time windows\n"
         "  sudo %s --count 10 | cat                          # text mode (piped)\n",
-        prog, prog, prog, prog, prog, prog);
+        prog, prog, prog, prog, prog, prog, prog);
 }
 
 static enum pgwt_view parse_view(const char *s)
@@ -54,6 +56,51 @@ static enum pgwt_view parse_view(const char *s)
     if (strcmp(s, "query_event") == 0)    return PGWT_VIEW_QUERY_EVENT;
     fprintf(stderr, "ERROR: unknown view '%s'\n", s);
     exit(1);
+}
+
+static int parse_windows(const char *s, int *windows, int *num_windows)
+{
+    char buf[128];
+    int n = 0;
+
+    snprintf(buf, sizeof(buf), "%s", s);
+
+    char *tok = strtok(buf, ",");
+    while (tok && n < PGWT_MAX_WINDOWS) {
+        char *end;
+        long val = strtol(tok, &end, 10);
+        if (val <= 0 || end == tok) {
+            fprintf(stderr, "ERROR: invalid window value '%s'\n", tok);
+            return -1;
+        }
+
+        int secs;
+        switch (*end) {
+        case 's': case '\0': secs = (int)val; break;
+        case 'm':            secs = (int)val * 60; break;
+        case 'h':            secs = (int)val * 3600; break;
+        default:
+            fprintf(stderr, "ERROR: invalid window suffix '%c' (use s, m, h)\n", *end);
+            return -1;
+        }
+
+        if (n > 0 && secs <= windows[n - 1]) {
+            fprintf(stderr, "FATAL: windows must be in increasing order (%ds <= %ds)\n",
+                    secs, windows[n - 1]);
+            return -1;
+        }
+
+        windows[n++] = secs;
+        tok = strtok(NULL, ",");
+    }
+
+    if (n == 0) {
+        fprintf(stderr, "ERROR: --window requires at least one value\n");
+        return -1;
+    }
+
+    *num_windows = n;
+    return 0;
 }
 
 static enum pgwt_format parse_format(const char *s)
@@ -74,6 +121,7 @@ static struct option long_opts[] = {
     {"view",       required_argument, NULL, 'V'},
     {"format",     required_argument, NULL, 'f'},
     {"count",      required_argument, NULL, 'n'},
+    {"window",     required_argument, NULL, 'w'},
     {"event",      required_argument, NULL, 'e'},
     {"pid-filter", required_argument, NULL, 'P'},
     {"query-id",   required_argument, NULL, 'Q'},
@@ -101,7 +149,7 @@ int main(int argc, char **argv)
     bool format_set = false;
     int opt;
 
-    while ((opt = getopt_long(argc, argv, "p:D:i:d:V:f:n:e:P:Q:vh", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:D:i:d:V:f:n:w:e:P:Q:vh", long_opts, NULL)) != -1) {
         switch (opt) {
         case 'p': pm_pid = atoi(optarg); break;
         case 'D': pgdata = optarg; break;
@@ -110,6 +158,12 @@ int main(int argc, char **argv)
         case 'V': d->view = parse_view(optarg); break;
         case 'f': d->format = parse_format(optarg); format_set = true; break;
         case 'n': d->count = atoi(optarg); break;
+        case 'w':
+            if (parse_windows(optarg, d->windows, &d->num_windows) != 0) {
+                free(d);
+                return 1;
+            }
+            break;
         case 'e': d->event_filter = optarg; break;
         case 'P': d->pid_filter = atoi(optarg); break;
         case 'Q': d->query_id_filter = strtoull(optarg, NULL, 10); break;
@@ -122,6 +176,19 @@ int main(int argc, char **argv)
     /* TTY auto-detect: tui for terminal, text for pipe */
     if (!format_set)
         d->format = isatty(STDOUT_FILENO) ? PGWT_FMT_TUI : PGWT_FMT_TEXT;
+
+    /* Validate options (before PG discovery) */
+    if (d->interval < 1) {
+        fprintf(stderr, "FATAL: interval must be >= 1 second\n");
+        free(d);
+        return 1;
+    }
+    if (d->num_windows > 0 && d->windows[0] != d->interval) {
+        fprintf(stderr, "FATAL: first window (%ds) must equal --interval (%ds)\n",
+                d->windows[0], d->interval);
+        free(d);
+        return 1;
+    }
 
     /* Resolve postmaster PID */
     if (pm_pid == 0 && pgdata) {
@@ -151,12 +218,7 @@ int main(int argc, char **argv)
     }
     d->postmaster_pid = pm_pid;
 
-    /* Validate options */
-    if (d->interval < 1) {
-        fprintf(stderr, "FATAL: interval must be >= 1 second\n");
-        free(d);
-        return 1;
-    }
+    /* Validate view-specific options */
     if (d->view == PGWT_VIEW_HISTOGRAM && (!d->event_filter || !d->event_filter[0])) {
         fprintf(stderr, "FATAL: histogram view requires --event <NAME>\n");
         free(d);
