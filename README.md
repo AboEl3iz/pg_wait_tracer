@@ -37,7 +37,7 @@ sudo ./pg_wait_tracer --window 5s,1m,5m --count 3
 | `--interval <SEC>` | `-i` | 5 | Refresh interval in seconds (minimum 1) |
 | `--duration <SEC>` | `-d` | unlimited | Stop after N seconds |
 | `--count <N>` | `-n` | unlimited | Print N intervals then exit |
-| `--window <W1,W2,W3>` | `-w` | — | Time windows for time_model/system_event, e.g. `5s,1m,5m` (first must equal interval) |
+| `--window <W1,W2,W3>` | `-w` | — | Time windows for time_model/system_event/query_event, e.g. `5s,1m,5m` (first must equal interval) |
 | `--view <VIEW>` | `-V` | `time_model` | Output view (see below) |
 | `--format <FMT>` | `-f` | auto-detect | Output format: `tui` (terminal), `text` (pipe) |
 | `--event <NAME>` | `-e` | — | Event filter (histogram: required; query_event: by event) |
@@ -360,23 +360,20 @@ pg_wait_tracer — Event Histogram
 Wait events grouped by PostgreSQL query ID. Shows which queries cause which
 waits. Requires `compute_query_id = on` (or `auto`) in `postgresql.conf`.
 
-**Columns:**
+Three modes are available depending on flags:
 
-| Column | Description |
-|--------|-------------|
-| query_id | PostgreSQL query fingerprint (matches `pg_stat_statements.queryid`) |
-| Wait Event | Event name |
-| Total Waits | Number of occurrences |
-| Total (ms) | Cumulative duration |
-| Avg (us) | Average per occurrence |
-| Max (us) | Longest occurrence |
-| % DB | Fraction of DB Time |
+#### Mode A (default) — Top query-event combinations
+
+Shows all query/event pairs sorted by total duration. This is the starting point
+for identifying which queries contribute most to wait time.
+
+**Columns:** query_id | Wait Event | Total Waits | Total (ms) | Avg (us) | Max (us) | % DB
 
 **Example:**
 
 ```
 ════════════════════════════════════════════════════════════════════════════════
-pg_wait_tracer — Query Events (cumulative)    Backends: 12
+pg_wait_tracer — Query Events    Backends: 12    Interval: 5s
 ════════════════════════════════════════════════════════════════════════════════
 
   query_id             Wait Event                 Total Waits     Total (ms)   Avg (us)     Max (us)    % DB
@@ -396,6 +393,92 @@ pg_wait_tracer — Query Events (cumulative)    Backends: 12
 - The same query can appear multiple times with different wait events.
 - A query with high `Lock:Transaction` time is waiting for row locks held by
   other transactions.
+
+#### Mode B (`--event`) — Top queries for a specific event
+
+Answers: "Which queries are responsible for this wait event?"
+
+```bash
+sudo ./pg_wait_tracer --view query_event --event IO:DataFileRead
+```
+
+**Columns:** query_id | Waits | Total (ms) | Avg (us) | Max (us) | % Event | % DB
+
+**Example:**
+
+```
+════════════════════════════════════════════════════════════════════════════════
+pg_wait_tracer — Top Queries for IO:DataFileRead    Backends: 12    Interval: 5s
+════════════════════════════════════════════════════════════════════════════════
+
+  query_id             Waits     Total (ms)   Avg (us)     Max (us)  % Event    % DB
+  ─────────────────────────────────────────────────────────────────────────────────────
+   5678234567890123      2340        1024.5      437.8     45623.1    78.2%    4.1%
+   9876543210987654       456         201.8      442.5      5432.1    15.4%    0.8%
+   1111222233334444        84          83.4      992.9      3210.5     6.4%    0.3%
+```
+
+- **% Event** shows each query's share of the total time spent in that specific event.
+  The column sums to ~100%.
+- **% DB** shows the fraction of total DB Time. Use this to gauge overall impact.
+
+#### Mode C (`--query-id`) — Wait profile for one query
+
+Answers: "What does this query spend its time waiting on?"
+
+```bash
+sudo ./pg_wait_tracer --view query_event --query-id 5678234567890123
+```
+
+**Columns:** Wait Event | Waits | Total (ms) | Avg (us) | Max (us) | % Query | % DB
+
+**Example:**
+
+```
+════════════════════════════════════════════════════════════════════════════════
+pg_wait_tracer — Wait Profile for query_id 5678234567890123    Backends: 12    Interval: 5s
+════════════════════════════════════════════════════════════════════════════════
+
+  Wait Event                 Waits     Total (ms)   Avg (us)     Max (us)  % Query    % DB
+  ────────────────────────────────────────────────────────────────────────────────────────
+  CPU*                        8920        1820.3      204.1     12340.5    52.1%    7.3%
+  IO:DataFileRead             2340        1024.5      437.8     45623.1    29.3%    4.1%
+  LWLock:WALInsert             890         334.2      375.5      8934.2     9.6%    1.3%
+  IO:DataFileWrite             312         198.4      635.9      5612.0     5.7%    0.8%
+  LWLock:BufferContent         178         115.2      647.2      3451.0     3.3%    0.5%
+```
+
+- **% Query** shows each event's share of this query's total time. The column
+  sums to ~100%. CPU\* is always present.
+- Use this to understand the wait profile of a specific slow query.
+
+#### Multi-window mode
+
+All three modes support `--window` with vertically stacked sections per window:
+
+```bash
+sudo ./pg_wait_tracer --view query_event --window 5s,1m --event IO:DataFileRead
+```
+
+```
+---- Last 5s -----------------------------------------------------------------
+  query_id             Waits     Total (ms)   Avg (us)  % Event    % DB
+  ────────────────────────────────────────────────────────────────────────────
+   5678234567890123       234         102.5      437.8    78.2%    4.1%
+   9876543210987654        46          20.2      438.5    15.4%    0.8%
+
+---- Last 1m -----------------------------------------------------------------
+  query_id             Waits     Total (ms)   Avg (us)  % Event    % DB
+  ────────────────────────────────────────────────────────────────────────────
+   5678234567890123      2810        1229.4      437.5    76.8%    3.9%
+   9876543210987654       547         242.2      442.8    15.1%    0.8%
+   1111222233334444       105         104.2      992.4     6.5%    0.3%
+```
+
+- **Max (us) is not shown** in multi-window mode because delta snapshots track
+  cumulative count and total — not per-window maximums.
+- Shorter windows fill first. Longer windows show "(waiting for data)" until
+  enough history accumulates.
 
 ## Wait Event Classes
 
@@ -515,14 +598,26 @@ The histogram view reveals latency distribution patterns:
 
 Workflow for finding problematic queries:
 
-1. Run `query_event` view to identify top query_id / event combinations
+1. Start with **Mode A** (default) to identify the top query/event combinations:
+   ```bash
+   sudo ./pg_wait_tracer --view query_event
+   ```
 2. Look up the SQL in pg_stat_statements:
    ```sql
    SELECT queryid, calls, mean_exec_time, query
    FROM pg_stat_statements
    ORDER BY total_exec_time DESC;
    ```
-3. Correlate: a query with high `IO:DataFileRead` time may need better indexes;
+3. Drill down with **Mode B** to see which queries are responsible for a specific
+   bottleneck event:
+   ```bash
+   sudo ./pg_wait_tracer --view query_event --event IO:DataFileRead
+   ```
+4. Or use **Mode C** to get the full wait profile of a specific query:
+   ```bash
+   sudo ./pg_wait_tracer --view query_event --query-id 5678234567890123
+   ```
+5. Correlate: a query with high `IO:DataFileRead` time may need better indexes;
    a query with high `Lock:Transaction` time is hitting contention.
 
 ## How It Works

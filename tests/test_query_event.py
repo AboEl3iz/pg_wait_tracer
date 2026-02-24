@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """test_query_event.py — Verify query-level wait event attribution.
 
-Two tests:
+Tests:
   1. Basic: pgbench workload produces query_ids in query_event view,
      cross-referenced against pg_stat_statements.
   2. Specific: a known query's query_id from pg_stat_statements
      appears in tracer output.
+  3. Mode B: --event filter shows only matching events with % Event column
+  4. Mode C: --query-id filter shows wait profile with % Query column
 
 Requires: root, running PostgreSQL 18, pg_wait_tracer built, pgbench initialized,
           compute_query_id = on/auto.
@@ -237,6 +239,190 @@ def test_specific_query_id(pm_pid):
               f"(raw: '{specific_raw}')")
 
 
+def parse_mode_b_events(output):
+    """Parse Mode B output (--event filter): query_id | Waits | Total | Avg | Max | % Event | % DB."""
+    events = []
+    for line in output.split('\n'):
+        line = line.strip()
+        m = re.match(
+            r'^(-?\d+)\s+'           # query_id
+            r'(\d+)\s+'              # waits
+            r'([\d.]+)\s+'           # total (ms)
+            r'([\d.]+)\s+'           # avg (us)
+            r'([\d.]+)\s+'           # max (us)
+            r'([\d.]+)%\s+'          # % Event
+            r'([\d.]+)%',            # % DB
+            line
+        )
+        if m:
+            events.append({
+                'query_id': int(m.group(1)),
+                'count': int(m.group(2)),
+                'total_ms': float(m.group(3)),
+                'pct_event': float(m.group(6)),
+                'pct_db': float(m.group(7)),
+            })
+    return events
+
+
+def parse_mode_c_events(output):
+    """Parse Mode C output (--query-id filter): Wait Event | Waits | Total | Avg | Max | % Query | % DB."""
+    events = []
+    for line in output.split('\n'):
+        line = line.strip()
+        m = re.match(
+            r'^(\S+(?::\S+)?)\s+'    # event name
+            r'(\d+)\s+'              # waits
+            r'([\d.]+)\s+'           # total (ms)
+            r'([\d.]+)\s+'           # avg (us)
+            r'([\d.]+)\s+'           # max (us)
+            r'([\d.]+)%\s+'          # % Query
+            r'([\d.]+)%',            # % DB
+            line
+        )
+        if m:
+            events.append({
+                'name': m.group(1),
+                'count': int(m.group(2)),
+                'total_ms': float(m.group(3)),
+                'pct_query': float(m.group(6)),
+                'pct_db': float(m.group(7)),
+            })
+    return events
+
+
+def test_mode_b(pm_pid):
+    """Verify --event filter shows only matching events with % Event column."""
+    print("--- Test 3: Mode B (--event filter) ---")
+
+    pgbench = subprocess.Popen(
+        ["pgbench", "-U", "postgres", "-d", "postgres",
+         "-c", "4", "-T", "15"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+
+    time.sleep(3)
+
+    tracer = subprocess.Popen(
+        [TRACER, "--pid", str(pm_pid),
+         "--interval", "8", "--duration", "12",
+         "--view", "query_event", "--event", "Client:ClientRead"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+
+    try:
+        stdout, stderr = tracer.communicate(timeout=25)
+    except subprocess.TimeoutExpired:
+        tracer.kill()
+        stdout, _ = tracer.communicate()
+
+    pgbench.wait()
+
+    output = STRIP_ANSI.sub('', stdout.decode('utf-8', errors='replace'))
+
+    # Header should mention the event
+    check("Top Queries for Client:ClientRead" in output,
+          "Mode B header contains event name")
+
+    # % Event column present
+    check("% Event" in output,
+          "Mode B output contains '% Event' column")
+
+    # Parse and validate
+    events = parse_mode_b_events(output)
+    check(len(events) > 0,
+          f"Mode B parsed {len(events)} entries")
+
+    if events:
+        # % Event should sum to ~100%
+        pct_sum = sum(e['pct_event'] for e in events)
+        check(80 < pct_sum < 120,
+              f"Mode B % Event sums to {pct_sum:.1f}% (expected ~100%)")
+
+        # All entries should have count > 0
+        all_positive = all(e['count'] > 0 for e in events)
+        check(all_positive,
+              "Mode B all entries have count > 0")
+
+
+def test_mode_c(pm_pid):
+    """Verify --query-id filter shows wait profile with % Query column."""
+    print("--- Test 4: Mode C (--query-id filter) ---")
+
+    psql("CREATE EXTENSION IF NOT EXISTS pg_stat_statements")
+    psql("SELECT pg_stat_statements_reset()")
+
+    # Run pgbench to generate query_ids
+    pgbench = subprocess.Popen(
+        ["pgbench", "-U", "postgres", "-d", "postgres",
+         "-c", "4", "-T", "15"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+
+    time.sleep(8)
+
+    # Get a known query_id from pg_stat_statements
+    qid_raw = psql(
+        "SELECT queryid FROM pg_stat_statements "
+        "WHERE dbid = (SELECT oid FROM pg_database WHERE datname = 'postgres') "
+        "AND queryid IS NOT NULL AND queryid != 0 "
+        "ORDER BY total_exec_time DESC LIMIT 1"
+    )
+
+    query_id = None
+    if qid_raw.strip():
+        try:
+            query_id = int(qid_raw.strip())
+        except ValueError:
+            pass
+
+    if not query_id:
+        pgbench.wait()
+        check(False, "Could not find query_id in pg_stat_statements")
+        return
+
+    tracer = subprocess.Popen(
+        [TRACER, "--pid", str(pm_pid),
+         "--interval", "8", "--duration", "12",
+         "--view", "query_event", "--query-id", str(query_id)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+
+    try:
+        stdout, stderr = tracer.communicate(timeout=25)
+    except subprocess.TimeoutExpired:
+        tracer.kill()
+        stdout, _ = tracer.communicate()
+
+    pgbench.wait()
+
+    output = STRIP_ANSI.sub('', stdout.decode('utf-8', errors='replace'))
+
+    # Header should mention the query_id
+    check(f"Wait Profile for query_id {query_id}" in output,
+          f"Mode C header contains query_id {query_id}")
+
+    # % Query column present
+    check("% Query" in output,
+          "Mode C output contains '% Query' column")
+
+    # Parse and validate
+    events = parse_mode_c_events(output)
+    check(len(events) > 0,
+          f"Mode C parsed {len(events)} events for query_id {query_id}")
+
+    if events:
+        # % Query should sum to ~100%
+        pct_sum = sum(e['pct_query'] for e in events)
+        check(80 < pct_sum < 120,
+              f"Mode C % Query sums to {pct_sum:.1f}% (expected ~100%)")
+
+        # CPU* should be present (every query has some CPU)
+        has_cpu = any(e['name'] == 'CPU*' for e in events)
+        check(has_cpu,
+              "Mode C includes CPU* event")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--pid', type=int, help='Postmaster PID')
@@ -267,6 +453,8 @@ def main():
 
     test_query_event_basic(pm_pid)
     test_specific_query_id(pm_pid)
+    test_mode_b(pm_pid)
+    test_mode_c(pm_pid)
 
     print(f"\n{tests_passed}/{tests_run} tests passed")
     sys.exit(0 if tests_failed == 0 else 1)

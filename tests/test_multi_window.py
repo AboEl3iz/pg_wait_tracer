@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""test_multi_window.py — Verify multi-window time_model and system_event output.
+"""test_multi_window.py — Verify multi-window time_model, system_event, and query_event output.
 
 Tests:
   1. time_model format validation: column headers, separator, data rows present
@@ -8,8 +8,12 @@ Tests:
   4. system_event format: vertically stacked sections with section headers
   5. system_event progressive population: shorter sections fill first
   6. system_event data sanity: events sorted, counts > 0, no Max column
+  7. query_event Mode A multi-window: section headers, column headers, data rows
+  8. query_event Mode B multi-window: --event filter with % Event column
+  9. query_event Mode C multi-window: --query-id filter with % Query column
 
-Requires: root, running PostgreSQL 18, pgbench initialized.
+Requires: root, running PostgreSQL 18, pgbench initialized,
+          compute_query_id = on/auto.
 Usage: sudo python3 tests/test_multi_window.py [--pid POSTMASTER_PID]
 """
 import subprocess
@@ -43,7 +47,7 @@ def check(cond, msg):
 
 
 def run_tracer(pm_pid, interval, count, windows, view="time_model",
-               duration=None, timeout_extra=15):
+               duration=None, timeout_extra=15, extra_args=None):
     """Run tracer with --window, return cleaned stdout."""
     cmd = [TRACER, "--pid", str(pm_pid),
            "--interval", str(interval),
@@ -52,6 +56,8 @@ def run_tracer(pm_pid, interval, count, windows, view="time_model",
            "--view", view]
     if duration:
         cmd += ["--duration", str(duration)]
+    if extra_args:
+        cmd += extra_args
     wall = interval * count + timeout_extra
     result = subprocess.run(cmd, capture_output=True, timeout=wall)
     return STRIP_ANSI.sub('', result.stdout.decode('utf-8', errors='replace'))
@@ -462,6 +468,315 @@ def test_system_event_data(pm_pid):
           f"Percentages sum to {pct_sum:.1f}% (expected ~100%)")
 
 
+# ── Test 7: query_event Mode A multi-window ─────────────────
+
+def parse_query_events_section(text):
+    """Parse query_event Mode A rows from a multi-window section.
+
+    Format: query_id  Wait Event  Waits  Total (ms)  Avg (us)  % DB
+    """
+    events = []
+    for line in text.split('\n'):
+        line = line.strip()
+        m = re.match(
+            r'^(-?\d+)\s+'           # query_id
+            r'(\S+(?::\S+)?)\s+'     # event name
+            r'(\d+)\s+'              # waits
+            r'([\d.]+)\s+'           # total (ms)
+            r'([\d.]+)\s+'           # avg (us)
+            r'([\d.]+)%',            # % DB
+            line
+        )
+        if m:
+            events.append({
+                'query_id': int(m.group(1)),
+                'name': m.group(2),
+                'count': int(m.group(3)),
+                'total_ms': float(m.group(4)),
+                'pct': float(m.group(6)),
+            })
+    return events
+
+
+def test_query_event_mode_a(pm_pid):
+    """Verify multi-window query_event Mode A has section headers and data."""
+    print("--- Test 7: query_event Mode A multi-window ---")
+
+    pgbench = subprocess.Popen(
+        ["pgbench", "-U", "postgres", "-d", "postgres",
+         "-c", "4", "-T", "25"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+
+    time.sleep(3)
+
+    output = run_tracer(pm_pid, interval=1, count=5, windows="1s,3s",
+                        view="query_event")
+
+    pgbench.wait()
+
+    # Section headers present
+    check("Last 1s" in output,
+          "query_event Mode A contains 'Last 1s' section")
+    check("Last 3s" in output,
+          "query_event Mode A contains 'Last 3s' section")
+
+    # Has section header format
+    has_section_header = bool(re.search(r'^---- Last \d+s -+$', output,
+                                        re.MULTILINE))
+    check(has_section_header,
+          "query_event Mode A has '---- Last Xs ----' format")
+
+    # Column headers
+    check("query_id" in output,
+          "query_event Mode A contains 'query_id' column")
+    check("Wait Event" in output,
+          "query_event Mode A contains 'Wait Event' column")
+    check("% DB" in output,
+          "query_event Mode A contains '% DB' column")
+
+    # No Max column in multi-window mode
+    max_count = output.count("Max (us)")
+    check(max_count == 0,
+          f"query_event Mode A multi-window has no Max column (found {max_count})")
+
+    # Parse data from last tick with data
+    ticks = split_ticks(output)
+    last_data_tick = None
+    for tick in reversed(ticks):
+        if "query_id" in tick:
+            last_data_tick = tick
+            break
+
+    if last_data_tick:
+        events = parse_query_events_section(last_data_tick)
+        check(len(events) > 0,
+              f"query_event Mode A parsed {len(events)} entries")
+    else:
+        check(False, "query_event Mode A: no tick with data found")
+
+
+# ── Test 8: query_event Mode B multi-window ─────────────────
+
+def parse_mode_b_section(text):
+    """Parse query_event Mode B rows: query_id  Waits  Total  Avg  % Event  % DB."""
+    events = []
+    for line in text.split('\n'):
+        line = line.strip()
+        m = re.match(
+            r'^(-?\d+)\s+'           # query_id
+            r'(\d+)\s+'              # waits
+            r'([\d.]+)\s+'           # total (ms)
+            r'([\d.]+)\s+'           # avg (us)
+            r'([\d.]+)%\s+'          # % Event
+            r'([\d.]+)%',            # % DB
+            line
+        )
+        if m:
+            events.append({
+                'query_id': int(m.group(1)),
+                'count': int(m.group(2)),
+                'total_ms': float(m.group(3)),
+                'pct_event': float(m.group(5)),
+                'pct_db': float(m.group(6)),
+            })
+    return events
+
+
+def test_query_event_mode_b(pm_pid):
+    """Verify multi-window query_event --event filter shows % Event."""
+    print("--- Test 8: query_event Mode B multi-window ---")
+
+    pgbench = subprocess.Popen(
+        ["pgbench", "-U", "postgres", "-d", "postgres",
+         "-c", "4", "-T", "25"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+
+    time.sleep(3)
+
+    output = run_tracer(pm_pid, interval=1, count=5, windows="1s,3s",
+                        view="query_event",
+                        extra_args=["--event", "Client:ClientRead"])
+
+    pgbench.wait()
+
+    # Header mentions the event
+    check("Top Queries for Client:ClientRead" in output,
+          "query_event Mode B multi-window has correct header")
+
+    # Section headers present
+    check("Last 1s" in output,
+          "query_event Mode B contains 'Last 1s' section")
+
+    # % Event column present
+    check("% Event" in output,
+          "query_event Mode B multi-window contains '% Event' column")
+
+    # No Max column
+    max_count = output.count("Max (us)")
+    check(max_count == 0,
+          f"query_event Mode B multi-window has no Max column (found {max_count})")
+
+    # Parse and validate data
+    ticks = split_ticks(output)
+    last_data_tick = None
+    for tick in reversed(ticks):
+        if "% Event" in tick:
+            last_data_tick = tick
+            break
+
+    if last_data_tick:
+        # Get first section with data
+        sections = re.split(r'^---- Last \d+[smh] -+$', last_data_tick,
+                            flags=re.MULTILINE)
+        events = []
+        for section in sections:
+            events = parse_mode_b_section(section)
+            if events:
+                break
+
+        check(len(events) > 0,
+              f"query_event Mode B parsed {len(events)} entries")
+
+        if events:
+            pct_sum = sum(e['pct_event'] for e in events)
+            check(80 < pct_sum < 120,
+                  f"query_event Mode B % Event sums to {pct_sum:.1f}% "
+                  f"(expected ~100%)")
+    else:
+        check(False, "query_event Mode B: no tick with data found")
+        check(False, "query_event Mode B: cannot check % Event sum")
+
+
+# ── Test 9: query_event Mode C multi-window ─────────────────
+
+def psql(sql, timeout=10):
+    result = subprocess.run(
+        ["psql", "-U", "postgres", "-d", "postgres", "-tAc", sql],
+        capture_output=True, text=True, timeout=timeout
+    )
+    return result.stdout.strip()
+
+
+def parse_mode_c_section(text):
+    """Parse query_event Mode C rows: Wait Event  Waits  Total  Avg  % Query  % DB."""
+    events = []
+    for line in text.split('\n'):
+        line = line.strip()
+        m = re.match(
+            r'^(\S+(?::\S+)?)\s+'    # event name
+            r'(\d+)\s+'              # waits
+            r'([\d.]+)\s+'           # total (ms)
+            r'([\d.]+)\s+'           # avg (us)
+            r'([\d.]+)%\s+'          # % Query
+            r'([\d.]+)%',            # % DB
+            line
+        )
+        if m:
+            events.append({
+                'name': m.group(1),
+                'count': int(m.group(2)),
+                'total_ms': float(m.group(3)),
+                'pct_query': float(m.group(5)),
+                'pct_db': float(m.group(6)),
+            })
+    return events
+
+
+def test_query_event_mode_c(pm_pid):
+    """Verify multi-window query_event --query-id filter shows % Query."""
+    print("--- Test 9: query_event Mode C multi-window ---")
+
+    psql("CREATE EXTENSION IF NOT EXISTS pg_stat_statements")
+    psql("SELECT pg_stat_statements_reset()")
+
+    pgbench = subprocess.Popen(
+        ["pgbench", "-U", "postgres", "-d", "postgres",
+         "-c", "4", "-T", "25"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+
+    time.sleep(8)
+
+    # Get a known query_id from pg_stat_statements
+    qid_raw = psql(
+        "SELECT queryid FROM pg_stat_statements "
+        "WHERE dbid = (SELECT oid FROM pg_database WHERE datname = 'postgres') "
+        "AND queryid IS NOT NULL AND queryid != 0 "
+        "ORDER BY total_exec_time DESC LIMIT 1"
+    )
+
+    query_id = None
+    if qid_raw.strip():
+        try:
+            query_id = int(qid_raw.strip())
+        except ValueError:
+            pass
+
+    if not query_id:
+        pgbench.wait()
+        check(False, "Could not find query_id in pg_stat_statements")
+        return
+
+    output = run_tracer(pm_pid, interval=1, count=5, windows="1s,3s",
+                        view="query_event",
+                        extra_args=["--query-id", str(query_id)])
+
+    pgbench.wait()
+
+    # Header mentions the query_id
+    check(f"Wait Profile for query_id {query_id}" in output,
+          f"query_event Mode C multi-window header contains query_id")
+
+    # Section headers present
+    check("Last 1s" in output,
+          "query_event Mode C contains 'Last 1s' section")
+
+    # % Query column present
+    check("% Query" in output,
+          "query_event Mode C multi-window contains '% Query' column")
+
+    # No Max column
+    max_count = output.count("Max (us)")
+    check(max_count == 0,
+          f"query_event Mode C multi-window has no Max column (found {max_count})")
+
+    # Parse and validate data
+    ticks = split_ticks(output)
+    last_data_tick = None
+    for tick in reversed(ticks):
+        if "% Query" in tick:
+            last_data_tick = tick
+            break
+
+    if last_data_tick:
+        sections = re.split(r'^---- Last \d+[smh] -+$', last_data_tick,
+                            flags=re.MULTILINE)
+        events = []
+        for section in sections:
+            events = parse_mode_c_section(section)
+            if events:
+                break
+
+        check(len(events) > 0,
+              f"query_event Mode C parsed {len(events)} events")
+
+        if events:
+            pct_sum = sum(e['pct_query'] for e in events)
+            check(80 < pct_sum < 120,
+                  f"query_event Mode C % Query sums to {pct_sum:.1f}% "
+                  f"(expected ~100%)")
+
+            has_cpu = any(e['name'] == 'CPU*' for e in events)
+            check(has_cpu,
+                  "query_event Mode C includes CPU* event")
+    else:
+        check(False, "query_event Mode C: no tick with data found")
+        check(False, "query_event Mode C: cannot check % Query sum")
+        check(False, "query_event Mode C: cannot check CPU*")
+
+
 # ── Main ─────────────────────────────────────────────────────
 
 def main():
@@ -492,6 +807,9 @@ def main():
     test_system_event_format(pm_pid)
     test_system_event_progressive(pm_pid)
     test_system_event_data(pm_pid)
+    test_query_event_mode_a(pm_pid)
+    test_query_event_mode_b(pm_pid)
+    test_query_event_mode_c(pm_pid)
 
     print(f"\n{tests_passed}/{tests_run} tests passed")
     sys.exit(0 if tests_failed == 0 else 1)

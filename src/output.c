@@ -668,15 +668,190 @@ static int cmp_query_event_total(const void *a, const void *b)
     return 0;
 }
 
+/* qsort comparator for snapshot query events (multi-window mode) */
+static int cmp_snap_query_event_total(const void *a, const void *b)
+{
+    const struct pgwt_snap_query_event *ea = a;
+    const struct pgwt_snap_query_event *eb = b;
+    if (eb->total_ns > ea->total_ns) return 1;
+    if (eb->total_ns < ea->total_ns) return -1;
+    return 0;
+}
+
+/* Multi-window query_event: vertically stacked sections per window */
+static void print_query_event_multi(struct pgwt_daemon *d)
+{
+    int nw = d->num_windows;
+    struct pgwt_snapshot deltas[PGWT_MAX_WINDOWS];
+    int valid[PGWT_MAX_WINDOWS] = {0};
+
+    int mode_b = (d->event_filter && d->event_filter[0]);
+    int mode_c = (d->query_id_filter != 0);
+
+    for (int w = 0; w < nw; w++) {
+        int ticks = d->windows[w] / d->interval;
+        valid[w] = (pgwt_ring_delta(&d->ring, ticks, &deltas[w]) == 0);
+    }
+
+    for (int w = 0; w < nw; w++) {
+        char label[16];
+        format_window_label(d->windows[w], label, sizeof(label));
+        printf("---- %s ", label);
+        int used = 5 + (int)strlen(label) + 1;
+        for (int i = used; i < 78; i++) putchar('-');
+        printf("\n");
+
+        if (!valid[w]) {
+            printf("  (waiting for data)\n\n");
+            continue;
+        }
+
+        /* Sort delta query events */
+        qsort(deltas[w].query_events, deltas[w].num_query_events,
+              sizeof(deltas[w].query_events[0]), cmp_snap_query_event_total);
+
+        uint64_t db = deltas[w].tm.db_time_ns;
+
+        /* Compute denominator for % Event / % Query */
+        uint64_t denom_ns = 0;
+        if (mode_b) {
+            for (int i = 0; i < deltas[w].num_query_events; i++) {
+                char name[64];
+                pgwt_event_full_name(deltas[w].query_events[i].wait_event,
+                                     name, sizeof(name));
+                if (strcmp(name, d->event_filter) == 0)
+                    denom_ns += deltas[w].query_events[i].total_ns;
+            }
+        } else if (mode_c) {
+            for (int i = 0; i < deltas[w].num_query_events; i++)
+                if (deltas[w].query_events[i].query_id == d->query_id_filter)
+                    denom_ns += deltas[w].query_events[i].total_ns;
+        }
+
+        /* Column headers */
+        if (mode_c) {
+            printf("  %-26s %12s %14s %10s %9s %9s\n",
+                   "Wait Event", "Waits", "Total (ms)",
+                   "Avg (us)", "% Query", "% DB");
+            printf("  ");
+            for (int i = 0; i < 26; i++) putchar('-');
+            printf(" ");
+            for (int i = 0; i < 12; i++) putchar('-');
+            printf(" ");
+            for (int i = 0; i < 14; i++) putchar('-');
+            printf(" ");
+            for (int i = 0; i < 10; i++) putchar('-');
+            printf(" ");
+            for (int i = 0; i < 9; i++) putchar('-');
+            printf(" ");
+            for (int i = 0; i < 9; i++) putchar('-');
+            printf("\n");
+        } else if (mode_b) {
+            printf("  %-20s %12s %14s %10s %9s %9s\n",
+                   "query_id", "Waits", "Total (ms)",
+                   "Avg (us)", "% Event", "% DB");
+            printf("  ");
+            for (int i = 0; i < 20; i++) putchar('-');
+            printf(" ");
+            for (int i = 0; i < 12; i++) putchar('-');
+            printf(" ");
+            for (int i = 0; i < 14; i++) putchar('-');
+            printf(" ");
+            for (int i = 0; i < 10; i++) putchar('-');
+            printf(" ");
+            for (int i = 0; i < 9; i++) putchar('-');
+            printf(" ");
+            for (int i = 0; i < 9; i++) putchar('-');
+            printf("\n");
+        } else {
+            printf("  %-20s %-26s %12s %14s %10s %9s\n",
+                   "query_id", "Wait Event", "Waits", "Total (ms)",
+                   "Avg (us)", "% DB");
+            printf("  ");
+            for (int i = 0; i < 20; i++) putchar('-');
+            printf(" ");
+            for (int i = 0; i < 26; i++) putchar('-');
+            printf(" ");
+            for (int i = 0; i < 12; i++) putchar('-');
+            printf(" ");
+            for (int i = 0; i < 14; i++) putchar('-');
+            printf(" ");
+            for (int i = 0; i < 10; i++) putchar('-');
+            printf(" ");
+            for (int i = 0; i < 9; i++) putchar('-');
+            printf("\n");
+        }
+
+        int shown = 0;
+        for (int i = 0; i < deltas[w].num_query_events && shown < 30; i++) {
+            struct pgwt_snap_query_event *qe = &deltas[w].query_events[i];
+            if (qe->count == 0) continue;
+            if (pgwt_is_idle_event(qe->wait_event)) continue;
+
+            char name[64];
+            pgwt_event_full_name(qe->wait_event, name, sizeof(name));
+
+            if (mode_b && strcmp(name, d->event_filter) != 0) continue;
+            if (mode_c && qe->query_id != d->query_id_filter) continue;
+
+            double avg_us = qe->count ?
+                ns_to_us(qe->total_ns) / qe->count : 0;
+
+            if (mode_c) {
+                printf("  %-26s %12lu %14.1f %10.1f %8.1f%% %8.1f%%\n",
+                       name,
+                       (unsigned long)qe->count,
+                       ns_to_ms(qe->total_ns),
+                       avg_us,
+                       denom_ns ? 100.0 * qe->total_ns / denom_ns : 0,
+                       db ? 100.0 * qe->total_ns / db : 0);
+            } else if (mode_b) {
+                printf("  %20ld %12lu %14.1f %10.1f %8.1f%% %8.1f%%\n",
+                       (int64_t)qe->query_id,
+                       (unsigned long)qe->count,
+                       ns_to_ms(qe->total_ns),
+                       avg_us,
+                       denom_ns ? 100.0 * qe->total_ns / denom_ns : 0,
+                       db ? 100.0 * qe->total_ns / db : 0);
+            } else {
+                printf("  %20ld %-26s %12lu %14.1f %10.1f %8.1f%%\n",
+                       (int64_t)qe->query_id,
+                       name,
+                       (unsigned long)qe->count,
+                       ns_to_ms(qe->total_ns),
+                       avg_us,
+                       db ? 100.0 * qe->total_ns / db : 0);
+            }
+            shown++;
+        }
+        printf("\n");
+    }
+}
+
 void pgwt_print_query_event(struct pgwt_daemon *d)
 {
     struct pgwt_accumulator *acc = &d->accum;
 
+    int mode_b = (d->event_filter && d->event_filter[0]);
+    int mode_c = (d->query_id_filter != 0);
+
     print_view_start(d);
     printf("%s\n", LINE);
-    printf("pg_wait_tracer — Query Events (cumulative)    Backends: %d\n",
-           count_active_backends(d));
+    if (mode_b)
+        printf("pg_wait_tracer — Top Queries for %s    Backends: %d    Interval: %ds\n",
+               d->event_filter, count_active_backends(d), d->interval);
+    else if (mode_c)
+        printf("pg_wait_tracer — Wait Profile for query_id %ld    Backends: %d    Interval: %ds\n",
+               (int64_t)d->query_id_filter, count_active_backends(d), d->interval);
+    else
+        printf("pg_wait_tracer — Query Events    Backends: %d    Interval: %ds\n",
+               count_active_backends(d), d->interval);
     printf("%s\n\n", LINE);
+
+    if (d->num_windows > 0 && d->ring.slots) {
+        print_query_event_multi(d);
+        return;
+    }
 
     if (acc->num_query_events == 0) {
         printf("  (no query data yet — ensure compute_query_id = on/auto)\n\n");
@@ -692,12 +867,44 @@ void pgwt_print_query_event(struct pgwt_daemon *d)
 
     uint64_t db = acc->tm.db_time_ns;
 
-    printf("  %-20s %-26s %12s %14s %10s %12s %9s\n",
-           "query_id", "Wait Event", "Total Waits", "Total (ms)",
-           "Avg (us)", "Max (us)", "% DB");
-    printf("  %-20s %-26s %12s %14s %10s %12s %9s\n",
-           DASH + 60, DASH + 54, DASH + 68, DASH + 66,
-           DASH + 70, DASH + 68, DASH + 71);
+    /* Compute denominator for % Event (Mode B) or % Query (Mode C) */
+    uint64_t denom_ns = 0;
+    if (mode_b) {
+        for (int i = 0; i < n; i++) {
+            char name[64];
+            pgwt_event_full_name(sorted[i].wait_event, name, sizeof(name));
+            if (strcmp(name, d->event_filter) == 0)
+                denom_ns += sorted[i].total_ns;
+        }
+    } else if (mode_c) {
+        for (int i = 0; i < n; i++)
+            if (sorted[i].query_id == d->query_id_filter)
+                denom_ns += sorted[i].total_ns;
+    }
+
+    /* Column headers */
+    if (mode_c) {
+        printf("  %-26s %12s %14s %10s %12s %9s %9s\n",
+               "Wait Event", "Waits", "Total (ms)",
+               "Avg (us)", "Max (us)", "% Query", "% DB");
+        printf("  %-26s %12s %14s %10s %12s %9s %9s\n",
+               DASH + 54, DASH + 68, DASH + 66,
+               DASH + 70, DASH + 68, DASH + 71, DASH + 71);
+    } else if (mode_b) {
+        printf("  %-20s %12s %14s %10s %12s %9s %9s\n",
+               "query_id", "Waits", "Total (ms)",
+               "Avg (us)", "Max (us)", "% Event", "% DB");
+        printf("  %-20s %12s %14s %10s %12s %9s %9s\n",
+               DASH + 60, DASH + 68, DASH + 66,
+               DASH + 70, DASH + 68, DASH + 71, DASH + 71);
+    } else {
+        printf("  %-20s %-26s %12s %14s %10s %12s %9s\n",
+               "query_id", "Wait Event", "Total Waits", "Total (ms)",
+               "Avg (us)", "Max (us)", "% DB");
+        printf("  %-20s %-26s %12s %14s %10s %12s %9s\n",
+               DASH + 60, DASH + 54, DASH + 68, DASH + 66,
+               DASH + 70, DASH + 68, DASH + 71);
+    }
 
     int shown = 0;
     for (int i = 0; i < n && shown < 30; i++) {
@@ -707,17 +914,41 @@ void pgwt_print_query_event(struct pgwt_daemon *d)
         char name[64];
         pgwt_event_full_name(sorted[i].wait_event, name, sizeof(name));
 
+        /* Apply mode filter */
+        if (mode_b && strcmp(name, d->event_filter) != 0) continue;
+        if (mode_c && sorted[i].query_id != d->query_id_filter) continue;
+
         double avg_us = sorted[i].count ?
             ns_to_us(sorted[i].total_ns) / sorted[i].count : 0;
 
-        printf("  %20ld %-26s %12lu %14.1f %10.1f %12.1f %8.1f%%\n",
-               (int64_t)sorted[i].query_id,
-               name,
-               (unsigned long)sorted[i].count,
-               ns_to_ms(sorted[i].total_ns),
-               avg_us,
-               ns_to_us(sorted[i].max_ns),
-               db ? 100.0 * sorted[i].total_ns / db : 0);
+        if (mode_c) {
+            printf("  %-26s %12lu %14.1f %10.1f %12.1f %8.1f%% %8.1f%%\n",
+                   name,
+                   (unsigned long)sorted[i].count,
+                   ns_to_ms(sorted[i].total_ns),
+                   avg_us,
+                   ns_to_us(sorted[i].max_ns),
+                   denom_ns ? 100.0 * sorted[i].total_ns / denom_ns : 0,
+                   db ? 100.0 * sorted[i].total_ns / db : 0);
+        } else if (mode_b) {
+            printf("  %20ld %12lu %14.1f %10.1f %12.1f %8.1f%% %8.1f%%\n",
+                   (int64_t)sorted[i].query_id,
+                   (unsigned long)sorted[i].count,
+                   ns_to_ms(sorted[i].total_ns),
+                   avg_us,
+                   ns_to_us(sorted[i].max_ns),
+                   denom_ns ? 100.0 * sorted[i].total_ns / denom_ns : 0,
+                   db ? 100.0 * sorted[i].total_ns / db : 0);
+        } else {
+            printf("  %20ld %-26s %12lu %14.1f %10.1f %12.1f %8.1f%%\n",
+                   (int64_t)sorted[i].query_id,
+                   name,
+                   (unsigned long)sorted[i].count,
+                   ns_to_ms(sorted[i].total_ns),
+                   avg_us,
+                   ns_to_us(sorted[i].max_ns),
+                   db ? 100.0 * sorted[i].total_ns / db : 0);
+        }
         shown++;
     }
     printf("\n");

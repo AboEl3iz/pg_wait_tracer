@@ -173,6 +173,28 @@ if [[ -n "$PM_PID" ]]; then
         echo "  FAIL: --window system_event missing column headers"
         failed=$((failed + 1))
     fi
+
+    # query_event Mode B header (no workload — just verify header text)
+    output=$(timeout 15 "$TRACER" --pid "$PM_PID" --view query_event \
+        --event Client:ClientRead --interval 1 --count 2 2>/dev/null || true)
+    if echo "$output" | grep -q "Top Queries for Client:ClientRead"; then
+        echo "  PASS: query_event Mode B has correct header"
+        passed=$((passed + 1))
+    else
+        echo "  FAIL: query_event Mode B missing header"
+        failed=$((failed + 1))
+    fi
+
+    # query_event Mode C header (no workload — just verify header text)
+    output=$(timeout 15 "$TRACER" --pid "$PM_PID" --view query_event \
+        --query-id 12345 --interval 1 --count 2 2>/dev/null || true)
+    if echo "$output" | grep -q "Wait Profile for query_id 12345"; then
+        echo "  PASS: query_event Mode C has correct header"
+        passed=$((passed + 1))
+    else
+        echo "  FAIL: query_event Mode C missing header"
+        failed=$((failed + 1))
+    fi
 else
     echo "  SKIP: no running PG (pass --pid to test valid args)"
 fi
