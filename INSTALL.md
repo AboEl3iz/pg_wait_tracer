@@ -127,10 +127,10 @@ psql -U postgres -c "ALTER SYSTEM SET max_parallel_workers_per_gather = 4"
 sudo systemctl restart postgresql-17
 ```
 
-Initialize pgbench with enough data for parallel query tests (IPC events):
+Initialize pgbench:
 
 ```bash
-pgbench -U postgres -i -s 50 postgres    # ~5 million rows in pgbench_accounts
+pgbench -U postgres -i postgres    # any scale works; -s 50 for more realistic IO
 ```
 
 #### Optional: pg_wait_sampling (for cross-validation tests)

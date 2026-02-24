@@ -24,7 +24,7 @@ sudo ./pg_wait_tracer --count 1 --interval 10
 # Pipe to file (auto-switches to text format with timestamps)
 sudo ./pg_wait_tracer --count 5 > output.log
 
-# Time windows (infrastructure for multi-window views, future phases)
+# Multi-window: compare wait profiles across time horizons
 sudo ./pg_wait_tracer --window 5s,1m,5m --count 3
 ```
 
@@ -37,7 +37,7 @@ sudo ./pg_wait_tracer --window 5s,1m,5m --count 3
 | `--interval <SEC>` | `-i` | 5 | Refresh interval in seconds (minimum 1) |
 | `--duration <SEC>` | `-d` | unlimited | Stop after N seconds |
 | `--count <N>` | `-n` | unlimited | Print N intervals then exit |
-| `--window <W1,W2,W3>` | `-w` | — | Time windows, e.g. `5s,1m,5m` (first must equal interval) |
+| `--window <W1,W2,W3>` | `-w` | — | Time windows for time_model, e.g. `5s,1m,5m` (first must equal interval) |
 | `--view <VIEW>` | `-V` | `time_model` | Output view (see below) |
 | `--format <FMT>` | `-f` | auto-detect | Output format: `tui` (terminal), `text` (pipe) |
 | `--event <NAME>` | `-e` | — | Event filter (histogram: required; query_event: by event) |
@@ -116,6 +116,44 @@ pg_wait_tracer — Time Model    Backends: 12    Interval: 5s
   `system_event` view for the full event list.
 - **Activity/Idle** is shown separately and excluded from DB Time. Idle backends
   contribute nothing to DB Time.
+
+#### Multi-window mode
+
+With `--window`, the time_model view shows side-by-side columns — one per window —
+so you can see how wait profiles change across time horizons:
+
+```bash
+sudo ./pg_wait_tracer --window 5s,1m,5m
+```
+
+```
+════════════════════════════════════════════════════════════════════════════════
+pg_wait_tracer — Time Model    Backends: 12    Interval: 5s
+════════════════════════════════════════════════════════════════════════════════
+
+  Stat Name                         Last 5s    % DB   Last 1m    % DB   Last 5m    % DB
+  -------------------------------- --------- ------- --------- ------- --------- -------
+  DB Time                            5088.6  100.0%   62340.1  100.0%  312450.8  100.0%
+    CPU*                             1498.6   29.4%   13712.3   22.0%   72312.1   23.1%
+    IO                                862.3   16.9%   12340.5   19.8%   98234.2   31.4%
+      IO:DataFileRead                 621.2   12.2%    9823.1   15.8%   82123.4   26.3%
+      IO:DataFileWrite                198.4    3.9%    2012.3    3.2%   12345.6    4.0%
+    LWLock                            423.1    8.3%    4923.4    7.9%   21234.5    6.8%
+      LWLock:WALInsert                312.3    6.1%    3812.1    6.1%   16234.2    5.2%
+
+  (Activity/Idle)                   12560.4       -   62340.1       -  312450.8       -
+```
+
+**Reading this output:**
+
+- Each column shows the delta for that time window. "Last 5s" is the most recent
+  5 seconds, "Last 5m" covers the last 5 minutes.
+- Compare columns to spot trends: IO rising from 16.9% (5s) to 31.4% (5m) means
+  IO has been decreasing recently — the system is improving.
+- **Progressive population:** On startup, shorter windows fill first. Longer windows
+  show `-` until enough history accumulates (e.g., "Last 5m" needs 5 minutes of data).
+- The first window must equal the `--interval` value. Windows must be increasing.
+- Without `--window`, the default single-column cumulative view is shown (see above).
 
 ---
 
