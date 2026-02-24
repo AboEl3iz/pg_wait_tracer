@@ -131,21 +131,46 @@ if [[ -n "$PM_PID" ]]; then
         failed=$((failed + 1))
     fi
 
-    # --window output contains multi-window column headers
+    # --window time_model output contains multi-window column headers
     output=$(timeout 15 "$TRACER" --pid "$PM_PID" --window 1s,3s \
         --interval 1 --count 4 2>/dev/null || true)
     if echo "$output" | grep -q "Last 1s"; then
-        echo "  PASS: --window output contains window headers"
+        echo "  PASS: --window time_model output contains window headers"
         passed=$((passed + 1))
     else
-        echo "  FAIL: --window output missing 'Last 1s' header"
+        echo "  FAIL: --window time_model output missing 'Last 1s' header"
         failed=$((failed + 1))
     fi
     if echo "$output" | grep -q "% DB"; then
-        echo "  PASS: --window output contains '% DB' header"
+        echo "  PASS: --window time_model output contains '% DB' header"
         passed=$((passed + 1))
     else
-        echo "  FAIL: --window output missing '% DB' header"
+        echo "  FAIL: --window time_model output missing '% DB' header"
+        failed=$((failed + 1))
+    fi
+
+    # --window system_event output contains section headers
+    output=$(timeout 15 "$TRACER" --pid "$PM_PID" --view system_event \
+        --window 1s,3s --interval 1 --count 4 2>/dev/null || true)
+    if echo "$output" | grep -q "Last 1s"; then
+        echo "  PASS: --window system_event contains 'Last 1s' section"
+        passed=$((passed + 1))
+    else
+        echo "  FAIL: --window system_event missing 'Last 1s' section"
+        failed=$((failed + 1))
+    fi
+    if echo "$output" | grep -q "Last 3s"; then
+        echo "  PASS: --window system_event contains 'Last 3s' section"
+        passed=$((passed + 1))
+    else
+        echo "  FAIL: --window system_event missing 'Last 3s' section"
+        failed=$((failed + 1))
+    fi
+    if echo "$output" | grep -q "Wait Event"; then
+        echo "  PASS: --window system_event contains column headers"
+        passed=$((passed + 1))
+    else
+        echo "  FAIL: --window system_event missing column headers"
         failed=$((failed + 1))
     fi
 else

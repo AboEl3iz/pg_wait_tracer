@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""test_multi_window.py — Verify multi-window time_model output.
+"""test_multi_window.py — Verify multi-window time_model and system_event output.
 
 Tests:
-  1. Format validation: column headers, separator, data rows present
-  2. Progressive population: shorter windows fill first, longer show '-'
-  3. Internal consistency: DB Time = CPU + Wait classes (first window)
+  1. time_model format validation: column headers, separator, data rows present
+  2. time_model progressive population: shorter windows fill first, longer show '-'
+  3. time_model internal consistency: DB Time = CPU + Wait classes (first window)
+  4. system_event format: vertically stacked sections with section headers
+  5. system_event progressive population: shorter sections fill first
+  6. system_event data sanity: events sorted, counts > 0, no Max column
 
 Requires: root, running PostgreSQL 18, pgbench initialized.
 Usage: sudo python3 tests/test_multi_window.py [--pid POSTMASTER_PID]
@@ -39,13 +42,14 @@ def check(cond, msg):
         print(f"  FAIL: {msg}")
 
 
-def run_tracer(pm_pid, interval, count, windows, duration=None, timeout_extra=15):
+def run_tracer(pm_pid, interval, count, windows, view="time_model",
+               duration=None, timeout_extra=15):
     """Run tracer with --window, return cleaned stdout."""
     cmd = [TRACER, "--pid", str(pm_pid),
            "--interval", str(interval),
            "--window", windows,
            "--count", str(count),
-           "--view", "time_model"]
+           "--view", view]
     if duration:
         cmd += ["--duration", str(duration)]
     wall = interval * count + timeout_extra
@@ -265,6 +269,199 @@ def test_internal_consistency(pm_pid):
               f"vs DB Time {db_time_ms:.0f}ms (error {error_pct:.1f}%)")
 
 
+# ── Test 4: system_event Format ─────────────────────────────
+
+def test_system_event_format(pm_pid):
+    """Verify multi-window system_event has vertically stacked sections."""
+    print("--- Test 4: system_event Format ---")
+
+    pgbench = subprocess.Popen(
+        ["pgbench", "-U", "postgres", "-d", "postgres",
+         "-c", "2", "-T", "20"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+
+    time.sleep(3)
+
+    output = run_tracer(pm_pid, interval=1, count=4, windows="1s,3s",
+                        view="system_event")
+
+    pgbench.wait()
+
+    # Section headers present (---- Last Xs ----)
+    check("Last 1s" in output,
+          "system_event contains 'Last 1s' section header")
+    check("Last 3s" in output,
+          "system_event contains 'Last 3s' section header")
+
+    # Verify section headers use ---- format
+    has_section_header = bool(re.search(r'^---- Last \d+s -+$', output, re.MULTILINE))
+    check(has_section_header,
+          "system_event has '---- Last Xs ----' section header format")
+
+    # Column headers in each section
+    check("Wait Event" in output,
+          "system_event contains 'Wait Event' column")
+    check("Total Waits" in output,
+          "system_event contains 'Total Waits' column")
+    check("Avg (us)" in output,
+          "system_event contains 'Avg (us)' column")
+    check("% DB" in output,
+          "system_event contains '% DB' column")
+
+    # No Max column in multi-window mode (deltas don't track max)
+    # Count occurrences of "Max (us)" — should be 0
+    max_count = output.count("Max (us)")
+    check(max_count == 0,
+          f"system_event multi-window has no Max column (found {max_count})")
+
+
+# ── Test 5: system_event Progressive Population ────────────
+
+def test_system_event_progressive(pm_pid):
+    """Verify shorter sections fill before longer ones."""
+    print("--- Test 5: system_event Progressive Population ---")
+
+    pgbench = subprocess.Popen(
+        ["pgbench", "-U", "postgres", "-d", "postgres",
+         "-c", "2", "-T", "20"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+
+    time.sleep(3)
+
+    output = run_tracer(pm_pid, interval=1, count=7, windows="1s,5s",
+                        view="system_event")
+
+    pgbench.wait()
+
+    ticks = split_ticks(output)
+
+    check(len(ticks) >= 5,
+          f"Got {len(ticks)} ticks (expected >= 5)")
+
+    if len(ticks) < 2:
+        return
+
+    # First tick: both sections should show "waiting for data"
+    check("waiting for data" in ticks[0],
+          "First tick shows 'waiting for data'")
+
+    # Early tick (2-4): first section has data, second shows "waiting for data"
+    found_partial = False
+    for tick in ticks[1:4]:
+        sections = re.split(r'^---- Last \d+[smh] -+$', tick, flags=re.MULTILINE)
+        if len(sections) >= 3:
+            # sections[1] = content after "Last 1s", sections[2] = content after "Last 5s"
+            first_has_data = bool(re.search(r'Wait Event', sections[1]))
+            second_waiting = "waiting for data" in sections[2]
+            if first_has_data and second_waiting:
+                found_partial = True
+                break
+
+    check(found_partial,
+          "Early tick: first section has data, second shows 'waiting for data'")
+
+    # Later ticks: both sections should have data
+    if len(ticks) >= 6:
+        last_tick = ticks[-1]
+        sections = re.split(r'^---- Last \d+[smh] -+$', last_tick,
+                            flags=re.MULTILINE)
+        if len(sections) >= 3:
+            both_have_data = (
+                bool(re.search(r'Wait Event', sections[1])) and
+                bool(re.search(r'Wait Event', sections[2]))
+            )
+            check(both_have_data,
+                  "Last tick has data in both sections")
+
+
+# ── Test 6: system_event Data Sanity ───────────────────────
+
+def parse_system_events_section(text):
+    """Parse events from a system_event section."""
+    events = []
+    for line in text.split('\n'):
+        line = line.strip()
+        m = re.match(
+            r'^(\S+(?::\S+)?)\s+'
+            r'(\d+)\s+'
+            r'([\d.]+)\s+'
+            r'([\d.]+)\s+'
+            r'([\d.]+)%',
+            line
+        )
+        if m:
+            events.append({
+                'name': m.group(1),
+                'count': int(m.group(2)),
+                'total_ms': float(m.group(3)),
+                'avg_us': float(m.group(4)),
+                'pct': float(m.group(5)),
+            })
+    return events
+
+
+def test_system_event_data(pm_pid):
+    """Verify system_event multi-window data is sane."""
+    print("--- Test 6: system_event Data Sanity ---")
+
+    CLIENTS = 4
+    BENCH_SEC = 30
+
+    pgbench = subprocess.Popen(
+        ["pgbench", "-U", "postgres", "-d", "postgres",
+         "-c", str(CLIENTS), "-T", str(BENCH_SEC)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+
+    time.sleep(3)
+
+    output = run_tracer(pm_pid, interval=5, count=3, windows="5s",
+                        view="system_event")
+
+    pgbench.wait()
+
+    ticks = split_ticks(output)
+
+    # Find last tick with actual data
+    last_data_tick = None
+    for tick in reversed(ticks):
+        if "Wait Event" in tick:
+            last_data_tick = tick
+            break
+
+    check(last_data_tick is not None,
+          "Found tick with event data")
+
+    if not last_data_tick:
+        return
+
+    events = parse_system_events_section(last_data_tick)
+
+    check(len(events) > 0,
+          f"Parsed {len(events)} events from system_event section")
+
+    if not events:
+        return
+
+    # Events should be sorted by total_ms descending
+    totals = [e['total_ms'] for e in events]
+    is_sorted = all(totals[i] >= totals[i + 1] for i in range(len(totals) - 1))
+    check(is_sorted,
+          "Events sorted by Total (ms) descending")
+
+    # All events should have count > 0
+    all_positive = all(e['count'] > 0 for e in events)
+    check(all_positive,
+          "All events have count > 0")
+
+    # Percentages should sum to roughly 100% (allowing for rounding)
+    pct_sum = sum(e['pct'] for e in events)
+    check(80 < pct_sum < 120,
+          f"Percentages sum to {pct_sum:.1f}% (expected ~100%)")
+
+
 # ── Main ─────────────────────────────────────────────────────
 
 def main():
@@ -292,6 +489,9 @@ def main():
     test_format(pm_pid)
     test_progressive_population(pm_pid)
     test_internal_consistency(pm_pid)
+    test_system_event_format(pm_pid)
+    test_system_event_progressive(pm_pid)
+    test_system_event_data(pm_pid)
 
     print(f"\n{tests_passed}/{tests_run} tests passed")
     sys.exit(0 if tests_failed == 0 else 1)

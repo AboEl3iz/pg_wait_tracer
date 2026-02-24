@@ -357,15 +357,101 @@ static int cmp_event_total(const void *a, const void *b)
     return 0;
 }
 
+/* qsort comparator for snapshot events (used in multi-window mode) */
+static int cmp_snap_event_total(const void *a, const void *b)
+{
+    const struct pgwt_snap_event *ea = a;
+    const struct pgwt_snap_event *eb = b;
+    if (eb->total_ns > ea->total_ns) return 1;
+    if (eb->total_ns < ea->total_ns) return -1;
+    return 0;
+}
+
+/* Multi-window system_event: vertically stacked sections per window */
+static void print_system_event_multi(struct pgwt_daemon *d)
+{
+    int nw = d->num_windows;
+    struct pgwt_snapshot deltas[PGWT_MAX_WINDOWS];
+    int valid[PGWT_MAX_WINDOWS] = {0};
+
+    for (int w = 0; w < nw; w++) {
+        int ticks = d->windows[w] / d->interval;
+        valid[w] = (pgwt_ring_delta(&d->ring, ticks, &deltas[w]) == 0);
+    }
+
+    for (int w = 0; w < nw; w++) {
+        /* Section header: ---- Last 5s ---- */
+        char label[16];
+        format_window_label(d->windows[w], label, sizeof(label));
+        printf("---- %s ", label);
+        int used = 5 + (int)strlen(label) + 1;
+        for (int i = used; i < 78; i++) putchar('-');
+        printf("\n");
+
+        if (!valid[w]) {
+            printf("  (waiting for data)\n\n");
+            continue;
+        }
+
+        /* Sort delta events */
+        qsort(deltas[w].events, deltas[w].num_events,
+              sizeof(deltas[w].events[0]), cmp_snap_event_total);
+
+        uint64_t db = deltas[w].tm.db_time_ns;
+
+        /* Column headers (no Max column — not available in deltas) */
+        printf("  %-26s %12s %14s %10s %9s\n",
+               "Wait Event", "Total Waits", "Total (ms)", "Avg (us)", "% DB");
+        printf("  ");
+        for (int i = 0; i < 26; i++) putchar('-');
+        printf(" ");
+        for (int i = 0; i < 12; i++) putchar('-');
+        printf(" ");
+        for (int i = 0; i < 14; i++) putchar('-');
+        printf(" ");
+        for (int i = 0; i < 10; i++) putchar('-');
+        printf(" ");
+        for (int i = 0; i < 9; i++) putchar('-');
+        printf("\n");
+
+        int shown = 0;
+        for (int i = 0; i < deltas[w].num_events && shown < 20; i++) {
+            struct pgwt_snap_event *ev = &deltas[w].events[i];
+            if (ev->count == 0) continue;
+            if (pgwt_is_idle_event(ev->wait_event)) continue;
+
+            char name[64];
+            pgwt_event_full_name(ev->wait_event, name, sizeof(name));
+
+            double avg_us = ev->count ?
+                ns_to_us(ev->total_ns) / ev->count : 0;
+
+            printf("  %-26s %12lu %14.1f %10.1f %8.1f%%\n",
+                   name,
+                   (unsigned long)ev->count,
+                   ns_to_ms(ev->total_ns),
+                   avg_us,
+                   db ? 100.0 * ev->total_ns / db : 0);
+            shown++;
+        }
+        printf("\n");
+    }
+}
+
 void pgwt_print_system_event(struct pgwt_daemon *d)
 {
     struct pgwt_accumulator *acc = &d->accum;
 
     print_view_start(d);
     printf("%s\n", LINE);
-    printf("pg_wait_tracer — System Events (cumulative)    Backends: %d\n",
-           count_active_backends(d));
+    printf("pg_wait_tracer — System Events    Backends: %d    Interval: %ds\n",
+           count_active_backends(d), d->interval);
     printf("%s\n\n", LINE);
+
+    if (d->num_windows > 0 && d->ring.slots) {
+        print_system_event_multi(d);
+        return;
+    }
 
     if (acc->num_system_events == 0) {
         printf("  (no data yet)\n\n");

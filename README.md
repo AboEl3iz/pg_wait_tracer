@@ -37,7 +37,7 @@ sudo ./pg_wait_tracer --window 5s,1m,5m --count 3
 | `--interval <SEC>` | `-i` | 5 | Refresh interval in seconds (minimum 1) |
 | `--duration <SEC>` | `-d` | unlimited | Stop after N seconds |
 | `--count <N>` | `-n` | unlimited | Print N intervals then exit |
-| `--window <W1,W2,W3>` | `-w` | — | Time windows for time_model, e.g. `5s,1m,5m` (first must equal interval) |
+| `--window <W1,W2,W3>` | `-w` | — | Time windows for time_model/system_event, e.g. `5s,1m,5m` (first must equal interval) |
 | `--view <VIEW>` | `-V` | `time_model` | Output view (see below) |
 | `--format <FMT>` | `-f` | auto-detect | Output format: `tui` (terminal), `text` (pipe) |
 | `--event <NAME>` | `-e` | — | Event filter (histogram: required; query_event: by event) |
@@ -201,6 +201,50 @@ pg_wait_tracer — System Events (cumulative)    Backends: 12
   — high concurrency on the WAL.
 - **Large Max vs Avg gap** suggests outlier events. Use `histogram` view to see
   the full distribution.
+
+#### Multi-window mode
+
+With `--window`, the system_event view shows vertically stacked sections — one per
+window — so you can see how the top events change across time horizons:
+
+```bash
+sudo ./pg_wait_tracer --view system_event --window 5s,1m,5m
+```
+
+```
+════════════════════════════════════════════════════════════════════════════════
+pg_wait_tracer — System Events    Backends: 12    Interval: 5s
+════════════════════════════════════════════════════════════════════════════════
+
+---- Last 5s -----------------------------------------------------------------
+  Wait Event                  Total Waits     Total (ms)   Avg (us)      % DB
+  -------------------------- ------------ -------------- ---------- ---------
+  CPU*                           4346        549.9      126.5     21.9%
+  IO:DataFileRead                 823        326.3      396.2     13.0%
+  Lock:transactionid               57        210.4     3712.2      8.4%
+  ...
+
+---- Last 1m -----------------------------------------------------------------
+  Wait Event                  Total Waits     Total (ms)   Avg (us)      % DB
+  -------------------------- ------------ -------------- ---------- ---------
+  CPU*                          52143       6598.7      126.5     22.0%
+  IO:DataFileRead                9882       3915.4      396.2     13.0%
+  ...
+
+---- Last 5m -----------------------------------------------------------------
+  (waiting for data)
+```
+
+**Reading this output:**
+
+- Each section shows the delta for that time window. Events are sorted by total
+  duration within each section, so the ranking can differ between windows.
+- **Max (us) is not shown** in multi-window mode because delta snapshots track
+  cumulative count and total — not per-window maximums. Avg (us) is still valid.
+- Shorter windows fill first. Longer windows show "(waiting for data)" until enough
+  history accumulates.
+- Without `--window`, the default single-column cumulative view is shown (see above),
+  which includes the Max (us) column.
 
 ---
 
