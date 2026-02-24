@@ -173,7 +173,11 @@ def test_ipc(pm_pid):
     # parallel-eligible queries.
     sql_file = "/tmp/_pgwt_test_ipc.sql"
     with open(sql_file, "w") as f:
+        # Force parallel execution even on small pgbench_accounts tables
         f.write("SET max_parallel_workers_per_gather = 4;\n")
+        f.write("SET parallel_setup_cost = 0;\n")
+        f.write("SET parallel_tuple_cost = 0;\n")
+        f.write("SET min_parallel_table_scan_size = '1kB';\n")
         for _ in range(200):
             f.write("SELECT count(*) FROM pgbench_accounts WHERE aid > 0;\n")
 

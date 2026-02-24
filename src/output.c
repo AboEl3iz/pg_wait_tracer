@@ -16,6 +16,43 @@
 static double ns_to_ms(uint64_t ns) { return (double)ns / 1e6; }
 static double ns_to_us(uint64_t ns) { return (double)ns / 1e3; }
 
+/* ── Multi-window helpers ───────────────────────────────── */
+
+static void format_window_label(int secs, char *buf, size_t bufsz)
+{
+    if (secs >= 3600 && secs % 3600 == 0)
+        snprintf(buf, bufsz, "Last %dh", secs / 3600);
+    else if (secs >= 60 && secs % 60 == 0)
+        snprintf(buf, bufsz, "Last %dm", secs / 60);
+    else
+        snprintf(buf, bufsz, "Last %ds", secs);
+}
+
+static uint64_t find_snap_event_ns(const struct pgwt_snapshot *snap,
+                                   uint32_t we)
+{
+    for (int i = 0; i < snap->num_events; i++)
+        if (snap->events[i].wait_event == we)
+            return snap->events[i].total_ns;
+    return 0;
+}
+
+static uint64_t tm_class_ns(const struct pgwt_time_model *tm,
+                            uint32_t class_id)
+{
+    switch (class_id) {
+    case PG_WAIT_IO:        return tm->io_time_ns;
+    case PG_WAIT_LWLOCK:    return tm->lwlock_time_ns;
+    case PG_WAIT_LOCK:      return tm->lock_time_ns;
+    case PG_WAIT_CLIENT:    return tm->client_time_ns;
+    case PG_WAIT_IPC:       return tm->ipc_time_ns;
+    case PG_WAIT_BUFFERPIN: return tm->bufferpin_time_ns;
+    case PG_WAIT_TIMEOUT:   return tm->timeout_time_ns;
+    case PG_WAIT_EXTENSION: return tm->extension_time_ns;
+    default:                return 0;
+    }
+}
+
 static int count_active_backends(struct pgwt_daemon *d)
 {
     int n = 0;
@@ -49,6 +86,158 @@ void pgwt_print_header(struct pgwt_daemon *d)
 
 /* ── Time Model View ─────────────────────────────────────── */
 
+/* Multi-window time_model: side-by-side columns per window */
+static void print_time_model_multi(struct pgwt_daemon *d)
+{
+    int nw = d->num_windows;
+    struct pgwt_snapshot deltas[PGWT_MAX_WINDOWS];
+    int valid[PGWT_MAX_WINDOWS] = {0};
+
+    for (int w = 0; w < nw; w++) {
+        int ticks = d->windows[w] / d->interval;
+        valid[w] = (pgwt_ring_delta(&d->ring, ticks, &deltas[w]) == 0);
+    }
+
+    if (!valid[0]) {
+        printf("  (waiting for data)\n\n");
+        return;
+    }
+
+    /* Column headers */
+    printf("  %-32s", "Stat Name");
+    for (int w = 0; w < nw; w++) {
+        char label[16];
+        format_window_label(d->windows[w], label, sizeof(label));
+        printf(" %9s %7s", label, "% DB");
+    }
+    printf("\n");
+
+    /* Separator */
+    printf("  ");
+    for (int i = 0; i < 32; i++) putchar('-');
+    for (int w = 0; w < nw; w++) {
+        putchar(' ');
+        for (int i = 0; i < 9; i++) putchar('-');
+        putchar(' ');
+        for (int i = 0; i < 7; i++) putchar('-');
+    }
+    printf("\n");
+
+    /* DB Time */
+    printf("  %-32s", "DB Time");
+    for (int w = 0; w < nw; w++) {
+        if (!valid[w]) { printf(" %9s %7s", "-", "-"); continue; }
+        printf(" %9.1f %6.1f%%", ns_to_ms(deltas[w].tm.db_time_ns), 100.0);
+    }
+    printf("\n");
+
+    /* CPU* */
+    printf("    %-30s", "CPU*");
+    for (int w = 0; w < nw; w++) {
+        if (!valid[w]) { printf(" %9s %7s", "-", "-"); continue; }
+        uint64_t db = deltas[w].tm.db_time_ns;
+        printf(" %9.1f %6.1f%%", ns_to_ms(deltas[w].tm.cpu_time_ns),
+               db ? 100.0 * deltas[w].tm.cpu_time_ns / db : 0);
+    }
+    printf("\n");
+
+    /* Wait classes sorted by first window */
+    struct { const char *name; uint32_t class_id; uint64_t sort_ns; } classes[] = {
+        {"IO",        PG_WAIT_IO,        deltas[0].tm.io_time_ns},
+        {"LWLock",    PG_WAIT_LWLOCK,    deltas[0].tm.lwlock_time_ns},
+        {"Lock",      PG_WAIT_LOCK,      deltas[0].tm.lock_time_ns},
+        {"Client",    PG_WAIT_CLIENT,    deltas[0].tm.client_time_ns},
+        {"IPC",       PG_WAIT_IPC,       deltas[0].tm.ipc_time_ns},
+        {"BufferPin", PG_WAIT_BUFFERPIN, deltas[0].tm.bufferpin_time_ns},
+        {"Timeout",   PG_WAIT_TIMEOUT,   deltas[0].tm.timeout_time_ns},
+        {"Extension", PG_WAIT_EXTENSION, deltas[0].tm.extension_time_ns},
+    };
+    int nc = sizeof(classes) / sizeof(classes[0]);
+
+    for (int i = 0; i < nc - 1; i++)
+        for (int j = i + 1; j < nc; j++)
+            if (classes[j].sort_ns > classes[i].sort_ns) {
+                typeof(classes[0]) tmp = classes[i];
+                classes[i] = classes[j];
+                classes[j] = tmp;
+            }
+
+#define MAX_SUB_EVENTS_M 3
+#define MIN_DB_PCT_M     1.0
+
+    uint64_t db0 = deltas[0].tm.db_time_ns;
+
+    for (int i = 0; i < nc; i++) {
+        if (classes[i].sort_ns == 0) continue;
+
+        /* Class row */
+        printf("    %-30s", classes[i].name);
+        for (int w = 0; w < nw; w++) {
+            if (!valid[w]) { printf(" %9s %7s", "-", "-"); continue; }
+            uint64_t db = deltas[w].tm.db_time_ns;
+            uint64_t cls_ns = tm_class_ns(&deltas[w].tm, classes[i].class_id);
+            printf(" %9.1f %6.1f%%", ns_to_ms(cls_ns),
+                   db ? 100.0 * cls_ns / db : 0);
+        }
+        printf("\n");
+
+        /* Top sub-events from first window */
+        struct { uint32_t we; uint64_t total_ns; } top[MAX_SUB_EVENTS_M];
+        int ntop = 0;
+
+        for (int j = 0; j < deltas[0].num_events; j++) {
+            struct pgwt_snap_event *ev = &deltas[0].events[j];
+            if (ev->count == 0) continue;
+            if (WE_CLASS(ev->wait_event) != classes[i].class_id) continue;
+            if (db0 == 0 || 100.0 * ev->total_ns / db0 < MIN_DB_PCT_M)
+                continue;
+
+            int pos = ntop;
+            for (int k = 0; k < ntop; k++) {
+                if (ev->total_ns > top[k].total_ns) { pos = k; break; }
+            }
+            if (pos < MAX_SUB_EVENTS_M) {
+                int tail = ntop < MAX_SUB_EVENTS_M ? ntop : MAX_SUB_EVENTS_M - 1;
+                for (int k = tail; k > pos; k--)
+                    top[k] = top[k - 1];
+                top[pos].we = ev->wait_event;
+                top[pos].total_ns = ev->total_ns;
+                if (ntop < MAX_SUB_EVENTS_M)
+                    ntop++;
+            }
+        }
+
+        for (int t = 0; t < ntop; t++) {
+            char name[64];
+            pgwt_event_full_name(top[t].we, name, sizeof(name));
+            printf("      %-28s", name);
+            for (int w = 0; w < nw; w++) {
+                if (!valid[w]) { printf(" %9s %7s", "-", "-"); continue; }
+                uint64_t db = deltas[w].tm.db_time_ns;
+                uint64_t ev_ns = find_snap_event_ns(&deltas[w], top[t].we);
+                printf(" %9.1f %6.1f%%", ns_to_ms(ev_ns),
+                       db ? 100.0 * ev_ns / db : 0);
+            }
+            printf("\n");
+        }
+    }
+
+#undef MAX_SUB_EVENTS_M
+#undef MIN_DB_PCT_M
+
+    /* Activity/Idle */
+    if (deltas[0].tm.activity_time_ns > 0) {
+        printf("\n  %-32s", "(Activity/Idle)");
+        for (int w = 0; w < nw; w++) {
+            if (!valid[w]) { printf(" %9s %7s", "-", "-"); continue; }
+            printf(" %9.1f %7s", ns_to_ms(deltas[w].tm.activity_time_ns), "-");
+        }
+        printf("\n");
+    }
+
+    printf("\n");
+}
+
 void pgwt_print_time_model(struct pgwt_daemon *d)
 {
     struct pgwt_accumulator *acc = &d->accum;
@@ -59,6 +248,11 @@ void pgwt_print_time_model(struct pgwt_daemon *d)
     printf("pg_wait_tracer — Time Model    Backends: %d    Interval: %ds\n",
            count_active_backends(d), d->interval);
     printf("%s\n\n", LINE);
+
+    if (d->num_windows > 0 && d->ring.slots) {
+        print_time_model_multi(d);
+        return;
+    }
 
     uint64_t db = tm->db_time_ns;
     if (db == 0) {

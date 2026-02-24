@@ -130,6 +130,24 @@ if [[ -n "$PM_PID" ]]; then
         echo "  FAIL: --window with valid args returned exit code $rc"
         failed=$((failed + 1))
     fi
+
+    # --window output contains multi-window column headers
+    output=$(timeout 15 "$TRACER" --pid "$PM_PID" --window 1s,3s \
+        --interval 1 --count 4 2>/dev/null || true)
+    if echo "$output" | grep -q "Last 1s"; then
+        echo "  PASS: --window output contains window headers"
+        passed=$((passed + 1))
+    else
+        echo "  FAIL: --window output missing 'Last 1s' header"
+        failed=$((failed + 1))
+    fi
+    if echo "$output" | grep -q "% DB"; then
+        echo "  PASS: --window output contains '% DB' header"
+        passed=$((passed + 1))
+    else
+        echo "  FAIL: --window output missing '% DB' header"
+        failed=$((failed + 1))
+    fi
 else
     echo "  SKIP: no running PG (pass --pid to test valid args)"
 fi
