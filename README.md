@@ -39,6 +39,7 @@ sudo ./pg_wait_tracer --window 5s,1m,5m --count 3
 | `--count <N>` | `-n` | unlimited | Print N intervals then exit |
 | `--window <W1,W2,W3>` | `-w` | — | Time windows for all views, e.g. `5s,1m,5m` (first must equal interval) |
 | `--view <VIEW>` | `-V` | `time_model` | Output view (see below) |
+| `--sort <MODE>` | `-S` | `wait_time` | Sort for active view: `wait_time`, `db_time`, `pid`, `event` |
 | `--format <FMT>` | `-f` | auto-detect | Output format: `tui` (terminal), `text` (pipe) |
 | `--event <NAME>` | `-e` | — | Event filter (histogram: required; query_event: by event) |
 | `--pid-filter <PID>` | `-P` | — | Show per-event detail for one backend (session_event view) |
@@ -293,6 +294,71 @@ system_event).
 - A backend with high Wait% and `Lock:Transaction` as top wait is blocked by
   another transaction — check for long-running queries or deadlocks.
 - System processes (bgwriter, checkpointer, walwriter) normally show IO waits.
+
+---
+
+### active
+
+A "top-like" view of currently active backends, showing each backend's current
+state, wait event, and cumulative DB Time. This is the first view a DBA opens to
+see what's happening right now.
+
+```bash
+sudo ./pg_wait_tracer --view active
+sudo ./pg_wait_tracer --view active --sort db_time
+sudo ./pg_wait_tracer --view active --sort pid
+```
+
+**Columns:**
+
+| Column | Description |
+|--------|-------------|
+| PID | Backend OS process ID |
+| State | `on cpu`, `waiting`, or `idle` (from BPF tracing state) |
+| Wait Event | Current wait event name (if waiting), `—` otherwise |
+| Wait (ms) | Duration in current wait state, `—` if not waiting |
+| DB Time (ms) | Cumulative non-idle time for this backend |
+| Backend Type | From `/proc/PID/cmdline` parsing (client, checkpointer, bgwriter, etc.) |
+
+**Example:**
+
+```
+════════════════════════════════════════════════════════════════════════════════
+pg_wait_tracer — Active Sessions    Backends: 12    Uptime: 32m 15s
+════════════════════════════════════════════════════════════════════════════════
+
+  PID     State      Wait Event                  Wait (ms)   DB Time (ms)  Backend Type
+  ------- ---------- ------------------------ ------------ -------------- ------------------
+  34521   waiting    Lock:Transaction             8923.1        12450.3  client
+  34587   waiting    IO:DataFileRead                 3.2         8234.1  client
+  34602   on cpu     —                               —          5123.4  client
+  34534   waiting    LWLock:WALInsert                0.8         4892.1  client
+  34498   waiting    Client:ClientRead            1234.5         3421.2  client
+  34612   idle       —                               —              —  client
+  34701   idle       —                               —              —  autovac_launcher
+  34702   idle       —                               —              —  walwriter
+```
+
+**Sorting** (`--sort` flag):
+
+| Mode | Description |
+|------|-------------|
+| `wait_time` | Sort by current wait duration, longest first (default) |
+| `db_time` | Sort by cumulative DB Time, highest first |
+| `pid` | Sort by PID ascending |
+| `event` | Sort by wait event name alphabetically |
+
+**Reading this output:**
+
+- **waiting** means the backend is blocked on a wait event. The Wait (ms) column
+  shows how long it has been stuck. A backend waiting on `Lock:Transaction` for
+  8923 ms is blocked by another transaction.
+- **on cpu** means no PostgreSQL wait event is set — the backend is executing.
+- **idle** means the backend is in an Activity wait (waiting for a new query).
+  Idle backends contribute no DB Time.
+- Use `--sort db_time` to find the busiest backends. Use `--sort event` to group
+  backends by the same bottleneck. Use `--sort pid` for a stable ordering.
+- The **Uptime** field shows how long pg_wait_tracer has been running.
 
 ---
 

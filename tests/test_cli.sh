@@ -72,6 +72,10 @@ check_exit 1 $? "invalid PID exits non-zero"
 "$TRACER" --pid "${PM_PID:-1}" --view invalid_view > /dev/null 2>&1
 check_exit 1 $? "invalid view exits non-zero"
 
+# Invalid sort mode exits non-zero
+"$TRACER" --pid "${PM_PID:-1}" --sort invalid_sort > /dev/null 2>&1
+check_exit 1 $? "invalid sort mode exits non-zero"
+
 # Interval 0 exits non-zero
 "$TRACER" --pid "${PM_PID:-1}" --interval 0 > /dev/null 2>&1
 check_exit 1 $? "interval 0 exits non-zero"
@@ -101,8 +105,8 @@ if [[ -n "$PM_PID" ]]; then
         failed=$((failed + 1))
     fi
 
-    # All 4 views work
-    for view in time_model system_event session_event query_event; do
+    # All views work
+    for view in time_model system_event session_event query_event active; do
         timeout 10 "$TRACER" --pid "$PM_PID" --interval 1 --duration 2 \
             --view "$view" > /dev/null 2>&1
         rc=$?
@@ -190,6 +194,43 @@ if [[ -n "$PM_PID" ]]; then
         passed=$((passed + 1))
     else
         echo "  FAIL: --window histogram missing 'Bucket(us)' column"
+        failed=$((failed + 1))
+    fi
+
+    # active view output contains correct header and column names
+    output=$(timeout 15 "$TRACER" --pid "$PM_PID" --view active \
+        --interval 1 --count 2 2>/dev/null || true)
+    if echo "$output" | grep -q "Active Sessions"; then
+        echo "  PASS: active view has 'Active Sessions' header"
+        passed=$((passed + 1))
+    else
+        echo "  FAIL: active view missing 'Active Sessions' header"
+        failed=$((failed + 1))
+    fi
+    if echo "$output" | grep -q "Backend Type"; then
+        echo "  PASS: active view has 'Backend Type' column"
+        passed=$((passed + 1))
+    else
+        echo "  FAIL: active view missing 'Backend Type' column"
+        failed=$((failed + 1))
+    fi
+    if echo "$output" | grep -q "Uptime"; then
+        echo "  PASS: active view has 'Uptime' in header"
+        passed=$((passed + 1))
+    else
+        echo "  FAIL: active view missing 'Uptime' in header"
+        failed=$((failed + 1))
+    fi
+
+    # active view with --sort db_time works
+    timeout 10 "$TRACER" --pid "$PM_PID" --view active --sort db_time \
+        --interval 1 --count 1 > /dev/null 2>&1
+    rc=$?
+    if [[ $rc -eq 0 || $rc -eq 124 ]]; then
+        echo "  PASS: --view active --sort db_time works"
+        passed=$((passed + 1))
+    else
+        echo "  FAIL: --view active --sort db_time returned exit code $rc"
         failed=$((failed + 1))
     fi
 

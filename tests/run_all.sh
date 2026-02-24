@@ -96,6 +96,7 @@ if [[ $(id -u) -eq 0 ]] && pgrep -x postgres > /dev/null 2>&1; then
     run_test "test_cross_pg_wait_sampling" python3 "$SCRIPT_DIR/test_cross_pg_wait_sampling.py" $PID_ARG
     run_test "test_event_classes" python3 "$SCRIPT_DIR/test_event_classes.py" $PID_ARG
     run_test "test_multi_window" python3 "$SCRIPT_DIR/test_multi_window.py" $PID_ARG
+    run_test "test_active" python3 "$SCRIPT_DIR/test_active.py" $PID_ARG
 else
     if [[ $(id -u) -ne 0 ]]; then
         skip_test "test_lifecycle" "requires root"
@@ -110,6 +111,7 @@ else
         skip_test "test_cross_pg_wait_sampling" "requires root"
         skip_test "test_event_classes" "requires root"
         skip_test "test_multi_window" "requires root"
+        skip_test "test_active" "requires root"
     else
         skip_test "test_lifecycle" "PostgreSQL not running"
         skip_test "test_cross_validate" "PostgreSQL not running"
@@ -123,6 +125,7 @@ else
         skip_test "test_cross_pg_wait_sampling" "PostgreSQL not running"
         skip_test "test_event_classes" "PostgreSQL not running"
         skip_test "test_multi_window" "PostgreSQL not running"
+        skip_test "test_active" "PostgreSQL not running"
     fi
 fi
 

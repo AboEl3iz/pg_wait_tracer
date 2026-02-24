@@ -120,6 +120,8 @@ int pgwt_read_maps(struct pgwt_daemon *d)
         d->accum.pids[i].db_time_ns = 0;
         d->accum.pids[i].cpu_time_ns = 0;
         d->accum.pids[i].wait_time_ns = 0;
+        d->accum.pids[i].current_event = 0;
+        d->accum.pids[i].current_wait_ns = 0;
     }
     d->accum.num_system_events = 0;
     d->accum.num_query_events = 0;
@@ -228,6 +230,15 @@ int pgwt_read_maps(struct pgwt_daemon *d)
         if (bpf_map_lookup_elem(state_fd, &snext, &sval) == 0) {
             uint64_t open_ns = now - sval.last_ts;
             uint32_t we = sval.last_event;
+
+            /* Store current state for active sessions view */
+            {
+                struct pgwt_pid_accum *pa_cur = get_or_create_pid(&d->accum, snext);
+                if (pa_cur) {
+                    pa_cur->current_event = we;
+                    pa_cur->current_wait_ns = open_ns;
+                }
+            }
 
             /* Skip if wait_stats already has data for this (PID, event) */
             struct pgwt_agg_key check_key = { .pid = snext, .wait_event = we };

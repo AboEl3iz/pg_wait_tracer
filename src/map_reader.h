@@ -25,6 +25,8 @@ struct pgwt_pid_accum {
     uint64_t db_time_ns;      /* total non-idle time */
     uint64_t cpu_time_ns;     /* event=0 time */
     uint64_t wait_time_ns;    /* all event!=0 time */
+    uint32_t current_event;   /* current wait event from state_map */
+    uint64_t current_wait_ns; /* time in current state */
     struct pgwt_event_stats events[MAX_EVENTS_PER_PID];
 };
 

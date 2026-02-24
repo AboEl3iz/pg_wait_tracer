@@ -1,4 +1,4 @@
-/* output.c — CLI output formatters for the 4 diagnostic views */
+/* output.c — CLI output formatters for diagnostic views */
 #include "output.h"
 #include "daemon.h"
 #include "map_reader.h"
@@ -1029,6 +1029,185 @@ void pgwt_print_query_event(struct pgwt_daemon *d)
                    db ? 100.0 * sorted[i].total_ns / db : 0);
         }
         shown++;
+    }
+    printf("\n");
+}
+
+/* ── Active Sessions View ────────────────────────────────── */
+
+/* Backend state for active sessions view */
+#define ACTIVE_STATE_WAITING 0
+#define ACTIVE_STATE_ON_CPU  1
+#define ACTIVE_STATE_IDLE    2
+
+struct active_entry {
+    uint32_t    pid;
+    int         state;              /* ACTIVE_STATE_* */
+    char        event_name[64];     /* wait event name or "" */
+    uint64_t    current_wait_ns;    /* time in current state */
+    uint64_t    db_time_ns;
+    const char *type_name;
+};
+
+static int cmp_active_wait_time(const void *a, const void *b)
+{
+    const struct active_entry *ea = a;
+    const struct active_entry *eb = b;
+    /* Waiting first, then on-cpu, then idle */
+    if (ea->state != eb->state)
+        return ea->state - eb->state;
+    /* Within same state: longest duration first */
+    if (eb->current_wait_ns > ea->current_wait_ns) return 1;
+    if (eb->current_wait_ns < ea->current_wait_ns) return -1;
+    return 0;
+}
+
+static int cmp_active_db_time(const void *a, const void *b)
+{
+    const struct active_entry *ea = a;
+    const struct active_entry *eb = b;
+    if (eb->db_time_ns > ea->db_time_ns) return 1;
+    if (eb->db_time_ns < ea->db_time_ns) return -1;
+    return 0;
+}
+
+static int cmp_active_pid(const void *a, const void *b)
+{
+    const struct active_entry *ea = a;
+    const struct active_entry *eb = b;
+    if (ea->pid < eb->pid) return -1;
+    if (ea->pid > eb->pid) return 1;
+    return 0;
+}
+
+static int cmp_active_event(const void *a, const void *b)
+{
+    const struct active_entry *ea = a;
+    const struct active_entry *eb = b;
+    int cmp = strcmp(ea->event_name, eb->event_name);
+    if (cmp != 0) return cmp;
+    /* Same event: longest duration first */
+    if (eb->current_wait_ns > ea->current_wait_ns) return 1;
+    if (eb->current_wait_ns < ea->current_wait_ns) return -1;
+    return 0;
+}
+
+static void format_uptime(uint64_t start_ts, char *buf, size_t bufsz)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t now = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+    uint64_t uptime_s = (now - start_ts) / 1000000000ULL;
+
+    int hours = (int)(uptime_s / 3600);
+    int mins = (int)((uptime_s % 3600) / 60);
+    int secs = (int)(uptime_s % 60);
+
+    if (hours > 0)
+        snprintf(buf, bufsz, "%dh %dm %ds", hours, mins, secs);
+    else if (mins > 0)
+        snprintf(buf, bufsz, "%dm %ds", mins, secs);
+    else
+        snprintf(buf, bufsz, "%ds", secs);
+}
+
+void pgwt_print_active(struct pgwt_daemon *d)
+{
+    struct pgwt_accumulator *acc = &d->accum;
+    int active_count = count_active_backends(d);
+
+    char uptime[32];
+    format_uptime(d->start_ts, uptime, sizeof(uptime));
+
+    print_view_start(d);
+    printf("%s\n", LINE);
+    printf("pg_wait_tracer — Active Sessions    Backends: %d    Uptime: %s\n",
+           active_count, uptime);
+    printf("%s\n\n", LINE);
+
+    /* Build entry array from backend table */
+    struct active_entry entries[MAX_BACKENDS];
+    int n = 0;
+
+    for (int i = 0; i < d->backends.count; i++) {
+        struct pgwt_backend *be = &d->backends.entries[i];
+        if (!be->is_alive || be->pid == 0) continue;
+        if (n >= MAX_BACKENDS) break;
+
+        struct active_entry *e = &entries[n++];
+        e->pid = be->pid;
+        e->type_name = pgwt_backend_type_name(be->meta.backend_type);
+
+        struct pgwt_pid_accum *pa = pgwt_find_pid_accum(acc, be->pid);
+        if (pa) {
+            e->db_time_ns = pa->db_time_ns;
+            e->current_wait_ns = pa->current_wait_ns;
+
+            if (pgwt_is_idle_event(pa->current_event)) {
+                e->state = ACTIVE_STATE_IDLE;
+                e->event_name[0] = '\0';
+            } else if (pa->current_event == 0) {
+                e->state = ACTIVE_STATE_ON_CPU;
+                e->event_name[0] = '\0';
+            } else {
+                e->state = ACTIVE_STATE_WAITING;
+                pgwt_event_full_name(pa->current_event,
+                                     e->event_name, sizeof(e->event_name));
+            }
+        } else {
+            e->db_time_ns = 0;
+            e->current_wait_ns = 0;
+            e->state = ACTIVE_STATE_IDLE;
+            e->event_name[0] = '\0';
+        }
+    }
+
+    /* Sort */
+    int (*cmp)(const void *, const void *);
+    switch (d->sort_mode) {
+    case PGWT_SORT_DB_TIME:    cmp = cmp_active_db_time; break;
+    case PGWT_SORT_PID:        cmp = cmp_active_pid; break;
+    case PGWT_SORT_EVENT:      cmp = cmp_active_event; break;
+    default:                   cmp = cmp_active_wait_time; break;
+    }
+    qsort(entries, n, sizeof(entries[0]), cmp);
+
+    /* Column headers */
+    printf("  %-7s %-10s %-24s %12s %14s  %-18s\n",
+           "PID", "State", "Wait Event",
+           "Wait (ms)", "DB Time (ms)", "Backend Type");
+    printf("  %-7s %-10s %-24s %12s %14s  %-18s\n",
+           DASH + 73, DASH + 70, DASH + 56,
+           DASH + 68, DASH + 66, DASH + 62);
+
+    static const char *state_names[] = {
+        [ACTIVE_STATE_WAITING] = "waiting",
+        [ACTIVE_STATE_ON_CPU]  = "on cpu",
+        [ACTIVE_STATE_IDLE]    = "idle",
+    };
+
+    for (int i = 0; i < n; i++) {
+        struct active_entry *e = &entries[i];
+
+        const char *state_str = state_names[e->state];
+        const char *event_str = e->event_name[0] ? e->event_name : "\xe2\x80\x94";
+
+        char wait_str[16];
+        char db_str[16];
+
+        if (e->state == ACTIVE_STATE_WAITING)
+            snprintf(wait_str, sizeof(wait_str), "%.1f", ns_to_ms(e->current_wait_ns));
+        else
+            snprintf(wait_str, sizeof(wait_str), "\xe2\x80\x94");
+
+        if (e->db_time_ns > 0)
+            snprintf(db_str, sizeof(db_str), "%.1f", ns_to_ms(e->db_time_ns));
+        else
+            snprintf(db_str, sizeof(db_str), "\xe2\x80\x94");
+
+        printf("  %-7d %-10s %-24s %12s %14s  %-18s\n",
+               e->pid, state_str, event_str,
+               wait_str, db_str, e->type_name);
     }
     printf("\n");
 }

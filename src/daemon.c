@@ -69,6 +69,9 @@ static void handle_timer(struct pgwt_daemon *d)
     case PGWT_VIEW_QUERY_EVENT:
         pgwt_print_query_event(d);
         break;
+    case PGWT_VIEW_ACTIVE:
+        pgwt_print_active(d);
+        break;
     }
     fflush(stdout);
 

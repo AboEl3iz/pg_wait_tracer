@@ -21,7 +21,9 @@ static void usage(const char *prog)
         "\n"
         "Output control:\n"
         "  -V, --view <VIEW>     time_model (default), system_event, session_event,\n"
-        "                        histogram, query_event\n"
+        "                        histogram, query_event, active\n"
+        "  -S, --sort <MODE>     Sort for active view: wait_time (default), db_time,\n"
+        "                        pid, event\n"
         "  -f, --format <FMT>    tui | text (default: auto-detect TTY)\n"
         "  -i, --interval <SEC>  Refresh interval in seconds (default: 5)\n"
         "  -d, --duration <SEC>  Run for N seconds then exit (default: unlimited)\n"
@@ -54,7 +56,18 @@ static enum pgwt_view parse_view(const char *s)
     if (strcmp(s, "session_event") == 0)  return PGWT_VIEW_SESSION_EVENT;
     if (strcmp(s, "histogram") == 0)      return PGWT_VIEW_HISTOGRAM;
     if (strcmp(s, "query_event") == 0)    return PGWT_VIEW_QUERY_EVENT;
+    if (strcmp(s, "active") == 0)        return PGWT_VIEW_ACTIVE;
     fprintf(stderr, "ERROR: unknown view '%s'\n", s);
+    exit(1);
+}
+
+static enum pgwt_sort_mode parse_sort(const char *s)
+{
+    if (strcmp(s, "wait_time") == 0)  return PGWT_SORT_WAIT_TIME;
+    if (strcmp(s, "db_time") == 0)    return PGWT_SORT_DB_TIME;
+    if (strcmp(s, "pid") == 0)        return PGWT_SORT_PID;
+    if (strcmp(s, "event") == 0)      return PGWT_SORT_EVENT;
+    fprintf(stderr, "ERROR: unknown sort mode '%s' (use: wait_time, db_time, pid, event)\n", s);
     exit(1);
 }
 
@@ -125,6 +138,7 @@ static struct option long_opts[] = {
     {"event",      required_argument, NULL, 'e'},
     {"pid-filter", required_argument, NULL, 'P'},
     {"query-id",   required_argument, NULL, 'Q'},
+    {"sort",       required_argument, NULL, 'S'},
     {"verbose",    no_argument,       NULL, 'v'},
     {"help",       no_argument,       NULL, 'h'},
     {NULL, 0, NULL, 0},
@@ -149,7 +163,7 @@ int main(int argc, char **argv)
     bool format_set = false;
     int opt;
 
-    while ((opt = getopt_long(argc, argv, "p:D:i:d:V:f:n:w:e:P:Q:vh", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:D:i:d:V:f:n:w:e:P:Q:S:vh", long_opts, NULL)) != -1) {
         switch (opt) {
         case 'p': pm_pid = atoi(optarg); break;
         case 'D': pgdata = optarg; break;
@@ -167,6 +181,7 @@ int main(int argc, char **argv)
         case 'e': d->event_filter = optarg; break;
         case 'P': d->pid_filter = atoi(optarg); break;
         case 'Q': d->query_id_filter = strtoull(optarg, NULL, 10); break;
+        case 'S': d->sort_mode = parse_sort(optarg); break;
         case 'v': d->verbose = true; break;
         case 'h': usage(argv[0]); free(d); return 0;
         default:  usage(argv[0]); free(d); return 1;

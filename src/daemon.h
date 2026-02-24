@@ -22,6 +22,15 @@ enum pgwt_view {
     PGWT_VIEW_SESSION_EVENT,
     PGWT_VIEW_HISTOGRAM,
     PGWT_VIEW_QUERY_EVENT,
+    PGWT_VIEW_ACTIVE,
+};
+
+/* Sort modes (for active sessions view) */
+enum pgwt_sort_mode {
+    PGWT_SORT_WAIT_TIME = 0,  /* default: by current wait duration */
+    PGWT_SORT_DB_TIME,
+    PGWT_SORT_PID,
+    PGWT_SORT_EVENT,
 };
 
 /* Output formats */
@@ -58,6 +67,7 @@ struct pgwt_daemon {
     int         count;               /* max intervals, 0 = unlimited */
     int         tick;                /* current interval number */
     uint64_t    query_id_filter;     /* filter query_event to one query, 0 = no filter */
+    enum pgwt_sort_mode sort_mode;   /* sort mode for active view */
 
     /* Time windows */
 #define PGWT_MAX_WINDOWS 3
