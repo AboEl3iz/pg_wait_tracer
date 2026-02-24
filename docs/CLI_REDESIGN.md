@@ -683,7 +683,42 @@ redesign is complete and validated.
 
 ---
 
-## 17. Verification
+## 17. Future: Query Plan Exposure
+
+**Idea**: Show the execution plan for currently running queries alongside wait event
+data. A DBA sees a backend stuck on `IO:DataFileRead` and immediately wants to know
+*why* — is it a sequential scan? A bad join? Having the plan available without a
+separate `EXPLAIN` session would be a significant debugging shortcut.
+
+**Open questions to investigate:**
+- PostgreSQL stores the active plan tree in backend-local memory (`QueryDesc.planstate`).
+  Can we read it from another process via `/proc/PID/mem` or `process_vm_readv()`?
+  The tree uses pointers — we'd need to chase them across process memory.
+- `auto_explain` logs plans but only after query completion. Could we hook into
+  `ExecutorStart` or `ExecutorRun` via eBPF uprobe to capture the plan at execution
+  time? The plan tree is complex — serializing it in BPF is likely impractical.
+- Alternative: hook `ExplainOnePlan()` or the `EXPLAIN` code path to get a text
+  representation, but this only runs when the user explicitly calls `EXPLAIN`.
+- `pg_stat_statements` stores `query_id` → normalized query text but not plans.
+- PG14+ has `pg_stat_plans` (third-party) — could we integrate or learn from it?
+- Simplest useful approach might be: capture `queryId` + basic plan info (node type
+  of the root plan node, estimated vs actual rows) rather than the full plan tree.
+
+**Potential approaches (ranked by feasibility):**
+1. **Minimal**: Show root plan node type (SeqScan/IndexScan/HashJoin/etc.) by reading
+   `QueryDesc.planstate->type` from process memory. Low complexity, immediately useful.
+2. **Medium**: Hook `ExecutorStart` via uprobe, read `PlannedStmt` fields (total_cost,
+   plan node type, relation OIDs). Store in BPF map per PID.
+3. **Full**: Somehow invoke `ExplainPrintPlan()` in the target backend's context.
+   Very complex, likely requires cooperation from the backend (signal + handler).
+
+**Not yet planned as a phase** — needs feasibility research first. Depends on Phase 16
+(query text) being implemented, as plan exposure builds on the same memory-reading or
+uprobe infrastructure.
+
+---
+
+## 18. Verification
 
 ```bash
 # Auto-detect single instance
