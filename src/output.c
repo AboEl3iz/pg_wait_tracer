@@ -315,7 +315,7 @@ void pgwt_print_histogram(struct pgwt_daemon *d)
 
     uint64_t cum = 0;
     for (int b = 0; b < HISTOGRAM_BUCKETS; b++) {
-        uint32_t w = target->histogram[b];
+        uint64_t w = target->histogram[b];
         cum += w;
         double pct = target->count ? 100.0 * w / target->count : 0;
         double cum_pct = target->count ? 100.0 * cum / target->count : 0;
@@ -327,8 +327,8 @@ void pgwt_print_histogram(struct pgwt_daemon *d)
         memset(bar, '#', bar_len);
         bar[bar_len] = '\0';
 
-        printf("  %s %12u %9.1f%% %11.1f%%  %s\n",
-               bucket_labels[b], w, pct, cum_pct, bar);
+        printf("  %s %12lu %9.1f%% %11.1f%%  %s\n",
+               bucket_labels[b], (unsigned long)w, pct, cum_pct, bar);
     }
     printf("\n");
 }

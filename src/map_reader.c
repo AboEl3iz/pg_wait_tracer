@@ -137,7 +137,7 @@ int pgwt_read_maps(struct pgwt_daemon *d)
 
         /* Sum across all CPUs */
         uint64_t count = 0, total = 0, min_v = UINT64_MAX, max_v = 0;
-        uint32_t hist[HISTOGRAM_BUCKETS] = {};
+        uint64_t hist[HISTOGRAM_BUCKETS] = {};
 
         for (int cpu = 0; cpu < nr_cpus && cpu < MAX_CPUS; cpu++) {
             count += values[cpu].count;

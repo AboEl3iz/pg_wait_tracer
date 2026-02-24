@@ -52,7 +52,7 @@ struct pgwt_agg_value {
     u64 total_ns;
     u64 min_ns;
     u64 max_ns;
-    u32 histogram[HISTOGRAM_BUCKETS];
+    u64 histogram[HISTOGRAM_BUCKETS];
 };
 
 /* ── Lifecycle Events (ring buffer) ───────────────────────── */

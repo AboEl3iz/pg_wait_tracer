@@ -14,7 +14,7 @@ struct pgwt_event_stats {
     uint64_t total_ns;
     uint64_t min_ns;
     uint64_t max_ns;
-    uint32_t histogram[HISTOGRAM_BUCKETS];
+    uint64_t histogram[HISTOGRAM_BUCKETS];
 };
 
 /* Per-PID accumulator */
