@@ -419,6 +419,7 @@ Other:
 | **Phase 13** | Filtering (--class, --min-pct, --top) | Small |
 | **Phase 14** | Update README + tests | Medium |
 | **Phase 15** | Recording & replay (`--record`, `--replay`, `--from`, `--to`) | Medium |
+| **Phase 16** | SQL query text exposure (shared memory or eBPF uprobe) | Medium-Large |
 
 ---
 
@@ -440,6 +441,8 @@ Other:
 | `src/output_csv.c` | **New** — CSV formatter |
 | `src/recording.c` | **New** — Snapshot recording and replay |
 | `src/recording.h` | **New** — Recording file format and API |
+| `src/query_text.c` | **New** — Query text reader (shmem or BPF, Phase 16) |
+| `src/query_text.h` | **New** — Query text API |
 | `Makefile` | Add new .c files |
 
 ---
@@ -524,7 +527,133 @@ replays from start to end.
 
 ---
 
-## 15. Future: Daemon Mode (not in Phase 1-15)
+## 15. SQL Query Text Exposure
+
+Show the currently executing SQL statement for each backend. Two implementation
+approaches to evaluate — decision deferred.
+
+### Where Query Text Appears
+
+- **Active sessions view**: New `Query` column (truncated to ~60 chars) showing the
+  current statement for each backend
+- **query_event view**: Optionally map `query_id` → query text for display
+- **session_event detail**: Show current query for the filtered PID
+
+Example active view with query text:
+```
+  PID      State       Wait Event       Wait (ms)  DB Time (ms)  Query
+  ────────────────────────────────────────────────────────────────────────────────
+  34521    waiting     Lock:Transaction   8923.1      12450.3     UPDATE accounts SET ba...
+  34587    waiting     IO:DataFileRead       3.2       8234.1     SELECT * FROM orders W...
+  34602    on cpu      —                     —         5123.4     INSERT INTO logs (ts, ...
+  34612    idle        —                     —            —       —
+```
+
+### Option A: Shared Memory (`PgBackendStatus.st_activity`)
+
+PostgreSQL maintains `PgBackendStatus` in shared memory for each backend. The
+`st_activity` field contains the current query text (up to `track_activity_query_size`,
+default 1024 bytes). This is what `pg_stat_activity.query` reads.
+
+**How it works:**
+1. Find the `BackendStatusArray` symbol in the postgres binary (ELF lookup, like we
+   do for `my_wait_event_info`)
+2. For each backend PID, read `PgBackendStatus.st_activity` from `/proc/PID/mem`
+   or via `process_vm_readv()`
+3. Display truncated text in output
+
+**Pros:**
+- Simpler implementation (~100-150 lines)
+- No additional BPF programs needed
+- Reads the same data `pg_stat_activity` shows — well-understood semantics
+- Works for all backend types that set `st_activity`
+
+**Cons:**
+- Shared memory layout is PG-version-dependent (struct offsets change between major
+  versions). Need per-version offset tables or runtime discovery via DWARF/debuginfo.
+- `BackendStatusArray` is a static variable — need to resolve its address per version.
+  May require debuginfo packages on some distros.
+- Read is a point-in-time snapshot — slight race with backend updating the field.
+  Acceptable for display purposes (same race `pg_stat_activity` has).
+- `track_activity_query_size` limits text length (default 1024, configurable).
+
+**Implementation sketch:**
+```c
+/* Resolve BackendStatusArray address from ELF symbols */
+uintptr_t status_array = pgwt_resolve_symbol("BackendStatusArray");
+
+/* For each backend, read st_activity */
+struct iovec local  = { .iov_base = buf, .iov_len = 1024 };
+struct iovec remote = { .iov_base = (void *)(status_array + idx * sizeof_entry + activity_offset),
+                        .iov_len = 1024 };
+process_vm_readv(pid, &local, 1, &remote, 1, 0);
+```
+
+### Option B: eBPF Uprobe on Query Execution
+
+Attach a uprobe to a query execution function (e.g., `exec_simple_query()`,
+`PortalRun()`, or `pgstat_report_activity()`) and capture the query string via
+`bpf_probe_read_user()`.
+
+**How it works:**
+1. Attach uprobe to `exec_simple_query(const char *query_string)` — called for
+   every simple query protocol message
+2. In the BPF program, read the query string argument and store it in a per-PID
+   hash map (`query_text_map`)
+3. Userspace reads `query_text_map` alongside other maps during each tick
+
+**Pros:**
+- No shared memory layout dependency — reads function arguments directly
+- Version-resilient: `exec_simple_query` signature has been stable for 15+ years
+- Natural fit with existing BPF infrastructure (same attach/read pattern)
+- Can also hook extended query protocol (`exec_parse_message`, `exec_bind_message`)
+
+**Cons:**
+- `bpf_probe_read_user()` has a size limit in BPF programs (typically ~256 bytes per
+  read, can do multiple reads but adds complexity). Long queries get truncated.
+- BPF hash map value size must be fixed at compile time. Storing 1024 bytes per PID
+  in a BPF map is expensive: 1024 * max_backends. With 1000 backends = ~1MB map.
+- Extended query protocol: prepared statements execute via `PortalRun()` where the
+  query text isn't a direct argument — need to hook `exec_parse_message` to capture
+  the text at parse time and correlate with portal execution.
+- `pgstat_report_activity()` is called more often but has the text as an argument —
+  could be a simpler single hook point that covers both protocols.
+- Additional uprobe = additional overhead (though likely negligible — one read per
+  query start, not per wait event).
+
+**Implementation sketch:**
+```c
+/* BPF program attached to exec_simple_query */
+SEC("uprobe/exec_simple_query")
+int handle_query(struct pt_regs *ctx)
+{
+    const char *query = (const char *)PT_REGS_PARM1(ctx);
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    char buf[256];
+    bpf_probe_read_user_str(buf, sizeof(buf), query);
+    bpf_map_update_elem(&query_text_map, &pid, buf, BPF_ANY);
+    return 0;
+}
+```
+
+### Decision Criteria
+
+| Factor | Option A (shmem) | Option B (eBPF) |
+|--------|-------------------|-----------------|
+| Implementation complexity | Medium | Medium-Large |
+| PG version sensitivity | High (struct layout) | Low (function signature stable) |
+| Debuginfo dependency | Likely needed | Not needed |
+| Text length | Full (1024 default) | Limited (~256 per read) |
+| Overhead | Minimal (read on tick) | Minimal (one write per query) |
+| Extended query protocol | Handled (always in st_activity) | Needs extra hooks |
+| Consistency with tool | Different pattern (shmem) | Same pattern (BPF) |
+
+**Decision deferred** — evaluate both options when implementing. May depend on
+which PG versions need support and whether debuginfo is reliably available.
+
+---
+
+## 16. Future: Daemon Mode (not in Phase 1-16)
 
 After the CLI is feature-complete, add a daemon mode for continuous monitoring:
 
@@ -549,12 +678,12 @@ pg_wait_tracer --view time_model # CLI client, connects to daemon via Unix socke
 **Protocol**: Simple request/response over Unix domain socket. Client sends view
 name + filters as JSON, daemon responds with JSON data. CLI client formats output.
 
-**Not in scope for Phase 1-15** — this is a separate future project after the CLI
+**Not in scope for Phase 1-16** — this is a separate future project after the CLI
 redesign is complete and validated.
 
 ---
 
-## 16. Verification
+## 17. Verification
 
 ```bash
 # Auto-detect single instance
@@ -599,6 +728,9 @@ sudo ./pg_wait_tracer
 sudo ./pg_wait_tracer --record /tmp/perf.pgwt --interval 5 --count 10
 ./pg_wait_tracer --replay /tmp/perf.pgwt
 ./pg_wait_tracer --replay /tmp/perf.pgwt --from "14:00" --to "14:05" --view query_event
+
+# Active sessions with query text (Phase 16)
+sudo ./pg_wait_tracer --view active --show-query
 
 # Existing tests
 sudo tests/run_all.sh
