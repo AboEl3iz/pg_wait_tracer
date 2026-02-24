@@ -15,23 +15,40 @@ copied to userspace. Typical TPS overhead is under 5% in pgbench benchmarks
 # Build (see INSTALL.md for prerequisites)
 make
 
-# Run with default time_model view (must be root)
-sudo ./pg_wait_tracer --pid $(pgrep -xo postgres)
+# Run (auto-discovers single PG instance, must be root)
+sudo ./pg_wait_tracer
+
+# One-shot: collect one 10-second interval and exit
+sudo ./pg_wait_tracer --count 1 --interval 10
+
+# Pipe to file (auto-switches to text format with timestamps)
+sudo ./pg_wait_tracer --count 5 > output.log
 ```
 
 ## CLI Reference
 
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
-| `--pid <PID>` | `-p` | — | Postmaster PID (required unless `--pgdata` given) |
+| `--pid <PID>` | `-p` | auto-detect | Postmaster PID (auto-discovered if omitted) |
 | `--pgdata <DIR>` | `-D` | — | PGDATA directory (reads postmaster.pid) |
 | `--interval <SEC>` | `-i` | 5 | Refresh interval in seconds (minimum 1) |
 | `--duration <SEC>` | `-d` | unlimited | Stop after N seconds |
+| `--count <N>` | `-n` | unlimited | Print N intervals then exit |
 | `--view <VIEW>` | `-V` | `time_model` | Output view (see below) |
-| `--event <NAME>` | `-e` | — | Event filter for histogram view (e.g. `IO:DataFileRead`) |
+| `--format <FMT>` | `-f` | auto-detect | Output format: `tui` (terminal), `text` (pipe) |
+| `--event <NAME>` | `-e` | — | Event filter (histogram: required; query_event: by event) |
 | `--pid-filter <PID>` | `-P` | — | Show per-event detail for one backend (session_event view) |
+| `--query-id <ID>` | `-Q` | — | Filter query_event to one query |
 | `--verbose` | `-v` | off | Print diagnostic info to stderr |
 | `--help` | `-h` | — | Show usage |
+
+**Auto-discovery:** When neither `--pid` nor `--pgdata` is given, pg_wait_tracer
+scans `/proc` for running PostgreSQL instances. If exactly one is found, it
+attaches automatically. If multiple are found, it lists them and exits.
+
+**Format auto-detect:** When stdout is a terminal, output uses TUI mode (screen
+clearing). When piped or redirected, output switches to text mode (timestamps
+per interval, no screen clearing).
 
 ## Views
 
