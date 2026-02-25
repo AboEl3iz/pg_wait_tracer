@@ -1,0 +1,16 @@
+[package]
+name = "pgwt-cli"
+version = "0.1.0"
+edition = "2021"
+description = "Interactive investigation client for pg_wait_tracer trace files"
+
+[[bin]]
+name = "pgwt-cli"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+lz4_flex = "0.11"
+chrono = "0.4"
+clap = { version = "4", features = ["derive"] }

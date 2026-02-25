@@ -20,7 +20,7 @@ runcmd:
   - dnf config-manager --set-enabled crb
 
   # Build tools
-  - dnf install -y gcc clang llvm make tar bpftool libbpf-devel elfutils-libelf-devel zlib-devel elfutils git python3 bc
+  - dnf install -y gcc clang llvm make tar bpftool libbpf-devel elfutils-libelf-devel zlib-devel lz4-devel elfutils git python3 bc
 
   # PostgreSQL 18 + extensions
   - dnf install -y postgresql18-server postgresql18-contrib pg_wait_sampling_18
@@ -51,6 +51,10 @@ runcmd:
 
   # pgbench init (scale 10 = 1M rows)
   - sudo -u postgres /usr/pgsql-18/bin/pgbench -i -s 10 postgres
+
+  # Rust toolchain (for the investigation client)
+  - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+  - echo 'source "$HOME/.cargo/env"' >> /root/.bashrc
 
   # PATH for interactive use
   - echo 'export PATH=/usr/pgsql-18/bin:$PATH' >> /root/.bashrc

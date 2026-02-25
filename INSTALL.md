@@ -153,7 +153,19 @@ psql -U postgres -c "ALTER SYSTEM SET shared_preload_libraries = 'pg_stat_statem
 sudo systemctl restart postgresql-17
 ```
 
+### 5. Rust Toolchain (for the investigation client)
+
+The interactive investigation client (`pgwt-cli`) is written in Rust. Install
+the Rust toolchain if you want to build it:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source "$HOME/.cargo/env"
+```
+
 ## Build
+
+### Daemon (C)
 
 ```bash
 cd pg_wait_tracer
@@ -168,6 +180,17 @@ Build steps performed automatically:
 2. Compile BPF program with `clang`
 3. Generate BPF skeleton header via `bpftool gen skeleton`
 4. Compile and link userspace C code with `gcc`
+
+### Investigation Client (Rust)
+
+```bash
+cd client
+cargo build --release
+```
+
+This produces `client/target/release/pgwt-cli`. The client reads `.trace.lz4`
+files produced by the daemon and provides an interactive TUI for investigation.
+It does not require root or a running PostgreSQL instance.
 
 ## Quick Test
 
