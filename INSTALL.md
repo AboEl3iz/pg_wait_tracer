@@ -25,7 +25,7 @@ sudo dnf install -y gcc clang llvm make tar
 sudo dnf install -y bpftool libbpf-devel
 
 # ELF and compression libraries
-sudo dnf install -y elfutils-libelf-devel zlib-devel
+sudo dnf install -y elfutils-libelf-devel zlib-devel lz4-devel
 
 # For DWARF-based st_query_id offset detection (optional, for query_event view)
 sudo dnf install -y elfutils    # provides readelf
@@ -41,7 +41,7 @@ sudo apt install -y gcc clang llvm make
 sudo apt install -y linux-tools-common linux-tools-$(uname -r) libbpf-dev
 
 # ELF and compression libraries
-sudo apt install -y libelf-dev zlib1g-dev
+sudo apt install -y libelf-dev zlib1g-dev liblz4-dev
 
 # For DWARF-based st_query_id offset detection (optional)
 sudo apt install -y binutils    # provides readelf

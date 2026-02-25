@@ -4,10 +4,23 @@ Real-time PostgreSQL wait event tracer using BPF hardware watchpoints.
 
 pg_wait_tracer attaches to a running PostgreSQL cluster and captures every
 wait event transition across all backends with nanosecond precision. It
-requires no PostgreSQL patches, no extensions, and no restarts. All
-aggregation happens in-kernel via BPF maps — only summary statistics are
-copied to userspace. Typical TPS overhead is under 5% in pgbench benchmarks
-(up to ~13% under heavy write contention).
+requires no PostgreSQL patches, no extensions, and no restarts.
+
+Key capabilities:
+
+- **6 diagnostic views**: time_model, system_event, session_event, histogram,
+  query_event, active
+- **Multi-window analysis**: compare wait profiles across time horizons
+  (e.g. last 5s vs 1m vs 5m)
+- **Daemon mode**: persistent monitoring with automatic re-attach on
+  PostgreSQL restarts
+- **Trace recording**: columnar LZ4-compressed event files with hourly
+  rotation and configurable retention
+- **Offline replay**: analyze historical trace files without root or a
+  running PostgreSQL instance
+
+Typical TPS overhead is under 5% in pgbench benchmarks (up to ~13% under
+heavy write contention).
 
 ## Quick Start
 
@@ -21,39 +34,155 @@ sudo ./pg_wait_tracer
 # One-shot: collect one 10-second interval and exit
 sudo ./pg_wait_tracer --count 1 --interval 10
 
-# Pipe to file (auto-switches to text format with timestamps)
-sudo ./pg_wait_tracer --count 5 > output.log
-
 # Multi-window: compare wait profiles across time horizons
-sudo ./pg_wait_tracer --window 5s,1m,5m --count 3
+sudo ./pg_wait_tracer --window 5s,1m,5m
+
+# Daemon mode: persistent monitoring with trace recording
+sudo ./pg_wait_tracer --daemon -T /var/lib/pgwt/traces
+
+# Offline replay: analyze last hour from trace files (no root needed)
+pg_wait_tracer --replay -T /var/lib/pgwt/traces --from 1h
 ```
+
+## Operating Modes
+
+pg_wait_tracer has three operating modes:
+
+### Interactive (default)
+
+Attaches to PostgreSQL, displays live views, and exits when interrupted or
+when `--count`/`--duration` is reached. This is the original mode — useful
+for quick investigations.
+
+```bash
+sudo ./pg_wait_tracer --view system_event --count 3
+```
+
+### Daemon (`--daemon`)
+
+Runs persistently. When PostgreSQL restarts (crash, upgrade, `pg_ctl restart`),
+the daemon detects the terminated postmaster, waits for a new one to appear,
+and re-attaches automatically. BPF programs are destroyed and reloaded on each
+cycle because BPF rodata is immutable after load.
+
+Cannot be combined with `--count` or `--duration`.
+
+```bash
+# Daemon with trace recording and 48-hour retention
+sudo ./pg_wait_tracer --daemon -T /var/lib/pgwt/traces -R 48
+
+# Daemon with live output to terminal
+sudo ./pg_wait_tracer --daemon --view active
+```
+
+**How restart detection works:**
+
+1. Every interval tick, the daemon calls `kill(postmaster_pid, 0)` to check
+   if the postmaster is alive.
+2. When the postmaster dies, the daemon prints a message and enters a wait
+   loop, checking for a new PostgreSQL instance every 5 seconds.
+3. PGDATA is inferred from `/proc/<pid>/cwd` at startup (or provided via
+   `--pgdata`). On restart, the daemon reads the new `postmaster.pid` from
+   PGDATA to discover the new PID.
+4. On re-attach, all BPF state is reset — accumulators start fresh.
+
+### Replay (`--replay`)
+
+Reads completed trace files and produces the same views as live mode, but
+from historical data. Does not require root or a running PostgreSQL instance.
+
+```bash
+# Replay last hour, time_model view
+pg_wait_tracer --replay -T /var/lib/pgwt/traces --from 1h
+
+# Replay specific time range
+pg_wait_tracer --replay -T /var/lib/pgwt/traces \
+    --from "2025-02-25T14:00:00" --to "2025-02-25T14:30:00" \
+    --view system_event
+
+# Replay with multi-window
+pg_wait_tracer --replay -T /var/lib/pgwt/traces --from 2h \
+    --view query_event --window 5s,1m,5m
+```
+
+**Limitations:**
+
+- The `active` view is not available in replay mode (it requires the live
+  BPF state_map to read current wait states).
+- `current.trace` (the file being written by the daemon) has no footer and
+  cannot be read by replay. Only rotated `.trace.lz4` files are readable.
+- Output format is always `text` in replay mode.
 
 ## CLI Reference
 
+### Target Selection
+
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
-| `--pid <PID>` | `-p` | auto-detect | Postmaster PID (auto-discovered if omitted) |
-| `--pgdata <DIR>` | `-D` | — | PGDATA directory (reads postmaster.pid) |
-| `--interval <SEC>` | `-i` | 5 | Refresh interval in seconds (minimum 1) |
-| `--duration <SEC>` | `-d` | unlimited | Stop after N seconds |
-| `--count <N>` | `-n` | unlimited | Print N intervals then exit |
-| `--window <W1,W2,W3>` | `-w` | — | Time windows for all views, e.g. `5s,1m,5m` (first must equal interval) |
-| `--view <VIEW>` | `-V` | `time_model` | Output view (see below) |
-| `--sort <MODE>` | `-S` | `wait_time` | Sort for active view: `wait_time`, `db_time`, `pid`, `event` |
-| `--format <FMT>` | `-f` | auto-detect | Output format: `tui` (terminal), `text` (pipe) |
-| `--event <NAME>` | `-e` | — | Event filter (histogram: required; query_event: by event) |
-| `--pid-filter <PID>` | `-P` | — | Show per-event detail for one backend (session_event view) |
-| `--query-id <ID>` | `-Q` | — | Filter query_event to one query |
-| `--verbose` | `-v` | off | Print diagnostic info to stderr |
-| `--help` | `-h` | — | Show usage |
+| `--pid <PID>` | `-p` | auto-detect | Postmaster PID |
+| `--pgdata <DIR>` | `-D` | auto-detect | PGDATA directory (reads postmaster.pid) |
 
 **Auto-discovery:** When neither `--pid` nor `--pgdata` is given, pg_wait_tracer
 scans `/proc` for running PostgreSQL instances. If exactly one is found, it
 attaches automatically. If multiple are found, it lists them and exits.
 
+### Output Control
+
+| Flag | Short | Default | Description |
+|------|-------|---------|-------------|
+| `--view <VIEW>` | `-V` | `time_model` | Output view (see Views section) |
+| `--sort <MODE>` | `-S` | `wait_time` | Sort for active view: `wait_time`, `db_time`, `pid`, `event` |
+| `--format <FMT>` | `-f` | auto-detect | Output format: `tui` (terminal), `text` (pipe) |
+| `--interval <SEC>` | `-i` | 5 | Refresh interval in seconds (minimum 1) |
+| `--duration <SEC>` | `-d` | unlimited | Stop after N seconds |
+| `--count <N>` | `-n` | unlimited | Print N intervals then exit |
+| `--window <W1,W2,W3>` | `-w` | — | Time windows, e.g. `5s,1m,5m` (first must equal interval) |
+
 **Format auto-detect:** When stdout is a terminal, output uses TUI mode (screen
 clearing). When piped or redirected, output switches to text mode (timestamps
 per interval, no screen clearing).
+
+### Filters
+
+| Flag | Short | Default | Description |
+|------|-------|---------|-------------|
+| `--event <NAME>` | `-e` | — | Event filter (required for histogram; optional for query_event) |
+| `--pid-filter <PID>` | `-P` | — | Per-event detail for one backend (session_event view) |
+| `--query-id <ID>` | `-Q` | — | Filter query_event to one query |
+
+### Trace Recording
+
+| Flag | Short | Default | Description |
+|------|-------|---------|-------------|
+| `--trace-dir <DIR>` | `-T` | disabled | Directory for trace files (enables recording) |
+| `--trace-retention <H>` | `-R` | 24 | Keep trace files for H hours |
+
+### Replay
+
+| Flag | Short | Default | Description |
+|------|-------|---------|-------------|
+| `--replay` | — | off | Replay mode (read trace files instead of live tracing) |
+| `--from <TIME>` | — | start of files | Start time for replay |
+| `--to <TIME>` | — | end of files | End time for replay |
+
+**Time formats for `--from`/`--to`:**
+
+- ISO 8601: `2025-02-25T14:30:00` or `2025-02-25 14:30:00`
+- Relative: `1h`, `30m`, `90s`, `2h30m` (that much time ago from now)
+- Special: `now`
+
+### Daemon
+
+| Flag | Short | Default | Description |
+|------|-------|---------|-------------|
+| `--daemon` | — | off | Persistent mode with PostgreSQL restart detection |
+
+### Other
+
+| Flag | Short | Default | Description |
+|------|-------|---------|-------------|
+| `--verbose` | `-v` | off | Print diagnostic info to stderr |
+| `--help` | `-h` | — | Show usage |
 
 ## Views
 
@@ -306,7 +435,6 @@ see what's happening right now.
 ```bash
 sudo ./pg_wait_tracer --view active
 sudo ./pg_wait_tracer --view active --sort db_time
-sudo ./pg_wait_tracer --view active --sort pid
 ```
 
 **Columns:**
@@ -318,7 +446,7 @@ sudo ./pg_wait_tracer --view active --sort pid
 | Wait Event | Current wait event name (if waiting), `—` otherwise |
 | Wait (ms) | Duration in current wait state, `—` if not waiting |
 | DB Time (ms) | Cumulative non-idle time for this backend |
-| Backend Type | From `/proc/PID/cmdline` parsing (client, checkpointer, bgwriter, etc.) |
+| Backend Type | From `/proc/PID/cmdline` parsing |
 
 **Example:**
 
@@ -356,9 +484,7 @@ pg_wait_tracer — Active Sessions    Backends: 12    Uptime: 32m 15s
 - **on cpu** means no PostgreSQL wait event is set — the backend is executing.
 - **idle** means the backend is in an Activity wait (waiting for a new query).
   Idle backends contribute no DB Time.
-- Use `--sort db_time` to find the busiest backends. Use `--sort event` to group
-  backends by the same bottleneck. Use `--sort pid` for a stable ordering.
-- The **Uptime** field shows how long pg_wait_tracer has been running.
+- The active view requires live BPF — it is not available in replay mode.
 
 ---
 
@@ -380,7 +506,7 @@ to >=16 ms. Requires the `--event` flag.
 **Example:**
 
 ```bash
-sudo ./pg_wait_tracer --pid 12345 --view histogram --event IO:DataFileRead
+sudo ./pg_wait_tracer --view histogram --event IO:DataFileRead
 ```
 
 ```
@@ -419,47 +545,8 @@ pg_wait_tracer — Event Histogram
 - A **heavy tail** (significant counts in 1K+ us buckets) indicates storage
   latency spikes — check disk I/O saturation.
 
-#### Multi-window mode
-
-With `--window`, the histogram shows side-by-side columns — one per window — so
-you can see how latency distribution changes over time:
-
-```bash
-sudo ./pg_wait_tracer --view histogram --event IO:DataFileRead --window 5s,1m,5m
-```
-
-```
-════════════════════════════════════════════════════════════════════════════════
-pg_wait_tracer — Event Histogram    Backends: 12    Interval: 5s
-════════════════════════════════════════════════════════════════════════════════
-
-  Event: IO:DataFileRead
-
-  Bucket(us)              Last 5s              Last 1m              Last 5m
-  ---------- -------------------- -------------------- --------------------
-       <1          12      1.5%        123      1.3%        612      0.7%
-    1-  2          45      5.5%        512      5.3%       4312      5.1%
-    2-  4         183     22.3%       2132     22.0%      18234     21.5%
-    4-  8         210     25.6%       2505     25.8%      22123     26.1%
-    8- 16         153     18.6%       1843     19.0%      16234     19.2%
-   16- 32          98     11.9%       1234     12.7%      10812     12.8%
-   32- 64          54      6.6%        623      6.4%       5234      6.2%
-   64-128          31      3.8%        378      3.9%       3123      3.7%
-  128-256          17      2.1%        198      2.0%       1812      2.1%
-  256-512           9      1.1%         95      1.0%        812      1.0%
-  512-1K            5      0.6%         42      0.4%        412      0.5%
-   1K- 2K           3      0.4%         18      0.2%        198      0.2%
-  >=16K             1      0.1%          1      0.0%         12      0.0%
-  Total            821                9704               83930
-```
-
-**Reading this output:**
-
-- Compare distributions across windows: a stable distribution means no latency
-  shift. A widening distribution in shorter windows means things are getting worse.
-- **Cumulative and ASCII bar** are only shown in single-window mode.
-- Shorter windows fill first. Longer windows show `-` until enough history
-  accumulates.
+Multi-window mode shows side-by-side columns per window, without the ASCII bar
+and cumulative columns.
 
 ---
 
@@ -475,32 +562,17 @@ Three modes are available depending on flags:
 Shows all query/event pairs sorted by total duration. This is the starting point
 for identifying which queries contribute most to wait time.
 
-**Columns:** query_id | Wait Event | Total Waits | Total (ms) | Avg (us) | Max (us) | % DB
-
-**Example:**
-
 ```
-════════════════════════════════════════════════════════════════════════════════
-pg_wait_tracer — Query Events    Backends: 12    Interval: 5s
-════════════════════════════════════════════════════════════════════════════════
-
   query_id             Wait Event                 Total Waits     Total (ms)   Avg (us)     Max (us)    % DB
   ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
    5678234567890123     IO:DataFileRead                2340        1024.5      437.8     45623.1    4.1%
    1234567890123456     Lock:Transaction                145         892.3     6153.8    892100.5    3.6%
-   5678234567890123     LWLock:WALInsert                890         334.2      375.5      8934.2    1.3%
-   9876543210987654     IO:DataFileRead                 456         201.8      442.5      5432.1    0.8%
 ```
 
-**Reading this output:**
-
-- Cross-reference `query_id` with `pg_stat_statements` to find the actual SQL:
-  ```sql
-  SELECT query FROM pg_stat_statements WHERE queryid = 5678234567890123;
-  ```
-- The same query can appear multiple times with different wait events.
-- A query with high `Lock:Transaction` time is waiting for row locks held by
-  other transactions.
+Cross-reference `query_id` with `pg_stat_statements`:
+```sql
+SELECT query FROM pg_stat_statements WHERE queryid = 5678234567890123;
+```
 
 #### Mode B (`--event`) — Top queries for a specific event
 
@@ -510,26 +582,6 @@ Answers: "Which queries are responsible for this wait event?"
 sudo ./pg_wait_tracer --view query_event --event IO:DataFileRead
 ```
 
-**Columns:** query_id | Waits | Total (ms) | Avg (us) | Max (us) | % Event | % DB
-
-**Example:**
-
-```
-════════════════════════════════════════════════════════════════════════════════
-pg_wait_tracer — Top Queries for IO:DataFileRead    Backends: 12    Interval: 5s
-════════════════════════════════════════════════════════════════════════════════
-
-  query_id             Waits     Total (ms)   Avg (us)     Max (us)  % Event    % DB
-  ─────────────────────────────────────────────────────────────────────────────────────
-   5678234567890123      2340        1024.5      437.8     45623.1    78.2%    4.1%
-   9876543210987654       456         201.8      442.5      5432.1    15.4%    0.8%
-   1111222233334444        84          83.4      992.9      3210.5     6.4%    0.3%
-```
-
-- **% Event** shows each query's share of the total time spent in that specific event.
-  The column sums to ~100%.
-- **% DB** shows the fraction of total DB Time. Use this to gauge overall impact.
-
 #### Mode C (`--query-id`) — Wait profile for one query
 
 Answers: "What does this query spend its time waiting on?"
@@ -538,55 +590,51 @@ Answers: "What does this query spend its time waiting on?"
 sudo ./pg_wait_tracer --view query_event --query-id 5678234567890123
 ```
 
-**Columns:** Wait Event | Waits | Total (ms) | Avg (us) | Max (us) | % Query | % DB
+All three modes support `--window` with vertically stacked sections per window.
 
-**Example:**
+## Trace File Format
 
-```
-════════════════════════════════════════════════════════════════════════════════
-pg_wait_tracer — Wait Profile for query_id 5678234567890123    Backends: 12    Interval: 5s
-════════════════════════════════════════════════════════════════════════════════
+When `--trace-dir` is specified, the daemon (or interactive mode) writes raw
+events to disk in a columnar, LZ4-compressed format.
 
-  Wait Event                 Waits     Total (ms)   Avg (us)     Max (us)  % Query    % DB
-  ────────────────────────────────────────────────────────────────────────────────────────
-  CPU*                        8920        1820.3      204.1     12340.5    52.1%    7.3%
-  IO:DataFileRead             2340        1024.5      437.8     45623.1    29.3%    4.1%
-  LWLock:WALInsert             890         334.2      375.5      8934.2     9.6%    1.3%
-  IO:DataFileWrite             312         198.4      635.9      5612.0     5.7%    0.8%
-  LWLock:BufferContent         178         115.2      647.2      3451.0     3.3%    0.5%
-```
-
-- **% Query** shows each event's share of this query's total time. The column
-  sums to ~100%. CPU\* is always present.
-- Use this to understand the wait profile of a specific slow query.
-
-#### Multi-window mode
-
-All three modes support `--window` with vertically stacked sections per window:
-
-```bash
-sudo ./pg_wait_tracer --view query_event --window 5s,1m --event IO:DataFileRead
-```
+### File layout
 
 ```
----- Last 5s -----------------------------------------------------------------
-  query_id             Waits     Total (ms)   Avg (us)  % Event    % DB
-  ────────────────────────────────────────────────────────────────────────────
-   5678234567890123       234         102.5      437.8    78.2%    4.1%
-   9876543210987654        46          20.2      438.5    15.4%    0.8%
+[File Header - 28 bytes]
+  magic: "PGWT"
+  version: 1
+  flags: 0x0001 (LZ4)
+  pg_version: major version (17, 18, ...)
+  start_time_ns: wall-clock (CLOCK_REALTIME)
+  clock_offset_ns: monotonic (CLOCK_MONOTONIC)
 
----- Last 1m -----------------------------------------------------------------
-  query_id             Waits     Total (ms)   Avg (us)  % Event    % DB
-  ────────────────────────────────────────────────────────────────────────────
-   5678234567890123      2810        1229.4      437.5    76.8%    3.9%
-   9876543210987654       547         242.2      442.8    15.1%    0.8%
-   1111222233334444       105         104.2      992.4     6.5%    0.3%
+[Block 0]
+  [Block Header - 28 bytes]
+    first/last timestamp, num_events, compressed/uncompressed size
+  [LZ4 Compressed Columnar Data]
+    Columns: timestamp (delta + varint), pid, old_event, new_event,
+             duration (varint), query_id
+
+[Block 1]
+  ...
+
+[Footer]
+  [Block Index - N x 16 bytes]
+    (first_timestamp, file_offset) per block
+  [Block Count - 4 bytes]
 ```
 
-- **Max (us) is not shown** in multi-window mode because delta snapshots track
-  cumulative count and total — not per-window maximums.
-- Shorter windows fill first. Longer windows show "(waiting for data)" until
-  enough history accumulates.
+### File lifecycle
+
+- **Active file**: `current.trace` — being written, no footer, not readable
+  by the reader.
+- **Rotation**: Every calendar hour, the current file is finalized (footer
+  written) and renamed to `YYYY-MM-DD_HH.trace.lz4`.
+- **Retention**: Files older than `--trace-retention` hours are deleted.
+  Cleanup runs every 60 ticks (60 x interval seconds).
+- **Block size**: 4096 events per block. Blocks are flushed when full or
+  on rotation.
+- **Compression ratio**: Typical ~36x (36 bytes/event raw, ~1 byte compressed).
 
 ## Wait Event Classes
 
@@ -739,18 +787,20 @@ When the watchpoint fires, a BPF program runs in kernel context:
 
 1. Reads the previous and new wait event values
 2. Computes the duration of the previous state using `bpf_ktime_get_ns()`
-3. Accumulates statistics (count, total, min, max, histogram bucket) into
-   per-CPU BPF hash maps
-4. Updates state for the next transition
+3. Emits a raw event to a BPF ring buffer (timestamp, pid, old/new event,
+   duration, query_id)
+4. Updates per-backend state for the next transition
 
-Userspace reads the BPF maps at each `--interval` to produce the output views.
-No data is copied per-event — only aggregated summaries are read.
+Userspace consumes ring buffer events and accumulates them into per-view
+statistics. When `--trace-dir` is enabled, events are also written to disk
+in columnar LZ4-compressed trace files.
 
 This design means:
 - **No PostgreSQL patches or extensions required** — works with stock binaries
 - **No sampling** — every event transition is captured exactly
 - **Low overhead** — BPF runs in nanoseconds, typically <5% TPS impact
-- **No lock contention** — per-CPU maps avoid cache-line bouncing
+- **No lock contention** — ring buffer is lock-free
+- **Historical analysis** — trace files enable offline replay of past events
 
 ## Requirements
 

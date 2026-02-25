@@ -1,5 +1,5 @@
-# pg_wait_tracer — Phase 1: CLI daemon
-# Requires: clang, llvm-strip, bpftool, libbpf-dev, libelf-dev, zlib1g-dev
+# pg_wait_tracer
+# Requires: clang, llvm-strip, bpftool, libbpf-dev, libelf-dev, zlib1g-dev, liblz4-dev
 
 CLANG      ?= clang
 LLVM_STRIP ?= llvm-strip
