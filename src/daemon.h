@@ -44,7 +44,8 @@ enum pgwt_format {
 struct pgwt_daemon {
     /* BPF */
     struct pg_wait_tracer_bpf *skel;
-    struct ring_buffer *rb;
+    struct ring_buffer *rb;          /* lifecycle ringbuf consumer */
+    struct ring_buffer *event_rb;    /* trace event ringbuf consumer */
 
     /* epoll */
     int epoll_fd;
@@ -74,6 +75,9 @@ struct pgwt_daemon {
     int         num_windows;                    /* 0 = no windowing */
     int         windows[PGWT_MAX_WINDOWS];      /* window sizes in seconds */
     struct pgwt_ring ring;                       /* snapshot ring buffer */
+
+    /* Event stream */
+    struct pgwt_accumulator *event_accum;   /* heap-allocated, cumulative from events */
 
     /* State */
     struct pgwt_backend_table backends;

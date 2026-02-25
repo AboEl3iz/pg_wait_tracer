@@ -250,8 +250,10 @@ def test_db_time_sanity(pm_pid):
           f"DB Time = {db_time_ms:.0f}ms (expected > 1000ms for {CLIENTS} clients)")
 
     # Upper bound: can't exceed CLIENTS × INTERVAL × 1000 + some extra from
-    # system backends (checkpointer, bgwriter, walwriter also contribute)
-    theoretical_max_ms = (CLIENTS + 5) * INTERVAL * 1000
+    # system backends (checkpointer, bgwriter, walwriter also contribute).
+    # Add 5% margin: open intervals from state_map can slightly exceed
+    # wall-clock due to timing drift between event and state_map timestamps.
+    theoretical_max_ms = (CLIENTS + 5) * INTERVAL * 1000 * 1.05
     check(db_time_ms < theoretical_max_ms,
           f"DB Time {db_time_ms:.0f}ms < theoretical max {theoretical_max_ms:.0f}ms")
 

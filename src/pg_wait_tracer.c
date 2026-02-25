@@ -138,9 +138,9 @@ static struct option long_opts[] = {
     {"event",      required_argument, NULL, 'e'},
     {"pid-filter", required_argument, NULL, 'P'},
     {"query-id",   required_argument, NULL, 'Q'},
-    {"sort",       required_argument, NULL, 'S'},
-    {"verbose",    no_argument,       NULL, 'v'},
-    {"help",       no_argument,       NULL, 'h'},
+    {"sort",         required_argument, NULL, 'S'},
+    {"verbose",      no_argument,       NULL, 'v'},
+    {"help",         no_argument,       NULL, 'h'},
     {NULL, 0, NULL, 0},
 };
 

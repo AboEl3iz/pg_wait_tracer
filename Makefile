@@ -26,6 +26,7 @@ USER_SRCS  = $(SRC_DIR)/pg_wait_tracer.c \
              $(SRC_DIR)/backend.c \
              $(SRC_DIR)/discovery.c \
              $(SRC_DIR)/map_reader.c \
+             $(SRC_DIR)/event_stream.c \
              $(SRC_DIR)/output.c \
              $(SRC_DIR)/wait_event.c \
              $(SRC_DIR)/perf_event.c \

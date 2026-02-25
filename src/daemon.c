@@ -1,6 +1,7 @@
 /* daemon.c — Main event loop: epoll on ring buffer, timer, signals */
 #include "daemon.h"
 #include "backend.h"
+#include "event_stream.h"
 #include "map_reader.h"
 #include "output.h"
 #include "perf_event.h"
@@ -48,7 +49,12 @@ static void handle_timer(struct pgwt_daemon *d)
     ssize_t r = read(d->timer_fd, &expirations, sizeof(expirations));
     (void)r;
 
-    pgwt_read_maps(d);
+    /* Copy cumulative event_accum to display accum,
+     * then add open intervals from state_map */
+    struct pgwt_time_model saved_tm = d->accum.tm;
+    pgwt_accum_copy_used(&d->accum, d->event_accum);
+    d->accum.prev_tm = saved_tm;
+    pgwt_read_state_map(d);
 
     if (d->ring.slots)
         pgwt_ring_push(&d->ring, &d->accum);
@@ -145,11 +151,27 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
         goto fail;
     }
 
-    /* Set up ring buffer consumer */
+    /* Set up lifecycle ring buffer consumer */
     int rb_map_fd = bpf_map__fd(d->skel->maps.lifecycle_rb);
     d->rb = ring_buffer__new(rb_map_fd, handle_lifecycle_event, d, NULL);
     if (!d->rb) {
         fprintf(stderr, "FATAL: cannot create ring buffer: %s\n",
+                strerror(errno));
+        goto fail;
+    }
+
+    /* Set up event ring buffer consumer */
+    d->event_accum = calloc(1, sizeof(*d->event_accum));
+    if (!d->event_accum) {
+        fprintf(stderr, "FATAL: cannot allocate event accumulator\n");
+        goto fail;
+    }
+    pgwt_accum_init(d->event_accum);
+
+    int event_rb_map_fd = bpf_map__fd(d->skel->maps.event_ringbuf);
+    d->event_rb = ring_buffer__new(event_rb_map_fd, pgwt_handle_trace_event, d, NULL);
+    if (!d->event_rb) {
+        fprintf(stderr, "FATAL: cannot create event ring buffer: %s\n",
                 strerror(errno));
         goto fail;
     }
@@ -196,11 +218,17 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
 
     struct epoll_event ev;
 
-    /* Add ring buffer fd */
+    /* Add lifecycle ring buffer fd */
     int rb_fd = ring_buffer__epoll_fd(d->rb);
     ev.events = EPOLLIN;
     ev.data.fd = rb_fd;
     epoll_ctl(d->epoll_fd, EPOLL_CTL_ADD, rb_fd, &ev);
+
+    /* Add event ring buffer fd */
+    int event_rb_fd = ring_buffer__epoll_fd(d->event_rb);
+    ev.events = EPOLLIN;
+    ev.data.fd = event_rb_fd;
+    epoll_ctl(d->epoll_fd, EPOLL_CTL_ADD, event_rb_fd, &ev);
 
     /* Add timer fd */
     ev.events = EPOLLIN;
@@ -229,6 +257,7 @@ int pgwt_daemon_run(struct pgwt_daemon *d)
 {
     struct epoll_event events[8];
     int rb_fd = ring_buffer__epoll_fd(d->rb);
+    int event_rb_fd = ring_buffer__epoll_fd(d->event_rb);
 
     uint64_t deadline = 0;
     if (d->duration > 0) {
@@ -258,6 +287,8 @@ int pgwt_daemon_run(struct pgwt_daemon *d)
                 handle_timer(d);
             } else if (events[i].data.fd == rb_fd) {
                 ring_buffer__consume(d->rb);
+            } else if (events[i].data.fd == event_rb_fd) {
+                ring_buffer__consume(d->event_rb);
             } else if (events[i].data.fd == d->signal_fd) {
                 handle_signal(d);
             }
@@ -273,6 +304,14 @@ void pgwt_daemon_cleanup(struct pgwt_daemon *d)
     pgwt_ring_free(&d->ring);
     pgwt_close_all_backends(&d->backends);
 
+    if (d->event_rb) {
+        ring_buffer__free(d->event_rb);
+        d->event_rb = NULL;
+    }
+    if (d->event_accum) {
+        free(d->event_accum);
+        d->event_accum = NULL;
+    }
     if (d->rb) {
         ring_buffer__free(d->rb);
         d->rb = NULL;

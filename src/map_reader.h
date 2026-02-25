@@ -81,8 +81,8 @@ struct pgwt_daemon;
 /* Initialize accumulator. */
 void pgwt_accum_init(struct pgwt_accumulator *acc);
 
-/* Read all BPF map entries and update accumulator. */
-int pgwt_read_maps(struct pgwt_daemon *d);
+/* Read state_map for open intervals and current state (active view). */
+void pgwt_read_state_map(struct pgwt_daemon *d);
 
 /* Find per-PID accumulator. Returns NULL if not found. */
 struct pgwt_pid_accum *pgwt_find_pid_accum(struct pgwt_accumulator *acc, uint32_t pid);
@@ -90,5 +90,17 @@ struct pgwt_pid_accum *pgwt_find_pid_accum(struct pgwt_accumulator *acc, uint32_
 /* Find system-wide event stats. Returns NULL if not found. */
 struct pgwt_event_stats *pgwt_find_system_event(struct pgwt_accumulator *acc,
                                                  uint32_t wait_event);
+
+/* Get or create helpers — shared between map_reader and event_stream */
+struct pgwt_pid_accum *pgwt_get_or_create_pid(struct pgwt_accumulator *acc, uint32_t pid);
+struct pgwt_event_stats *pgwt_get_or_create_event(struct pgwt_pid_accum *pa, uint32_t we);
+struct pgwt_event_stats *pgwt_get_or_create_system_event(struct pgwt_accumulator *acc,
+                                                          uint32_t we);
+struct pgwt_query_event_stats *pgwt_get_or_create_query_event(
+    struct pgwt_accumulator *acc, uint64_t query_id, uint32_t we);
+
+/* Update time model by wait event class. */
+void pgwt_update_time_model(struct pgwt_time_model *tm, uint32_t event,
+                             uint64_t duration_ns);
 
 #endif /* PGWT_MAP_READER_H */

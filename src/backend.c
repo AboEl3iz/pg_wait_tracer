@@ -267,22 +267,6 @@ int pgwt_handle_exit(struct pgwt_daemon *d, pid_t pid)
     uint32_t key = pid;
     bpf_map_delete_elem(state_fd, &key);
 
-    /* Delete wait_stats entries for this PID.
-     * We iterate to find all keys with this PID. */
-    int stats_fd = bpf_map__fd(d->skel->maps.wait_stats);
-    struct pgwt_agg_key skey = {}, next_key;
-    while (bpf_map_get_next_key(stats_fd, &skey, &next_key) == 0) {
-        if (next_key.pid == (uint32_t)pid) {
-            bpf_map_delete_elem(stats_fd, &next_key);
-            /* Don't advance — deletion may affect iteration.
-             * Restart from the deleted key position. */
-            skey = next_key;
-            skey.wait_event = 0; /* force re-search from this pid */
-            continue;
-        }
-        skey = next_key;
-    }
-
     be->is_alive = false;
 
     if (d->verbose)

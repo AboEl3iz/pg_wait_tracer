@@ -33,28 +33,6 @@ struct pgwt_pid_state {
     u64 last_query_id;  /* query_id active during last_event */
 };
 
-/* Key for wait_stats map */
-struct pgwt_agg_key {
-    u32 pid;
-    u32 wait_event;     /* full wait_event_info; 0 = CPU */
-};
-
-/* Key for query_wait_stats map */
-struct pgwt_query_agg_key {
-    u64 query_id;       /* PG query fingerprint hash */
-    u32 wait_event;
-    u32 _pad;           /* alignment */
-};
-
-/* Value for wait_stats map */
-struct pgwt_agg_value {
-    u64 count;
-    u64 total_ns;
-    u64 min_ns;
-    u64 max_ns;
-    u64 histogram[HISTOGRAM_BUCKETS];
-};
-
 /* ── Lifecycle Events (ring buffer) ───────────────────────── */
 
 enum pgwt_lifecycle_type {
@@ -69,6 +47,20 @@ struct pgwt_lifecycle_event {
     u64 addr;       /* for INIT: PGPROC->wait_event_info address */
     u64 timestamp;
 };
+
+/* ── Raw Trace Event (ringbuf, 36 bytes) ─────────────────── */
+
+struct pgwt_trace_event {
+    u64 timestamp_ns;   /* absolute ktime_get_ns() */
+    u32 pid;            /* backend PID */
+    u32 old_event;      /* previous wait_event_info */
+    u32 new_event;      /* new wait_event_info (0xFFFFFFFF = exit) */
+    u32 _pad;           /* alignment */
+    u64 duration_ns;    /* time spent in old_event */
+    u64 query_id;       /* active query during old_event */
+};
+
+#define PGWT_EVENT_EXIT  0xFFFFFFFFU  /* sentinel new_event for process exit */
 
 /* ── Wait Event Class IDs ─────────────────────────────────── */
 #define PG_WAIT_LWLOCK      0x01

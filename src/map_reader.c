@@ -1,4 +1,4 @@
-/* map_reader.c — Read BPF PERCPU_HASH maps, sum per-CPU, accumulate */
+/* map_reader.c — Read BPF state_map for open intervals, accumulator helpers */
 #include "map_reader.h"
 #include "daemon.h"
 #include "wait_event.h"
@@ -33,7 +33,7 @@ struct pgwt_pid_accum *pgwt_find_pid_accum(struct pgwt_accumulator *acc, uint32_
     return NULL;
 }
 
-static struct pgwt_pid_accum *get_or_create_pid(struct pgwt_accumulator *acc, uint32_t pid)
+struct pgwt_pid_accum *pgwt_get_or_create_pid(struct pgwt_accumulator *acc, uint32_t pid)
 {
     struct pgwt_pid_accum *pa = pgwt_find_pid_accum(acc, pid);
     if (pa) return pa;
@@ -47,7 +47,7 @@ static struct pgwt_pid_accum *get_or_create_pid(struct pgwt_accumulator *acc, ui
     return pa;
 }
 
-static struct pgwt_event_stats *get_or_create_event(struct pgwt_pid_accum *pa, uint32_t we)
+struct pgwt_event_stats *pgwt_get_or_create_event(struct pgwt_pid_accum *pa, uint32_t we)
 {
     for (int i = 0; i < pa->num_events; i++) {
         if (pa->events[i].wait_event == we)
@@ -72,8 +72,8 @@ struct pgwt_event_stats *pgwt_find_system_event(struct pgwt_accumulator *acc,
     return NULL;
 }
 
-static struct pgwt_event_stats *get_or_create_system_event(struct pgwt_accumulator *acc,
-                                                            uint32_t we)
+struct pgwt_event_stats *pgwt_get_or_create_system_event(struct pgwt_accumulator *acc,
+                                                          uint32_t we)
 {
     struct pgwt_event_stats *se = pgwt_find_system_event(acc, we);
     if (se) return se;
@@ -87,7 +87,7 @@ static struct pgwt_event_stats *get_or_create_system_event(struct pgwt_accumulat
     return se;
 }
 
-static struct pgwt_query_event_stats *get_or_create_query_event(
+struct pgwt_query_event_stats *pgwt_get_or_create_query_event(
     struct pgwt_accumulator *acc, uint64_t query_id, uint32_t we)
 {
     for (int i = 0; i < acc->num_query_events; i++) {
@@ -105,122 +105,31 @@ static struct pgwt_query_event_stats *get_or_create_query_event(
     return qe;
 }
 
-int pgwt_read_maps(struct pgwt_daemon *d)
+void pgwt_update_time_model(struct pgwt_time_model *tm, uint32_t event,
+                             uint64_t duration_ns)
 {
-    int stats_fd = bpf_map__fd(d->skel->maps.wait_stats);
-    int nr_cpus = libbpf_num_possible_cpus();
-    if (nr_cpus < 0) return -1;
-
-    /* Save previous time model for delta computation */
-    d->accum.prev_tm = d->accum.tm;
-
-    /* Reset accumulators (rebuild from BPF maps each tick) */
-    for (int i = 0; i < d->accum.num_pids; i++) {
-        d->accum.pids[i].num_events = 0;
-        d->accum.pids[i].db_time_ns = 0;
-        d->accum.pids[i].cpu_time_ns = 0;
-        d->accum.pids[i].wait_time_ns = 0;
-        d->accum.pids[i].current_event = 0;
-        d->accum.pids[i].current_wait_ns = 0;
+    if (event == 0) {
+        tm->cpu_time_ns += duration_ns;
+    } else {
+        int cls = WE_CLASS(event);
+        switch (cls) {
+        case PG_WAIT_IO:        tm->io_time_ns += duration_ns; break;
+        case PG_WAIT_LWLOCK:    tm->lwlock_time_ns += duration_ns; break;
+        case PG_WAIT_LOCK:      tm->lock_time_ns += duration_ns; break;
+        case PG_WAIT_BUFFERPIN: tm->bufferpin_time_ns += duration_ns; break;
+        case PG_WAIT_CLIENT:    tm->client_time_ns += duration_ns; break;
+        case PG_WAIT_IPC:       tm->ipc_time_ns += duration_ns; break;
+        case PG_WAIT_TIMEOUT:   tm->timeout_time_ns += duration_ns; break;
+        case PG_WAIT_EXTENSION: tm->extension_time_ns += duration_ns; break;
+        case PG_WAIT_ACTIVITY:  tm->activity_time_ns += duration_ns; break;
+        }
     }
-    d->accum.num_system_events = 0;
-    d->accum.num_query_events = 0;
-    memset(&d->accum.tm, 0, sizeof(d->accum.tm));
+    if (!pgwt_is_idle_event(event))
+        tm->db_time_ns += duration_ns;
+}
 
-    /* Iterate all entries in wait_stats PERCPU_HASH */
-    struct pgwt_agg_key key = {}, next_key;
-    struct pgwt_agg_value values[MAX_CPUS];
-
-    while (bpf_map_get_next_key(stats_fd, &key, &next_key) == 0) {
-        if (bpf_map_lookup_elem(stats_fd, &next_key, values) != 0) {
-            key = next_key;
-            continue;
-        }
-
-        /* Sum across all CPUs */
-        uint64_t count = 0, total = 0, min_v = UINT64_MAX, max_v = 0;
-        uint64_t hist[HISTOGRAM_BUCKETS] = {};
-
-        for (int cpu = 0; cpu < nr_cpus && cpu < MAX_CPUS; cpu++) {
-            count += values[cpu].count;
-            total += values[cpu].total_ns;
-            if (values[cpu].count > 0 && values[cpu].min_ns < min_v)
-                min_v = values[cpu].min_ns;
-            if (values[cpu].max_ns > max_v)
-                max_v = values[cpu].max_ns;
-            for (int b = 0; b < HISTOGRAM_BUCKETS; b++)
-                hist[b] += values[cpu].histogram[b];
-        }
-        if (min_v == UINT64_MAX) min_v = 0;
-        if (count == 0) { key = next_key; continue; }
-
-        uint32_t pid = next_key.pid;
-        uint32_t we  = next_key.wait_event;
-
-        /* Per-PID accumulation */
-        struct pgwt_pid_accum *pa = get_or_create_pid(&d->accum, pid);
-        if (pa) {
-            struct pgwt_event_stats *es = get_or_create_event(pa, we);
-            if (es) {
-                es->count = count;
-                es->total_ns = total;
-                es->min_ns = min_v;
-                es->max_ns = max_v;
-                memcpy(es->histogram, hist, sizeof(hist));
-            }
-
-            if (we == 0) {
-                pa->cpu_time_ns += total;
-            } else if (!pgwt_is_idle_event(we)) {
-                pa->wait_time_ns += total;
-            }
-            if (!pgwt_is_idle_event(we))
-                pa->db_time_ns += total;
-        }
-
-        /* System-wide accumulation */
-        struct pgwt_event_stats *se = get_or_create_system_event(&d->accum, we);
-        if (se) {
-            se->count += count;
-            se->total_ns += total;
-            if (min_v < se->min_ns) se->min_ns = min_v;
-            if (max_v > se->max_ns) se->max_ns = max_v;
-            for (int b = 0; b < HISTOGRAM_BUCKETS; b++)
-                se->histogram[b] += hist[b];
-        }
-
-        /* Time model by class */
-        struct pgwt_time_model *tm = &d->accum.tm;
-        if (we == 0) {
-            tm->cpu_time_ns += total;
-        } else {
-            int cls = WE_CLASS(we);
-            switch (cls) {
-            case PG_WAIT_IO:        tm->io_time_ns += total; break;
-            case PG_WAIT_LWLOCK:    tm->lwlock_time_ns += total; break;
-            case PG_WAIT_LOCK:      tm->lock_time_ns += total; break;
-            case PG_WAIT_BUFFERPIN: tm->bufferpin_time_ns += total; break;
-            case PG_WAIT_CLIENT:    tm->client_time_ns += total; break;
-            case PG_WAIT_IPC:       tm->ipc_time_ns += total; break;
-            case PG_WAIT_TIMEOUT:   tm->timeout_time_ns += total; break;
-            case PG_WAIT_EXTENSION: tm->extension_time_ns += total; break;
-            case PG_WAIT_ACTIVITY:  tm->activity_time_ns += total; break;
-            }
-        }
-        if (!pgwt_is_idle_event(we))
-            tm->db_time_ns += total;
-
-        key = next_key;
-    }
-
-    /* Account for open intervals: backends currently sitting in a wait
-     * state have accumulated no data via on_watchpoint if there were no
-     * state transitions. Read state_map to capture ongoing waits.
-     *
-     * Only add open intervals for (PID, event) combinations that have
-     * no data in wait_stats yet. This avoids double-counting for
-     * backends that ARE producing watchpoint fires (their accumulated
-     * closed intervals in wait_stats are already accurate). */
+void pgwt_read_state_map(struct pgwt_daemon *d)
+{
     int state_fd = bpf_map__fd(d->skel->maps.state_map);
     uint32_t skey = 0, snext;
     struct pgwt_pid_state sval;
@@ -232,21 +141,19 @@ int pgwt_read_maps(struct pgwt_daemon *d)
             uint32_t we = sval.last_event;
 
             /* Store current state for active sessions view */
-            {
-                struct pgwt_pid_accum *pa_cur = get_or_create_pid(&d->accum, snext);
-                if (pa_cur) {
-                    pa_cur->current_event = we;
-                    pa_cur->current_wait_ns = open_ns;
-                }
+            struct pgwt_pid_accum *pa_cur = pgwt_get_or_create_pid(&d->accum, snext);
+            if (pa_cur) {
+                pa_cur->current_event = we;
+                pa_cur->current_wait_ns = open_ns;
             }
 
-            /* Skip if wait_stats already has data for this (PID, event) */
-            struct pgwt_agg_key check_key = { .pid = snext, .wait_event = we };
-            struct pgwt_agg_value check_vals[MAX_CPUS];
+            /* Check if d->accum already has closed-interval data for this
+             * (PID, event). If so, skip the open interval to avoid double-counting. */
             bool has_closed_data = false;
-            if (bpf_map_lookup_elem(stats_fd, &check_key, check_vals) == 0) {
-                for (int cpu = 0; cpu < nr_cpus && cpu < MAX_CPUS; cpu++) {
-                    if (check_vals[cpu].count > 0) {
+            if (pa_cur) {
+                for (int i = 0; i < pa_cur->num_events; i++) {
+                    if (pa_cur->events[i].wait_event == we &&
+                        pa_cur->events[i].count > 0) {
                         has_closed_data = true;
                         break;
                     }
@@ -255,9 +162,9 @@ int pgwt_read_maps(struct pgwt_daemon *d)
 
             if (open_ns > 0 && !has_closed_data) {
                 /* Per-PID accumulation */
-                struct pgwt_pid_accum *pa = get_or_create_pid(&d->accum, snext);
+                struct pgwt_pid_accum *pa = pgwt_get_or_create_pid(&d->accum, snext);
                 if (pa) {
-                    struct pgwt_event_stats *es = get_or_create_event(pa, we);
+                    struct pgwt_event_stats *es = pgwt_get_or_create_event(pa, we);
                     if (es) {
                         es->count += 1;
                         es->total_ns += open_ns;
@@ -274,7 +181,7 @@ int pgwt_read_maps(struct pgwt_daemon *d)
                 }
 
                 /* System-wide accumulation */
-                struct pgwt_event_stats *se = get_or_create_system_event(&d->accum, we);
+                struct pgwt_event_stats *se = pgwt_get_or_create_system_event(&d->accum, we);
                 if (se) {
                     se->count += 1;
                     se->total_ns += open_ns;
@@ -283,30 +190,12 @@ int pgwt_read_maps(struct pgwt_daemon *d)
                 }
 
                 /* Time model by class */
-                struct pgwt_time_model *tm = &d->accum.tm;
-                if (we == 0) {
-                    tm->cpu_time_ns += open_ns;
-                } else {
-                    int cls = WE_CLASS(we);
-                    switch (cls) {
-                    case PG_WAIT_IO:        tm->io_time_ns += open_ns; break;
-                    case PG_WAIT_LWLOCK:    tm->lwlock_time_ns += open_ns; break;
-                    case PG_WAIT_LOCK:      tm->lock_time_ns += open_ns; break;
-                    case PG_WAIT_BUFFERPIN: tm->bufferpin_time_ns += open_ns; break;
-                    case PG_WAIT_CLIENT:    tm->client_time_ns += open_ns; break;
-                    case PG_WAIT_IPC:       tm->ipc_time_ns += open_ns; break;
-                    case PG_WAIT_TIMEOUT:   tm->timeout_time_ns += open_ns; break;
-                    case PG_WAIT_EXTENSION: tm->extension_time_ns += open_ns; break;
-                    case PG_WAIT_ACTIVITY:  tm->activity_time_ns += open_ns; break;
-                    }
-                }
-                if (!pgwt_is_idle_event(we))
-                    tm->db_time_ns += open_ns;
+                pgwt_update_time_model(&d->accum.tm, we, open_ns);
 
                 /* Query-level open interval */
                 if (sval.last_query_id != 0) {
                     struct pgwt_query_event_stats *qe =
-                        get_or_create_query_event(&d->accum, sval.last_query_id, we);
+                        pgwt_get_or_create_query_event(&d->accum, sval.last_query_id, we);
                     if (qe) {
                         qe->count += 1;
                         qe->total_ns += open_ns;
@@ -318,43 +207,5 @@ int pgwt_read_maps(struct pgwt_daemon *d)
         }
         skey = snext;
     }
-
-    /* ── Read query_wait_stats PERCPU_HASH ────────────────────── */
-    int qstats_fd = bpf_map__fd(d->skel->maps.query_wait_stats);
-    struct pgwt_query_agg_key qkey = {}, qnext;
-    struct pgwt_agg_value qvalues[MAX_CPUS];
-
-    while (bpf_map_get_next_key(qstats_fd, &qkey, &qnext) == 0) {
-        if (bpf_map_lookup_elem(qstats_fd, &qnext, qvalues) != 0) {
-            qkey = qnext;
-            continue;
-        }
-
-        /* Sum across all CPUs */
-        uint64_t count = 0, total = 0, min_v = UINT64_MAX, max_v = 0;
-
-        for (int cpu = 0; cpu < nr_cpus && cpu < MAX_CPUS; cpu++) {
-            count += qvalues[cpu].count;
-            total += qvalues[cpu].total_ns;
-            if (qvalues[cpu].count > 0 && qvalues[cpu].min_ns < min_v)
-                min_v = qvalues[cpu].min_ns;
-            if (qvalues[cpu].max_ns > max_v)
-                max_v = qvalues[cpu].max_ns;
-        }
-        if (min_v == UINT64_MAX) min_v = 0;
-        if (count == 0) { qkey = qnext; continue; }
-
-        struct pgwt_query_event_stats *qe =
-            get_or_create_query_event(&d->accum, qnext.query_id, qnext.wait_event);
-        if (qe) {
-            qe->count += count;
-            qe->total_ns += total;
-            if (min_v < qe->min_ns) qe->min_ns = min_v;
-            if (max_v > qe->max_ns) qe->max_ns = max_v;
-        }
-
-        qkey = qnext;
-    }
-
-    return 0;
 }
+

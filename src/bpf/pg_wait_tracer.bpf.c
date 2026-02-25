@@ -1,7 +1,7 @@
-/* pg_wait_tracer BPF programs — in-kernel wait event aggregation
+/* pg_wait_tracer BPF programs — wait event tracing via ringbuf
  *
  * Programs:
- *   on_watchpoint  — fires on PGPROC->wait_event_info write, aggregates stats
+ *   on_watchpoint  — fires on PGPROC->wait_event_info write, emits trace event
  *   on_bootstrap   — fires when InitProcess() writes my_wait_event_info pointer
  *   on_fork        — fires on postmaster fork, notifies daemon of new backend
  *   on_exit        — fires on backend exit, closes last interval, notifies daemon
@@ -32,81 +32,19 @@ struct {
     __type(value, struct pgwt_pid_state);
 } state_map SEC(".maps");
 
-/* Per-(PID, event) aggregation */
-struct {
-    __uint(type, BPF_MAP_TYPE_PERCPU_HASH);
-    __uint(max_entries, 65536);
-    __type(key, struct pgwt_agg_key);
-    __type(value, struct pgwt_agg_value);
-} wait_stats SEC(".maps");
-
-/* Per-(query_id, event) aggregation */
-struct {
-    __uint(type, BPF_MAP_TYPE_PERCPU_HASH);
-    __uint(max_entries, 65536);
-    __type(key, struct pgwt_query_agg_key);
-    __type(value, struct pgwt_agg_value);
-} query_wait_stats SEC(".maps");
-
 /* Ring buffer for lifecycle events — pollable via epoll */
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
     __uint(max_entries, 64 * 1024);
 } lifecycle_rb SEC(".maps");
 
+/* Ring buffer for raw trace events — every wait event transition */
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 64 * 1024 * 1024);  /* 64MB */
+} event_ringbuf SEC(".maps");
+
 /* ── Helpers ──────────────────────────────────────────────── */
-
-/* Log2 histogram bucket for a duration in nanoseconds.
- * BPF-safe: no loops, bounded if-else chain. */
-static __always_inline u32 duration_to_bucket(u64 ns)
-{
-    u64 us = ns / 1000;
-    if (us < 1)     return 0;
-    if (us < 2)     return 1;
-    if (us < 4)     return 2;
-    if (us < 8)     return 3;
-    if (us < 16)    return 4;
-    if (us < 32)    return 5;
-    if (us < 64)    return 6;
-    if (us < 128)   return 7;
-    if (us < 256)   return 8;
-    if (us < 512)   return 9;
-    if (us < 1024)  return 10;
-    if (us < 2048)  return 11;
-    if (us < 4096)  return 12;
-    if (us < 8192)  return 13;
-    if (us < 16384) return 14;
-    return 15;
-}
-
-/* Accumulate the duration of a state into wait_stats map */
-static __always_inline void accumulate(u32 pid, u32 event, u64 duration_ns)
-{
-    struct pgwt_agg_key key = { .pid = pid, .wait_event = event };
-    u32 bucket = duration_to_bucket(duration_ns);
-
-    struct pgwt_agg_value *val = bpf_map_lookup_elem(&wait_stats, &key);
-    if (val) {
-        val->count++;
-        val->total_ns += duration_ns;
-        if (duration_ns < val->min_ns)
-            val->min_ns = duration_ns;
-        if (duration_ns > val->max_ns)
-            val->max_ns = duration_ns;
-        if (bucket < HISTOGRAM_BUCKETS)
-            val->histogram[bucket]++;
-    } else {
-        struct pgwt_agg_value new_val = {};
-        new_val.count = 1;
-        new_val.total_ns = duration_ns;
-        new_val.min_ns = duration_ns;
-        new_val.max_ns = duration_ns;
-        __builtin_memset(new_val.histogram, 0, sizeof(new_val.histogram));
-        if (bucket < HISTOGRAM_BUCKETS)
-            new_val.histogram[bucket] = 1;
-        bpf_map_update_elem(&wait_stats, &key, &new_val, BPF_ANY);
-    }
-}
 
 /* Read the current query_id from PgBackendStatus via MyBEEntry.
  * Double-dereference: my_be_entry_addr → PgBackendStatus* → st_query_id. */
@@ -120,37 +58,6 @@ static __always_inline u64 read_query_id(void)
     bpf_probe_read_user(&qid, sizeof(qid),
                          (void *)(be_entry + st_query_id_offset));
     return qid;
-}
-
-/* Accumulate duration into query_wait_stats map (keyed by query_id + event) */
-static __always_inline void accumulate_query(u64 query_id, u32 event, u64 duration_ns)
-{
-    if (query_id == 0) return;  /* skip non-query backends */
-
-    struct pgwt_query_agg_key key = { .query_id = query_id, .wait_event = event };
-    u32 bucket = duration_to_bucket(duration_ns);
-
-    struct pgwt_agg_value *val = bpf_map_lookup_elem(&query_wait_stats, &key);
-    if (val) {
-        val->count++;
-        val->total_ns += duration_ns;
-        if (duration_ns < val->min_ns)
-            val->min_ns = duration_ns;
-        if (duration_ns > val->max_ns)
-            val->max_ns = duration_ns;
-        if (bucket < HISTOGRAM_BUCKETS)
-            val->histogram[bucket]++;
-    } else {
-        struct pgwt_agg_value new_val = {};
-        new_val.count = 1;
-        new_val.total_ns = duration_ns;
-        new_val.min_ns = duration_ns;
-        new_val.max_ns = duration_ns;
-        __builtin_memset(new_val.histogram, 0, sizeof(new_val.histogram));
-        if (bucket < HISTOGRAM_BUCKETS)
-            new_val.histogram[bucket] = 1;
-        bpf_map_update_elem(&query_wait_stats, &key, &new_val, BPF_ANY);
-    }
 }
 
 /* Read the current wait_event_info value via double-dereference.
@@ -182,10 +89,22 @@ int on_watchpoint(struct bpf_perf_event_data *ctx)
 
     struct pgwt_pid_state *st = bpf_map_lookup_elem(&state_map, &pid);
     if (st) {
-        /* Accumulate duration of PREVIOUS state */
+        /* Compute duration of PREVIOUS state */
         u64 duration = now - st->last_ts;
-        accumulate(pid, st->last_event, duration);
-        accumulate_query(st->last_query_id, st->last_event, duration);
+
+        /* Emit trace event to ringbuf */
+        struct pgwt_trace_event *evt =
+            bpf_ringbuf_reserve(&event_ringbuf, sizeof(*evt), 0);
+        if (evt) {
+            evt->timestamp_ns = now;
+            evt->pid = pid;
+            evt->old_event = st->last_event;
+            evt->new_event = new_event;
+            evt->duration_ns = duration;
+            evt->query_id = st->last_query_id;
+            bpf_ringbuf_submit(evt, 0);
+        }
+
         /* Transition to new state */
         st->last_event = new_event;
         st->last_ts = now;
@@ -267,8 +186,19 @@ int on_exit(struct trace_event_raw_sched_process_template *ctx)
     /* Close the last open interval */
     u64 now = bpf_ktime_get_ns();
     u64 duration = now - st->last_ts;
-    accumulate(pid, st->last_event, duration);
-    accumulate_query(st->last_query_id, st->last_event, duration);
+
+    /* Emit final trace event (exit sentinel) */
+    struct pgwt_trace_event *evt =
+        bpf_ringbuf_reserve(&event_ringbuf, sizeof(*evt), 0);
+    if (evt) {
+        evt->timestamp_ns = now;
+        evt->pid = pid;
+        evt->old_event = st->last_event;
+        evt->new_event = PGWT_EVENT_EXIT;
+        evt->duration_ns = duration;
+        evt->query_id = st->last_query_id;
+        bpf_ringbuf_submit(evt, 0);
+    }
 
     /* Notify daemon */
     struct pgwt_lifecycle_event *ev;
