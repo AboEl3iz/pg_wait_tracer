@@ -43,4 +43,18 @@ int pgwt_detect_query_id_offset(const char *pg_binary, int pg_major);
  * On multiple instances, prints a list to stderr. */
 pid_t pgwt_auto_discover_postmaster(bool verbose);
 
+/* Forward declaration */
+struct pgwt_daemon;
+
+/* Full discovery: resolve postmaster PID, binary, version, symbols.
+ * Reads d->pgdata (empty string = auto-discover).
+ * Fills d->postmaster_pid, my_wait_ptr_addr, my_be_entry_addr,
+ * pg_major_version, st_query_id_offset.
+ * Returns 0 on success, -1 on error. */
+int pgwt_discover(struct pgwt_daemon *d);
+
+/* Infer PGDATA from postmaster PID via /proc/<pid>/cwd.
+ * Returns 0 on success, -1 on error. */
+int pgwt_infer_pgdata(pid_t pid, char *buf, size_t bufsz);
+
 #endif /* PGWT_DISCOVERY_H */

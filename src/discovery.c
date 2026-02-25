@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <signal.h>
 #include <sys/utsname.h>
 #include <libelf.h>
 #include <gelf.h>
@@ -427,5 +428,137 @@ pid_t pgwt_auto_discover_postmaster(bool verbose)
                 candidates[i].version,
                 candidates[i].exe);
     }
+    return 0;
+}
+
+/* ── PGDATA Inference ─────────────────────────────────────── */
+
+int pgwt_infer_pgdata(pid_t pid, char *buf, size_t bufsz)
+{
+    char link[64];
+    snprintf(link, sizeof(link), "/proc/%d/cwd", pid);
+
+    ssize_t n = readlink(link, buf, bufsz - 1);
+    if (n < 0) {
+        fprintf(stderr, "readlink(%s): %s\n", link, strerror(errno));
+        return -1;
+    }
+    buf[n] = '\0';
+    return 0;
+}
+
+/* ── Full Discovery ───────────────────────────────────────── */
+
+#include "daemon.h"
+#include "wait_event.h"
+
+int pgwt_discover(struct pgwt_daemon *d)
+{
+    pid_t pm_pid = 0;
+
+    /* Resolve postmaster PID: pgdata > pre-set PID > auto-discover */
+    if (d->pgdata[0]) {
+        pm_pid = pgwt_find_postmaster_pid(d->pgdata);
+        if (pm_pid == 0) {
+            fprintf(stderr, "FATAL: cannot read postmaster PID from %s/postmaster.pid\n",
+                    d->pgdata);
+            return -1;
+        }
+    } else if (d->postmaster_pid > 0) {
+        /* PID pre-set by caller (e.g. --pid) */
+        pm_pid = d->postmaster_pid;
+    } else {
+        pm_pid = pgwt_auto_discover_postmaster(d->verbose);
+        if (pm_pid == 0) {
+            if (d->verbose)
+                fprintf(stderr, "INFO: no PostgreSQL instance found\n");
+            return -1;
+        }
+    }
+
+    /* Verify postmaster is alive */
+    if (kill(pm_pid, 0) != 0) {
+        fprintf(stderr, "FATAL: postmaster PID %d not found (not running?)\n", pm_pid);
+        return -1;
+    }
+    d->postmaster_pid = pm_pid;
+
+    /* Discover postgres binary */
+    char binary[256];
+    if (pgwt_find_pg_binary(pm_pid, binary, sizeof(binary)) != 0) {
+        fprintf(stderr, "FATAL: cannot resolve postgres binary for PID %d\n", pm_pid);
+        return -1;
+    }
+    if (d->verbose)
+        fprintf(stderr, "INFO: postgres binary: %s\n", binary);
+
+    /* Detect PostgreSQL major version */
+    d->pg_major_version = pgwt_detect_pg_version(binary);
+    if (d->pg_major_version == 0) {
+        fprintf(stderr, "WARN: cannot detect PostgreSQL version, assuming PG18\n");
+        d->pg_major_version = 18;
+    } else if (d->verbose) {
+        fprintf(stderr, "INFO: detected PostgreSQL %d\n", d->pg_major_version);
+    }
+
+    /* Initialize version-aware event name tables */
+    pgwt_init_event_names(d->pg_major_version);
+
+    /* Extract basename for /proc/pid/maps matching */
+    const char *base = strrchr(binary, '/');
+    base = base ? base + 1 : binary;
+
+    /* Resolve symbols */
+    d->my_wait_ptr_addr = pgwt_resolve_symbol(binary, "my_wait_event_info",
+                                               pm_pid, base);
+    if (d->my_wait_ptr_addr == 0) {
+        fprintf(stderr, "FATAL: cannot resolve 'my_wait_event_info' in %s (PID %d)\n",
+                binary, pm_pid);
+        return -1;
+    }
+    if (d->verbose)
+        fprintf(stderr, "INFO: my_wait_event_info VA: 0x%lx\n",
+                (unsigned long)d->my_wait_ptr_addr);
+
+    /* Verify pointer is readable */
+    uint64_t ptr_val = pgwt_read_pointer(pm_pid, d->my_wait_ptr_addr);
+    if (d->verbose)
+        fprintf(stderr, "INFO: my_wait_event_info value (postmaster): 0x%lx\n",
+                (unsigned long)ptr_val);
+
+    /* Discover MyBEEntry address (for query_id attribution) */
+    d->my_be_entry_addr = pgwt_resolve_symbol(binary, "MyBEEntry",
+                                               pm_pid, base);
+    if (d->my_be_entry_addr == 0) {
+        if (d->view == PGWT_VIEW_QUERY_EVENT) {
+            fprintf(stderr, "FATAL: symbol 'MyBEEntry' not found — query_event view unavailable\n");
+            return -1;
+        }
+        if (d->verbose)
+            fprintf(stderr, "WARN: symbol 'MyBEEntry' not found — query_event view disabled\n");
+    } else if (d->verbose) {
+        fprintf(stderr, "INFO: MyBEEntry VA: 0x%lx\n",
+                (unsigned long)d->my_be_entry_addr);
+    }
+
+    /* Detect st_query_id offset */
+    d->st_query_id_offset = pgwt_detect_query_id_offset(binary, d->pg_major_version);
+    if (d->st_query_id_offset > 0) {
+        if (d->verbose)
+            fprintf(stderr, "INFO: st_query_id offset: %d (PG%d)\n",
+                    d->st_query_id_offset, d->pg_major_version);
+    } else {
+        if (d->view == PGWT_VIEW_QUERY_EVENT) {
+            fprintf(stderr, "FATAL: st_query_id offset not found for PG%d — "
+                    "query_event view unavailable\n"
+                    "  Hint: install postgresql-%d-dbgsym for DWARF-based detection\n",
+                    d->pg_major_version, d->pg_major_version);
+            return -1;
+        }
+        if (d->verbose)
+            fprintf(stderr, "INFO: st_query_id offset not available — "
+                    "query_event view disabled\n");
+    }
+
     return 0;
 }

@@ -26,6 +26,12 @@ enum pgwt_view {
     PGWT_VIEW_ACTIVE,
 };
 
+/* Exit reasons (for supervision loop) */
+enum pgwt_exit_reason {
+    PGWT_EXIT_NORMAL = 0,   /* signal, duration, or count */
+    PGWT_EXIT_PG_DEAD,      /* postmaster died */
+};
+
 /* Sort modes (for active sessions view) */
 enum pgwt_sort_mode {
     PGWT_SORT_WAIT_TIME = 0,  /* default: by current wait duration */
@@ -71,6 +77,9 @@ struct pgwt_daemon {
     uint64_t    query_id_filter;     /* filter query_event to one query, 0 = no filter */
     enum pgwt_sort_mode sort_mode;   /* sort mode for active view */
     bool        replay_mode;             /* true when running --replay */
+    bool        daemon_mode;             /* true when running --daemon */
+    enum pgwt_exit_reason exit_reason;   /* why the event loop exited */
+    char        pgdata[512];             /* stored for restart detection */
 
     /* Trace file recording */
     const char *trace_dir;                  /* NULL = disabled */

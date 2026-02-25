@@ -10,6 +10,7 @@
 #include <getopt.h>
 #include <unistd.h>
 #include <signal.h>
+#include <time.h>
 
 static void usage(const char *prog)
 {
@@ -45,6 +46,9 @@ static void usage(const char *prog)
         "      --from <TIME>          Start time: ISO 8601, relative (1h, 30m), or 'now'\n"
         "      --to <TIME>            End time (same formats as --from)\n"
         "\n"
+        "Daemon:\n"
+        "      --daemon               Run as daemon (reconnect on PG restart)\n"
+        "\n"
         "Other:\n"
         "  -v, --verbose         Verbose output to stderr\n"
         "  -h, --help            Show this help\n"
@@ -57,11 +61,16 @@ static void usage(const char *prog)
         "  sudo %s --window 5s,1m,5m --count 3                 # time windows\n"
         "  sudo %s --count 10 | cat                          # text mode (piped)\n"
         "\n"
+        "  # Daemon (reconnects on PG restart):\n"
+        "  sudo %s --daemon -T /tmp/traces\n"
+        "  sudo %s --daemon --pgdata /var/lib/pgsql/18/data\n"
+        "\n"
         "  # Replay (no root needed):\n"
         "  %s --replay -T /tmp/traces --view time_model\n"
         "  %s --replay -T /tmp/traces --from 1h --view system_event\n"
         "  %s --replay -T /tmp/traces --from '2025-02-25T14:00:00' --to '2025-02-25T15:00:00'\n",
         prog, prog, prog, prog, prog, prog, prog,
+        prog, prog,
         prog, prog, prog);
 }
 
@@ -146,6 +155,7 @@ static enum pgwt_format parse_format(const char *s)
 #define OPT_REPLAY 256
 #define OPT_FROM   257
 #define OPT_TO     258
+#define OPT_DAEMON 259
 
 static struct option long_opts[] = {
     {"pid",        required_argument, NULL, 'p'},
@@ -165,6 +175,7 @@ static struct option long_opts[] = {
     {"replay",          no_argument,       NULL, OPT_REPLAY},
     {"from",            required_argument, NULL, OPT_FROM},
     {"to",              required_argument, NULL, OPT_TO},
+    {"daemon",          no_argument,       NULL, OPT_DAEMON},
     {"verbose",         no_argument,       NULL, 'v'},
     {"help",            no_argument,       NULL, 'h'},
     {NULL, 0, NULL, 0},
@@ -188,6 +199,7 @@ int main(int argc, char **argv)
     const char *pgdata = NULL;
     bool format_set = false;
     bool replay_mode = false;
+    bool daemon_mode = false;
     const char *from_str = NULL;
     const char *to_str = NULL;
     int opt;
@@ -216,6 +228,7 @@ int main(int argc, char **argv)
         case OPT_REPLAY: replay_mode = true; break;
         case OPT_FROM:   from_str = optarg; break;
         case OPT_TO:     to_str = optarg; break;
+        case OPT_DAEMON: daemon_mode = true; break;
         case 'v': d->verbose = true; break;
         case 'h': usage(argv[0]); free(d); return 0;
         default:  usage(argv[0]); free(d); return 1;
@@ -246,34 +259,11 @@ int main(int argc, char **argv)
         free(d);
         return 1;
     }
-
-    /* Resolve postmaster PID */
-    if (pm_pid == 0 && pgdata) {
-        pm_pid = pgwt_find_postmaster_pid(pgdata);
-        if (pm_pid == 0) {
-            fprintf(stderr, "FATAL: cannot read postmaster PID from %s/postmaster.pid\n",
-                    pgdata);
-            free(d);
-            return 1;
-        }
-    }
-    if (pm_pid == 0) {
-        /* Auto-discover: find single running PostgreSQL instance */
-        pm_pid = pgwt_auto_discover_postmaster(d->verbose);
-        if (pm_pid == 0) {
-            fprintf(stderr, "\nUse --pid <PID> or --pgdata <DIR>\n");
-            free(d);
-            return 1;
-        }
-    }
-
-    /* Verify postmaster is alive */
-    if (kill(pm_pid, 0) != 0) {
-        fprintf(stderr, "FATAL: postmaster PID %d not found (not running?)\n", pm_pid);
+    if (daemon_mode && (d->count > 0 || d->duration > 0)) {
+        fprintf(stderr, "FATAL: --daemon cannot be used with --count or --duration\n");
         free(d);
         return 1;
     }
-    d->postmaster_pid = pm_pid;
 
     /* Validate view-specific options */
     if (d->view == PGWT_VIEW_HISTOGRAM && (!d->event_filter || !d->event_filter[0])) {
@@ -289,93 +279,99 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* Discover postgres binary and version */
-    char binary[256];
-    if (pgwt_find_pg_binary(pm_pid, binary, sizeof(binary)) != 0) {
-        fprintf(stderr, "FATAL: cannot resolve postgres binary for PID %d\n", pm_pid);
+    d->daemon_mode = daemon_mode;
+
+    /* Set up discovery state: pgdata, pre-set PID, or auto-discover.
+     * pgwt_discover() uses: d->pgdata (if set) > d->postmaster_pid (if set) > auto. */
+    if (pgdata)
+        snprintf(d->pgdata, sizeof(d->pgdata), "%s", pgdata);
+    if (pm_pid > 0)
+        d->postmaster_pid = pm_pid;
+
+    /* In daemon mode with --pid but no --pgdata, infer PGDATA for restart detection */
+    if (daemon_mode && pm_pid > 0 && !pgdata) {
+        char inferred[512];
+        if (pgwt_infer_pgdata(pm_pid, inferred, sizeof(inferred)) == 0) {
+            snprintf(d->pgdata, sizeof(d->pgdata), "%s", inferred);
+            if (d->verbose)
+                fprintf(stderr, "INFO: inferred PGDATA: %s\n", d->pgdata);
+        } else {
+            fprintf(stderr, "WARN: cannot infer PGDATA from PID %d — "
+                    "restart detection may not work\n", pm_pid);
+        }
+    }
+
+    /* First discovery */
+    if (pgwt_discover(d) != 0) {
+        if (!pgdata && pm_pid == 0)
+            fprintf(stderr, "\nUse --pid <PID> or --pgdata <DIR>\n");
         free(d);
         return 1;
     }
-    if (d->verbose)
-        fprintf(stderr, "INFO: postgres binary: %s\n", binary);
 
-    /* Detect PostgreSQL major version */
-    d->pg_major_version = pgwt_detect_pg_version(binary);
-    if (d->pg_major_version == 0) {
-        fprintf(stderr, "WARN: cannot detect PostgreSQL version, assuming PG18\n");
-        d->pg_major_version = 18;
-    } else if (d->verbose) {
-        fprintf(stderr, "INFO: detected PostgreSQL %d\n", d->pg_major_version);
-    }
+    /* ── Daemon mode: supervision loop ─────────────────────── */
+    if (daemon_mode) {
+        int rc = 0;
 
-    /* Initialize version-aware event name tables */
-    pgwt_init_event_names(d->pg_major_version);
+        /* Block signals for sigtimedwait in wait phase.
+         * pgwt_daemon_init() will also call sigprocmask (idempotent). */
+        sigset_t mask;
+        sigemptyset(&mask);
+        sigaddset(&mask, SIGINT);
+        sigaddset(&mask, SIGTERM);
+        sigprocmask(SIG_BLOCK, &mask, NULL);
 
-    /* Extract basename for /proc/pid/maps matching */
-    const char *base = strrchr(binary, '/');
-    base = base ? base + 1 : binary;
+        for (;;) {
+            if (pgwt_daemon_init(d) != 0) {
+                rc = 1;
+                break;
+            }
 
-    d->my_wait_ptr_addr = pgwt_resolve_symbol(binary, "my_wait_event_info",
-                                               pm_pid, base);
-    if (d->my_wait_ptr_addr == 0) {
-        fprintf(stderr, "FATAL: cannot resolve 'my_wait_event_info' in %s (PID %d)\n",
-                binary, pm_pid);
+            pgwt_daemon_run(d);
+            pgwt_daemon_cleanup(d);
+
+            if (d->exit_reason != PGWT_EXIT_PG_DEAD)
+                break;
+
+            /* Wait for PG restart */
+            fprintf(stderr, "pg_wait_tracer: waiting for PostgreSQL to restart...\n");
+            bool found = false;
+            while (!found) {
+                struct timespec ts = { .tv_sec = 5 };
+                int sig = sigtimedwait(&mask, NULL, &ts);
+                if (sig > 0) {
+                    fprintf(stderr, "\npg_wait_tracer: shutting down\n");
+                    goto done;
+                }
+                /* sigtimedwait returns -1/EAGAIN on timeout — try discover */
+
+                /* Clear pre-set PID so discover uses pgdata or auto */
+                d->postmaster_pid = 0;
+
+                if (pgwt_discover(d) == 0) {
+                    fprintf(stderr, "pg_wait_tracer: PostgreSQL restarted (PID %d), "
+                            "re-attaching\n", d->postmaster_pid);
+                    found = true;
+                }
+            }
+
+            /* Reset per-cycle state */
+            d->tick = 0;
+            d->exit_reason = PGWT_EXIT_NORMAL;
+        }
+
+done:
         free(d);
-        return 1;
-    }
-    if (d->verbose)
-        fprintf(stderr, "INFO: my_wait_event_info VA: 0x%lx\n", d->my_wait_ptr_addr);
-
-    /* Verify pointer is readable */
-    uint64_t ptr_val = pgwt_read_pointer(pm_pid, d->my_wait_ptr_addr);
-    if (d->verbose)
-        fprintf(stderr, "INFO: my_wait_event_info value (postmaster): 0x%lx\n", ptr_val);
-
-    /* Discover MyBEEntry address (for query_id attribution) */
-    d->my_be_entry_addr = pgwt_resolve_symbol(binary, "MyBEEntry",
-                                               pm_pid, base);
-    if (d->my_be_entry_addr == 0) {
-        if (d->view == PGWT_VIEW_QUERY_EVENT) {
-            fprintf(stderr, "FATAL: symbol 'MyBEEntry' not found — query_event view unavailable\n");
-            free(d);
-            return 1;
-        }
-        fprintf(stderr, "WARN: symbol 'MyBEEntry' not found — query_event view disabled\n");
-    } else if (d->verbose) {
-        fprintf(stderr, "INFO: MyBEEntry VA: 0x%lx\n",
-                (unsigned long)d->my_be_entry_addr);
+        return rc;
     }
 
-    /* Detect st_query_id offset for query_event view */
-    d->st_query_id_offset = pgwt_detect_query_id_offset(binary, d->pg_major_version);
-    if (d->st_query_id_offset > 0) {
-        if (d->verbose)
-            fprintf(stderr, "INFO: st_query_id offset: %d (PG%d)\n",
-                    d->st_query_id_offset, d->pg_major_version);
-    } else {
-        if (d->view == PGWT_VIEW_QUERY_EVENT) {
-            fprintf(stderr, "FATAL: st_query_id offset not found for PG%d — "
-                    "query_event view unavailable\n"
-                    "  Hint: install postgresql-%d-dbgsym for DWARF-based detection\n",
-                    d->pg_major_version, d->pg_major_version);
-            free(d);
-            return 1;
-        }
-        if (d->verbose)
-            fprintf(stderr, "INFO: st_query_id offset not available — "
-                    "query_event view disabled\n");
-    }
-
-    /* Init daemon: load BPF, attach tracepoints, scan backends */
+    /* ── Single-shot mode ──────────────────────────────────── */
     if (pgwt_daemon_init(d) != 0) {
         free(d);
         return 1;
     }
 
-    /* Run event loop */
     pgwt_daemon_run(d);
-
-    /* Cleanup */
     pgwt_daemon_cleanup(d);
     free(d);
     return 0;

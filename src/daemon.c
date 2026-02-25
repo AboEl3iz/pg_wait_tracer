@@ -50,6 +50,17 @@ static void handle_timer(struct pgwt_daemon *d)
     ssize_t r = read(d->timer_fd, &expirations, sizeof(expirations));
     (void)r;
 
+    /* Health check: is PostgreSQL still alive? */
+    if (d->daemon_mode) {
+        if (kill(d->postmaster_pid, 0) != 0) {
+            fprintf(stderr, "\npg_wait_tracer: PostgreSQL (PID %d) stopped\n",
+                    d->postmaster_pid);
+            d->exit_reason = PGWT_EXIT_PG_DEAD;
+            d->running = false;
+            return;
+        }
+    }
+
     /* Copy cumulative event_accum to display accum,
      * then add open intervals from state_map */
     struct pgwt_time_model saved_tm = d->accum.tm;
@@ -324,7 +335,12 @@ int pgwt_daemon_run(struct pgwt_daemon *d)
         }
     }
 
-    fprintf(stderr, "\npg_wait_tracer: shutting down\n");
+    /* Drain remaining events before cleanup */
+    ring_buffer__consume(d->event_rb);
+    ring_buffer__consume(d->rb);
+
+    if (d->exit_reason != PGWT_EXIT_PG_DEAD)
+        fprintf(stderr, "\npg_wait_tracer: shutting down\n");
     return 0;
 }
 
