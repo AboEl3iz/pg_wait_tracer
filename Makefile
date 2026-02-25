@@ -32,7 +32,9 @@ USER_SRCS  = $(SRC_DIR)/pg_wait_tracer.c \
              $(SRC_DIR)/perf_event.c \
              $(SRC_DIR)/cmdline.c \
              $(SRC_DIR)/snapshot.c \
-             $(SRC_DIR)/event_writer.c
+             $(SRC_DIR)/event_writer.c \
+             $(SRC_DIR)/event_reader.c \
+             $(SRC_DIR)/replay.c
 
 USER_OBJS  = $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(USER_SRCS))
 

@@ -78,10 +78,15 @@ static void print_view_start(struct pgwt_daemon *d)
 
 void pgwt_print_header(struct pgwt_daemon *d)
 {
-    fprintf(stderr, "pg_wait_tracer v0.1 — postmaster PID %d\n",
-            d->postmaster_pid);
-    fprintf(stderr, "Tracing %d backends | %ds interval | Ctrl-C to stop\n\n",
-            count_active_backends(d), d->interval);
+    if (d->replay_mode) {
+        fprintf(stderr, "pg_wait_tracer v0.1 — replay mode (PG%d)\n\n",
+                d->pg_major_version);
+    } else {
+        fprintf(stderr, "pg_wait_tracer v0.1 — postmaster PID %d\n",
+                d->postmaster_pid);
+        fprintf(stderr, "Tracing %d backends | %ds interval | Ctrl-C to stop\n\n",
+                count_active_backends(d), d->interval);
+    }
 }
 
 /* ── Time Model View ─────────────────────────────────────── */

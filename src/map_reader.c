@@ -128,6 +128,27 @@ void pgwt_update_time_model(struct pgwt_time_model *tm, uint32_t event,
         tm->db_time_ns += duration_ns;
 }
 
+uint32_t pgwt_duration_to_bucket(uint64_t ns)
+{
+    uint64_t us = ns / 1000;
+    if (us < 1)     return 0;
+    if (us < 2)     return 1;
+    if (us < 4)     return 2;
+    if (us < 8)     return 3;
+    if (us < 16)    return 4;
+    if (us < 32)    return 5;
+    if (us < 64)    return 6;
+    if (us < 128)   return 7;
+    if (us < 256)   return 8;
+    if (us < 512)   return 9;
+    if (us < 1024)  return 10;
+    if (us < 2048)  return 11;
+    if (us < 4096)  return 12;
+    if (us < 8192)  return 13;
+    if (us < 16384) return 14;
+    return 15;
+}
+
 void pgwt_read_state_map(struct pgwt_daemon *d)
 {
     int state_fd = bpf_map__fd(d->skel->maps.state_map);

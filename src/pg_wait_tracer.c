@@ -1,6 +1,7 @@
 /* pg_wait_tracer.c — Main entry point: argument parsing, discovery, startup */
 #include "daemon.h"
 #include "discovery.h"
+#include "replay.h"
 #include "wait_event.h"
 
 #include <stdio.h>
@@ -39,6 +40,11 @@ static void usage(const char *prog)
         "  -T, --trace-dir <DIR>      Write raw trace files to DIR\n"
         "  -R, --trace-retention <H>  Keep trace files for H hours (default: 24)\n"
         "\n"
+        "Replay (offline analysis — no root, no PostgreSQL needed):\n"
+        "      --replay               Replay trace files instead of live tracing\n"
+        "      --from <TIME>          Start time: ISO 8601, relative (1h, 30m), or 'now'\n"
+        "      --to <TIME>            End time (same formats as --from)\n"
+        "\n"
         "Other:\n"
         "  -v, --verbose         Verbose output to stderr\n"
         "  -h, --help            Show this help\n"
@@ -49,8 +55,14 @@ static void usage(const char *prog)
         "  sudo %s --view system_event --count 5             # 5 intervals\n"
         "  sudo %s --view histogram --event IO:DataFileRead\n"
         "  sudo %s --window 5s,1m,5m --count 3                 # time windows\n"
-        "  sudo %s --count 10 | cat                          # text mode (piped)\n",
-        prog, prog, prog, prog, prog, prog, prog);
+        "  sudo %s --count 10 | cat                          # text mode (piped)\n"
+        "\n"
+        "  # Replay (no root needed):\n"
+        "  %s --replay -T /tmp/traces --view time_model\n"
+        "  %s --replay -T /tmp/traces --from 1h --view system_event\n"
+        "  %s --replay -T /tmp/traces --from '2025-02-25T14:00:00' --to '2025-02-25T15:00:00'\n",
+        prog, prog, prog, prog, prog, prog, prog,
+        prog, prog, prog);
 }
 
 static enum pgwt_view parse_view(const char *s)
@@ -130,6 +142,11 @@ static enum pgwt_format parse_format(const char *s)
     exit(1);
 }
 
+/* Long-only option values (no short form) */
+#define OPT_REPLAY 256
+#define OPT_FROM   257
+#define OPT_TO     258
+
 static struct option long_opts[] = {
     {"pid",        required_argument, NULL, 'p'},
     {"pgdata",     required_argument, NULL, 'D'},
@@ -145,6 +162,9 @@ static struct option long_opts[] = {
     {"sort",            required_argument, NULL, 'S'},
     {"trace-dir",       required_argument, NULL, 'T'},
     {"trace-retention", required_argument, NULL, 'R'},
+    {"replay",          no_argument,       NULL, OPT_REPLAY},
+    {"from",            required_argument, NULL, OPT_FROM},
+    {"to",              required_argument, NULL, OPT_TO},
     {"verbose",         no_argument,       NULL, 'v'},
     {"help",            no_argument,       NULL, 'h'},
     {NULL, 0, NULL, 0},
@@ -167,6 +187,9 @@ int main(int argc, char **argv)
     pid_t pm_pid = 0;
     const char *pgdata = NULL;
     bool format_set = false;
+    bool replay_mode = false;
+    const char *from_str = NULL;
+    const char *to_str = NULL;
     int opt;
 
     while ((opt = getopt_long(argc, argv, "p:D:i:d:V:f:n:w:e:P:Q:S:T:R:vh", long_opts, NULL)) != -1) {
@@ -190,6 +213,9 @@ int main(int argc, char **argv)
         case 'S': d->sort_mode = parse_sort(optarg); break;
         case 'T': d->trace_dir = optarg; break;
         case 'R': d->trace_retention = atoi(optarg); break;
+        case OPT_REPLAY: replay_mode = true; break;
+        case OPT_FROM:   from_str = optarg; break;
+        case OPT_TO:     to_str = optarg; break;
         case 'v': d->verbose = true; break;
         case 'h': usage(argv[0]); free(d); return 0;
         default:  usage(argv[0]); free(d); return 1;
@@ -199,6 +225,14 @@ int main(int argc, char **argv)
     /* TTY auto-detect: tui for terminal, text for pipe */
     if (!format_set)
         d->format = isatty(STDOUT_FILENO) ? PGWT_FMT_TUI : PGWT_FMT_TEXT;
+
+    /* Replay mode: bypass all BPF/PostgreSQL discovery */
+    if (replay_mode) {
+        d->format = PGWT_FMT_TEXT;  /* replay always text mode */
+        int rc = pgwt_run_replay(d, from_str, to_str);
+        free(d);
+        return rc;
+    }
 
     /* Validate options (before PG discovery) */
     if (d->interval < 1) {

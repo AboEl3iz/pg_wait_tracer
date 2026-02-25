@@ -11,28 +11,7 @@
 
 #include <string.h>
 
-/* Log2 histogram bucket for a duration in nanoseconds.
- * Mirrors duration_to_bucket() in BPF program. */
-static uint32_t duration_to_bucket(uint64_t ns)
-{
-    uint64_t us = ns / 1000;
-    if (us < 1)     return 0;
-    if (us < 2)     return 1;
-    if (us < 4)     return 2;
-    if (us < 8)     return 3;
-    if (us < 16)    return 4;
-    if (us < 32)    return 5;
-    if (us < 64)    return 6;
-    if (us < 128)   return 7;
-    if (us < 256)   return 8;
-    if (us < 512)   return 9;
-    if (us < 1024)  return 10;
-    if (us < 2048)  return 11;
-    if (us < 4096)  return 12;
-    if (us < 8192)  return 13;
-    if (us < 16384) return 14;
-    return 15;
-}
+/* duration_to_bucket() moved to map_reader.c as pgwt_duration_to_bucket() */
 
 int pgwt_handle_trace_event(void *ctx, void *data, size_t data_sz)
 {
@@ -58,7 +37,7 @@ int pgwt_handle_trace_event(void *ctx, void *data, size_t data_sz)
             es->total_ns += dur;
             if (dur < es->min_ns) es->min_ns = dur;
             if (dur > es->max_ns) es->max_ns = dur;
-            uint32_t bucket = duration_to_bucket(dur);
+            uint32_t bucket = pgwt_duration_to_bucket(dur);
             if (bucket < HISTOGRAM_BUCKETS)
                 es->histogram[bucket]++;
         }
@@ -79,7 +58,7 @@ int pgwt_handle_trace_event(void *ctx, void *data, size_t data_sz)
         se->total_ns += dur;
         if (dur < se->min_ns) se->min_ns = dur;
         if (dur > se->max_ns) se->max_ns = dur;
-        uint32_t bucket = duration_to_bucket(dur);
+        uint32_t bucket = pgwt_duration_to_bucket(dur);
         if (bucket < HISTOGRAM_BUCKETS)
             se->histogram[bucket]++;
     }

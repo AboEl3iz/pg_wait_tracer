@@ -103,4 +103,7 @@ struct pgwt_query_event_stats *pgwt_get_or_create_query_event(
 void pgwt_update_time_model(struct pgwt_time_model *tm, uint32_t event,
                              uint64_t duration_ns);
 
+/* Log2 histogram bucket for a duration in nanoseconds. */
+uint32_t pgwt_duration_to_bucket(uint64_t ns);
+
 #endif /* PGWT_MAP_READER_H */
