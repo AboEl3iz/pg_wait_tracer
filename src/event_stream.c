@@ -5,6 +5,7 @@
  * for display (pgwt_accum_copy_used). */
 #include "event_stream.h"
 #include "daemon.h"
+#include "event_writer.h"
 #include "map_reader.h"
 #include "wait_event.h"
 
@@ -40,6 +41,10 @@ int pgwt_handle_trace_event(void *ctx, void *data, size_t data_sz)
     struct pgwt_accumulator *acc = d->event_accum;
 
     (void)data_sz;
+
+    /* Write to trace file if recording is enabled */
+    if (d->event_writer)
+        pgwt_writer_push_event(d->event_writer, evt);
 
     uint32_t we = evt->old_event;
     uint64_t dur = evt->duration_ns;

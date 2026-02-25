@@ -35,6 +35,10 @@ static void usage(const char *prog)
         "  -P, --pid-filter <PID> Show detail for specific backend (session_event)\n"
         "  -Q, --query-id <ID>   Filter query_event to one query\n"
         "\n"
+        "Recording:\n"
+        "  -T, --trace-dir <DIR>      Write raw trace files to DIR\n"
+        "  -R, --trace-retention <H>  Keep trace files for H hours (default: 24)\n"
+        "\n"
         "Other:\n"
         "  -v, --verbose         Verbose output to stderr\n"
         "  -h, --help            Show this help\n"
@@ -138,9 +142,11 @@ static struct option long_opts[] = {
     {"event",      required_argument, NULL, 'e'},
     {"pid-filter", required_argument, NULL, 'P'},
     {"query-id",   required_argument, NULL, 'Q'},
-    {"sort",         required_argument, NULL, 'S'},
-    {"verbose",      no_argument,       NULL, 'v'},
-    {"help",         no_argument,       NULL, 'h'},
+    {"sort",            required_argument, NULL, 'S'},
+    {"trace-dir",       required_argument, NULL, 'T'},
+    {"trace-retention", required_argument, NULL, 'R'},
+    {"verbose",         no_argument,       NULL, 'v'},
+    {"help",            no_argument,       NULL, 'h'},
     {NULL, 0, NULL, 0},
 };
 
@@ -163,7 +169,7 @@ int main(int argc, char **argv)
     bool format_set = false;
     int opt;
 
-    while ((opt = getopt_long(argc, argv, "p:D:i:d:V:f:n:w:e:P:Q:S:vh", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:D:i:d:V:f:n:w:e:P:Q:S:T:R:vh", long_opts, NULL)) != -1) {
         switch (opt) {
         case 'p': pm_pid = atoi(optarg); break;
         case 'D': pgdata = optarg; break;
@@ -182,6 +188,8 @@ int main(int argc, char **argv)
         case 'P': d->pid_filter = atoi(optarg); break;
         case 'Q': d->query_id_filter = strtoull(optarg, NULL, 10); break;
         case 'S': d->sort_mode = parse_sort(optarg); break;
+        case 'T': d->trace_dir = optarg; break;
+        case 'R': d->trace_retention = atoi(optarg); break;
         case 'v': d->verbose = true; break;
         case 'h': usage(argv[0]); free(d); return 0;
         default:  usage(argv[0]); free(d); return 1;

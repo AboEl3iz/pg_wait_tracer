@@ -4,6 +4,7 @@
 
 #include "pg_wait_tracer.h"
 #include "backend.h"
+#include "event_writer.h"
 #include "map_reader.h"
 #include "snapshot.h"
 
@@ -69,6 +70,11 @@ struct pgwt_daemon {
     int         tick;                /* current interval number */
     uint64_t    query_id_filter;     /* filter query_event to one query, 0 = no filter */
     enum pgwt_sort_mode sort_mode;   /* sort mode for active view */
+
+    /* Trace file recording */
+    const char *trace_dir;                  /* NULL = disabled */
+    int         trace_retention;            /* hours, default 24 */
+    struct pgwt_event_writer *event_writer; /* NULL if disabled */
 
     /* Time windows */
 #define PGWT_MAX_WINDOWS 3

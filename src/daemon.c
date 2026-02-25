@@ -2,6 +2,7 @@
 #include "daemon.h"
 #include "backend.h"
 #include "event_stream.h"
+#include "event_writer.h"
 #include "map_reader.h"
 #include "output.h"
 #include "perf_event.h"
@@ -80,6 +81,13 @@ static void handle_timer(struct pgwt_daemon *d)
         break;
     }
     fflush(stdout);
+
+    /* Trace file: check hourly rotation, periodic cleanup */
+    if (d->event_writer) {
+        pgwt_writer_check_rotation(d->event_writer);
+        if (d->tick > 0 && d->tick % 60 == 0)
+            pgwt_writer_cleanup_old_files(d->event_writer);
+    }
 
     d->tick++;
     if (d->count > 0 && d->tick >= d->count)
@@ -174,6 +182,27 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
         fprintf(stderr, "FATAL: cannot create event ring buffer: %s\n",
                 strerror(errno));
         goto fail;
+    }
+
+    /* Init trace file writer (opt-in via --trace-dir) */
+    if (d->trace_dir) {
+        d->event_writer = calloc(1, sizeof(*d->event_writer));
+        if (!d->event_writer) {
+            fprintf(stderr, "FATAL: cannot allocate event writer\n");
+            goto fail;
+        }
+        int ret = d->trace_retention > 0 ? d->trace_retention : 24;
+        if (pgwt_writer_init(d->event_writer, d->trace_dir,
+                             d->pg_major_version, ret) != 0) {
+            fprintf(stderr, "FATAL: cannot initialize trace writer\n");
+            free(d->event_writer);
+            d->event_writer = NULL;
+            goto fail;
+        }
+        d->event_writer->verbose = d->verbose;
+        if (d->verbose)
+            fprintf(stderr, "INFO: trace writer: %s (retention %dh)\n",
+                    d->trace_dir, ret);
     }
 
     /* Scan existing backends (tracepoints are already attached,
@@ -301,6 +330,13 @@ int pgwt_daemon_run(struct pgwt_daemon *d)
 
 void pgwt_daemon_cleanup(struct pgwt_daemon *d)
 {
+    if (d->event_writer) {
+        pgwt_writer_close(d->event_writer);
+        pgwt_writer_destroy(d->event_writer);
+        free(d->event_writer);
+        d->event_writer = NULL;
+    }
+
     pgwt_ring_free(&d->ring);
     pgwt_close_all_backends(&d->backends);
 

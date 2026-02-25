@@ -5,7 +5,7 @@ CC       ?= gcc
 CFLAGS    = -g -O2 -Wall -I../src -I../include
 BUILD     = ../build
 
-TESTS     = test_wait_event test_cmdline
+TESTS     = test_wait_event test_cmdline test_event_writer
 
 .PHONY: all clean
 
@@ -16,6 +16,9 @@ test_wait_event: test_wait_event.c $(BUILD)/wait_event.o
 
 test_cmdline: test_cmdline.c $(BUILD)/cmdline.o
 	$(CC) $(CFLAGS) -o $@ $^
+
+test_event_writer: test_event_writer.c $(BUILD)/event_writer.o
+	$(CC) $(CFLAGS) -o $@ $^ -llz4
 
 clean:
 	rm -f $(TESTS)
