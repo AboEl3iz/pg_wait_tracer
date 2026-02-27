@@ -17,6 +17,7 @@ const LOCK_TRANSACTIONID: u32 = 0x03000005; // Lock:transactionid (index 5)
 const LWLOCK_WAL_INSERT: u32 = 0x0100003D;  // LWLock:WALInsert (index 61)
 const CLIENT_READ: u32 = 0x06000000;        // Client:ClientRead (index 0)
 const TIMEOUT_PG_SLEEP: u32 = 0x09000002;   // Timeout:PgSleep (index 2)
+const IPC_EXECUTE_GATHER: u32 = 0x0800000D;  // IPC:ExecuteGather (index 13)
 const ACTIVITY_IDLE: u32 = 0x05000001;      // Activity:AutovacuumMain (index 1)
 
 fn encode_varint(val: u64, out: &mut Vec<u8>) {
@@ -110,30 +111,55 @@ pub fn generate_test_file(path: &Path) -> io::Result<()> {
         456789012345678,
     ];
 
-    // Event distribution (weighted):
-    // CPU 30%, IO:DataFileRead 25%, Lock:transactionid 15%, LWLock:WALInsert 10%,
-    // IO:DataFileWrite 5%, Client:ClientRead 5%, Timeout:PgSleep 2%, Activity 8%
-    let event_pool: Vec<(u32, u64)> = vec![
-        // (event_id, avg_duration_ns)
-        (CPU, 200_000),                    // 200us avg
-        (CPU, 150_000),
-        (CPU, 300_000),
-        (IO_DATA_FILE_READ, 400_000),      // 400us avg
-        (IO_DATA_FILE_READ, 800_000),
-        (IO_DATA_FILE_WRITE, 300_000),
-        (LOCK_TRANSACTIONID, 5_000_000),     // 5ms avg
-        (LOCK_TRANSACTIONID, 50_000_000),    // 50ms some long ones
-        (LWLOCK_WAL_INSERT, 100_000),      // 100us avg
-        (CLIENT_READ, 1_000_000),          // 1ms avg
-        (TIMEOUT_PG_SLEEP, 200_000_000),   // 200ms
-        (ACTIVITY_IDLE, 500_000_000),      // 500ms idle
+    // Realistic OLTP workload: CPU and IO dominate, Lock spikes in middle
+    //
+    // Durations represent time between wait-state transitions (10-50ms for CPU
+    // means a backend ran queries for that long before hitting IO/lock/etc).
+    //
+    // Normal phase (first & last third): AAS ~1.7
+    //   CPU ~70% of DB time, IO ~20%, rest ~10%
+    // Contention phase (middle third): AAS ~3.3
+    //   Lock surges as hot-row contention kicks in
+    //
+    // Pool entries: (event_id, avg_duration_ns) — repeated for weight
+    let normal_pool: Vec<(u32, u64)> = vec![
+        // CPU: 6 entries (query execution, parsing, planning)
+        (CPU, 15_000_000),                 // 15ms
+        (CPU, 25_000_000),                 // 25ms
+        (CPU, 35_000_000),                 // 35ms
+        (CPU, 50_000_000),                 // 50ms (complex join)
+        (CPU, 20_000_000),                 // 20ms
+        (CPU, 30_000_000),                 // 30ms
+        // IO: 5 entries (heap reads, index scans, checkpoint writes)
+        (IO_DATA_FILE_READ, 5_000_000),    // 5ms (cached)
+        (IO_DATA_FILE_READ, 12_000_000),   // 12ms (uncached)
+        (IO_DATA_FILE_READ, 25_000_000),   // 25ms (seq scan page)
+        (IO_DATA_FILE_WRITE, 4_000_000),   // 4ms
+        (IO_DATA_FILE_WRITE, 10_000_000),  // 10ms
+        // LWLock: 2 entries (WAL insert, buffer mapping)
+        (LWLOCK_WAL_INSERT, 1_000_000),    // 1ms
+        (LWLOCK_WAL_INSERT, 4_000_000),    // 4ms
+        // Lock: 1 entry (light row contention)
+        (LOCK_TRANSACTIONID, 5_000_000),   // 5ms
+        // Client: 1 entry (app round-trip)
+        (CLIENT_READ, 3_000_000),          // 3ms
+        // IPC: 1 entry (parallel query gather)
+        (IPC_EXECUTE_GATHER, 2_000_000),   // 2ms
+    ];
+
+    // Contention phase: Lock events with long durations (hot-row updates)
+    let lock_spike_pool: Vec<(u32, u64)> = vec![
+        (LOCK_TRANSACTIONID, 15_000_000),  // 15ms
+        (LOCK_TRANSACTIONID, 30_000_000),  // 30ms
+        (LOCK_TRANSACTIONID, 60_000_000),  // 60ms
+        (LOCK_TRANSACTIONID, 100_000_000), // 100ms (blocked on long tx)
     ];
 
     let mut events = Vec::new();
     let mut ts = start_mono_ns;
 
-    // Generate ~50000 events over 30 minutes
-    let total_events = 50_000usize;
+    // 200K events over 30 min — dense enough for AAS ~1.7 normal, ~3.3 spike
+    let total_events = 200_000usize;
     let time_span_ns = 1800_000_000_000u64; // 30 minutes
     let time_step = time_span_ns / total_events as u64;
 
@@ -146,30 +172,26 @@ pub fn generate_test_file(path: &Path) -> io::Result<()> {
     };
 
     for i in 0..total_events {
-        let r = cheap_random();
-        let pool_idx = (r % event_pool.len() as u64) as usize;
-        let (event_id, base_dur) = event_pool[pool_idx];
+        let in_spike = i > total_events / 3 && i < 2 * total_events / 3;
+
+        // During spike: 40% of events come from lock_spike_pool
+        let (event_id, base_dur) = if in_spike && cheap_random() % 5 < 2 {
+            let idx = (cheap_random() % lock_spike_pool.len() as u64) as usize;
+            lock_spike_pool[idx]
+        } else {
+            let idx = (cheap_random() % normal_pool.len() as u64) as usize;
+            normal_pool[idx]
+        };
 
         // Add jitter to duration (0.5x to 2x)
         let jitter = (cheap_random() % 150 + 50) as f64 / 100.0;
         let duration = (base_dur as f64 * jitter) as u64;
 
         let pid = pids[(cheap_random() % pids.len() as u64) as usize];
-        let qid = if event_id == ACTIVITY_IDLE || event_id == CPU {
-            if cheap_random() % 3 == 0 { 0 } else { query_ids[(cheap_random() % query_ids.len() as u64) as usize] }
+        let qid = if event_id == CPU {
+            query_ids[(cheap_random() % query_ids.len() as u64) as usize]
         } else {
             query_ids[(cheap_random() % query_ids.len() as u64) as usize]
-        };
-
-        // Simulate a "spike" in the middle third (Lock:transactionid heavy)
-        let event_id = if i > total_events / 3 && i < 2 * total_events / 3 {
-            if cheap_random() % 3 == 0 {
-                LOCK_TRANSACTIONID
-            } else {
-                event_id
-            }
-        } else {
-            event_id
         };
 
         events.push(Event {
