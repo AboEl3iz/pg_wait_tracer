@@ -497,7 +497,7 @@ fn draw(app: &mut App, frame: &mut Frame) {
                 let pw = body_rect.width as u32 * font_w.max(1) as u32;
                 let ph = body_rect.height as u32 * font_h.max(1) as u32;
                 let img = chart::chart_body_image(&aas, pw, ph);
-                let dyn_img = image::DynamicImage::ImageRgb8(img);
+                let dyn_img = image::DynamicImage::ImageRgba8(img);
                 let mut state = picker.new_resize_protocol(dyn_img);
                 frame.render_stateful_widget(
                     StatefulImage::default(),

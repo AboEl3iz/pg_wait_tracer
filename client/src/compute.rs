@@ -140,7 +140,7 @@ pub fn compute_time_model(events: &[TraceEvent], filters: &Filters, wall_ms: f64
 
             for ((_cls, _eid), &sub_ms) in sub_events.iter().take(3) {
                 let sub_pct = if db_time_ms > 0.0 { sub_ms / db_time_ms * 100.0 } else { 0.0 };
-                if sub_pct < 1.0 {
+                if sub_pct < 0.1 {
                     break;
                 }
                 rows.push(TimeModelRow {

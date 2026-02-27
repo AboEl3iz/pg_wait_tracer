@@ -5,7 +5,7 @@
 //! - **Half-block** (fallback): '▄' technique for 2× vertical resolution
 
 use ratatui::prelude::*;
-use image::{RgbImage, Rgb};
+use image;
 use crate::compute::{AasBucketResult, NUM_WAIT_CLASSES};
 
 // -- Color palette (ASH-style) ------------------------------------------------
@@ -60,9 +60,9 @@ pub fn chart_body_rect(area: Rect) -> Rect {
     }
 }
 
-/// Render the stacked bar chart body as a pixel image.
-pub fn chart_body_image(result: &AasBucketResult, width: u32, height: u32) -> RgbImage {
-    let mut img = RgbImage::from_pixel(width, height, Rgb([255, 255, 255]));
+/// Render the stacked bar chart body as a pixel image with transparent background.
+pub fn chart_body_image(result: &AasBucketResult, width: u32, height: u32) -> image::RgbaImage {
+    let mut img = image::RgbaImage::from_pixel(width, height, image::Rgba([0, 0, 0, 0]));
     let nbuckets = result.buckets.len();
     if nbuckets == 0 || height == 0 || width == 0 {
         return img;
@@ -84,7 +84,8 @@ pub fn chart_body_image(result: &AasBucketResult, width: u32, height: u32) -> Rg
             cum += aas;
             let y_top = height - ((cum / max_aas) * height as f64).min(height as f64) as u32;
 
-            let color = Rgb(CLASS_COLORS_RGB[class_idx]);
+            let c = CLASS_COLORS_RGB[class_idx];
+            let color = image::Rgba([c[0], c[1], c[2], 255]);
             for x in x0..x1.min(width) {
                 for y in y_top..y_bottom.min(height) {
                     img.put_pixel(x, y, color);
