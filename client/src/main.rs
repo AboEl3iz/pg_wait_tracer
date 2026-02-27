@@ -468,7 +468,7 @@ fn draw(app: &App, frame: &mut Frame) {
         .constraints([
             Constraint::Length(1),  // header
             Constraint::Length(1),  // tabs
-            Constraint::Length(12), // chart
+            Constraint::Length(20), // chart
             Constraint::Min(5),    // main content
             Constraint::Length(1),  // footer
         ])
