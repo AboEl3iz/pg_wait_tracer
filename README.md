@@ -10,6 +10,9 @@ Key capabilities:
 
 - **6 diagnostic views**: time_model, system_event, session_event, histogram,
   query_event, active
+- **Interactive investigation client** (`pgwt-cli`): Rust TUI with AAS stacked
+  bar chart, drill-down navigation, and pixel-perfect rendering on supported
+  terminals (iTerm2, Kitty, WezTerm, Sixel)
 - **Multi-window analysis**: compare wait profiles across time horizons
   (e.g. last 5s vs 1m vs 5m)
 - **Daemon mode**: persistent monitoring with automatic re-attach on
@@ -42,6 +45,9 @@ sudo ./pg_wait_tracer --daemon -T /var/lib/pgwt/traces
 
 # Offline replay: analyze last hour from trace files (no root needed)
 pg_wait_tracer --replay -T /var/lib/pgwt/traces --from 1h
+
+# Investigation client: interactive TUI with AAS chart (no root needed)
+pgwt-cli /var/lib/pgwt/traces
 ```
 
 ## Operating Modes
@@ -111,7 +117,64 @@ pg_wait_tracer --replay -T /var/lib/pgwt/traces --from 2h \
   BPF state_map to read current wait states).
 - `current.trace` (the file being written by the daemon) has no footer and
   cannot be read by replay. Only rotated `.trace.lz4` files are readable.
+  (The investigation client `pgwt-cli` *can* read `current.trace` — see below.)
 - Output format is always `text` in replay mode.
+
+### Investigation Client (`pgwt-cli`)
+
+A separate Rust-based TUI for interactive drill-down analysis of trace files.
+Unlike the C replay mode, `pgwt-cli` provides:
+
+- **AAS (Average Active Sessions) stacked bar chart** — shows wait class
+  distribution over time with color-coded bars. Uses pixel-perfect rendering
+  on terminals that support iTerm2/Sixel/Kitty graphics protocols, with
+  half-block Unicode fallback on standard terminals.
+- **4 drill-down views**: Overview (time model), Events, Sessions, Queries
+- **Filter & pivot navigation**: Enter to drill into a class/event/session,
+  Esc to go back, `\` to clear all filters
+- **Live trace reading**: reads `current.trace` (the active file being written
+  by the daemon) by scanning blocks sequentially, in addition to rotated
+  `.trace.lz4` files
+
+```bash
+# View trace files interactively (no root needed)
+pgwt-cli /var/lib/pgwt/traces
+
+# Generate synthetic test data for demo/development
+pgwt-cli /tmp/test --generate-test
+pgwt-cli /tmp/test
+
+# Print summary to stdout (no TUI)
+pgwt-cli /var/lib/pgwt/traces --dump
+```
+
+**Keyboard shortcuts:**
+
+| Key | Action |
+|-----|--------|
+| `Enter` | Drill down (filter to selected row, pivot to next view) |
+| `Esc` / `Backspace` | Drill back (undo last filter) |
+| `o` / `e` / `s` / `r` | Switch view: Overview / Events / Sessions / Queries |
+| `j` / `k` or arrows | Move cursor up/down |
+| `\` | Clear all filters |
+| `q` | Quit |
+
+**Wait class colors (AAS chart):**
+
+| Class | Color |
+|-------|-------|
+| CPU | Green |
+| IO | Blue |
+| Lock | Red |
+| LwLock | Pink |
+| IPC | Cyan |
+| Client | Yellow |
+| Timeout | Orange |
+| BufferPin | Teal |
+| Activity | Purple |
+| Extension | Light purple |
+
+See [INSTALL.md](INSTALL.md) for build instructions.
 
 ## CLI Reference
 
@@ -626,8 +689,8 @@ events to disk in a columnar, LZ4-compressed format.
 
 ### File lifecycle
 
-- **Active file**: `current.trace` — being written, no footer, not readable
-  by the reader.
+- **Active file**: `current.trace` — being written, no footer. Not readable
+  by the C replay mode, but readable by `pgwt-cli` (streaming reader).
 - **Rotation**: Every calendar hour, the current file is finalized (footer
   written) and renamed to `YYYY-MM-DD_HH.trace.lz4`.
 - **Retention**: Files older than `--trace-retention` hours are deleted.

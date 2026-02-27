@@ -188,9 +188,27 @@ cd client
 cargo build --release
 ```
 
-This produces `client/target/release/pgwt-cli`. The client reads `.trace.lz4`
-files produced by the daemon and provides an interactive TUI for investigation.
+This produces `client/target/release/pgwt-cli`. The client reads trace files
+produced by the daemon (both rotated `.trace.lz4` and the live `current.trace`)
+and provides an interactive TUI with an AAS stacked bar chart for investigation.
 It does not require root or a running PostgreSQL instance.
+
+**Pixel-perfect chart rendering:** On terminals that support graphics protocols
+(iTerm2, Kitty, WezTerm, foot, Sixel-capable terminals), the AAS chart renders
+as true pixel graphics. On standard terminals, it falls back to half-block
+Unicode characters. Protocol detection is automatic.
+
+```bash
+# Quick test with synthetic data
+./client/target/release/pgwt-cli /tmp/test --generate-test
+./client/target/release/pgwt-cli /tmp/test
+
+# Analyze real traces (works while daemon is running)
+./client/target/release/pgwt-cli /var/lib/pgwt/traces
+
+# Non-interactive summary
+./client/target/release/pgwt-cli /var/lib/pgwt/traces --dump
+```
 
 ## Quick Test
 
