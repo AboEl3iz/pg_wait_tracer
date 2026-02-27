@@ -14,6 +14,8 @@ use crossterm::execute;
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 
+use ratatui_image::{picker::Picker, StatefulImage};
+
 use compute::Filters;
 
 // -- CLI args ----------------------------------------------------------------
@@ -84,6 +86,7 @@ struct App {
     drill_stack: Vec<DrillEntry>,
 
     should_quit: bool,
+    picker: Option<Picker>,
 }
 
 impl App {
@@ -102,6 +105,7 @@ impl App {
             cursor: 0,
             drill_stack: Vec::new(),
             should_quit: false,
+            picker: None,
         }
     }
 
@@ -462,7 +466,7 @@ fn render_footer(area: Rect, buf: &mut Buffer) {
         .render(area, buf);
 }
 
-fn draw(app: &App, frame: &mut Frame) {
+fn draw(app: &mut App, frame: &mut Frame) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -484,8 +488,32 @@ fn draw(app: &App, frame: &mut Frame) {
             &app.events, &app.filters,
             app.time_from_ns, app.time_to_ns, chart_width,
         );
-        chart::AasChart::new(&aas, app.time_from_ns, app.time_to_ns)
-            .render(chunks[2], frame.buffer_mut());
+
+        if let Some(ref picker) = app.picker {
+            // Pixel rendering (iTerm2 / Sixel / Kitty)
+            let body_rect = chart::chart_body_rect(chunks[2]);
+            if body_rect.width > 0 && body_rect.height > 0 {
+                let (font_w, font_h) = picker.font_size();
+                let pw = body_rect.width as u32 * font_w.max(1) as u32;
+                let ph = body_rect.height as u32 * font_h.max(1) as u32;
+                let img = chart::chart_body_image(&aas, pw, ph);
+                let dyn_img = image::DynamicImage::ImageRgb8(img);
+                let mut state = picker.new_resize_protocol(dyn_img);
+                frame.render_stateful_widget(
+                    StatefulImage::default(),
+                    body_rect,
+                    &mut state,
+                );
+            }
+            chart::render_chart_decorations(
+                &aas, app.time_from_ns, app.time_to_ns,
+                chunks[2], frame.buffer_mut(),
+            );
+        } else {
+            // Fallback: half-block rendering
+            chart::AasChart::new(&aas, app.time_from_ns, app.time_to_ns)
+                .render(chunks[2], frame.buffer_mut());
+        }
     }
 
     match app.view {
@@ -566,12 +594,16 @@ fn main() -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
+
+    // Detect graphics protocol (must be after EnterAlternateScreen, before event loop)
+    app.picker = Picker::from_query_stdio().ok();
+
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     // Event loop
     loop {
-        terminal.draw(|frame| draw(&app, frame))?;
+        terminal.draw(|frame| draw(&mut app, frame))?;
 
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {

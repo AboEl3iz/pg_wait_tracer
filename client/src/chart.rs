@@ -1,9 +1,11 @@
-//! AAS stacked bar chart widget with half-block rendering.
+//! AAS stacked bar chart widget.
 //!
-//! Uses the '▄' (lower half block) technique to achieve 2× vertical resolution.
-//! Each terminal cell represents two virtual rows, allowing smooth stacked bars.
+//! Two rendering paths:
+//! - **Pixel**: true pixel rendering via ratatui-image (iTerm2/Sixel/Kitty)
+//! - **Half-block** (fallback): '▄' technique for 2× vertical resolution
 
 use ratatui::prelude::*;
+use image::{RgbImage, Rgb};
 use crate::compute::{AasBucketResult, NUM_WAIT_CLASSES};
 
 // -- Color palette (ASH-style) ------------------------------------------------
@@ -27,7 +29,110 @@ const CLASS_LABELS: [&str; NUM_WAIT_CLASSES] = [
     "BufferPin", "Activity", "Extension", "Unknown",
 ];
 
+const CLASS_COLORS_RGB: [[u8; 3]; NUM_WAIT_CLASSES] = [
+    [80, 250, 123],   // 0 Cpu: green
+    [30, 100, 255],   // 1 Io: vivid blue
+    [255, 85, 85],    // 2 Lock: red
+    [255, 121, 198],  // 3 LwLock: pink
+    [0, 200, 255],    // 4 Ipc: cyan
+    [255, 220, 100],  // 5 Client: yellow
+    [255, 165, 0],    // 6 Timeout: orange
+    [0, 210, 180],    // 7 BufferPin: teal
+    [150, 100, 255],  // 8 Activity: purple
+    [190, 150, 255],  // 9 Extension: light purple
+    [180, 180, 180],  // 10 Unknown: gray
+];
+
 const Y_AXIS_W: u16 = 6; // 5 chars for label + 1 for '│'
+
+// -- Pixel chart rendering ----------------------------------------------------
+
+/// Return the sub-rect for the chart body (excluding y-axis, x-axis, legend).
+pub fn chart_body_rect(area: Rect) -> Rect {
+    if area.width < 12 || area.height < 5 {
+        return Rect::default();
+    }
+    Rect {
+        x: area.x + Y_AXIS_W,
+        y: area.y,
+        width: area.width.saturating_sub(Y_AXIS_W + 1),
+        height: area.height.saturating_sub(2),
+    }
+}
+
+/// Render the stacked bar chart body as a pixel image.
+pub fn chart_body_image(result: &AasBucketResult, width: u32, height: u32) -> RgbImage {
+    let mut img = RgbImage::from_pixel(width, height, Rgb([0, 0, 0]));
+    let nbuckets = result.buckets.len();
+    if nbuckets == 0 || height == 0 || width == 0 {
+        return img;
+    }
+
+    let max_aas = result.max_aas.max(0.01);
+    let col_w = width as f64 / nbuckets as f64;
+
+    for (i, bucket) in result.buckets.iter().enumerate() {
+        let x0 = (i as f64 * col_w) as u32;
+        let x1 = (((i + 1) as f64) * col_w) as u32;
+
+        let mut cum = 0.0f64;
+        for class_idx in 0..NUM_WAIT_CLASSES {
+            let aas = bucket.class_aas[class_idx];
+            if aas <= 0.0 { continue; }
+
+            let y_bottom = height - ((cum / max_aas) * height as f64).min(height as f64) as u32;
+            cum += aas;
+            let y_top = height - ((cum / max_aas) * height as f64).min(height as f64) as u32;
+
+            let color = Rgb(CLASS_COLORS_RGB[class_idx]);
+            for x in x0..x1.min(width) {
+                for y in y_top..y_bottom.min(height) {
+                    img.put_pixel(x, y, color);
+                }
+            }
+        }
+    }
+
+    img
+}
+
+/// Render chart text decorations (y-axis, x-axis labels, legend) — used with pixel path.
+pub fn render_chart_decorations(
+    result: &AasBucketResult,
+    from_ns: u64,
+    to_ns: u64,
+    area: Rect,
+    buf: &mut Buffer,
+) {
+    if area.width < 12 || area.height < 5 { return; }
+
+    let body_height = area.height.saturating_sub(2) as usize;
+    let body_width = area.width.saturating_sub(Y_AXIS_W + 1) as usize;
+    let body_x = area.x + Y_AXIS_W;
+    let xaxis_y = area.y + body_height as u16;
+    let legend_y = xaxis_y + 1;
+
+    let max_aas = if result.max_aas > 0.0 { result.max_aas } else { 1.0 };
+
+    // Y-axis separator
+    for row in 0..body_height {
+        set_cell(buf, area.x + Y_AXIS_W - 1, area.y + row as u16,
+                 '│', Style::new().fg(Color::DarkGray));
+    }
+
+    // Y-axis labels
+    render_y_label(buf, area.x, area.y, max_aas);
+    if body_height > 2 {
+        render_y_label(buf, area.x, area.y + (body_height / 2) as u16, max_aas / 2.0);
+    }
+    render_y_label(buf, area.x, area.y + (body_height - 1) as u16, 0.0);
+
+    // X-axis
+    render_x_axis(buf, body_x, xaxis_y, body_width, from_ns, to_ns);
+
+    // Legend
+    render_legend(buf, area.x, legend_y, area.width as usize, result);
+}
 
 // -- Half-block class color lookup --------------------------------------------
 
