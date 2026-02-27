@@ -4,7 +4,7 @@
 //! and optional filters, and produce sorted result rows for display.
 
 use std::collections::HashMap;
-use crate::trace::{TraceEvent, class_name, is_idle_event, we_class};
+use crate::trace::{TraceEvent, class_name, event_name, is_idle_event, we_class};
 
 // -- Filter ------------------------------------------------------------------
 
@@ -144,7 +144,7 @@ pub fn compute_time_model(events: &[TraceEvent], filters: &Filters, wall_ms: f64
                     break;
                 }
                 rows.push(TimeModelRow {
-                    name: format!("0x{:08X}", _eid), // TODO: event name lookup
+                    name: event_name(*_eid),
                     time_ms: sub_ms,
                     pct_db_time: sub_pct,
                     aas: if wall_ms > 0.0 { sub_ms / wall_ms } else { 0.0 },
@@ -212,7 +212,7 @@ pub fn compute_top_events(events: &[TraceEvent], filters: &Filters, wall_ms: f64
             let name = if eid == 0 {
                 "CPU*".to_string()
             } else {
-                format!("{}:0x{:04X}", class_name(eid), eid & 0x00FFFFFF)
+                event_name(eid)
             };
             EventRow {
                 event_id: eid,
@@ -295,7 +295,7 @@ pub fn compute_top_sessions(events: &[TraceEvent], filters: &Filters, _wall_ms: 
             let top_wait = if top_wait_id == 0 {
                 "CPU*".to_string()
             } else {
-                format!("{}:0x{:04X}", class_name(top_wait_id), top_wait_id & 0x00FFFFFF)
+                event_name(top_wait_id)
             };
 
             SessionRow {
@@ -365,7 +365,7 @@ pub fn compute_top_queries(events: &[TraceEvent], filters: &Filters, _wall_ms: f
             let top_wait = if top_wait_id == 0 {
                 "CPU*".to_string()
             } else {
-                format!("{}:0x{:04X}", class_name(top_wait_id), top_wait_id & 0x00FFFFFF)
+                event_name(top_wait_id)
             };
 
             QueryRow {
@@ -390,4 +390,135 @@ pub fn compute_top_queries(events: &[TraceEvent], filters: &Filters, _wall_ms: f
 
     rows.sort_by(|a, b| b.total_ms.partial_cmp(&a.total_ms).unwrap());
     rows
+}
+
+// -- Wait Class (for AAS chart) -----------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum WaitClass {
+    Cpu = 0,
+    Io = 1,
+    Lock = 2,
+    LwLock = 3,
+    Ipc = 4,
+    Client = 5,
+    Timeout = 6,
+    BufferPin = 7,
+    Activity = 8,
+    Extension = 9,
+    Unknown = 10,
+}
+
+pub const NUM_WAIT_CLASSES: usize = 11;
+
+pub fn wait_class(event_id: u32) -> WaitClass {
+    if event_id == 0 {
+        return WaitClass::Cpu;
+    }
+    match we_class(event_id) {
+        0x0A => WaitClass::Io,
+        0x03 => WaitClass::Lock,
+        0x01 => WaitClass::LwLock,
+        0x08 => WaitClass::Ipc,
+        0x06 => WaitClass::Client,
+        0x09 => WaitClass::Timeout,
+        0x04 => WaitClass::BufferPin,
+        0x05 => WaitClass::Activity,
+        0x07 => WaitClass::Extension,
+        _    => WaitClass::Unknown,
+    }
+}
+
+// -- AAS Buckets (for stacked bar chart) --------------------------------------
+
+#[derive(Clone, Debug)]
+pub struct AasBucket {
+    pub start_ns: u64,
+    pub class_aas: [f64; NUM_WAIT_CLASSES],
+}
+
+pub struct AasBucketResult {
+    pub buckets: Vec<AasBucket>,
+    pub bucket_ns: u64,
+    pub max_aas: f64,
+}
+
+pub fn compute_aas_buckets(
+    events: &[TraceEvent],
+    filters: &Filters,
+    from_ns: u64,
+    to_ns: u64,
+    num_buckets: usize,
+) -> AasBucketResult {
+    let range_ns = to_ns.saturating_sub(from_ns);
+    if range_ns == 0 || num_buckets == 0 {
+        return AasBucketResult {
+            buckets: Vec::new(),
+            bucket_ns: 1_000_000_000,
+            max_aas: 0.0,
+        };
+    }
+
+    // bucket_ns = max(1s, ceil(range / num_buckets))
+    let bucket_ns = ((range_ns + num_buckets as u64 - 1) / num_buckets as u64)
+        .max(1_000_000_000);
+    let actual_buckets = ((range_ns + bucket_ns - 1) / bucket_ns) as usize;
+
+    let mut buckets: Vec<AasBucket> = (0..actual_buckets)
+        .map(|i| AasBucket {
+            start_ns: from_ns + i as u64 * bucket_ns,
+            class_aas: [0.0; NUM_WAIT_CLASSES],
+        })
+        .collect();
+
+    for ev in events {
+        if !filters.matches(ev) || is_idle_event(ev.old_event) {
+            continue;
+        }
+        let ev_start = ev.timestamp_ns;
+        let ev_end = ev.timestamp_ns + ev.duration_ns;
+
+        if ev_end <= from_ns || ev_start >= to_ns {
+            continue;
+        }
+
+        let class_idx = wait_class(ev.old_event) as usize;
+        let first_bucket = if ev_start <= from_ns {
+            0
+        } else {
+            ((ev_start - from_ns) / bucket_ns) as usize
+        };
+        let last_bucket = if ev_end >= to_ns {
+            actual_buckets - 1
+        } else {
+            ((ev_end - from_ns).saturating_sub(1) / bucket_ns) as usize
+        };
+        let last_bucket = last_bucket.min(actual_buckets - 1);
+
+        for b in first_bucket..=last_bucket {
+            let b_start = from_ns + b as u64 * bucket_ns;
+            let b_end = b_start + bucket_ns;
+            let overlap_start = ev_start.max(b_start);
+            let overlap_end = ev_end.min(b_end);
+            if overlap_end > overlap_start {
+                buckets[b].class_aas[class_idx] += (overlap_end - overlap_start) as f64;
+            }
+        }
+    }
+
+    // Convert accumulated ns → AAS = accumulated_ns / bucket_ns
+    let mut max_aas: f64 = 0.0;
+    for bucket in &mut buckets {
+        let mut total = 0.0;
+        for v in bucket.class_aas.iter_mut() {
+            *v /= bucket_ns as f64;
+            total += *v;
+        }
+        if total > max_aas {
+            max_aas = total;
+        }
+    }
+
+    AasBucketResult { buckets, bucket_ns, max_aas }
 }

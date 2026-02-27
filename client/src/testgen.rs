@@ -9,15 +9,15 @@ const PGWT_TRACE_VERSION: u16 = 1;
 const PGWT_FLAG_LZ4: u16 = 0x0001;
 const BLOCK_EVENTS: usize = 4096;
 
-// Wait event IDs (class << 24 | event_index)
+// Wait event IDs (class << 24 | event_index) — PG18 indices
 const CPU: u32 = 0x00000000;
-const IO_DATA_FILE_READ: u32 = 0x0A000015;  // IO class (0x0A), event 21
-const IO_DATA_FILE_WRITE: u32 = 0x0A000018; // IO class (0x0A), event 24
-const LOCK_TRANSACTION: u32 = 0x03000007;    // Lock class (0x03), event 7
-const LWLOCK_WAL_INSERT: u32 = 0x01000030;   // LWLock class (0x01), event 48
-const CLIENT_READ: u32 = 0x06000001;         // Client class (0x06), event 1
-const TIMEOUT_PG_SLEEP: u32 = 0x09000006;    // Timeout class (0x09), event 6
-const ACTIVITY_IDLE: u32 = 0x05000001;       // Activity class (0x05)
+const IO_DATA_FILE_READ: u32 = 0x0A000015;  // IO:DataFileRead (index 21)
+const IO_DATA_FILE_WRITE: u32 = 0x0A000018; // IO:DataFileWrite (index 24)
+const LOCK_TRANSACTIONID: u32 = 0x03000005; // Lock:transactionid (index 5)
+const LWLOCK_WAL_INSERT: u32 = 0x0100003D;  // LWLock:WALInsert (index 61)
+const CLIENT_READ: u32 = 0x06000000;        // Client:ClientRead (index 0)
+const TIMEOUT_PG_SLEEP: u32 = 0x09000002;   // Timeout:PgSleep (index 2)
+const ACTIVITY_IDLE: u32 = 0x05000001;      // Activity:AutovacuumMain (index 1)
 
 fn encode_varint(val: u64, out: &mut Vec<u8>) {
     let mut v = val;
@@ -111,7 +111,7 @@ pub fn generate_test_file(path: &Path) -> io::Result<()> {
     ];
 
     // Event distribution (weighted):
-    // CPU 30%, IO:DataFileRead 25%, Lock:Transaction 15%, LWLock:WALInsert 10%,
+    // CPU 30%, IO:DataFileRead 25%, Lock:transactionid 15%, LWLock:WALInsert 10%,
     // IO:DataFileWrite 5%, Client:ClientRead 5%, Timeout:PgSleep 2%, Activity 8%
     let event_pool: Vec<(u32, u64)> = vec![
         // (event_id, avg_duration_ns)
@@ -121,8 +121,8 @@ pub fn generate_test_file(path: &Path) -> io::Result<()> {
         (IO_DATA_FILE_READ, 400_000),      // 400us avg
         (IO_DATA_FILE_READ, 800_000),
         (IO_DATA_FILE_WRITE, 300_000),
-        (LOCK_TRANSACTION, 5_000_000),     // 5ms avg
-        (LOCK_TRANSACTION, 50_000_000),    // 50ms some long ones
+        (LOCK_TRANSACTIONID, 5_000_000),     // 5ms avg
+        (LOCK_TRANSACTIONID, 50_000_000),    // 50ms some long ones
         (LWLOCK_WAL_INSERT, 100_000),      // 100us avg
         (CLIENT_READ, 1_000_000),          // 1ms avg
         (TIMEOUT_PG_SLEEP, 200_000_000),   // 200ms
@@ -161,10 +161,10 @@ pub fn generate_test_file(path: &Path) -> io::Result<()> {
             query_ids[(cheap_random() % query_ids.len() as u64) as usize]
         };
 
-        // Simulate a "spike" in the middle third (Lock:Transaction heavy)
+        // Simulate a "spike" in the middle third (Lock:transactionid heavy)
         let event_id = if i > total_events / 3 && i < 2 * total_events / 3 {
             if cheap_random() % 3 == 0 {
-                LOCK_TRANSACTION
+                LOCK_TRANSACTIONID
             } else {
                 event_id
             }

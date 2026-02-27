@@ -1,3 +1,4 @@
+mod chart;
 mod compute;
 mod testgen;
 mod trace;
@@ -465,24 +466,36 @@ fn draw(app: &App, frame: &mut Frame) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // header
-            Constraint::Length(1), // tabs
-            Constraint::Min(5),   // main content
-            Constraint::Length(1), // footer
+            Constraint::Length(1),  // header
+            Constraint::Length(1),  // tabs
+            Constraint::Length(12), // chart
+            Constraint::Min(5),    // main content
+            Constraint::Length(1),  // footer
         ])
         .split(frame.area());
 
     render_header(app, chunks[0], frame.buffer_mut());
     render_tabs(app, chunks[1], frame.buffer_mut());
 
-    match app.view {
-        View::Overview => render_overview(app, chunks[2], frame.buffer_mut()),
-        View::Events => render_events(app, chunks[2], frame.buffer_mut()),
-        View::Sessions => render_sessions(app, chunks[2], frame.buffer_mut()),
-        View::Queries => render_queries(app, chunks[2], frame.buffer_mut()),
+    // AAS stacked bar chart
+    let chart_width = chunks[2].width.saturating_sub(7) as usize;
+    if chart_width > 0 {
+        let aas = compute::compute_aas_buckets(
+            &app.events, &app.filters,
+            app.time_from_ns, app.time_to_ns, chart_width,
+        );
+        chart::AasChart::new(&aas, app.time_from_ns, app.time_to_ns)
+            .render(chunks[2], frame.buffer_mut());
     }
 
-    render_footer(chunks[3], frame.buffer_mut());
+    match app.view {
+        View::Overview => render_overview(app, chunks[3], frame.buffer_mut()),
+        View::Events => render_events(app, chunks[3], frame.buffer_mut()),
+        View::Sessions => render_sessions(app, chunks[3], frame.buffer_mut()),
+        View::Queries => render_queries(app, chunks[3], frame.buffer_mut()),
+    }
+
+    render_footer(chunks[4], frame.buffer_mut());
 }
 
 // -- Main --------------------------------------------------------------------

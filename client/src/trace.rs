@@ -398,3 +398,216 @@ pub fn load_events(
     all_events.sort_by_key(|e| e.timestamp_ns);
     Ok(all_events)
 }
+
+// -- Wait event name lookup (PG18) --------------------------------------------
+
+static IO_EVENTS: &[&str] = &[
+    "AioIoCompletion", "AioIoUringExecution", "AioIoUringSubmit",
+    "BasebackupRead", "BasebackupSync", "BasebackupWrite",
+    "BufFileRead", "BufFileTruncate", "BufFileWrite",
+    "ControlFileRead", "ControlFileSync", "ControlFileSyncUpdate",
+    "ControlFileWrite", "ControlFileWriteUpdate",
+    "CopyFileCopy", "CopyFileRead", "CopyFileWrite",
+    "DataFileExtend", "DataFileFlush", "DataFileImmediateSync",
+    "DataFilePrefetch", "DataFileRead", "DataFileSync",
+    "DataFileTruncate", "DataFileWrite",
+    "DsmAllocate", "DsmFillZeroWrite",
+    "LockFileAddToDataDirRead", "LockFileAddToDataDirSync",
+    "LockFileAddToDataDirWrite", "LockFileCreateRead",
+    "LockFileCreateSync", "LockFileCreateWrite",
+    "LockFileReCheckDataDirRead",
+    "LogicalRewriteCheckpointSync", "LogicalRewriteMappingSync",
+    "LogicalRewriteMappingWrite", "LogicalRewriteSync",
+    "LogicalRewriteTruncate", "LogicalRewriteWrite",
+    "RelationMapRead", "RelationMapReplace", "RelationMapWrite",
+    "ReorderBufferRead", "ReorderBufferWrite",
+    "ReorderLogicalMappingRead",
+    "ReplicationSlotRead", "ReplicationSlotRestoreSync",
+    "ReplicationSlotSync", "ReplicationSlotWrite",
+    "SlruFlushSync", "SlruRead", "SlruSync", "SlruWrite",
+    "SnapbuildRead", "SnapbuildSync", "SnapbuildWrite",
+    "TimelineHistoryFileSync", "TimelineHistoryFileWrite",
+    "TimelineHistoryRead", "TimelineHistorySync", "TimelineHistoryWrite",
+    "TwophaseFileRead", "TwophaseFileSync", "TwophaseFileWrite",
+    "VersionFileSync", "VersionFileWrite",
+    "WalSenderTimelineHistoryRead",
+    "WalBootstrapSync", "WalBootstrapWrite",
+    "WalCopyRead", "WalCopySync", "WalCopyWrite",
+    "WalInitSync", "WalInitWrite", "WalRead",
+    "WalSummaryRead", "WalSummaryWrite",
+    "WalSync", "WalSyncMethodAssign", "WalWrite",
+];
+
+static LOCK_EVENTS: &[&str] = &[
+    "relation", "extend", "frozenid", "page", "tuple",
+    "transactionid", "virtualxid", "spectoken", "object",
+    "userlock", "advisory", "applytransaction",
+];
+
+static TIMEOUT_EVENTS: &[&str] = &[
+    "BaseBackupThrottle", "CheckpointWriteDelay", "PgSleep",
+    "RecoveryApplyDelay", "RecoveryRetrieveRetryInterval",
+    "RegisterSyncRequest", "SpinDelay", "VacuumDelay",
+    "VacuumTruncate", "WalSummarizerError",
+];
+
+static ACTIVITY_EVENTS: &[&str] = &[
+    "ArchiverMain", "AutovacuumMain", "BgwriterHibernate",
+    "BgwriterMain", "CheckpointerMain", "CheckpointerShutdown",
+    "IoWorkerMain", "LogicalApplyMain", "LogicalLauncherMain",
+    "LogicalParallelApplyMain", "RecoveryWalStream",
+    "ReplicationSlotsyncMain", "ReplicationSlotsyncShutdown",
+    "SysloggerMain", "WalReceiverMain", "WalSenderMain",
+    "WalSummarizerWal", "WalWriterMain",
+];
+
+static CLIENT_EVENTS: &[&str] = &[
+    "ClientRead", "ClientWrite", "GssOpenServer",
+    "LibPQWalReceiverConnect", "LibPQWalReceiverReceive",
+    "SslOpenServer", "WaitForStandbyConfirmation",
+    "WalSenderWaitForWal", "WalSenderWriteData",
+];
+
+static IPC_EVENTS: &[&str] = &[
+    "AppendReady", "ArchiveCleanupCommand", "ArchiveCommand",
+    "BackendTermination", "BackupWaitWalArchive",
+    "BgWorkerShutdown", "BgWorkerStartup", "BtreePage",
+    "BufferIO", "CheckpointDelayComplete", "CheckpointDelayStart",
+    "CheckpointDone", "CheckpointStart", "ExecuteGather",
+    "HashBatchAllocate", "HashBatchElect", "HashBatchLoad",
+    "HashBuildAllocate", "HashBuildElect", "HashBuildHashInner",
+    "HashBuildHashOuter", "HashGrowBatchesDecide",
+    "HashGrowBatchesElect", "HashGrowBatchesFinish",
+    "HashGrowBatchesReallocate", "HashGrowBatchesRepartition",
+    "HashGrowBucketsElect", "HashGrowBucketsReallocate",
+    "HashGrowBucketsReinsert", "LogicalApplySendData",
+    "LogicalParallelApplyStateChange", "LogicalSyncData",
+    "LogicalSyncStateChange", "MessageQueueInternal",
+    "MessageQueuePutMessage", "MessageQueueReceive",
+    "MessageQueueSend", "MultixactCreation", "ParallelBitmapScan",
+    "ParallelCreateIndexScan", "ParallelFinish",
+    "ProcarrayGroupUpdate", "ProcSignalBarrier", "Promote",
+    "RecoveryConflictSnapshot", "RecoveryConflictTablespace",
+    "RecoveryEndCommand", "RecoveryPause",
+    "ReplicationOriginDrop", "ReplicationSlotDrop",
+    "RestoreCommand", "SafeSnapshot", "SyncRep",
+    "WalReceiverExit", "WalReceiverWaitStart",
+    "WalSummaryReady", "XactGroupUpdate",
+];
+
+fn lwlock_name(id: usize) -> Option<&'static str> {
+    match id {
+        1 => Some("ShmemIndex"),
+        2 => Some("OidGen"),
+        3 => Some("XidGen"),
+        4 => Some("ProcArray"),
+        5 => Some("SInvalRead"),
+        6 => Some("SInvalWrite"),
+        7 => Some("WALBufMapping"),
+        8 => Some("WALWrite"),
+        9 => Some("ControlFile"),
+        13 => Some("MultiXactGen"),
+        16 => Some("RelCacheInit"),
+        17 => Some("CheckpointerComm"),
+        18 => Some("TwoPhaseState"),
+        19 => Some("TablespaceCreate"),
+        20 => Some("BtreeVacuum"),
+        21 => Some("AddinShmemInit"),
+        22 => Some("Autovacuum"),
+        23 => Some("AutovacuumSchedule"),
+        24 => Some("SyncScan"),
+        25 => Some("RelationMapping"),
+        27 => Some("NotifyQueue"),
+        28 => Some("SerializableXactHash"),
+        29 => Some("SerializableFinishedList"),
+        30 => Some("SerializablePredicateList"),
+        32 => Some("SyncRep"),
+        33 => Some("BackgroundWorker"),
+        34 => Some("DynamicSharedMemoryControl"),
+        35 => Some("AutoFile"),
+        36 => Some("ReplicationSlotAllocation"),
+        37 => Some("ReplicationSlotControl"),
+        39 => Some("CommitTs"),
+        40 => Some("ReplicationOrigin"),
+        41 => Some("MultiXactTruncation"),
+        43 => Some("LogicalRepWorker"),
+        44 => Some("XactTruncation"),
+        46 => Some("WrapLimitsVacuum"),
+        47 => Some("NotifyQueueTail"),
+        48 => Some("WaitEventCustom"),
+        49 => Some("WALSummarizer"),
+        50 => Some("DSMRegistry"),
+        51 => Some("InjectionPoint"),
+        52 => Some("SerialControl"),
+        53 => Some("AioWorkerSubmissionQueue"),
+        54 => Some("XactBuffer"),
+        55 => Some("CommitTsBuffer"),
+        56 => Some("SubtransBuffer"),
+        57 => Some("MultiXactOffsetBuffer"),
+        58 => Some("MultiXactMemberBuffer"),
+        59 => Some("NotifyBuffer"),
+        60 => Some("SerialBuffer"),
+        61 => Some("WALInsert"),
+        62 => Some("BufferContent"),
+        63 => Some("ReplicationOriginState"),
+        64 => Some("ReplicationSlotIO"),
+        65 => Some("LockFastPath"),
+        66 => Some("BufferMapping"),
+        67 => Some("LockManager"),
+        68 => Some("PredicateLockManager"),
+        69 => Some("ParallelHashJoin"),
+        70 => Some("ParallelBtreeScan"),
+        71 => Some("ParallelQueryDSA"),
+        72 => Some("PerSessionDSA"),
+        73 => Some("PerSessionRecordType"),
+        74 => Some("PerSessionRecordTypmod"),
+        75 => Some("SharedTupleStore"),
+        76 => Some("SharedTidBitmap"),
+        77 => Some("ParallelAppend"),
+        78 => Some("PerXactPredicateList"),
+        79 => Some("PgStatsDSA"),
+        80 => Some("PgStatsHash"),
+        81 => Some("PgStatsData"),
+        82 => Some("LogicalRepLauncherDSA"),
+        83 => Some("LogicalRepLauncherHash"),
+        84 => Some("DSMRegistryDSA"),
+        85 => Some("DSMRegistryHash"),
+        86 => Some("CommitTsSLRU"),
+        87 => Some("MultiXactOffsetSLRU"),
+        88 => Some("MultiXactMemberSLRU"),
+        89 => Some("NotifySLRU"),
+        90 => Some("SerialSLRU"),
+        91 => Some("SubtransSLRU"),
+        92 => Some("XactSLRU"),
+        93 => Some("ParallelVacuumDSA"),
+        94 => Some("AioUringCompletion"),
+        _ => None,
+    }
+}
+
+pub fn event_name(wei: u32) -> String {
+    if wei == 0 {
+        return "CPU".to_string();
+    }
+    let cls = we_class(wei);
+    let id = (wei & 0x00FFFFFF) as usize;
+    let cls_str = class_name(wei);
+
+    let ev = match cls {
+        0x0A => IO_EVENTS.get(id).copied(),
+        0x03 => LOCK_EVENTS.get(id).copied(),
+        0x09 => TIMEOUT_EVENTS.get(id).copied(),
+        0x05 => ACTIVITY_EVENTS.get(id).copied(),
+        0x06 => CLIENT_EVENTS.get(id).copied(),
+        0x08 => IPC_EVENTS.get(id).copied(),
+        0x01 => lwlock_name(id),
+        0x04 => Some("BufferPin"),
+        0x07 => Some("Extension"),
+        _ => None,
+    };
+
+    match ev {
+        Some(name) => format!("{}:{}", cls_str, name),
+        None => format!("{}:id={}", cls_str, id),
+    }
+}
