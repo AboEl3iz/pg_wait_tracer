@@ -75,7 +75,7 @@ sudo dnf install -y postgresql17-server postgresql17-contrib
 sudo /usr/pgsql-17/bin/postgresql-17-setup initdb
 sudo systemctl enable --now postgresql-17
 
-# (Optional) Debug symbols for query_event view
+# (Optional) Debug symbols for query_event view, query text capture, plan_id
 sudo dnf install -y postgresql17-debuginfo
 ```
 
@@ -85,7 +85,7 @@ sudo dnf install -y postgresql17-debuginfo
 # Install PostgreSQL 17 (or 18)
 sudo apt install -y postgresql-17 postgresql-contrib-17
 
-# (Optional) Debug symbols for query_event view
+# (Optional) Debug symbols for query_event view, query text capture, plan_id
 sudo apt install -y postgresql-17-dbgsym
 ```
 
@@ -258,6 +258,21 @@ The `query_event` view requires knowing the offset of `st_query_id` in
 2. **Known offset table** — built-in for PG17/18 on x86_64 (offset=424)
 3. **Disabled** — other views (time_model, system_event, session_event, histogram)
    still work
+
+The same DWARF-based discovery is used for `st_activity` (query text capture)
+and `st_plan_id` (plan identifier, PG18+ only). Installing debug symbols
+enables all three features.
+
+### Plan identifier (st_plan_id) shows 0
+
+PostgreSQL 18 added `st_plan_id` to `PgBackendStatus`, but core PG does not
+compute it automatically. You need a `planner_hook` extension:
+
+- **pg_store_plans** — stores actual plan text indexed by (queryid, planid)
+- **pg_stat_sql_plans** — computes plan hash and stores plan-level stats
+
+Without such an extension, `st_plan_id` remains 0 and the feature is silently
+inactive. On PG17 and earlier, `st_plan_id` does not exist.
 
 ### "Cannot find load base" or "/proc permission denied"
 

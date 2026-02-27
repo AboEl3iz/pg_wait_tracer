@@ -16,7 +16,8 @@ like Oracle ASH. Need to support real DBA investigation workflows.
 - Auto-discover PG instance when only one cluster is running
 - Semi-interactive "top-like" active sessions view (--sort flag, no ncurses)
 - No query text initially — cmdline parsing only for backend info
-- Query text from shared memory: future phase
+- Query text from shared memory: planned (Phase E.2 — `st_activity` via `process_vm_readv`)
+- Plan identifier from shared memory: planned (Phase E.3 — `st_plan_id`, PG18+ only)
 
 ---
 
@@ -529,8 +530,12 @@ replays from start to end.
 
 ## 15. SQL Query Text Exposure
 
+**Decision made**: Option A (shared memory) — read `PgBackendStatus.st_activity`
+via `process_vm_readv()`. Captures the actual running SQL (not normalized).
+See [ROADMAP.md](ROADMAP.md) Phase E.2 for full implementation plan.
+
 Show the currently executing SQL statement for each backend. Two implementation
-approaches to evaluate — decision deferred.
+approaches were evaluated:
 
 ### Where Query Text Appears
 
@@ -648,8 +653,9 @@ int handle_query(struct pt_regs *ctx)
 | Extended query protocol | Handled (always in st_activity) | Needs extra hooks |
 | Consistency with tool | Different pattern (shmem) | Same pattern (BPF) |
 
-**Decision deferred** — evaluate both options when implementing. May depend on
-which PG versions need support and whether debuginfo is reliably available.
+**Decision**: Option A chosen. `st_activity` gives the actual running SQL with real
+parameter values, which is more useful for debugging than normalized queries. We
+deduplicate by `query_id` and keep the first-seen text as representative.
 
 ---
 
@@ -683,38 +689,31 @@ redesign is complete and validated.
 
 ---
 
-## 17. Future: Query Plan Exposure
+## 17. Query Plan Identification
 
-**Idea**: Show the execution plan for currently running queries alongside wait event
-data. A DBA sees a backend stuck on `IO:DataFileRead` and immediately wants to know
-*why* — is it a sequential scan? A bad join? Having the plan available without a
-separate `EXPLAIN` session would be a significant debugging shortcut.
+**Decision made**: Capture `st_plan_id` from `PgBackendStatus` in shared memory (PG18+).
+See [ROADMAP.md](ROADMAP.md) Phase E.3 for full implementation plan.
 
-**Open questions to investigate:**
-- PostgreSQL stores the active plan tree in backend-local memory (`QueryDesc.planstate`).
-  Can we read it from another process via `/proc/PID/mem` or `process_vm_readv()`?
-  The tree uses pointers — we'd need to chase them across process memory.
-- `auto_explain` logs plans but only after query completion. Could we hook into
-  `ExecutorStart` or `ExecutorRun` via eBPF uprobe to capture the plan at execution
-  time? The plan tree is complex — serializing it in BPF is likely impractical.
-- Alternative: hook `ExplainOnePlan()` or the `EXPLAIN` code path to get a text
-  representation, but this only runs when the user explicitly calls `EXPLAIN`.
-- `pg_stat_statements` stores `query_id` → normalized query text but not plans.
-- PG14+ has `pg_stat_plans` (third-party) — could we integrate or learn from it?
-- Simplest useful approach might be: capture `queryId` + basic plan info (node type
-  of the root plan node, estimated vs actual rows) rather than the full plan tree.
+**Key finding**: PostgreSQL 18 added `int64 st_plan_id` to `PgBackendStatus` right
+after `st_query_id`. It's readable from shared memory via the same `process_vm_readv()`
+technique — essentially free (extend existing read by 8 bytes).
 
-**Potential approaches (ranked by feasibility):**
-1. **Minimal**: Show root plan node type (SeqScan/IndexScan/HashJoin/etc.) by reading
-   `QueryDesc.planstate->type` from process memory. Low complexity, immediately useful.
-2. **Medium**: Hook `ExecutorStart` via uprobe, read `PlannedStmt` fields (total_cost,
-   plan node type, relation OIDs). Store in BPF map per PID.
-3. **Full**: Somehow invoke `ExplainPrintPlan()` in the target backend's context.
-   Very complex, likely requires cooperation from the backend (signal + handler).
+**Limitation**: Core PG does **not** compute `planId` automatically. Users need a
+`planner_hook` extension (e.g., `pg_store_plans`, `pg_stat_sql_plans`). Without one,
+`st_plan_id` is always 0. On PG17, the field does not exist.
 
-**Not yet planned as a phase** — needs feasibility research first. Depends on Phase 16
-(query text) being implemented, as plan exposure builds on the same memory-reading or
-uprobe infrastructure.
+**Full execution plans are not feasible** to capture passively:
+- Plan tree is in backend-local memory (complex pointer-chasing structure)
+- Serializing from eBPF is impractical (dozens of node types)
+- `auto_explain` captures actual plans but only to PG log (complex parsing)
+- `pg_store_plans` stores plan text indexed by (queryid, planid) — best option
+  if users want the actual plan text alongside the plan hash
+
+**Practical investigation flow with plan_id**:
+1. See wait time spike in AAS chart
+2. Drill to query causing the spike
+3. See `plan_id` changed at the spike time → plan regression confirmed
+4. Use `pg_store_plans` or `EXPLAIN` to examine the specific plan
 
 ---
 

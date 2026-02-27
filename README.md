@@ -174,7 +174,16 @@ pgwt-cli /var/lib/pgwt/traces --dump
 | Activity | Purple |
 | Extension | Light purple |
 
-See [INSTALL.md](INSTALL.md) for build instructions.
+See [INSTALL.md](INSTALL.md) for build instructions and
+[docs/ROADMAP.md](docs/ROADMAP.md) for the development roadmap.
+
+**Planned features** (see roadmap for details):
+- Query text capture from `st_activity` in shared memory
+- Plan identifier capture (`st_plan_id`, PG18+) for plan regression detection
+- Drill-down filter system (Oracle ASH-style filter+pivot investigation)
+- Time navigation (zoom, shift, click-to-zoom)
+- Histogram view and Activity Over Time view
+- Live mode (connect pgwt-cli to running daemon via Unix socket)
 
 ## CLI Reference
 
