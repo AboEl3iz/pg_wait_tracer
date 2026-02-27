@@ -62,7 +62,7 @@ pub fn chart_body_rect(area: Rect) -> Rect {
 
 /// Render the stacked bar chart body as a pixel image.
 pub fn chart_body_image(result: &AasBucketResult, width: u32, height: u32) -> RgbImage {
-    let mut img = RgbImage::from_pixel(width, height, Rgb([0, 0, 0]));
+    let mut img = RgbImage::from_pixel(width, height, Rgb([255, 255, 255]));
     let nbuckets = result.buckets.len();
     if nbuckets == 0 || height == 0 || width == 0 {
         return img;
