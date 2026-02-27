@@ -181,12 +181,74 @@ silently inactive. Document this clearly.
 
 ---
 
-## Planned: Phase E.4 — Drill-Down & Filter System
+## Planned: Phase E.4 — UX Overhaul (Oracle ASH / RDS PI inspired)
 
-**Goal**: Turn pgwt-cli from a static viewer into an interactive
-investigation tool with Oracle ASH-style filter+pivot workflow.
+**Goal**: Transform pgwt-cli into an Oracle ASH-class investigation tool.
+Based on UX research of Oracle EM Performance Hub, AWS RDS Performance
+Insights, PASH-Viewer, and pg_ash.
 
-### Drill-down chain
+### Design principles (from the gold standard tools)
+
+1. **The chart is the entry point** — every investigation starts with a
+   visual anomaly in the stacked chart
+2. **Time range selection drives everything** — selecting a window filters
+   all detail panels
+3. **Dimensional pivot** — switch what the chart/table breaks down by
+   (wait class, event, SQL, session)
+4. **Progressive drill-down** — each row is clickable, taking you deeper
+5. **CPU line as reference** — horizontal line at CPU core count shows
+   saturation instantly
+
+### E.4a: Chart improvements
+
+**Stacked area chart** (replace current bars):
+- Continuous filled areas instead of discrete bars — better for time-series
+- Each colored band = one wait class, stacked bottom to top
+- Stacking order: CPU → IO → Lock → LwLock → IPC → Client → Timeout →
+  BufferPin → Activity → Extension → Unknown
+
+**Max CPU reference line**:
+- Horizontal dashed line at the number of CPU cores
+- Label: "N vCPUs" on the right edge
+- When total AAS exceeds this line, the system is CPU-saturated
+- CPU count source:
+  - **Daemon**: `sysconf(_SC_NPROCESSORS_ONLN)` → write to trace file header
+  - **Client**: read from trace file header (works for historical analysis
+    from a different machine)
+  - Trace file header change: add `uint16 num_cpus` field, bump version
+  - Fallback for old trace files: `std::thread::available_parallelism()`
+    (local machine)
+
+**Time range indicator**:
+- Overview mini-chart at the top showing the full available time range
+- A highlighted box showing the currently visible window
+- Drag/click to pan (future — keyboard first: `[` `]` `+` `-`)
+
+**Filtered context outline** (Oracle ASH pattern):
+- When a filter is active, draw a dim outline of the total (unfiltered)
+  AAS as context behind the filtered chart
+- DBA sees filtered portion relative to the whole system
+
+### E.4b: Table improvements
+
+**Mini wait-breakdown bars in table rows** (RDS PI pattern):
+- Each row in Events/Sessions/Queries tables gets a small color-coded
+  horizontal bar showing the wait class breakdown for that item
+- Uses the same color palette as the main chart
+- Provides instant visual cross-reference between chart and table
+
+**"Other" rollup row**:
+- Top-N tables show the top 9 items + an "Other" row aggregating the rest
+- Prevents long tail from dominating the view
+- pg_ash uses this pattern with `top 9 + Other`
+
+**Sortable columns**:
+- `Tab` cycles sort column
+- Visual indicator (arrow) on the active sort column
+
+### E.4c: Drill-down & filter system
+
+**Drill-down chain** (Oracle EM canonical pattern):
 
 ```
 Overview (time_model)
@@ -202,29 +264,70 @@ Overview (time_model)
 
 Esc pops back one level. Full history stack maintained.
 
-### Filter system
-
+**Filter system**:
 - `/` opens filter input (text match on event name, PID, query_id)
 - `\` clears all filters
 - Filters are cumulative (AND logic)
-- Active filters shown in status bar: `Filters: class=Lock > event=Lock:Transaction`
+- Active filters shown in status bar:
+  `Filters: class=Lock > event=Lock:Transaction`
+- Removable filter tags (navigate to tag, press Delete)
 
-### Time navigation
+**"Slice by" dimension switch** (RDS PI pattern):
+- `d` key opens dimension picker: Waits / Events / SQL / Sessions
+- Re-renders the chart by the selected dimension
+- Independent of table tab — chart can show waits while table shows SQL
 
-- `[` / `]` shift time window left/right
-- `+` / `-` zoom in/out
-- Chart click to zoom to a specific time range
+### E.4d: Time navigation
 
-### Additional views
+- `[` / `]` shift time window left/right (10% of visible range)
+- `+` / `-` zoom in/out (2x each step)
+- `Home` / `End` jump to start/end of available data
+- Time range shown in header: `14:00:00 — 14:30:00 (30m)`
 
-- **Activity Over Time**: split time range into 10 slots, show AAS + top 3
-  events per slot (identify WHEN the problem happened)
-- **Histogram**: latency distribution with 16 log2 buckets for current
-  filter context
+### E.4e: Additional views
 
-### Sort
+**Histogram**:
+- Latency distribution for current filter context
+- 16 log2 buckets from <1us to >=16ms
+- ASCII bar chart within the table area
+- Shows for the most specific event in the filter stack
 
-- `Tab` cycles sort column in current view
+**Activity Over Time** (Oracle EM pattern):
+- Split selected time range into 10 time slots
+- Show AAS + top 3 events per slot
+- Identify WHEN the problem happened
+- Click/Enter on a slot to zoom to that time range
+
+### E.4f: Implementation order
+
+| Step | What | Impact |
+|------|------|--------|
+| 1 | CPU cores reference line on chart | High — instant saturation indicator |
+| 2 | Stacked area rendering (replace bars) | High — matches all gold standard tools |
+| 3 | Drill-down chain (Enter/Esc) | High — core investigation workflow |
+| 4 | Time navigation (`[]` `+-`) | High — essential for investigation |
+| 5 | Filter system (`/` `\`) | High — cumulative AND filters |
+| 6 | Mini wait-breakdown bars in table rows | Medium — visual cross-reference |
+| 7 | "Other" rollup row | Medium — cleaner tables |
+| 8 | Filtered context outline | Medium — shows context when drilling |
+| 9 | "Slice by" dimension switch | Medium — chart independence from table |
+| 10 | Histogram view | Medium — latency distribution |
+| 11 | Activity Over Time view | Medium — time-slot drill-down |
+| 12 | Sortable columns with indicator | Low — polish |
+| 13 | Time range overview mini-chart | Low — nice to have |
+
+### UX reference sources
+
+- **Oracle EM Performance Hub / ASH Analytics**: stacked area chart,
+  two-tier time slider, click-to-filter, dimensional pivot dropdown,
+  filter tags bar, CPU cores line, load map treemap view
+- **AWS RDS Performance Insights**: "slice by" dropdown, mini wait bars
+  per SQL row, Max vCPU line, top 25 items per dimension tab
+- **PASH-Viewer**: time range selection on chart, Top SQL drill-down,
+  execution plan display
+- **pg_ash**: ASCII stacked bar charts, Unicode block characters for
+  rendering, "Other" rollup in top-N, per-query wait profile,
+  semantic color mapping (green=CPU, blue=IO, red=Lock)
 
 ---
 
