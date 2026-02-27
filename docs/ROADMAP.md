@@ -72,7 +72,187 @@ The centerpiece visual — Average Active Sessions over time.
 
 ---
 
-## Planned: Phase E.2 — Query Text Capture
+## PRIORITY: Phase F — Web Investigation Client
+
+**Goal**: Oracle ASH / RDS Performance Insights-class interactive
+investigation tool with a rich web UI, running on the DBA's laptop and
+connecting to the DB server over SSH.
+
+### Architecture
+
+```
+[DBA laptop]                              [DB server]
+pgwt (Go binary)                          pgwt-server (C binary)
+  ├─ spawns: ssh user@host pgwt-server    ├─ reads trace files (reuses event_reader.c)
+  ├─ localhost HTTP server (net/http)     ├─ computes aggregates (reuses replay.c,
+  ├─ WebSocket bridge: browser ↔ SSH      │   map_reader.c, wait_event.c)
+  ├─ static assets (//go:embed)           └─ JSON lines on stdin/stdout
+  └─ auto-opens browser
+```
+
+**Why this architecture**:
+- Like git/rsync/mosh — spawns real `ssh`, inherits user's `~/.ssh/config`,
+  agent, ProxyJump, known_hosts. Zero auth code.
+- Server side is pure C — reuses existing trace reader and compute code,
+  no new runtime dependencies on DB server
+- Client side is Go — single static binary, stdlib HTTP/embed, trivial
+  cross-compilation (macOS/Linux/Windows)
+- Web frontend (ECharts + JS) gives full interactive charts, mouse
+  interaction, tooltips — all the UX patterns that terminal can't do
+
+**Usage**:
+```bash
+pgwt ssh root@db-server /var/lib/pgwt/traces
+# Browser opens http://localhost:8384 automatically
+```
+
+### F.1: Server side — `pgwt-server` (C)
+
+New binary: `src/server.c` (+ `src/server_compute.c`)
+
+Reuses existing modules directly:
+- `event_reader.c` — trace file reading, LZ4 decompression, block index
+- `replay.c` — event iteration, time range filtering
+- `wait_event.c` — event name resolution (PG17/PG18 tables)
+- `map_reader.c` — accumulator logic
+
+**Protocol** (JSON lines over stdin/stdout):
+
+```
+--> {"cmd":"info"}
+<-- {"from_ns":1709000000,"to_ns":1709036000,"num_events":284000,"num_cpus":8}
+
+--> {"cmd":"aas","from":1709000000,"to":1709003600,"buckets":120,"filters":{}}
+<-- {"buckets":[{"t":1709000000,"cpu":2.1,"io":0.8,"lock":0.3,...},...],
+     "max_aas":4.2}
+
+--> {"cmd":"top_events","from":1709000000,"to":1709003600,"filters":{"class":"IO"}}
+<-- {"rows":[{"event_id":167772161,"name":"IO:DataFileRead","count":4521,
+     "total_ms":892.3,"avg_us":197.4,"max_us":12400,"pct":34.2,"aas":0.25},...],
+     "db_time_ms":2608.1}
+
+--> {"cmd":"top_sessions","from":...,"to":...,"filters":{}}
+<-- {"rows":[{"pid":1234,"db_time_ms":450.2,"cpu_pct":62.1,"top_wait":"IO:DataFileRead"},...]}
+
+--> {"cmd":"top_queries","from":...,"to":...,"filters":{}}
+<-- {"rows":[{"query_id":123456789,"count":891,"total_ms":1200.5,"pct":46.0,
+     "top_wait":"Lock:transactionid"},...]}
+
+--> {"cmd":"time_model","from":...,"to":...,"filters":{}}
+<-- {"db_time_ms":2608.1,"idle_time_ms":45000,"aas":2.61,
+     "classes":[{"name":"CPU","ms":1200,"pct":46.0,"aas":1.2},...],"wall_ms":1000}
+```
+
+**Filters** (all optional, AND logic):
+```json
+{"class":"IO","event_id":167772161,"pid":1234,"query_id":123456789}
+```
+
+**Build**: compiled alongside the daemon by the existing Makefile.
+Linked against same object files. No new dependencies.
+
+### F.2: Client side — `pgwt` (Go)
+
+New directory: `web/` (Go module)
+
+```
+web/
+  ├── main.go          # CLI args, spawn ssh, HTTP server, open browser
+  ├── bridge.go        # WebSocket ↔ SSH stdin/stdout bridge
+  ├── static/          # Embedded web assets
+  │   ├── index.html   # Single-page app
+  │   ├── app.js       # Main application logic
+  │   ├── chart.js     # ECharts stacked area chart
+  │   └── style.css    # Layout and styling
+  ├── go.mod
+  └── go.sum
+```
+
+**Go dependencies** (minimal):
+- `gorilla/websocket` — WebSocket support
+- Everything else is stdlib (`net/http`, `os/exec`, `embed`, `encoding/json`)
+
+**SSH spawning**:
+```go
+cmd := exec.Command("ssh", host, "pgwt-server", traceDir)
+stdin, _  := cmd.StdinPipe()   // send requests
+stdout, _ := cmd.StdoutPipe()  // read responses
+```
+
+**WebSocket bridge**:
+- Browser sends JSON request via WebSocket
+- Go forwards to SSH stdin
+- Go reads JSON response from SSH stdout
+- Go forwards to browser via WebSocket
+- Requests/responses matched by `"id"` field for concurrency
+
+### F.3: Web frontend (HTML + JS + ECharts)
+
+**UX design** (Oracle ASH / RDS Performance Insights inspired):
+
+**Layout**:
+```
+┌──────────────────────────────────────────────┐
+│ pgwt — db-server   14:00–14:30 (30m)  [8cpu] │  header
+├──────────────────────────────────────────────┤
+│ ▓▓▓▓▓▓▓▓▓▓████████▓▓▓▓▓▓░░░░░░░░░░░▓▓▓▓▓▓ │  AAS stacked
+│ ▓▓▓▓▓▓████████████▓▓▓▓░░░░░░░░░░░░░░▓▓▓▓▓▓ │  area chart
+│ ▓▓▓▓████████████▓▓▓▓░░░░░░░░░░░░░░░░░▓▓▓▓▓ │  (ECharts)
+│ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 8 cpu ━━━━━━━ │
+│ ▓▓████████▓▓▓▓░░░░░░░░░░░░░░░░░░░░░░░░░▓▓▓ │
+├──────────────────────────────────────────────┤
+│ Slice by: [Waits ▼]   Filters: class=IO  ✕  │  controls
+├──────────────────────────────────────────────┤
+│ [Overview] [Events] [Sessions] [Queries]     │  tabs
+├──────────────────────────────────────────────┤
+│ #  Wait Event         Count  Total  %DB  AAS │  data table
+│ 1  IO:DataFileRead    4521   892ms  34%  0.25│  (click = drill)
+│ 2  Lock:transaction   1203   450ms  17%  0.13│
+│ ...                                          │
+│ 10 Other (42 events)         120ms   5%  0.03│
+└──────────────────────────────────────────────┘
+```
+
+**Chart features** (ECharts provides all of these):
+- Stacked area chart with 11 wait class colors
+- Brush selection — drag on chart to select time range, all tables update
+- Zoom — mouse wheel or toolbar buttons
+- Max CPU reference line (markLine)
+- Tooltip — hover shows AAS breakdown at that point
+- Filtered context outline — dim unfiltered total behind filtered chart
+- Legend — click to toggle wait classes
+
+**Table features**:
+- Click row to drill down (adds filter, pivots to next view)
+- Breadcrumb trail: `Overview > IO > IO:DataFileRead > PID 1234`
+- "Other" rollup row (top 9 + Other)
+- Mini wait-breakdown color bars per row (inline `<div>` bars)
+- Sortable columns (click header)
+- "Slice by" dropdown: Waits / Events / SQL / Sessions
+
+**Time navigation**:
+- Chart brush select (drag) — primary method
+- Zoom buttons / mouse wheel
+- Reset button (full time range)
+- Time range display in header
+
+### F.4: Implementation order
+
+| Step | What | Deliverable |
+|------|------|-------------|
+| 1 | `pgwt-server` — info + aas commands | C binary, reads traces, JSON stdout |
+| 2 | `pgwt` Go skeleton — SSH + HTTP + WS bridge | Go binary, connects to server |
+| 3 | AAS stacked area chart in browser | ECharts chart with time brush |
+| 4 | `pgwt-server` — all 4 compute commands | time_model, top_events/sessions/queries |
+| 5 | Data tables + drill-down | Click row → filter → next view |
+| 6 | Filters, breadcrumbs, "slice by" | Full investigation workflow |
+| 7 | Polish: CPU line, "Other" row, mini bars | RDS PI-quality UX |
+
+---
+
+## Planned: Phase G — Daemon Enhancements
+
+### G.1: Query Text Capture
 
 **Goal**: Show the actual SQL text alongside `query_id` in the investigation
 client, without requiring pg_stat_statements lookups.
@@ -82,7 +262,7 @@ memory via `process_vm_readv()` when it first sees a new `query_id`. This
 gives the actual running SQL (not normalized — real parameter values), which
 is more useful for debugging than `pg_stat_statements`' normalized form.
 
-### Daemon side
+#### Daemon side
 
 New module: `src/query_text.c`
 
@@ -112,24 +292,20 @@ New module: `src/query_text.c`
    - One line per unique `query_id`
    - Rotated alongside trace files (same retention policy)
 
-### Client side
+#### Server side
 
-New module: `client/src/query_text.rs`
+`pgwt-server` loads `query_texts.jsonl`, serves via `top_queries` response:
+```json
+{"query_id":123,"text":"SELECT * FROM accounts WHERE...","count":891,...}
+```
 
-1. Load `query_texts.jsonl` from trace directory
-2. Build `HashMap<u64, String>` (query_id -> text)
-3. Display truncated text (first 80 chars) in queries table
-4. Full text on drill-down or popup
-
-### Offset discovery
+#### Offset discovery
 
 - `BackendStatusArray + backend_index * sizeof(PgBackendStatus) + st_activity_offset`
 - Backend index = `MyBackendId - 1`
 - `st_activity` is `char[1024]` — null-terminated C string
 
----
-
-## Planned: Phase E.3 — Plan Identifier Capture (PG18+)
+### G.2: Plan Identifier Capture (PG18+)
 
 **Goal**: Capture the execution plan hash per-backend to detect plan changes
 correlated with wait event spikes (plan regression detection).
@@ -139,7 +315,7 @@ in shared memory (right after `st_query_id`). Core PG does **not** compute
 it automatically — it stays 0 unless a `planner_hook` extension populates it.
 There is no `compute_plan_id` GUC. On PG17, `st_plan_id` does not exist.
 
-### PG version matrix
+#### PG version matrix
 
 | PG Version | `st_query_id` | `st_plan_id` | Notes |
 |------------|:---:|:---:|---|
@@ -147,7 +323,7 @@ There is no `compute_plan_id` GUC. On PG17, `st_plan_id` does not exist.
 | 17 | `uint64` | Does not exist | Full wait tracing works |
 | 18+ | `int64` | `int64` (new) | Plan ID requires planner_hook extension |
 
-### Daemon side
+#### Daemon side
 
 1. **Discover `st_plan_id` offset** in `PgBackendStatus`:
    - DWARF: same approach as `st_query_id` / `st_activity`
@@ -161,7 +337,7 @@ There is no `compute_plan_id` GUC. On PG17, `st_plan_id` does not exist.
    - Bump trace file version (v1 -> v2)
    - Reader handles both versions gracefully
 
-### Client side
+#### Server + client side
 
 1. Show `plan_id` column in queries view (when non-zero)
 2. Plan change detection: highlight when same `query_id` has multiple
@@ -169,7 +345,7 @@ There is no `compute_plan_id` GUC. On PG17, `st_plan_id` does not exist.
 3. Investigation flow: wait time spike -> drill to query -> see `plan_id`
    changed at the spike -> plan regression confirmed
 
-### Requirements for non-zero plan_id
+#### Requirements for non-zero plan_id
 
 Users must install a `planner_hook` extension:
 - **pg_stat_sql_plans** — computes plan hash, stores plan-level stats
@@ -181,164 +357,24 @@ silently inactive. Document this clearly.
 
 ---
 
-## Planned: Phase E.4 — UX Overhaul (Oracle ASH / RDS PI inspired)
+## Planned: Phase H — Live Mode
 
-**Goal**: Transform pgwt-cli into an Oracle ASH-class investigation tool.
-Based on UX research of Oracle EM Performance Hub, AWS RDS Performance
-Insights, PASH-Viewer, and pg_ash.
+**Goal**: Connect the web client to a running daemon for real-time streaming.
 
-### Design principles (from the gold standard tools)
-
-1. **The chart is the entry point** — every investigation starts with a
-   visual anomaly in the stacked chart
-2. **Time range selection drives everything** — selecting a window filters
-   all detail panels
-3. **Dimensional pivot** — switch what the chart/table breaks down by
-   (wait class, event, SQL, session)
-4. **Progressive drill-down** — each row is clickable, taking you deeper
-5. **CPU line as reference** — horizontal line at CPU core count shows
-   saturation instantly
-
-### E.4a: Chart improvements
-
-**Stacked area chart** (replace current bars):
-- Continuous filled areas instead of discrete bars — better for time-series
-- Each colored band = one wait class, stacked bottom to top
-- Stacking order: CPU → IO → Lock → LwLock → IPC → Client → Timeout →
-  BufferPin → Activity → Extension → Unknown
-
-**Max CPU reference line**:
-- Horizontal dashed line at the number of CPU cores
-- Label: "N vCPUs" on the right edge
-- When total AAS exceeds this line, the system is CPU-saturated
-- CPU count source:
-  - **Daemon**: `sysconf(_SC_NPROCESSORS_ONLN)` → write to trace file header
-  - **Client**: read from trace file header (works for historical analysis
-    from a different machine)
-  - Trace file header change: add `uint16 num_cpus` field, bump version
-  - Fallback for old trace files: `std::thread::available_parallelism()`
-    (local machine)
-
-**Time range indicator**:
-- Overview mini-chart at the top showing the full available time range
-- A highlighted box showing the currently visible window
-- Drag/click to pan (future — keyboard first: `[` `]` `+` `-`)
-
-**Filtered context outline** (Oracle ASH pattern):
-- When a filter is active, draw a dim outline of the total (unfiltered)
-  AAS as context behind the filtered chart
-- DBA sees filtered portion relative to the whole system
-
-### E.4b: Table improvements
-
-**Mini wait-breakdown bars in table rows** (RDS PI pattern):
-- Each row in Events/Sessions/Queries tables gets a small color-coded
-  horizontal bar showing the wait class breakdown for that item
-- Uses the same color palette as the main chart
-- Provides instant visual cross-reference between chart and table
-
-**"Other" rollup row**:
-- Top-N tables show the top 9 items + an "Other" row aggregating the rest
-- Prevents long tail from dominating the view
-- pg_ash uses this pattern with `top 9 + Other`
-
-**Sortable columns**:
-- `Tab` cycles sort column
-- Visual indicator (arrow) on the active sort column
-
-### E.4c: Drill-down & filter system
-
-**Drill-down chain** (Oracle EM canonical pattern):
-
-```
-Overview (time_model)
-  -> Enter on a wait class
-  -> Events view filtered to that class
-    -> Enter on an event
-    -> Sessions view filtered to that event
-      -> Enter on a session
-      -> Queries view filtered to that session
-        -> Enter on a query
-        -> Histogram for that query+event combination
-```
-
-Esc pops back one level. Full history stack maintained.
-
-**Filter system**:
-- `/` opens filter input (text match on event name, PID, query_id)
-- `\` clears all filters
-- Filters are cumulative (AND logic)
-- Active filters shown in status bar:
-  `Filters: class=Lock > event=Lock:Transaction`
-- Removable filter tags (navigate to tag, press Delete)
-
-**"Slice by" dimension switch** (RDS PI pattern):
-- `d` key opens dimension picker: Waits / Events / SQL / Sessions
-- Re-renders the chart by the selected dimension
-- Independent of table tab — chart can show waits while table shows SQL
-
-### E.4d: Time navigation
-
-- `[` / `]` shift time window left/right (10% of visible range)
-- `+` / `-` zoom in/out (2x each step)
-- `Home` / `End` jump to start/end of available data
-- Time range shown in header: `14:00:00 — 14:30:00 (30m)`
-
-### E.4e: Additional views
-
-**Histogram**:
-- Latency distribution for current filter context
-- 16 log2 buckets from <1us to >=16ms
-- ASCII bar chart within the table area
-- Shows for the most specific event in the filter stack
-
-**Activity Over Time** (Oracle EM pattern):
-- Split selected time range into 10 time slots
-- Show AAS + top 3 events per slot
-- Identify WHEN the problem happened
-- Click/Enter on a slot to zoom to that time range
-
-### E.4f: Implementation order
-
-| Step | What | Impact |
-|------|------|--------|
-| 1 | CPU cores reference line on chart | High — instant saturation indicator |
-| 2 | Stacked area rendering (replace bars) | High — matches all gold standard tools |
-| 3 | Drill-down chain (Enter/Esc) | High — core investigation workflow |
-| 4 | Time navigation (`[]` `+-`) | High — essential for investigation |
-| 5 | Filter system (`/` `\`) | High — cumulative AND filters |
-| 6 | Mini wait-breakdown bars in table rows | Medium — visual cross-reference |
-| 7 | "Other" rollup row | Medium — cleaner tables |
-| 8 | Filtered context outline | Medium — shows context when drilling |
-| 9 | "Slice by" dimension switch | Medium — chart independence from table |
-| 10 | Histogram view | Medium — latency distribution |
-| 11 | Activity Over Time view | Medium — time-slot drill-down |
-| 12 | Sortable columns with indicator | Low — polish |
-| 13 | Time range overview mini-chart | Low — nice to have |
-
-### UX reference sources
-
-- **Oracle EM Performance Hub / ASH Analytics**: stacked area chart,
-  two-tier time slider, click-to-filter, dimensional pivot dropdown,
-  filter tags bar, CPU cores line, load map treemap view
-- **AWS RDS Performance Insights**: "slice by" dropdown, mini wait bars
-  per SQL row, Max vCPU line, top 25 items per dimension tab
-- **PASH-Viewer**: time range selection on chart, Top SQL drill-down,
-  execution plan display
-- **pg_ash**: ASCII stacked bar charts, Unicode block characters for
-  rendering, "Other" rollup in top-N, per-query wait profile,
-  semantic color mapping (green=CPU, blue=IO, red=Lock)
+- `pgwt-server` connects to daemon via Unix socket on the DB server
+- Pushes live AAS updates to the web client over the SSH channel
+- Active view works only in live mode (requires BPF state_map)
+- Dual mode: historical (trace files) + live (daemon) in same web UI
 
 ---
 
-## Planned: Phase E.5 — Live Mode
+## Legacy: Rust TUI Client
 
-**Goal**: Connect pgwt-cli to a running daemon for real-time streaming.
-
-- Unix socket protocol: JSON request -> length-prefixed response frames
-- Active view works only in live mode (requires BPF state_map)
-- Dual mode: historical (trace files) + live (socket) in same TUI
-- Separate from investigation workflow — additive feature
+The Rust TUI client (`client/` directory, Phases E.0–E.1) remains as a
+lightweight terminal-based option for quick checks over SSH. It works
+standalone on the DB server with no daemon needed — reads trace files
+directly. The web client (Phase F) supersedes it for interactive
+investigation workflows.
 
 ---
 
@@ -369,12 +405,24 @@ precision with ~5% TPS overhead.
 - Hourly rotation to `YYYY-MM-DD_HH.trace.lz4`
 - Configurable retention (default 24h)
 
-### Client architecture
+### Client-server protocol
 
-- Client-side compute: reads trace files directly, no daemon needed
-  for historical analysis
-- In-memory event store with on-the-fly aggregation
-- Dual rendering: pixel-perfect (iTerm2/Sixel/Kitty) with half-block
-  Unicode fallback
-- Tech stack: Rust + ratatui + crossterm + lz4_flex + chrono + clap +
-  image + ratatui-image
+- **Transport**: SSH exec channel (stdin/stdout of `pgwt-server`)
+- **Format**: JSON lines (newline-delimited JSON)
+- **Request**: `{"id":1,"cmd":"aas","from":...,"to":...,"filters":{}}`
+- **Response**: `{"id":1,"buckets":[...],"max_aas":4.2}`
+- **Matching**: `id` field for concurrent request/response pairing
+- **Same model as**: git over SSH, rsync --server, ParaView pvserver
+
+### UX reference sources
+
+- **Oracle EM Performance Hub / ASH Analytics**: stacked area chart,
+  two-tier time slider, click-to-filter, dimensional pivot dropdown,
+  filter tags bar, CPU cores line, load map treemap view
+- **AWS RDS Performance Insights**: "slice by" dropdown, mini wait bars
+  per SQL row, Max vCPU line, top 25 items per dimension tab
+- **PASH-Viewer**: time range selection on chart, Top SQL drill-down,
+  execution plan display
+- **pg_ash**: ASCII stacked bar charts, Unicode block characters for
+  rendering, "Other" rollup in top-N, per-query wait profile,
+  semantic color mapping (green=CPU, blue=IO, red=Lock)
