@@ -102,13 +102,15 @@ pub fn generate_test_file(path: &Path) -> io::Result<()> {
     file.write_all(&start_wall_ns.to_le_bytes())?;
     file.write_all(&start_mono_ns.to_le_bytes())?;
 
-    // Generate events: simulate 8 backends over 30 minutes
-    let pids = [1001u32, 1002, 1003, 1004, 1005, 1006, 1007, 1008];
+    // Generate events: simulate 10 backends over 30 minutes
+    let pids = [1001u32, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1009, 1010];
     let query_ids = [
         123456789012345u64,
         234567890123456,
         345678901234567,
         456789012345678,
+        567890123456789,
+        678901234567890,
     ];
 
     // Realistic OLTP workload: CPU and IO dominate, Lock spikes in middle
@@ -158,8 +160,8 @@ pub fn generate_test_file(path: &Path) -> io::Result<()> {
     let mut events = Vec::new();
     let mut ts = start_mono_ns;
 
-    // 200K events over 30 min — dense enough for AAS ~1.7 normal, ~3.3 spike
-    let total_events = 200_000usize;
+    // 300K events over 30 min — 10 sessions, AAS ~2.5 normal, ~5 spike
+    let total_events = 300_000usize;
     let time_span_ns = 1800_000_000_000u64; // 30 minutes
     let time_step = time_span_ns / total_events as u64;
 
