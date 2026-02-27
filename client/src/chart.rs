@@ -9,17 +9,17 @@ use crate::compute::{AasBucketResult, NUM_WAIT_CLASSES};
 // -- Color palette (ASH-style) ------------------------------------------------
 
 const CLASS_COLORS: [Color; NUM_WAIT_CLASSES] = [
-    Color::Rgb(0x00, 0xCC, 0x00), // 0 Cpu: green
-    Color::Rgb(0x33, 0x66, 0xFF), // 1 Io: blue
-    Color::Rgb(0xFF, 0x33, 0x33), // 2 Lock: red
-    Color::Rgb(0xFF, 0x99, 0x00), // 3 LwLock: orange
-    Color::Rgb(0xCC, 0x33, 0xFF), // 4 Ipc: purple
-    Color::Rgb(0x33, 0xCC, 0xCC), // 5 Client: cyan
-    Color::Rgb(0xFF, 0xCC, 0x00), // 6 Timeout: yellow
-    Color::Rgb(0x99, 0x33, 0x00), // 7 BufferPin: brown
-    Color::Rgb(0x80, 0x80, 0x80), // 8 Activity: gray
-    Color::Rgb(0x66, 0xCC, 0xFF), // 9 Extension: light blue
-    Color::Rgb(0x60, 0x60, 0x60), // 10 Unknown: dark gray
+    Color::Rgb(80, 250, 123),   // 0 Cpu: green
+    Color::Rgb(30, 100, 255),   // 1 Io: vivid blue
+    Color::Rgb(255, 85, 85),    // 2 Lock: red
+    Color::Rgb(255, 121, 198),  // 3 LwLock: pink
+    Color::Rgb(0, 200, 255),    // 4 Ipc: cyan
+    Color::Rgb(255, 220, 100),  // 5 Client: yellow
+    Color::Rgb(255, 165, 0),    // 6 Timeout: orange
+    Color::Rgb(0, 210, 180),    // 7 BufferPin: teal
+    Color::Rgb(150, 100, 255),  // 8 Activity: purple
+    Color::Rgb(190, 150, 255),  // 9 Extension: light purple
+    Color::Rgb(180, 180, 180),  // 10 Unknown: gray
 ];
 
 const CLASS_LABELS: [&str; NUM_WAIT_CLASSES] = [
