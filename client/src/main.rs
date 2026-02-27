@@ -80,6 +80,10 @@ struct App {
     time_to_ns: u64,
     wall_ms: f64,
 
+    total_from_ns: u64,
+    total_to_ns: u64,
+    num_cpus: Option<f64>,
+
     view: View,
     filters: Filters,
     cursor: usize,
@@ -95,11 +99,18 @@ impl App {
         let time_to_ns = events.last().map(|e| e.timestamp_ns).unwrap_or(0);
         let wall_ms = (time_to_ns - time_from_ns) as f64 / 1_000_000.0;
 
+        let num_cpus = std::thread::available_parallelism()
+            .ok()
+            .map(|n| n.get() as f64);
+
         Self {
             events,
             time_from_ns,
             time_to_ns,
             wall_ms,
+            total_from_ns: time_from_ns,
+            total_to_ns: time_to_ns,
+            num_cpus,
             view: View::Overview,
             filters: Filters::default(),
             cursor: 0,
@@ -109,27 +120,71 @@ impl App {
         }
     }
 
-    fn filtered_events(&self) -> Vec<&trace::TraceEvent> {
-        self.events
-            .iter()
-            .filter(|ev| ev.timestamp_ns >= self.time_from_ns && ev.timestamp_ns <= self.time_to_ns)
-            .collect()
+    fn update_time_range(&mut self, from: u64, to: u64) {
+        let from = from.max(self.total_from_ns);
+        let to = to.min(self.total_to_ns);
+        if to <= from { return; }
+        self.time_from_ns = from;
+        self.time_to_ns = to;
+        self.wall_ms = (to - from) as f64 / 1_000_000.0;
+    }
+
+    fn shift_time(&mut self, forward: bool) {
+        let range = self.time_to_ns - self.time_from_ns;
+        let offset = range / 10; // 10% shift
+        if forward {
+            let new_to = (self.time_to_ns + offset).min(self.total_to_ns);
+            let new_from = new_to.saturating_sub(range);
+            self.update_time_range(new_from, new_to);
+        } else {
+            let new_from = self.time_from_ns.saturating_sub(offset).max(self.total_from_ns);
+            let new_to = new_from + range;
+            self.update_time_range(new_from, new_to);
+        }
+    }
+
+    fn zoom(&mut self, zoom_in: bool) {
+        let range = self.time_to_ns - self.time_from_ns;
+        let center = self.time_from_ns + range / 2;
+        let new_range = if zoom_in {
+            range / 2
+        } else {
+            range.saturating_mul(2)
+        };
+        // Minimum zoom: 1 second
+        let new_range = new_range.max(1_000_000_000);
+        let half = new_range / 2;
+        let new_from = center.saturating_sub(half);
+        let new_to = new_from + new_range;
+        self.update_time_range(new_from, new_to);
+    }
+
+    fn reset_zoom(&mut self) {
+        self.update_time_range(self.total_from_ns, self.total_to_ns);
+    }
+
+    /// Return the slice of events within the visible time range (binary search, zero-copy).
+    fn visible_events(&self) -> &[trace::TraceEvent] {
+        let start = self.events.partition_point(|e| e.timestamp_ns < self.time_from_ns);
+        let end = self.events.partition_point(|e| e.timestamp_ns <= self.time_to_ns);
+        &self.events[start..end]
     }
 
     fn max_rows(&self) -> usize {
+        let vis = self.visible_events();
         match self.view {
             View::Overview => {
-                let tm = compute::compute_time_model(&self.events, &self.filters, self.wall_ms);
+                let tm = compute::compute_time_model(vis, &self.filters, self.wall_ms);
                 tm.rows.len()
             }
             View::Events => {
-                compute::compute_top_events(&self.events, &self.filters, self.wall_ms).len()
+                compute::compute_top_events(vis, &self.filters, self.wall_ms).len()
             }
             View::Sessions => {
-                compute::compute_top_sessions(&self.events, &self.filters, self.wall_ms).len()
+                compute::compute_top_sessions(vis, &self.filters, self.wall_ms).len()
             }
             View::Queries => {
-                compute::compute_top_queries(&self.events, &self.filters, self.wall_ms).len()
+                compute::compute_top_queries(vis, &self.filters, self.wall_ms).len()
             }
         }
     }
@@ -142,10 +197,11 @@ impl App {
             cursor: self.cursor,
         });
 
+        let vis = self.visible_events();
         match self.view {
             View::Overview => {
                 // Drill from overview: filter to the selected class, pivot to Events
-                let tm = compute::compute_time_model(&self.events, &self.filters, self.wall_ms);
+                let tm = compute::compute_time_model(vis, &self.filters, self.wall_ms);
                 if let Some(row) = tm.rows.get(self.cursor) {
                     let name = row.name.trim_end_matches('*').to_string();
                     if name != "DB Time" {
@@ -157,7 +213,7 @@ impl App {
             }
             View::Events => {
                 // Drill from events: filter to the selected event, pivot to Sessions
-                let rows = compute::compute_top_events(&self.events, &self.filters, self.wall_ms);
+                let rows = compute::compute_top_events(vis, &self.filters, self.wall_ms);
                 if let Some(row) = rows.get(self.cursor) {
                     self.filters.event = Some(row.event_id);
                 }
@@ -166,7 +222,7 @@ impl App {
             }
             View::Sessions => {
                 // Drill from sessions: filter to the selected PID, pivot to Queries
-                let rows = compute::compute_top_sessions(&self.events, &self.filters, self.wall_ms);
+                let rows = compute::compute_top_sessions(vis, &self.filters, self.wall_ms);
                 if let Some(row) = rows.get(self.cursor) {
                     self.filters.pid = Some(row.pid);
                 }
@@ -214,6 +270,21 @@ impl App {
             KeyCode::Char('s') => { self.view = View::Sessions; self.cursor = 0; }
             KeyCode::Char('r') => { self.view = View::Queries; self.cursor = 0; }
 
+            // Time navigation
+            KeyCode::Char('[') => self.shift_time(false),
+            KeyCode::Char(']') => self.shift_time(true),
+            KeyCode::Char('+') | KeyCode::Char('=') => self.zoom(true),
+            KeyCode::Char('-') => self.zoom(false),
+            KeyCode::Char('0') => self.reset_zoom(),
+            KeyCode::Home => {
+                let range = self.time_to_ns - self.time_from_ns;
+                self.update_time_range(self.total_from_ns, self.total_from_ns + range);
+            }
+            KeyCode::End => {
+                let range = self.time_to_ns - self.time_from_ns;
+                self.update_time_range(self.total_to_ns.saturating_sub(range), self.total_to_ns);
+            }
+
             // Clear filters
             KeyCode::Char('\\') => {
                 self.filters = Filters::default();
@@ -227,17 +298,42 @@ impl App {
 
 // -- Rendering ---------------------------------------------------------------
 
+fn format_duration_short(ns: u64) -> String {
+    let secs = ns as f64 / 1_000_000_000.0;
+    if secs < 60.0 {
+        format!("{:.0}s", secs)
+    } else if secs < 3600.0 {
+        let m = (secs / 60.0).floor();
+        let s = secs - m * 60.0;
+        if s > 0.5 { format!("{:.0}m{:.0}s", m, s) } else { format!("{:.0}m", m) }
+    } else {
+        let h = (secs / 3600.0).floor();
+        let m = ((secs - h * 3600.0) / 60.0).floor();
+        if m > 0.5 { format!("{:.0}h{:.0}m", h, m) } else { format!("{:.0}h", h) }
+    }
+}
+
 fn render_header(app: &App, area: Rect, buf: &mut Buffer) {
     let from = chrono::DateTime::from_timestamp_nanos(app.time_from_ns as i64);
     let to = chrono::DateTime::from_timestamp_nanos(app.time_to_ns as i64);
-    let dur_secs = app.wall_ms / 1000.0;
+    let range_ns = app.time_to_ns - app.time_from_ns;
+    let total_ns = app.total_to_ns - app.total_from_ns;
 
-    let tm = compute::compute_time_model(&app.events, &app.filters, app.wall_ms);
+    let tm = compute::compute_time_model(app.visible_events(), &app.filters, app.wall_ms);
+
+    let zoom_text = if range_ns < total_ns {
+        format!("  [{}  / {}]",
+            format_duration_short(range_ns),
+            format_duration_short(total_ns))
+    } else {
+        format!("  ({})", format_duration_short(range_ns))
+    };
+
     let header_text = format!(
-        " {} — {}  ({:.0}s)    AAS: {:.2}    DB Time: {:.1}s",
+        " {} — {}{}    AAS: {:.2}    DB Time: {:.1}s",
         from.format("%H:%M:%S"),
         to.format("%H:%M:%S"),
-        dur_secs,
+        zoom_text,
         tm.aas,
         tm.db_time_ms / 1000.0,
     );
@@ -275,7 +371,7 @@ fn render_tabs(app: &App, area: Rect, buf: &mut Buffer) {
 }
 
 fn render_overview(app: &App, area: Rect, buf: &mut Buffer) {
-    let tm = compute::compute_time_model(&app.events, &app.filters, app.wall_ms);
+    let tm = compute::compute_time_model(app.visible_events(), &app.filters, app.wall_ms);
 
     let rows: Vec<Row> = tm
         .rows
@@ -320,7 +416,7 @@ fn render_overview(app: &App, area: Rect, buf: &mut Buffer) {
 }
 
 fn render_events(app: &App, area: Rect, buf: &mut Buffer) {
-    let event_rows = compute::compute_top_events(&app.events, &app.filters, app.wall_ms);
+    let event_rows = compute::compute_top_events(app.visible_events(), &app.filters, app.wall_ms);
 
     let rows: Vec<Row> = event_rows
         .iter()
@@ -369,7 +465,7 @@ fn render_events(app: &App, area: Rect, buf: &mut Buffer) {
 }
 
 fn render_sessions(app: &App, area: Rect, buf: &mut Buffer) {
-    let session_rows = compute::compute_top_sessions(&app.events, &app.filters, app.wall_ms);
+    let session_rows = compute::compute_top_sessions(app.visible_events(), &app.filters, app.wall_ms);
 
     let rows: Vec<Row> = session_rows
         .iter()
@@ -414,7 +510,7 @@ fn render_sessions(app: &App, area: Rect, buf: &mut Buffer) {
 }
 
 fn render_queries(app: &App, area: Rect, buf: &mut Buffer) {
-    let query_rows = compute::compute_top_queries(&app.events, &app.filters, app.wall_ms);
+    let query_rows = compute::compute_top_queries(app.visible_events(), &app.filters, app.wall_ms);
 
     let rows: Vec<Row> = query_rows
         .iter()
@@ -461,7 +557,7 @@ fn render_queries(app: &App, area: Rect, buf: &mut Buffer) {
 }
 
 fn render_footer(area: Rect, buf: &mut Buffer) {
-    Paragraph::new(" Enter=drill  Esc=back  o/e/s/r=view  \\=clear filters  q=quit")
+    Paragraph::new(" Enter=drill  Esc=back  o/e/s/r=view  []=shift  +-=zoom  0=reset  \\=clear  q=quit")
         .style(Style::default().fg(Color::White).bg(Color::DarkGray))
         .render(area, buf);
 }
@@ -496,7 +592,7 @@ fn draw(app: &mut App, frame: &mut Frame) {
                 let (font_w, font_h) = picker.font_size();
                 let pw = body_rect.width as u32 * font_w.max(1) as u32;
                 let ph = body_rect.height as u32 * font_h.max(1) as u32;
-                let img = chart::chart_body_image(&aas, pw, ph);
+                let img = chart::chart_body_image(&aas, pw, ph, app.num_cpus);
                 let dyn_img = image::DynamicImage::ImageRgba8(img);
                 let mut state = picker.new_resize_protocol(dyn_img);
                 frame.render_stateful_widget(
@@ -507,11 +603,11 @@ fn draw(app: &mut App, frame: &mut Frame) {
             }
             chart::render_chart_decorations(
                 &aas, app.time_from_ns, app.time_to_ns,
-                chunks[2], frame.buffer_mut(),
+                chunks[2], frame.buffer_mut(), app.num_cpus,
             );
         } else {
             // Fallback: half-block rendering
-            chart::AasChart::new(&aas, app.time_from_ns, app.time_to_ns)
+            chart::AasChart::new(&aas, app.time_from_ns, app.time_to_ns, app.num_cpus)
                 .render(chunks[2], frame.buffer_mut());
         }
     }

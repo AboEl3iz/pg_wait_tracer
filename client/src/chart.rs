@@ -61,7 +61,12 @@ pub fn chart_body_rect(area: Rect) -> Rect {
 }
 
 /// Render the stacked bar chart body as a pixel image with transparent background.
-pub fn chart_body_image(result: &AasBucketResult, width: u32, height: u32) -> image::RgbaImage {
+pub fn chart_body_image(
+    result: &AasBucketResult,
+    width: u32,
+    height: u32,
+    num_cpus: Option<f64>,
+) -> image::RgbaImage {
     let mut img = image::RgbaImage::from_pixel(width, height, image::Rgba([0, 0, 0, 0]));
     let nbuckets = result.buckets.len();
     if nbuckets == 0 || height == 0 || width == 0 {
@@ -94,6 +99,21 @@ pub fn chart_body_image(result: &AasBucketResult, width: u32, height: u32) -> im
         }
     }
 
+    // CPU reference line (dashed, semi-transparent white)
+    if let Some(cpus) = num_cpus {
+        if cpus > 0.0 && cpus < max_aas {
+            let y_line = height - ((cpus / max_aas) * height as f64) as u32;
+            if y_line < height {
+                let dash_color = image::Rgba([255, 255, 255, 180]);
+                for x in 0..width {
+                    if (x / 4) % 2 == 0 {
+                        img.put_pixel(x, y_line, dash_color);
+                    }
+                }
+            }
+        }
+    }
+
     img
 }
 
@@ -104,6 +124,7 @@ pub fn render_chart_decorations(
     to_ns: u64,
     area: Rect,
     buf: &mut Buffer,
+    num_cpus: Option<f64>,
 ) {
     if area.width < 12 || area.height < 5 { return; }
 
@@ -127,6 +148,10 @@ pub fn render_chart_decorations(
         render_y_label(buf, area.x, area.y + (body_height / 2) as u16, max_aas / 2.0);
     }
     render_y_label(buf, area.x, area.y + (body_height - 1) as u16, 0.0);
+
+    // CPU reference line (text decorations only — pixel line is in the image)
+    render_cpu_line(buf, body_x, area.y, body_width, body_height, max_aas,
+                    area.x, num_cpus);
 
     // X-axis
     render_x_axis(buf, body_x, xaxis_y, body_width, from_ns, to_ns);
@@ -167,11 +192,12 @@ pub struct AasChart<'a> {
     result: &'a AasBucketResult,
     from_ns: u64,
     to_ns: u64,
+    num_cpus: Option<f64>,
 }
 
 impl<'a> AasChart<'a> {
-    pub fn new(result: &'a AasBucketResult, from_ns: u64, to_ns: u64) -> Self {
-        Self { result, from_ns, to_ns }
+    pub fn new(result: &'a AasBucketResult, from_ns: u64, to_ns: u64, num_cpus: Option<f64>) -> Self {
+        Self { result, from_ns, to_ns, num_cpus }
     }
 }
 
@@ -246,6 +272,10 @@ impl Widget for AasChart<'_> {
             }
         }
 
+        // -- CPU reference line --
+        render_cpu_line(buf, body_x, body_y, body_width, body_height, max_aas,
+                        area.x, self.num_cpus);
+
         // -- X-axis time labels --
         render_x_axis(buf, body_x, xaxis_y, body_width, self.from_ns, self.to_ns);
 
@@ -304,6 +334,52 @@ fn render_x_axis(buf: &mut Buffer, x: u16, y: u16, width: usize, from_ns: u64, t
             }
         }
     }
+}
+
+fn render_cpu_line(
+    buf: &mut Buffer,
+    body_x: u16,
+    body_y: u16,
+    body_width: usize,
+    body_height: usize,
+    max_aas: f64,
+    yaxis_x: u16,
+    num_cpus: Option<f64>,
+) {
+    let cpus = match num_cpus {
+        Some(c) if c > 0.0 && c < max_aas => c,
+        _ => return,
+    };
+
+    let frac = cpus / max_aas;
+    let row = body_height as f64 * (1.0 - frac);
+    let row = row.round() as usize;
+    if row >= body_height { return; }
+
+    let y = body_y + row as u16;
+    let style = Style::new().fg(Color::White);
+
+    // Dashed line across chart body
+    for col in 0..body_width {
+        if (col / 3) % 2 == 0 {
+            // Only draw dash if the cell is empty (don't overwrite chart data)
+            if let Some(cell) = buf.cell_mut(Position::new(body_x + col as u16, y)) {
+                if cell.symbol() == " " {
+                    cell.set_char('╌');
+                    cell.set_style(style);
+                }
+            }
+        }
+    }
+
+    // Label on Y-axis: "N cpu"
+    let label = format!("{:.0}cpu", cpus);
+    let style_label = Style::new().fg(Color::White);
+    for (i, ch) in label.chars().enumerate().take(5) {
+        set_cell(buf, yaxis_x + i as u16, y, ch, style_label);
+    }
+    // Separator
+    set_cell(buf, yaxis_x + Y_AXIS_W - 1, y, '┤', style_label);
 }
 
 fn render_legend(buf: &mut Buffer, x: u16, y: u16, width: usize, result: &AasBucketResult) {
