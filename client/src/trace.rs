@@ -334,6 +334,71 @@ impl TraceFileReader {
     }
 }
 
+// -- Streaming reader for current.trace (no footer) --------------------------
+
+/// Read all events from a trace file by scanning blocks sequentially from
+/// the header. Works for `current.trace` which has no footer/block index.
+pub fn read_events_streaming(path: &Path) -> io::Result<(FileHeader, Vec<TraceEvent>)> {
+    let mut file = File::open(path)?;
+
+    // Read file header (28 bytes)
+    let mut buf = [0u8; 28];
+    file.read_exact(&mut buf)?;
+    let header = FileHeader {
+        magic: u32::from_le_bytes(buf[0..4].try_into().unwrap()),
+        version: u16::from_le_bytes(buf[4..6].try_into().unwrap()),
+        flags: u16::from_le_bytes(buf[6..8].try_into().unwrap()),
+        pg_version: u32::from_le_bytes(buf[8..12].try_into().unwrap()),
+        start_time_ns: u64::from_le_bytes(buf[12..20].try_into().unwrap()),
+        clock_offset_ns: u64::from_le_bytes(buf[20..28].try_into().unwrap()),
+    };
+
+    if header.magic != PGWT_TRACE_MAGIC {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "bad magic"));
+    }
+
+    let mono_to_wall = header.start_time_ns as i64 - header.clock_offset_ns as i64;
+    let mut all_events = Vec::new();
+
+    // Scan blocks sequentially until EOF
+    loop {
+        let mut hdr_buf = [0u8; 28];
+        match file.read_exact(&mut hdr_buf) {
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e),
+        }
+
+        let num_events = u32::from_le_bytes(hdr_buf[16..20].try_into().unwrap());
+        let compressed_size = u32::from_le_bytes(hdr_buf[20..24].try_into().unwrap());
+        let uncompressed_size = u32::from_le_bytes(hdr_buf[24..28].try_into().unwrap());
+
+        let mut compressed = vec![0u8; compressed_size as usize];
+        match file.read_exact(&mut compressed) {
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break, // partial block
+            Err(e) => return Err(e),
+        }
+
+        let decompressed = match lz4_flex::decompress(&compressed, uncompressed_size as usize) {
+            Ok(d) => d,
+            Err(_) => break, // corrupt block — stop
+        };
+
+        match decode_block(&decompressed, num_events as usize) {
+            Ok(events) => {
+                for mut ev in events {
+                    ev.timestamp_ns = (ev.timestamp_ns as i64 + mono_to_wall) as u64;
+                    all_events.push(ev);
+                }
+            }
+            Err(_) => break, // corrupt block — stop
+        }
+    }
+
+    Ok((header, all_events))
+}
+
 // -- Multi-file scanner ------------------------------------------------------
 
 pub struct TraceFileEntry {
@@ -341,7 +406,7 @@ pub struct TraceFileEntry {
     pub start_wall_ns: u64,
 }
 
-/// Scan a directory for .trace.lz4 files, return sorted by start time.
+/// Scan a directory for .trace.lz4 and current.trace files, return sorted by start time.
 pub fn scan_trace_dir(dir: &Path) -> io::Result<Vec<TraceFileEntry>> {
     let mut entries = Vec::new();
 
@@ -349,7 +414,7 @@ pub fn scan_trace_dir(dir: &Path) -> io::Result<Vec<TraceFileEntry>> {
         let entry = entry?;
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
-        if !name_str.ends_with(".trace.lz4") {
+        if !name_str.ends_with(".trace.lz4") && name_str.as_ref() != "current.trace" {
             continue;
         }
 
@@ -362,8 +427,19 @@ pub fn scan_trace_dir(dir: &Path) -> io::Result<Vec<TraceFileEntry>> {
                     start_wall_ns: reader.header.start_time_ns,
                 });
             }
-            Err(e) => {
-                eprintln!("WARN: skipping {}: {}", path.display(), e);
+            Err(_) => {
+                // Try streaming reader (for current.trace with no footer)
+                match read_events_streaming(&path) {
+                    Ok((hdr, _)) => {
+                        entries.push(TraceFileEntry {
+                            path,
+                            start_wall_ns: hdr.start_time_ns,
+                        });
+                    }
+                    Err(e) => {
+                        eprintln!("WARN: skipping {}: {}", path.display(), e);
+                    }
+                }
             }
         }
     }
@@ -382,17 +458,24 @@ pub fn load_events(
     let mut all_events = Vec::new();
 
     for entry in &files {
-        let mut reader = TraceFileReader::open(&entry.path)?;
+        match TraceFileReader::open(&entry.path) {
+            Ok(mut reader) => {
+                let from_mono = from_wall_ns.map(|w| (w as i64 - reader.mono_to_wall) as u64);
+                let to_mono = to_wall_ns.map(|w| (w as i64 - reader.mono_to_wall) as u64);
 
-        let from_mono = from_wall_ns.map(|w| (w as i64 - reader.mono_to_wall) as u64);
-        let to_mono = to_wall_ns.map(|w| (w as i64 - reader.mono_to_wall) as u64);
-
-        let events = reader.read_events(from_mono, to_mono)?;
-        all_events.extend(events.into_iter().map(|mut ev| {
-            // Convert timestamps to wall-clock for uniform handling
-            ev.timestamp_ns = reader.mono_to_wall_ns(ev.timestamp_ns);
-            ev
-        }));
+                let events = reader.read_events(from_mono, to_mono)?;
+                all_events.extend(events.into_iter().map(|mut ev| {
+                    ev.timestamp_ns = reader.mono_to_wall_ns(ev.timestamp_ns);
+                    ev
+                }));
+            }
+            Err(_) => {
+                // Streaming fallback (current.trace with no footer)
+                if let Ok((_hdr, events)) = read_events_streaming(&entry.path) {
+                    all_events.extend(events);
+                }
+            }
+        }
     }
 
     all_events.sort_by_key(|e| e.timestamp_ns);
