@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>pgwt — SSH PoC</title>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+    max-width: 640px; margin: 40px auto; padding: 0 20px;
+    color: #222; background: #fafafa;
+  }
+  h1 { margin-bottom: 4px; }
+  .sub { color: #666; margin-top: 0; }
+  .status { padding: 12px; border-radius: 6px; margin: 16px 0; font-weight: 500; }
+  .ok { background: #d4edda; color: #155724; }
+  .err { background: #f8d7da; color: #721c24; }
+  .wait { background: #fff3cd; color: #856404; }
+  button {
+    padding: 8px 20px; background: #0066cc; color: #fff;
+    border: none; border-radius: 4px; cursor: pointer; margin: 4px 4px 4px 0;
+    font-size: 14px;
+  }
+  button:hover { background: #0052a3; }
+  pre {
+    background: #f0f0f0; padding: 10px; border-radius: 4px;
+    font-size: 13px; overflow-x: auto; margin: 6px 0;
+  }
+  .arrow { color: #999; }
+  .req .arrow { color: #0066cc; }
+  .res .arrow { color: #28a745; }
+  #log { margin-top: 20px; }
+</style>
+</head>
+<body>
+
+<h1>pgwt — SSH PoC</h1>
+<p class="sub">macOS (Go) &rarr; SSH &rarr; Linux (C) &rarr; JSON &rarr; WebSocket &rarr; Browser</p>
+
+<div id="status" class="status wait">Connecting to server via SSH...</div>
+
+<div>
+  <button onclick="send('ping')">Ping</button>
+  <button onclick="send('info')">Info</button>
+  <button onclick="pingLoop()">Ping x10 (latency test)</button>
+</div>
+
+<div id="log"></div>
+
+<script>
+let ws;
+const statusEl = document.getElementById('status');
+const logEl = document.getElementById('log');
+
+function connect() {
+  ws = new WebSocket('ws://' + location.host + '/ws');
+
+  ws.onopen = () => {
+    statusEl.className = 'status ok';
+    statusEl.textContent = 'WebSocket connected. Sending info request...';
+    send('info');
+  };
+
+  ws.onmessage = (e) => {
+    const data = JSON.parse(e.data);
+    addLog('res', JSON.stringify(data, null, 2));
+
+    if (data.host) {
+      statusEl.className = 'status ok';
+      statusEl.textContent = 'Connected: ' + data.host +
+        ' (' + data.cpus + ' CPUs, remote PID ' + data.pid + ')';
+    }
+    if (data.error) {
+      statusEl.className = 'status err';
+      statusEl.textContent = 'Error: ' + data.error;
+    }
+  };
+
+  ws.onclose = () => {
+    statusEl.className = 'status err';
+    statusEl.textContent = 'Disconnected';
+  };
+
+  ws.onerror = () => {
+    statusEl.className = 'status err';
+    statusEl.textContent = 'WebSocket error';
+  };
+}
+
+function send(cmd) {
+  const msg = JSON.stringify({ cmd: cmd });
+  addLog('req', msg);
+  ws.send(msg);
+}
+
+function pingLoop() {
+  let i = 0;
+  const start = performance.now();
+  function next() {
+    if (i >= 10) {
+      const elapsed = (performance.now() - start).toFixed(0);
+      addLog('res', '--- 10 pings completed in ' + elapsed + 'ms' +
+        ' (avg ' + (elapsed / 10).toFixed(0) + 'ms round-trip) ---');
+      return;
+    }
+    const msg = JSON.stringify({ cmd: 'ping' });
+    ws.send(msg);
+    i++;
+    ws.addEventListener('message', next, { once: true });
+  }
+  next();
+}
+
+function addLog(type, text) {
+  const div = document.createElement('div');
+  div.className = type;
+  const arrow = type === 'req' ? '&rarr; ' : '&larr; ';
+  div.innerHTML = '<pre><span class="arrow">' + arrow + '</span>' + escHtml(text) + '</pre>';
+  logEl.prepend(div);
+}
+
+function escHtml(s) {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+connect();
+</script>
+</body>
+</html>
