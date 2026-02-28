@@ -7,6 +7,10 @@ that Phase F is built on.
 requests/responses to a C binary on the DB server, and bridge them to a
 browser via WebSocket — all through standard SSH port 22.
 
+**Tested**: macOS (M-series) → SSH → Rocky Linux 9 (Hetzner, US).
+Result: 94ms avg round-trip across the Atlantic. Local network
+servers should be 5–20ms — plenty fast for an interactive web UI.
+
 ```
 [macOS laptop]                        [DB server]
 pgwt-poc (Go)                         pgwt-server-poc (C)
@@ -31,70 +35,92 @@ sudo dnf install -y gcc    # RHEL/Rocky/Oracle
 sudo apt install -y gcc    # Ubuntu/Debian
 ```
 
-**SSH access:** You must be able to `ssh user@server` without issues
-(key-based auth, agent, or password — whatever you normally use).
+**SSH access:** You must be able to `ssh user@server` from your laptop.
+Key-based auth, agent, password, `~/.ssh/config` aliases, ProxyJump —
+whatever you normally use. The PoC spawns your system's `ssh` binary
+so it inherits all your SSH config automatically.
+
+No root SSH required. The PoC server runs as a regular user.
 
 ## Quick Start
 
-### 1. Build the server (on DB host)
-
-```bash
-scp poc/server.c user@your-server:~
-ssh user@your-server 'gcc -O2 -o pgwt-server-poc server.c'
-```
-
-If you don't have root SSH but have `sudo`, just build as your regular user —
-the PoC server doesn't need root (it only reads stdin/writes stdout).
-
-You can verify it works directly on the server:
-
-```bash
-ssh user@your-server 'echo "{\"cmd\":\"ping\"}" | ./pgwt-server-poc'
-# Should print: {"cmd":"pong","host":"...","cpus":N,"pid":...,"ts":...}
-```
-
-### 2. Build the client (on macOS)
+### 1. Build the client (on macOS, one-time)
 
 ```bash
 cd poc/web
-go mod tidy
+go mod tidy       # downloads gorilla/websocket, generates go.sum
 go build -o pgwt-poc .
+```
+
+### 2. Deploy the server (on DB host)
+
+```bash
+# Copy and compile (one-time per server)
+scp poc/server.c user@your-server:~
+ssh user@your-server 'sudo dnf install -y gcc && gcc -O2 -o pgwt-server-poc server.c'
+```
+
+Verify it works on the server:
+
+```bash
+ssh user@your-server 'echo "{\"cmd\":\"ping\"}" | ./pgwt-server-poc'
+# Expected: {"cmd":"pong","host":"your-host","cpus":N,"pid":...,"ts":...}
 ```
 
 ### 3. Run
 
 ```bash
+cd poc/web
 ./pgwt-poc user@your-server /home/user/pgwt-server-poc
 ```
 
-Your browser opens `http://localhost:8384` automatically.
+Browser opens `http://localhost:8384` automatically.
 
-Use whatever SSH target you normally use — the PoC spawns your system's
-`ssh` binary, so `~/.ssh/config` aliases work too (e.g., `./pgwt-poc myserver /home/user/pgwt-server-poc`).
+SSH config aliases work too:
+```bash
+./pgwt-poc myserver /home/user/pgwt-server-poc
+```
 
 ### 4. Verify
 
-- **Green status bar** — shows remote hostname, CPU count, remote PID
-- **Ping button** — sends `{"cmd":"ping"}`, server responds with JSON
-- **Info button** — sends `{"cmd":"info"}`, same idea
-- **Ping x10** — measures round-trip latency through the full path:
-  browser → WebSocket → Go → SSH → C → SSH → Go → WebSocket → browser
+You should see in the browser:
 
-Expected latency: **2–10ms per round-trip** depending on network distance.
-This is fast enough for an interactive web UI.
+1. **Green status bar** — `Connected: your-hostname (N CPUs, remote PID XXXX)`
+2. **Ping button** — sends `{"cmd":"ping"}`, shows JSON response
+3. **Info button** — sends `{"cmd":"info"}`, shows host details
+4. **Ping x10** — the key test. Measures full round-trip latency:
+   `browser → WebSocket → Go → SSH → C → SSH → Go → WebSocket → browser`
 
-## What to Look For
+**Reference results** (Hetzner test, macOS → US east coast):
+- Single ping: ~94ms
+- 10 pings: 936ms total (94ms avg)
 
-**If it works** — you'll see server responses in the browser with the
-correct remote hostname and CPU count. The latency test confirms the
-SSH pipe is fast enough. Phase F is viable in your environment.
+**Expected for local/office network**: 5–20ms avg.
+Anything under 100ms is good enough for interactive web UI.
 
-**If SSH hangs** — check that `ssh root@your-server echo hello` works
-from the same terminal. The PoC uses your system's `ssh` binary, so it
-inherits all your `~/.ssh/config`, agent keys, and ProxyJump settings.
+## Troubleshooting
 
-**If WebSocket fails** — check that port 8384 is free on localhost.
-The Go binary serves on `localhost:8384` (not exposed to network).
+**SSH hangs or "connection refused":**
+```bash
+# Test SSH independently first
+ssh user@your-server echo hello
+```
+If this doesn't work, fix SSH access first. The PoC uses the same `ssh`.
+
+**"gcc: command not found" on server:**
+```bash
+sudo dnf install -y gcc    # RHEL/Rocky/Oracle
+```
+
+**Port 8384 already in use:**
+Kill any previous pgwt-poc process: `lsof -ti:8384 | xargs kill`
+
+**Browser doesn't open automatically:**
+Navigate to `http://localhost:8384` manually.
+
+**WebSocket disconnects immediately:**
+Check the terminal where pgwt-poc is running for SSH error messages.
+The Go binary prints SSH stderr to its own stderr.
 
 ## Files
 
@@ -106,40 +132,17 @@ poc/
     main.go             # Go client — spawns ssh, HTTP server, WS bridge
     static/
       index.html        # Browser UI — WebSocket client, ping/info buttons
-    go.mod
-    go.sum
+    go.mod              # Go module (one dependency: gorilla/websocket)
 ```
 
-## Test VM (Hetzner)
-
-A test VM was provisioned for verification:
-
-```
-IP:   178.156.188.200
-Type: cpx11 (2 CPU / 2 GB)
-OS:   Rocky Linux 9
-User: root
-```
-
-Server binary is pre-built at `/root/pgwt-server-poc`. Test from your laptop:
-
-```bash
-./pgwt-poc root@178.156.188.200 /root/pgwt-server-poc
-```
-
-To delete the VM when done:
-
-```bash
-export HCLOUD_TOKEN="..."
-tests/hetzner-vm.sh delete 122362956
-```
+Note: `go.sum` is not checked in — `go mod tidy` generates it on first build.
 
 ## Cleanup
 
 ```bash
 # Remove remote binary
-ssh user@your-server rm pgwt-server-poc server.c
+ssh user@your-server 'rm -f pgwt-server-poc server.c'
 
 # Remove local binary
-rm poc/web/pgwt-poc
+rm -f poc/web/pgwt-poc
 ```

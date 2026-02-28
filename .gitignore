@@ -10,3 +10,10 @@ include/pg_wait_tracer.skel.h
 tests/test_wait_event
 tests/test_cmdline
 tests/__pycache__/
+
+# Go build artifacts
+poc/web/pgwt-poc
+poc/web/go.sum
+
+# Rust build artifacts
+client/target/
