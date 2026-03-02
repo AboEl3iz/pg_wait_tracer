@@ -136,6 +136,7 @@ struct pgwt_query_row {
     double   pct_db;
     char     top_wait[64];
     uint32_t top_wait_id;
+    double   class_ms[PGWT_NUM_CLASSES];  /* per-class time breakdown */
 };
 
 struct pgwt_queries_result {

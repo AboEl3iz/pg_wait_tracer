@@ -133,7 +133,8 @@ async function init() {
         state.fromNs = info.from_ns;
         state.toNs = info.to_ns;
         state.numCpus = info.num_cpus;
-        state.viewFrom = info.from_ns;
+        const ONE_HOUR_NS = 3600 * 1e9;
+        state.viewFrom = Math.max(info.from_ns, info.to_ns - ONE_HOUR_NS);
         state.viewTo = info.to_ns;
         setStatus(info.num_cpus + ' CPUs, ~' + fmtCount(info.num_events) + ' events', 'connected');
         updateTimeRange();
@@ -262,6 +263,23 @@ function pctBar(pct, color) {
     return '<div class="pct-bar">' +
         '<div class="pct-fill" style="width:' + w.toFixed(1) + '%;background:' + c + '"></div>' +
         '<span>' + pct.toFixed(1) + '%</span></div>';
+}
+
+// -- Stacked bar (Performance Insights style) ---------------------------------
+
+function stackedBar(classes, total) {
+    if (!classes || !total || total <= 0) return '';
+    let html = '<div class="stacked-bar">';
+    for (let i = 0; i < WAIT_CLASSES.length && i < classes.length; i++) {
+        const pct = classes[i] / total * 100;
+        if (pct < 0.5) continue;
+        html += '<div class="bar-seg" style="width:' + pct.toFixed(1) +
+                '%;background:' + WAIT_CLASSES[i].color + '" title="' +
+                WAIT_CLASSES[i].label + ': ' + fmtMs(classes[i]) +
+                ' (' + pct.toFixed(1) + '%)"></div>';
+    }
+    html += '</div>';
+    return html;
 }
 
 // -- Tabs ---------------------------------------------------------------------
@@ -499,16 +517,22 @@ const TABLE_CONFIGS = {
     },
     queries: {
         columns: [
-            { key: 'query_id', label: 'Query ID', format: (r) => r.query_id },
-            { key: 'count', label: 'Count', cls: 'num', format: (r) => fmtCount(r.count) },
-            { key: 'total_ms', label: 'Total', cls: 'num', format: (r) => fmtMs(r.total_ms) },
+            { key: 'query_id', label: 'Query', format: (r) => {
+                const id = '<span class="query-id">' + r.query_id + '</span>';
+                if (r.text) return dot(r.top_wait) + esc(r.text.substring(0, 80)) +
+                    (r.text.length > 80 ? '...' : '');
+                return dot(r.top_wait) + id;
+            }},
+            { key: 'total_ms', label: 'Time', cls: 'num', format: (r) => fmtMs(r.total_ms) },
+            { key: 'pct', label: '%DB', cls: 'num', format: (r) => fmtPct(r.pct) },
+            { key: 'classes', label: 'Wait Profile', format: (r) =>
+                stackedBar(r.classes, r.total_ms) },
+            { key: 'count', label: 'Calls', cls: 'num', format: (r) => fmtCount(r.count) },
             { key: 'avg_us', label: 'Avg', cls: 'num', format: (r) => fmtUs(r.avg_us) },
-            { key: 'pct', label: '%DB', cls: 'num', format: (r) => pctBar(r.pct, '#4fc3f7') },
-            { key: 'top_wait', label: 'Top Wait', format: (r) => dot(r.top_wait) + esc(r.top_wait) },
         ],
         rowClass: () => 'clickable',
         onClick: (r) => {
-            drillDown('query_id', r.query_id, 'Query ' + r.query_id);
+            drillDown('query_id', r.query_id, r.text ? r.text.substring(0, 40) : 'Query ' + r.query_id);
         },
     },
 };

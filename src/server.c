@@ -687,6 +687,15 @@ static void handle_top_queries(struct pgwt_server *srv, struct pgwt_request *req
             }
             putchar('"');
         }
+
+        /* Per-class time breakdown */
+        printf(",\"classes\":[");
+        for (int c = 0; c < 11; c++) {
+            if (c > 0) putchar(',');
+            printf("%.2f", res.rows[i].class_ms[c]);
+        }
+        putchar(']');
+
         putchar('}');
     }
     printf("],\"db_time_ms\":%.2f}\n", res.db_time_ms);

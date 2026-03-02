@@ -500,6 +500,7 @@ struct query_accum {
     uint64_t query_id;
     uint64_t count;
     uint64_t total_ns;
+    uint64_t class_ns[PGWT_NUM_CLASSES]; /* per-class time breakdown */
     /* Top wait tracking */
     uint32_t wait_ids[64];
     uint64_t wait_ns[64];
@@ -546,6 +547,7 @@ void pgwt_compute_top_queries(const struct pgwt_trace_event *events, int count,
         }
         ht[h].count++;
         ht[h].total_ns += ev->duration_ns;
+        ht[h].class_ns[pgwt_wait_class_index(ev->old_event)] += ev->duration_ns;
 
         /* Track per-wait totals */
         int found = -1;
@@ -597,6 +599,9 @@ void pgwt_compute_top_queries(const struct pgwt_trace_event *events, int count,
             snprintf(r->top_wait, sizeof(r->top_wait), "CPU*");
         else
             pgwt_event_full_name(top_id, r->top_wait, sizeof(r->top_wait));
+
+        for (int c = 0; c < PGWT_NUM_CLASSES; c++)
+            r->class_ms[c] = (double)ht[i].class_ns[c] / 1e6;
 
         nr++;
     }
