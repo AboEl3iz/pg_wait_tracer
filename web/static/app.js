@@ -1,0 +1,569 @@
+/* pgwt — Web Investigation Client */
+
+// -- Wait class colors (Oracle ASH / RDS PI inspired) -------------------------
+
+const WAIT_CLASSES = [
+    { key: 'cpu',       label: 'CPU',       color: '#4CAF50' },
+    { key: 'io',        label: 'IO',        color: '#2196F3' },
+    { key: 'lock',      label: 'Lock',      color: '#F44336' },
+    { key: 'lwlock',    label: 'LwLock',    color: '#FF9800' },
+    { key: 'ipc',       label: 'IPC',       color: '#9C27B0' },
+    { key: 'client',    label: 'Client',    color: '#00BCD4' },
+    { key: 'timeout',   label: 'Timeout',   color: '#795548' },
+    { key: 'bufferpin', label: 'BufferPin', color: '#FF5722' },
+    { key: 'activity',  label: 'Activity',  color: '#9E9E9E' },
+    { key: 'extension', label: 'Extension', color: '#607D8B' },
+    { key: 'unknown',   label: 'Unknown',   color: '#BDBDBD' },
+];
+
+const CLASS_COLOR_MAP = {};
+WAIT_CLASSES.forEach(c => CLASS_COLOR_MAP[c.label.toLowerCase()] = c.color);
+
+// -- State --------------------------------------------------------------------
+
+const state = {
+    ws: null,
+    nextId: 1,
+    pending: {},
+
+    // Server info
+    fromNs: 0,
+    toNs: 0,
+    numCpus: 0,
+
+    // Current view window
+    viewFrom: 0,
+    viewTo: 0,
+
+    // Filters + drill-down
+    filters: {},
+    breadcrumbs: [],
+
+    // Active tab
+    activeTab: 'overview',
+
+    // Sort state per tab
+    sortCol: {},
+    sortAsc: {},
+};
+
+// -- WebSocket ----------------------------------------------------------------
+
+function connect() {
+    state.ws = new WebSocket('ws://' + location.host + '/ws');
+    state.ws.onopen = () => init();
+    state.ws.onclose = () => setStatus('Disconnected', 'error');
+    state.ws.onerror = () => setStatus('WebSocket error', 'error');
+    state.ws.onmessage = (e) => {
+        const data = JSON.parse(e.data);
+        const p = state.pending[data.id];
+        if (p) {
+            clearTimeout(p.timer);
+            delete state.pending[data.id];
+            p.resolve(data);
+        }
+    };
+}
+
+function send(cmd, params) {
+    const id = state.nextId++;
+    const msg = JSON.stringify({ id, cmd, ...params });
+    return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+            delete state.pending[id];
+            reject(new Error('timeout'));
+        }, 30000);
+        state.pending[id] = { resolve, reject, timer };
+        state.ws.send(msg);
+    });
+}
+
+// -- Init ---------------------------------------------------------------------
+
+async function init() {
+    setStatus('Loading...', 'connecting');
+    try {
+        const info = await send('info');
+        state.fromNs = info.from_ns;
+        state.toNs = info.to_ns;
+        state.numCpus = info.num_cpus;
+        state.viewFrom = info.from_ns;
+        state.viewTo = info.to_ns;
+        setStatus(info.num_cpus + ' CPUs, ~' + fmtCount(info.num_events) + ' events', 'connected');
+        updateTimeRange();
+        initChart();
+        initTabs();
+        await refresh();
+    } catch (e) {
+        setStatus('Error: ' + e.message, 'error');
+    }
+}
+
+// -- Refresh ------------------------------------------------------------------
+
+async function refresh() {
+    await Promise.all([refreshChart(), refreshTable()]);
+}
+
+async function refreshChart() {
+    const data = await send('aas', {
+        from: state.viewFrom,
+        to: state.viewTo,
+        buckets: Math.min(Math.floor(chartEl.clientWidth / 4), 300),
+        filters: state.filters,
+    });
+    renderChart(data);
+}
+
+async function refreshTable() {
+    const cmdMap = {
+        overview: 'time_model',
+        events: 'top_events',
+        sessions: 'top_sessions',
+        queries: 'top_queries',
+    };
+    const data = await send(cmdMap[state.activeTab], {
+        from: state.viewFrom,
+        to: state.viewTo,
+        filters: state.filters,
+    });
+    renderTable(state.activeTab, data);
+}
+
+// -- UI helpers ---------------------------------------------------------------
+
+function setStatus(text, cls) {
+    const el = document.getElementById('status');
+    el.textContent = text;
+    el.className = 'status ' + cls;
+}
+
+function updateTimeRange() {
+    const el = document.getElementById('time-range');
+    const from = fmtTime(state.viewFrom);
+    const to = fmtTime(state.viewTo);
+    const dur = fmtDuration(state.viewTo - state.viewFrom);
+    el.textContent = from + ' \u2013 ' + to + ' (' + dur + ')';
+}
+
+function fmtTime(ns) {
+    if (!ns) return '--';
+    const d = new Date(ns / 1e6);
+    return d.toLocaleTimeString();
+}
+
+function fmtDuration(ns) {
+    const s = ns / 1e9;
+    if (s < 60) return s.toFixed(0) + 's';
+    if (s < 3600) return (s / 60).toFixed(1) + 'm';
+    return (s / 3600).toFixed(1) + 'h';
+}
+
+function fmtMs(ms) {
+    if (ms >= 1000) return (ms / 1000).toFixed(1) + 's';
+    if (ms >= 1) return ms.toFixed(1) + 'ms';
+    return (ms * 1000).toFixed(0) + '\u00b5s';
+}
+
+function fmtCount(n) {
+    if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+    if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+    return n.toString();
+}
+
+function fmtPct(p) { return p.toFixed(1) + '%'; }
+function fmtAas(a) { return a.toFixed(2); }
+function fmtUs(us) {
+    if (us >= 1e6) return (us / 1e6).toFixed(1) + 's';
+    if (us >= 1000) return (us / 1000).toFixed(1) + 'ms';
+    return us.toFixed(0) + '\u00b5s';
+}
+
+// -- Tabs ---------------------------------------------------------------------
+
+function initTabs() {
+    document.querySelectorAll('.tab').forEach(btn => {
+        btn.addEventListener('click', () => {
+            switchTab(btn.dataset.tab);
+        });
+    });
+}
+
+function switchTab(tab) {
+    state.activeTab = tab;
+    document.querySelectorAll('.tab').forEach(b => {
+        b.classList.toggle('active', b.dataset.tab === tab);
+    });
+    refreshTable();
+}
+
+// -- Chart (ECharts) ----------------------------------------------------------
+
+let chart = null;
+const chartEl = document.getElementById('chart-container');
+
+function initChart() {
+    chart = echarts.init(chartEl, 'dark');
+    window.addEventListener('resize', () => chart.resize());
+
+    // Brush/zoom -> update time range
+    chart.on('datazoom', (params) => {
+        const opt = chart.getOption();
+        if (!opt.xAxis || !opt.xAxis[0] || !opt.xAxis[0].data) return;
+        const data = opt.xAxis[0].data;
+        const dz = opt.dataZoom[0];
+        const startIdx = Math.floor(data.length * dz.start / 100);
+        const endIdx = Math.ceil(data.length * dz.end / 100) - 1;
+        if (startIdx >= 0 && endIdx < data.length && startIdx < endIdx) {
+            state.viewFrom = data[startIdx];
+            state.viewTo = data[endIdx];
+            updateTimeRange();
+            refreshTable(); // only refresh table, chart already zoomed
+        }
+    });
+}
+
+function renderChart(data) {
+    if (!chart || !data.buckets || data.buckets.length === 0) return;
+
+    const times = data.buckets.map(b => b.t);
+
+    const series = WAIT_CLASSES.map(wc => ({
+        name: wc.label,
+        type: 'line',
+        stack: 'aas',
+        areaStyle: { opacity: 0.85 },
+        lineStyle: { width: 0 },
+        emphasis: { focus: 'series' },
+        symbol: 'none',
+        color: wc.color,
+        data: data.buckets.map(b => +(b[wc.key] || 0).toFixed(4)),
+    }));
+
+    // CPU reference line
+    const markData = [];
+    if (state.numCpus > 0) {
+        markData.push({
+            yAxis: state.numCpus,
+            label: {
+                formatter: state.numCpus + ' CPUs',
+                position: 'insideEndTop',
+                color: '#fff',
+                fontSize: 11,
+            },
+            lineStyle: { color: '#E53935', type: 'dashed', width: 2 },
+        });
+    }
+
+    const yMax = Math.max(
+        data.max_aas * 1.2,
+        state.numCpus > 0 ? state.numCpus * 1.5 : 0,
+        1
+    );
+
+    const option = {
+        backgroundColor: 'transparent',
+        tooltip: {
+            trigger: 'axis',
+            axisPointer: { type: 'cross' },
+            backgroundColor: '#1e1e3a',
+            borderColor: '#333',
+            textStyle: { color: '#e0e0e0', fontSize: 12 },
+            formatter: function(params) {
+                if (!params.length) return '';
+                let t = fmtTime(params[0].axisValue);
+                let total = 0;
+                let lines = [];
+                for (let i = params.length - 1; i >= 0; i--) {
+                    const p = params[i];
+                    if (p.value > 0.001) {
+                        lines.push(
+                            '<span style="color:' + p.color + '">\u25cf</span> ' +
+                            p.seriesName + ': <b>' + p.value.toFixed(2) + '</b>'
+                        );
+                        total += p.value;
+                    }
+                }
+                return '<b>' + t + '</b><br>Total AAS: <b>' +
+                    total.toFixed(2) + '</b><br>' + lines.join('<br>');
+            },
+        },
+        legend: {
+            data: WAIT_CLASSES.map(c => c.label),
+            bottom: 0,
+            textStyle: { color: '#888', fontSize: 11 },
+            itemWidth: 12,
+            itemHeight: 8,
+        },
+        grid: {
+            left: 50, right: 20, top: 20, bottom: 60,
+        },
+        dataZoom: [
+            { type: 'inside', xAxisIndex: 0 },
+            {
+                type: 'slider', xAxisIndex: 0, bottom: 25,
+                height: 20,
+                backgroundColor: '#1a1a2e',
+                borderColor: '#333',
+                fillerColor: 'rgba(79,195,247,0.15)',
+                textStyle: { color: '#888' },
+            },
+        ],
+        xAxis: {
+            type: 'category',
+            data: times,
+            axisLabel: {
+                color: '#888',
+                fontSize: 10,
+                formatter: function(v) { return fmtTime(v); },
+            },
+            axisLine: { lineStyle: { color: '#333' } },
+        },
+        yAxis: {
+            type: 'value',
+            name: 'Active Sessions',
+            nameTextStyle: { color: '#888', fontSize: 11 },
+            min: 0,
+            max: yMax,
+            axisLabel: { color: '#888', fontSize: 10 },
+            splitLine: { lineStyle: { color: '#2a2a4a' } },
+        },
+        series: [
+            ...series,
+            // CPU markLine as a dummy series
+            {
+                name: '_cpu_line',
+                type: 'line',
+                data: [],
+                markLine: {
+                    silent: true,
+                    symbol: 'none',
+                    data: markData,
+                },
+            },
+        ],
+    };
+
+    chart.setOption(option, true);
+}
+
+// -- Tables -------------------------------------------------------------------
+
+const TABLE_CONFIGS = {
+    overview: {
+        columns: [
+            { key: 'name', label: 'Stat Name', format: (r) => r.name },
+            { key: 'ms', label: 'Time', cls: 'num', format: (r) => fmtMs(r.ms) },
+            { key: 'pct', label: '%DB Time', cls: 'num', format: (r) => fmtPct(r.pct) },
+            { key: 'aas', label: 'AAS', cls: 'num', format: (r) => fmtAas(r.aas) },
+        ],
+        rowClass: (r) => {
+            let c = '';
+            if (r.indent === 1) c += ' indent-1 clickable';
+            if (r.indent === 2) c += ' indent-2';
+            return c;
+        },
+        onClick: (r) => {
+            if (r.indent !== 1) return;
+            // Class row -> drill to events filtered by class
+            const cls = r.name.replace('*', '');
+            drillDown('class', cls, cls);
+        },
+    },
+    events: {
+        columns: [
+            { key: 'name', label: 'Wait Event', format: (r) => r.name },
+            { key: 'count', label: 'Count', cls: 'num', format: (r) => fmtCount(r.count) },
+            { key: 'total_ms', label: 'Total', cls: 'num', format: (r) => fmtMs(r.total_ms) },
+            { key: 'avg_us', label: 'Avg', cls: 'num', format: (r) => fmtUs(r.avg_us) },
+            { key: 'max_us', label: 'Max', cls: 'num', format: (r) => fmtUs(r.max_us) },
+            { key: 'pct', label: '%DB', cls: 'num', format: (r) => fmtPct(r.pct) },
+            { key: 'aas', label: 'AAS', cls: 'num', format: (r) => fmtAas(r.aas) },
+        ],
+        rowClass: () => 'clickable',
+        onClick: (r) => {
+            drillDown('event_id', r.event_id, r.name);
+        },
+    },
+    sessions: {
+        columns: [
+            { key: 'pid', label: 'PID', format: (r) => r.pid },
+            { key: 'db_time_ms', label: 'DB Time', cls: 'num', format: (r) => fmtMs(r.db_time_ms) },
+            { key: 'cpu_pct', label: 'CPU%', cls: 'num', format: (r) => fmtPct(r.cpu_pct) },
+            { key: 'wait_pct', label: 'Wait%', cls: 'num', format: (r) => fmtPct(r.wait_pct) },
+            { key: 'top_wait', label: 'Top Wait', format: (r) => r.top_wait },
+        ],
+        rowClass: () => 'clickable',
+        onClick: (r) => {
+            drillDown('pid', r.pid, 'PID ' + r.pid);
+        },
+    },
+    queries: {
+        columns: [
+            { key: 'query_id', label: 'Query ID', format: (r) => r.query_id },
+            { key: 'count', label: 'Count', cls: 'num', format: (r) => fmtCount(r.count) },
+            { key: 'total_ms', label: 'Total', cls: 'num', format: (r) => fmtMs(r.total_ms) },
+            { key: 'avg_us', label: 'Avg', cls: 'num', format: (r) => fmtUs(r.avg_us) },
+            { key: 'pct', label: '%DB', cls: 'num', format: (r) => fmtPct(r.pct) },
+            { key: 'top_wait', label: 'Top Wait', format: (r) => r.top_wait },
+        ],
+        rowClass: () => 'clickable',
+        onClick: (r) => {
+            drillDown('query_id', r.query_id, 'Query ' + r.query_id);
+        },
+    },
+};
+
+function renderTable(tab, data) {
+    const container = document.getElementById('table-container');
+    const config = TABLE_CONFIGS[tab];
+    if (!config || !data) {
+        container.innerHTML = '<div class="loading">No data</div>';
+        return;
+    }
+
+    const rows = data.rows || [];
+    if (rows.length === 0) {
+        container.innerHTML = '<div class="loading">No data for selected range</div>';
+        return;
+    }
+
+    // Sort
+    const sortKey = state.sortCol[tab];
+    if (sortKey) {
+        const asc = state.sortAsc[tab];
+        rows.sort((a, b) => {
+            const va = a[sortKey], vb = b[sortKey];
+            if (typeof va === 'number' && typeof vb === 'number')
+                return asc ? va - vb : vb - va;
+            return asc ? String(va).localeCompare(String(vb))
+                       : String(vb).localeCompare(String(va));
+        });
+    }
+
+    let html = '<table><thead><tr>';
+    for (const col of config.columns) {
+        const arrow = state.sortCol[tab] === col.key
+            ? (state.sortAsc[tab] ? ' \u25b2' : ' \u25bc') : '';
+        html += '<th class="' + (col.cls || '') + '" data-sort="' + col.key + '">' +
+                col.label + arrow + '</th>';
+    }
+    html += '</tr></thead><tbody>';
+
+    for (const row of rows) {
+        const cls = config.rowClass ? config.rowClass(row) : '';
+        html += '<tr class="' + cls + '" data-row="' + rows.indexOf(row) + '">';
+        for (const col of config.columns) {
+            html += '<td class="' + (col.cls || '') + '">' + col.format(row) + '</td>';
+        }
+        html += '</tr>';
+    }
+    html += '</tbody></table>';
+    container.innerHTML = html;
+
+    // Attach click handlers
+    container.querySelectorAll('th[data-sort]').forEach(th => {
+        th.addEventListener('click', () => {
+            const key = th.dataset.sort;
+            if (state.sortCol[tab] === key) {
+                state.sortAsc[tab] = !state.sortAsc[tab];
+            } else {
+                state.sortCol[tab] = key;
+                state.sortAsc[tab] = false;
+            }
+            renderTable(tab, data);
+        });
+    });
+
+    container.querySelectorAll('tr.clickable').forEach(tr => {
+        tr.addEventListener('click', () => {
+            const idx = parseInt(tr.dataset.row);
+            if (config.onClick && rows[idx]) {
+                config.onClick(rows[idx]);
+            }
+        });
+    });
+}
+
+// -- Drill-down ---------------------------------------------------------------
+
+function drillDown(filterKey, filterValue, label) {
+    state.breadcrumbs.push({
+        label: label,
+        filters: { ...state.filters },
+        tab: state.activeTab,
+    });
+    state.filters[filterKey] = filterValue;
+
+    // Auto-pivot
+    const pivotMap = { class: 'events', event_id: 'sessions', pid: 'queries' };
+    if (pivotMap[filterKey]) {
+        switchTab(pivotMap[filterKey]);
+    }
+
+    updateBreadcrumb();
+    refresh();
+}
+
+function drillUp(index) {
+    const crumb = state.breadcrumbs[index];
+    state.filters = { ...crumb.filters };
+    state.breadcrumbs = state.breadcrumbs.slice(0, index);
+    switchTab(crumb.tab);
+    updateBreadcrumb();
+    refresh();
+}
+
+function clearFilters() {
+    state.filters = {};
+    state.breadcrumbs = [];
+    updateBreadcrumb();
+    switchTab('overview');
+    refresh();
+}
+
+function updateBreadcrumb() {
+    const el = document.getElementById('breadcrumb');
+    if (state.breadcrumbs.length === 0 && Object.keys(state.filters).length === 0) {
+        el.innerHTML = '';
+        return;
+    }
+
+    let html = '';
+    state.breadcrumbs.forEach((crumb, i) => {
+        if (i > 0) html += '<span class="crumb-sep">\u203a</span>';
+        html += '<span class="crumb" data-idx="' + i + '">' + esc(crumb.label) + '</span>';
+    });
+
+    // Current filter
+    const filterParts = [];
+    for (const [k, v] of Object.entries(state.filters)) {
+        filterParts.push(k + '=' + v);
+    }
+    if (filterParts.length > 0) {
+        if (state.breadcrumbs.length > 0) html += '<span class="crumb-sep">\u203a</span>';
+        html += '<span style="color:#4fc3f7">' + esc(filterParts.join(', ')) + '</span>';
+        html += ' <span class="crumb-clear" title="Clear all filters">\u2715</span>';
+    }
+
+    el.innerHTML = html;
+
+    el.querySelectorAll('.crumb').forEach(crumb => {
+        crumb.addEventListener('click', () => {
+            drillUp(parseInt(crumb.dataset.idx));
+        });
+    });
+
+    const clearBtn = el.querySelector('.crumb-clear');
+    if (clearBtn) {
+        clearBtn.addEventListener('click', clearFilters);
+    }
+}
+
+function esc(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// -- Start --------------------------------------------------------------------
+
+connect();

@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>pgwt</title>
+<link rel="stylesheet" href="style.css">
+<script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+</head>
+<body>
+
+<header>
+  <div class="header-left">
+    <h1>pgwt</h1>
+    <span id="status" class="status connecting">Connecting...</span>
+  </div>
+  <div id="time-range" class="header-right"></div>
+</header>
+
+<div id="chart-container"></div>
+
+<nav id="tabs">
+  <button class="tab active" data-tab="overview">Overview</button>
+  <button class="tab" data-tab="events">Events</button>
+  <button class="tab" data-tab="sessions">Sessions</button>
+  <button class="tab" data-tab="queries">Queries</button>
+</nav>
+
+<div id="breadcrumb"></div>
+<div id="table-container"></div>
+
+<script src="app.js"></script>
+</body>
+</html>

@@ -15,6 +15,8 @@ tests/__pycache__/
 # Go build artifacts
 poc/web/pgwt-poc
 poc/web/go.sum
+web/pgwt
+web/go.sum
 
 # Rust build artifacts
 client/target/
