@@ -7,10 +7,12 @@
 #include "daemon.h"
 #include "event_writer.h"
 #include "summary_writer.h"
+#include "query_text.h"
 #include "map_reader.h"
 #include "wait_event.h"
 
 #include <string.h>
+#include <time.h>
 
 /* duration_to_bucket() moved to map_reader.c as pgwt_duration_to_bucket() */
 
@@ -81,6 +83,10 @@ int pgwt_handle_trace_event(void *ctx, void *data, size_t data_sz)
             if (dur < qe->min_ns) qe->min_ns = dur;
             if (dur > qe->max_ns) qe->max_ns = dur;
         }
+
+        /* Capture query text (only on first occurrence of each query_id) */
+        if (d->query_text_capture)
+            pgwt_qt_check(d->query_text_capture, evt->pid, evt->query_id, 0);
     }
 
     return 0;

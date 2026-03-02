@@ -115,7 +115,7 @@ static void test_file_roundtrip(void)
     }
 
     struct pgwt_event_writer w;
-    int rc = pgwt_writer_init(&w, tmpdir, 18, 24);
+    int rc = pgwt_writer_init(&w, tmpdir, 18, 24, NULL);
     CHECK(rc == 0, "writer_init returned %d", rc);
     if (rc != 0) { rmdir(tmpdir); return; }
 

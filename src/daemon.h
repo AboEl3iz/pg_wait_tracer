@@ -6,6 +6,7 @@
 #include "backend.h"
 #include "event_writer.h"
 #include "summary_writer.h"
+#include "query_text.h"
 #include "map_reader.h"
 #include "snapshot.h"
 
@@ -72,6 +73,7 @@ struct pgwt_daemon {
     bool        verbose;
     int         pg_major_version;   /* 14, 15, 16, 17, or 18 */
     int         st_query_id_offset; /* 0 = not available */
+    int         st_activity_offset; /* st_activity_raw in PgBackendStatus, 0 = N/A */
     enum pgwt_format format;         /* output format (TUI/TEXT/JSON/CSV) */
     int         count;               /* max intervals, 0 = unlimited */
     int         tick;                /* current interval number */
@@ -88,6 +90,7 @@ struct pgwt_daemon {
     const char *trace_group;                /* group for trace files, default "dba" */
     struct pgwt_event_writer *event_writer;     /* NULL if disabled */
     struct pgwt_summary_writer *summary_writer; /* NULL if disabled */
+    struct pgwt_query_text_capture *query_text_capture; /* NULL if disabled */
 
     /* Time windows */
 #define PGWT_MAX_WINDOWS 3

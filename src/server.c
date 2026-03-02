@@ -15,6 +15,15 @@
 #include <unistd.h>
 #include <ctype.h>
 
+/* ── Query text map ───────────────────────────────────────── */
+
+#define QT_MAP_SIZE 8192
+
+struct qt_entry {
+    uint64_t query_id;
+    char     text[256];   /* truncated SQL text */
+};
+
 /* ── Server state ─────────────────────────────────────────── */
 
 struct pgwt_server {
@@ -25,6 +34,10 @@ struct pgwt_server {
     uint64_t earliest_wall_ns;
     uint64_t latest_wall_ns;
     int  total_events;
+
+    /* Query text map: query_id → SQL text */
+    struct qt_entry qt_map[QT_MAP_SIZE];
+    int  qt_count;
 };
 
 /* ── JSON request parsing (hand-written, no library) ──────── */
@@ -156,6 +169,111 @@ static void parse_request(const char *line, struct pgwt_request *req)
     json_uint64(line, "to", &req->to_ns);
     json_int(line, "buckets", &req->num_buckets);
     parse_filters(line, &req->filter);
+}
+
+/* ── Query text loading ───────────────────────────────────── */
+
+static uint64_t qt_hash64(uint64_t x)
+{
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+    x = x ^ (x >> 31);
+    return x;
+}
+
+static void qt_map_insert(struct pgwt_server *srv, uint64_t query_id,
+                           const char *text)
+{
+    uint32_t idx = (uint32_t)(qt_hash64(query_id) & (QT_MAP_SIZE - 1));
+    for (int i = 0; i < QT_MAP_SIZE; i++) {
+        struct qt_entry *e = &srv->qt_map[idx];
+        if (e->query_id == 0) {
+            e->query_id = query_id;
+            snprintf(e->text, sizeof(e->text), "%s", text);
+            srv->qt_count++;
+            return;
+        }
+        if (e->query_id == query_id)
+            return;  /* already present */
+        idx = (idx + 1) & (QT_MAP_SIZE - 1);
+    }
+}
+
+static const char *qt_map_lookup(const struct pgwt_server *srv, uint64_t query_id)
+{
+    if (query_id == 0)
+        return NULL;
+    uint32_t idx = (uint32_t)(qt_hash64(query_id) & (QT_MAP_SIZE - 1));
+    for (int i = 0; i < QT_MAP_SIZE; i++) {
+        const struct qt_entry *e = &srv->qt_map[idx];
+        if (e->query_id == query_id)
+            return e->text;
+        if (e->query_id == 0)
+            return NULL;
+        idx = (idx + 1) & (QT_MAP_SIZE - 1);
+    }
+    return NULL;
+}
+
+/* Load query_texts.jsonl from trace dir into the hash map.
+ * File format: {"q":<query_id>,"t":"<text>","ts":<wall_ns>} per line.
+ * Simple hand-rolled parsing (no JSON library). */
+static void server_load_query_texts(struct pgwt_server *srv)
+{
+    char path[600];
+    snprintf(path, sizeof(path), "%s/query_texts.jsonl", srv->trace_dir);
+
+    FILE *fp = fopen(path, "r");
+    if (!fp)
+        return;
+
+    char line[4096];
+    while (fgets(line, sizeof(line), fp)) {
+        /* Parse "q":<number> */
+        const char *qp = strstr(line, "\"q\":");
+        if (!qp) continue;
+        qp += 4;
+        char *end;
+        uint64_t qid = strtoull(qp, &end, 10);
+        if (end == qp || qid == 0) continue;
+
+        /* Parse "t":"<text>" */
+        const char *tp = strstr(line, "\"t\":\"");
+        if (!tp) continue;
+        tp += 5;
+
+        /* Extract text, handling JSON escapes minimally */
+        char text[256];
+        int ti = 0;
+        while (*tp && *tp != '"' && ti < (int)sizeof(text) - 1) {
+            if (*tp == '\\' && tp[1]) {
+                tp++;
+                switch (*tp) {
+                case 'n':  text[ti++] = ' '; break;  /* newlines → space */
+                case 'r':  break;
+                case 't':  text[ti++] = ' '; break;
+                case '"':  text[ti++] = '"'; break;
+                case '\\': text[ti++] = '\\'; break;
+                default:
+                    if (*tp == 'u' && tp[1] && tp[2] && tp[3] && tp[4]) {
+                        text[ti++] = ' ';  /* \uXXXX → space */
+                        tp += 4;
+                    }
+                    break;
+                }
+            } else {
+                text[ti++] = *tp;
+            }
+            tp++;
+        }
+        text[ti] = '\0';
+
+        qt_map_insert(srv, qid, text);
+    }
+
+    fclose(fp);
+    if (srv->qt_count > 0)
+        fprintf(stderr, "pgwt-server: loaded %d query texts\n", srv->qt_count);
 }
 
 /* ── Event loading ────────────────────────────────────────── */
@@ -293,6 +411,8 @@ static int server_init(struct pgwt_server *srv, const char *trace_dir)
     fprintf(stderr, "pgwt-server: %d trace files, %d CPUs, ~%d events\n",
             srv->num_files, srv->num_cpus, srv->total_events);
 
+    server_load_query_texts(srv);
+
     return 0;
 }
 
@@ -316,6 +436,11 @@ static void handle_info(struct pgwt_server *srv, struct pgwt_request *req)
 {
     /* Re-scan for new files */
     srv->num_files = pgwt_scan_trace_files(srv->trace_dir, srv->files, 256);
+
+    /* Re-load query texts (picks up newly captured queries) */
+    memset(srv->qt_map, 0, sizeof(srv->qt_map));
+    srv->qt_count = 0;
+    server_load_query_texts(srv);
 
     /* Re-compute time range */
     srv->earliest_wall_ns = 0;
@@ -535,12 +660,34 @@ static void handle_top_queries(struct pgwt_server *srv, struct pgwt_request *req
         if (i > 0) putchar(',');
         printf("{\"query_id\":%llu,\"count\":%llu,"
                "\"total_ms\":%.2f,\"avg_us\":%.2f,"
-               "\"pct\":%.2f,\"top_wait\":\"%s\",\"top_wait_id\":%u}",
+               "\"pct\":%.2f,\"top_wait\":\"%s\",\"top_wait_id\":%u",
                (unsigned long long)res.rows[i].query_id,
                (unsigned long long)res.rows[i].count,
                res.rows[i].total_ms, res.rows[i].avg_us,
                res.rows[i].pct_db, res.rows[i].top_wait,
                res.rows[i].top_wait_id);
+
+        /* Add query text if available */
+        const char *qt = qt_map_lookup(srv, res.rows[i].query_id);
+        if (qt) {
+            printf(",\"text\":\"");
+            for (const char *c = qt; *c; c++) {
+                switch (*c) {
+                case '"':  fputs("\\\"", stdout); break;
+                case '\\': fputs("\\\\", stdout); break;
+                case '\n': fputs("\\n", stdout);  break;
+                case '\r': fputs("\\r", stdout);  break;
+                case '\t': fputs("\\t", stdout);  break;
+                default:
+                    if ((unsigned char)*c < 0x20)
+                        printf("\\u%04x", (unsigned char)*c);
+                    else
+                        putchar(*c);
+                }
+            }
+            putchar('"');
+        }
+        putchar('}');
     }
     printf("],\"db_time_ms\":%.2f}\n", res.db_time_ms);
 

@@ -1,0 +1,55 @@
+/* query_text.h — SQL query text capture from PgBackendStatus.st_activity_raw
+ *
+ * When the daemon sees a new query_id in the event stream, it reads the
+ * backend's st_activity_raw from shared memory via /proc/<pid>/mem and
+ * writes the {query_id, text} pair to query_texts.jsonl in the trace dir.
+ *
+ * st_activity_raw is a char* pointer in PgBackendStatus (PG18+).
+ * Read sequence: MyBEEntry → PgBackendStatus* → st_activity_raw ptr → string.
+ */
+#ifndef PGWT_QUERY_TEXT_H
+#define PGWT_QUERY_TEXT_H
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <sys/types.h>
+
+/* Hash table size for seen query_ids (must be power of 2) */
+#define QT_HT_SIZE 4096
+
+/* Max length of captured query text */
+#define QT_MAX_TEXT 1024
+
+struct pgwt_query_text_capture {
+    char          trace_dir[256];
+    FILE         *fp;                    /* query_texts.jsonl file handle */
+
+    /* Seen set: open-addressing hash table of query_ids */
+    uint64_t      seen[QT_HT_SIZE];
+    int           num_seen;
+
+    /* Addresses for reading st_activity_raw */
+    uint64_t      my_be_entry_addr;     /* MyBEEntry symbol VA */
+    int           st_activity_offset;   /* offset of st_activity_raw in PgBackendStatus */
+
+    bool          enabled;
+    bool          verbose;
+};
+
+/* Initialize query text capture. Returns 0 on success. */
+int pgwt_qt_init(struct pgwt_query_text_capture *qt,
+                 const char *trace_dir,
+                 uint64_t my_be_entry_addr,
+                 int st_activity_offset);
+
+/* Check if query_id is new; if so, capture st_activity_raw from the backend.
+ * Called from the event stream handler for each trace event with query_id != 0.
+ * wall_ns is wall-clock timestamp for the JSONL record. */
+void pgwt_qt_check(struct pgwt_query_text_capture *qt,
+                   pid_t pid, uint64_t query_id, uint64_t wall_ns);
+
+/* Close the JSONL file. */
+void pgwt_qt_close(struct pgwt_query_text_capture *qt);
+
+#endif /* PGWT_QUERY_TEXT_H */

@@ -37,6 +37,12 @@ int pgwt_detect_pg_version(const char *pg_binary);
  * Returns offset in bytes, or 0 if unavailable. */
 int pgwt_detect_query_id_offset(const char *pg_binary, int pg_major);
 
+/* Detect st_activity_raw offset in PgBackendStatus.
+ * Tries: 1) DWARF debug info, 2) known offset table.
+ * Returns offset in bytes, or 0 if unavailable.
+ * Note: st_activity_raw is a char* pointer (PG18+), not an inline array. */
+int pgwt_detect_activity_offset(const char *pg_binary, int pg_major);
+
 /* Auto-discover a running PostgreSQL postmaster.
  * Scans /proc for postgres processes, filters children.
  * Returns PID if exactly one postmaster found, 0 otherwise.

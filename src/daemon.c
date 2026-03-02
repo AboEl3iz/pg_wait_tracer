@@ -236,6 +236,23 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
             goto fail;
         }
         d->summary_writer->verbose = d->verbose;
+
+        /* Init query text capture (requires st_activity_raw offset + MyBEEntry) */
+        if (d->st_activity_offset > 0 && d->my_be_entry_addr != 0) {
+            d->query_text_capture = calloc(1, sizeof(*d->query_text_capture));
+            if (d->query_text_capture) {
+                if (pgwt_qt_init(d->query_text_capture, d->trace_dir,
+                                  d->my_be_entry_addr,
+                                  d->st_activity_offset) != 0) {
+                    free(d->query_text_capture);
+                    d->query_text_capture = NULL;
+                } else {
+                    d->query_text_capture->verbose = d->verbose;
+                    if (d->verbose)
+                        fprintf(stderr, "INFO: query text capture enabled\n");
+                }
+            }
+        }
     }
 
     /* Scan existing backends (tracepoints are already attached,
@@ -368,6 +385,14 @@ int pgwt_daemon_run(struct pgwt_daemon *d)
 
 void pgwt_daemon_cleanup(struct pgwt_daemon *d)
 {
+    if (d->query_text_capture) {
+        if (d->query_text_capture->verbose)
+            fprintf(stderr, "INFO: query text capture: %d unique queries captured\n",
+                    d->query_text_capture->num_seen);
+        pgwt_qt_close(d->query_text_capture);
+        free(d->query_text_capture);
+        d->query_text_capture = NULL;
+    }
     if (d->summary_writer) {
         pgwt_summary_close(d->summary_writer);
         pgwt_summary_destroy(d->summary_writer);

@@ -313,6 +313,79 @@ int pgwt_detect_query_id_offset(const char *pg_binary, int pg_major)
     return 0;
 }
 
+/* ── st_activity_raw Offset Detection ─────────────────────── */
+
+/* Tier 1: Try DWARF debug info via readelf */
+static int detect_activity_offset_dwarf(const char *pg_binary)
+{
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd),
+             "readelf --debug-dump=info '%s' 2>/dev/null | awk '"
+             "/DW_TAG_structure_type/ { s=0 } "
+             "/DW_AT_name.*PgBackendStatus/ { s=1 } "
+             "s && /DW_AT_name.*st_activity_raw/ { "
+             "  while ((getline line) > 0) { "
+             "    if (line ~ /DW_AT_data_member_location/) { "
+             "      match(line, /[0-9]+$/); "
+             "      if (RSTART>0) { print substr(line,RSTART,RLENGTH); exit } "
+             "    } "
+             "    if (line ~ /DW_TAG_/) break "
+             "  } "
+             "}'",
+             pg_binary);
+
+    FILE *fp = popen(cmd, "r");
+    if (!fp)
+        return 0;
+
+    char buf[64];
+    int offset = 0;
+    if (fgets(buf, sizeof(buf), fp))
+        offset = atoi(buf);
+    pclose(fp);
+
+    return offset;
+}
+
+/* Tier 2: Known offsets for common PG versions on x86_64 */
+static int detect_activity_offset_known(int pg_major)
+{
+    struct utsname un;
+    if (uname(&un) != 0)
+        return 0;
+
+    if (strcmp(un.machine, "x86_64") == 0) {
+        switch (pg_major) {
+        case 18: return 248;
+        /* PG17 and earlier: field name and offset may differ.
+         * Return 0 for now — DWARF detection is preferred. */
+        default: return 0;
+        }
+    }
+    return 0;
+}
+
+int pgwt_detect_activity_offset(const char *pg_binary, int pg_major)
+{
+    if (pg_major < 17) {
+        /* st_activity_raw pointer was introduced in PG18 (refactored from inline).
+         * PG17 may have a different layout. Skip for safety. */
+        return 0;
+    }
+
+    /* Tier 1: DWARF debug symbols */
+    int offset = detect_activity_offset_dwarf(pg_binary);
+    if (offset > 0)
+        return offset;
+
+    /* Tier 2: Known offset table */
+    offset = detect_activity_offset_known(pg_major);
+    if (offset > 0)
+        return offset;
+
+    return 0;
+}
+
 /* ── Postmaster Auto-Discovery ───────────────────────────── */
 
 #include <dirent.h>
@@ -558,6 +631,18 @@ int pgwt_discover(struct pgwt_daemon *d)
         if (d->verbose)
             fprintf(stderr, "INFO: st_query_id offset not available — "
                     "query_event view disabled\n");
+    }
+
+    /* Detect st_activity_raw offset (for query text capture) */
+    d->st_activity_offset = pgwt_detect_activity_offset(binary, d->pg_major_version);
+    if (d->st_activity_offset > 0) {
+        if (d->verbose)
+            fprintf(stderr, "INFO: st_activity_raw offset: %d (PG%d)\n",
+                    d->st_activity_offset, d->pg_major_version);
+    } else {
+        if (d->verbose)
+            fprintf(stderr, "INFO: st_activity_raw offset not available — "
+                    "query text capture disabled\n");
     }
 
     return 0;
