@@ -10,7 +10,9 @@ Key capabilities:
 
 - **6 diagnostic views**: time_model, system_event, session_event, histogram,
   query_event, active
-- **Interactive investigation client** (`pgwt-cli`): Rust TUI with AAS stacked
+- **Web investigation client** (`pgwt`): browser UI with ECharts AAS chart,
+  drill-down tables, connects to DB server over SSH — runs from your laptop
+- **TUI investigation client** (`pgwt-cli`): Rust TUI with AAS stacked
   bar chart, drill-down navigation, and pixel-perfect rendering on supported
   terminals (iTerm2, Kitty, WezTerm, Sixel)
 - **Multi-window analysis**: compare wait profiles across time horizons
@@ -45,6 +47,9 @@ sudo ./pg_wait_tracer --daemon -T /var/lib/pgwt/traces
 
 # Offline replay: analyze last hour from trace files (no root needed)
 pg_wait_tracer --replay -T /var/lib/pgwt/traces --from 1h
+
+# Web client: browser UI from your laptop over SSH (no root needed)
+pgwt root@db-server
 
 # Investigation client: interactive TUI with AAS chart (no root needed)
 pgwt-cli /var/lib/pgwt/traces
@@ -119,6 +124,54 @@ pg_wait_tracer --replay -T /var/lib/pgwt/traces --from 2h \
   cannot be read by replay. Only rotated `.trace.lz4` files are readable.
   (The investigation client `pgwt-cli` *can* read `current.trace` — see below.)
 - Output format is always `text` in replay mode.
+
+### Web Investigation Client (`pgwt`)
+
+A browser-based investigation tool that connects to a remote DB server over SSH.
+No database credentials needed — it reads trace files directly on the server.
+
+```bash
+# From your laptop — opens browser automatically
+pgwt root@db-server
+
+# Custom trace directory and server binary path
+pgwt --trace-dir /var/lib/pgwt/traces \
+     --server-path /usr/local/bin/pgwt-server \
+     root@db-server
+```
+
+**Architecture:**
+
+```
+[Your laptop]                        [DB server]
+pgwt (Go binary)                     pgwt-server (C binary)
+  ├─ spawns: ssh user@host             ├─ reads trace files
+  │    pgwt-server <trace-dir>         ├─ computes aggregates
+  ├─ localhost:8384 HTTP server        └─ JSON lines on stdin/stdout
+  └─ browser UI (ECharts)
+```
+
+**Features:**
+
+- **AAS stacked area chart** (ECharts) — 11 wait class colors, interactive
+  zoom with drag-to-select, tooltip with per-class AAS breakdown
+- **4 table views**: Overview (time model), Events, Sessions, Queries
+- **Drill-down navigation**: click a wait class → see its events → click an
+  event → see sessions → click a session → see queries. Breadcrumb trail
+  shows filter stack with click-to-go-back.
+- **Sortable columns**: click any column header to sort ascending/descending
+- **Zero config**: auto-discovers trace files, auto-opens browser
+
+**Prerequisites on DB server:** `pgwt-server` binary and trace files from the
+daemon. See [INSTALL.md](INSTALL.md) for build instructions.
+
+**Flags:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--port` | 8384 | Local HTTP port |
+| `--trace-dir` | `/var/lib/pgsql/18/data/pg_wait_tracer/` | Trace directory on the remote host |
+| `--server-path` | `pgwt-server` | Path to `pgwt-server` binary on the remote host |
 
 ### Investigation Client (`pgwt-cli`)
 

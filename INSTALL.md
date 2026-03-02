@@ -153,9 +153,28 @@ psql -U postgres -c "ALTER SYSTEM SET shared_preload_libraries = 'pg_stat_statem
 sudo systemctl restart postgresql-17
 ```
 
-### 5. Rust Toolchain (for the investigation client)
+### 5. Go Toolchain (for the web investigation client)
 
-The interactive investigation client (`pgwt-cli`) is written in Rust. Install
+The web investigation client (`pgwt`) is written in Go. Install Go >= 1.21
+if you want to build it. This runs on your **laptop** (macOS or Linux), not
+the DB server.
+
+```bash
+# macOS (Homebrew)
+brew install go
+
+# Ubuntu / Debian
+sudo apt install -y golang-go
+
+# Rocky / RHEL / Fedora
+sudo dnf install -y golang
+
+# Or download from https://go.dev/dl/
+```
+
+### 6. Rust Toolchain (for the TUI investigation client)
+
+The interactive TUI investigation client (`pgwt-cli`) is written in Rust. Install
 the Rust toolchain if you want to build it:
 
 ```bash
@@ -165,7 +184,7 @@ source "$HOME/.cargo/env"
 
 ## Build
 
-### Daemon (C)
+### Daemon + Server (C) — runs on DB server
 
 ```bash
 cd pg_wait_tracer
@@ -173,7 +192,15 @@ make clean
 make
 ```
 
-This produces the `pg_wait_tracer` binary in the project root.
+This produces two binaries in the project root:
+- `pg_wait_tracer` — the BPF daemon (requires BPF toolchain, root)
+- `pgwt-server` — the trace file server (no BPF dependencies)
+
+To build only `pgwt-server` (e.g. on a machine without BPF toolchain):
+
+```bash
+make pgwt-server
+```
 
 Build steps performed automatically:
 1. Generate `vmlinux.h` from kernel BTF via `bpftool`
@@ -181,7 +208,59 @@ Build steps performed automatically:
 3. Generate BPF skeleton header via `bpftool gen skeleton`
 4. Compile and link userspace C code with `gcc`
 
-### Investigation Client (Rust)
+### Trace File Server (C) — runs on DB server
+
+```bash
+cd pg_wait_tracer
+make pgwt-server
+```
+
+This produces the `pgwt-server` binary. It reads trace files and serves
+aggregated data over stdin/stdout (JSON lines protocol). No BPF dependencies —
+only requires `liblz4` and `zlib` at runtime.
+
+Copy it to the DB server:
+
+```bash
+scp pgwt-server root@db-server:/usr/local/bin/
+```
+
+Or build directly on the DB server (no BPF toolchain needed):
+
+```bash
+# Only needs: gcc, make, lz4-devel, zlib-devel
+make pgwt-server
+```
+
+### Web Investigation Client (Go) — runs on your laptop
+
+```bash
+cd web
+go build -o pgwt .
+```
+
+This produces the `pgwt` binary. Run it from your laptop:
+
+```bash
+# Connects to DB server over SSH, opens browser at localhost:8384
+./pgwt root@db-server
+
+# Custom trace directory
+./pgwt --trace-dir /var/lib/pgwt/traces root@db-server
+
+# Custom pgwt-server path on remote host
+./pgwt --server-path /usr/local/bin/pgwt-server root@db-server
+```
+
+**Requirements:**
+
+- Go >= 1.21 on your laptop (build time only — the binary is self-contained)
+- SSH access to the DB server (uses your default SSH key)
+- `pgwt-server` binary on the DB server (either in PATH or specified with
+  `--server-path`)
+- Trace files on the DB server (produced by `pg_wait_tracer --daemon -T <dir>`)
+
+### TUI Investigation Client (Rust)
 
 ```bash
 cd client
