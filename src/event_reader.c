@@ -1,6 +1,8 @@
 /* event_reader.c — Trace file reader: block decode, time-range seek, replay */
 #include "event_reader.h"
+#ifndef PGWT_SERVER
 #include "map_reader.h"
+#endif
 #include "wait_event.h"
 
 #include <string.h>
@@ -339,6 +341,7 @@ done_relative:
 
 /* ── Replay accumulation ───────────────────────────────── */
 
+#ifndef PGWT_SERVER
 void pgwt_replay_events(struct pgwt_accumulator *acc,
                          const struct pgwt_trace_event *events, int count,
                          uint64_t from_mono_ns, uint64_t to_mono_ns)
@@ -403,3 +406,4 @@ void pgwt_replay_events(struct pgwt_accumulator *acc,
         }
     }
 }
+#endif /* !PGWT_SERVER */

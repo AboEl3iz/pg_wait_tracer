@@ -38,9 +38,18 @@ USER_SRCS  = $(SRC_DIR)/pg_wait_tracer.c \
 
 USER_OBJS  = $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(USER_SRCS))
 
+# pgwt-server: lightweight replay server (no BPF dependencies)
+SERVER_SRCS = $(SRC_DIR)/server.c \
+              $(SRC_DIR)/compute.c \
+              $(SRC_DIR)/event_reader.c \
+              $(SRC_DIR)/event_writer.c \
+              $(SRC_DIR)/wait_event.c
+SERVER_OBJS = $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/server_%.o,$(SERVER_SRCS))
+SERVER_LDFLAGS = -lz -llz4
+
 .PHONY: all clean
 
-all: $(TARGET)
+all: $(TARGET) pgwt-server
 
 $(BUILD_DIR):
 	@mkdir -p $(BUILD_DIR)
@@ -75,6 +84,16 @@ $(TARGET): $(USER_OBJS)
 	@$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 	@echo "  DONE     $@"
 
+# pgwt-server: compile WITHOUT skeleton dependency, with -DPGWT_SERVER
+$(BUILD_DIR)/server_%.o: $(SRC_DIR)/%.c $(SRC_DIR)/pg_wait_tracer.h | $(BUILD_DIR)
+	@echo "  CC       $@ (server)"
+	@$(CC) $(CFLAGS) -DPGWT_SERVER -c $< -o $@
+
+pgwt-server: $(SERVER_OBJS)
+	@echo "  LINK     $@"
+	@$(CC) $(CFLAGS) $^ -o $@ $(SERVER_LDFLAGS)
+	@echo "  DONE     $@"
+
 clean:
-	rm -rf $(BUILD_DIR) $(TARGET)
+	rm -rf $(BUILD_DIR) $(TARGET) pgwt-server
 	rm -f $(INC_DIR)/vmlinux.h $(INC_DIR)/pg_wait_tracer.skel.h
