@@ -409,10 +409,12 @@ static void handle_top_events(struct pgwt_server *srv, struct pgwt_request *req)
     printf("{\"id\":%lld,\"rows\":[", (long long)req->id);
     for (int i = 0; i < res.num_rows; i++) {
         if (i > 0) putchar(',');
-        printf("{\"event_id\":%u,\"name\":\"%s\",\"count\":%llu,"
+        printf("{\"event_id\":%u,\"name\":\"%s\","
+               "\"class\":\"%s\",\"count\":%llu,"
                "\"total_ms\":%.2f,\"avg_us\":%.2f,\"max_us\":%.2f,"
                "\"pct\":%.2f,\"aas\":%.4f}",
                res.rows[i].event_id, res.rows[i].name,
+               pgwt_class_name(res.rows[i].event_id),
                (unsigned long long)res.rows[i].count,
                res.rows[i].total_ms, res.rows[i].avg_us,
                res.rows[i].max_us, res.rows[i].pct_db,

@@ -17,7 +17,10 @@ const WAIT_CLASSES = [
 ];
 
 const CLASS_COLOR_MAP = {};
-WAIT_CLASSES.forEach(c => CLASS_COLOR_MAP[c.label.toLowerCase()] = c.color);
+WAIT_CLASSES.forEach(c => {
+    CLASS_COLOR_MAP[c.label.toLowerCase()] = c.color;
+    CLASS_COLOR_MAP[c.key] = c.color;
+});
 
 // -- State --------------------------------------------------------------------
 
@@ -45,16 +48,40 @@ const state = {
     // Sort state per tab
     sortCol: {},
     sortAsc: {},
+
+    // Reconnect
+    reconnectDelay: 2000,
+    reconnectTimer: null,
 };
 
 // -- WebSocket ----------------------------------------------------------------
 
 function connect() {
-    state.ws = new WebSocket('ws://' + location.host + '/ws');
-    state.ws.onopen = () => init();
-    state.ws.onclose = () => setStatus('Disconnected', 'error');
-    state.ws.onerror = () => setStatus('WebSocket error', 'error');
-    state.ws.onmessage = (e) => {
+    if (state.reconnectTimer) {
+        clearTimeout(state.reconnectTimer);
+        state.reconnectTimer = null;
+    }
+
+    setStatus('Connecting...', 'connecting');
+    const ws = new WebSocket('ws://' + location.host + '/ws');
+
+    ws.onopen = () => {
+        state.ws = ws;
+        state.reconnectDelay = 2000;
+        init();
+    };
+
+    ws.onclose = () => {
+        state.ws = null;
+        rejectAllPending('disconnected');
+        scheduleReconnect();
+    };
+
+    ws.onerror = () => {
+        // onclose will fire after onerror
+    };
+
+    ws.onmessage = (e) => {
         const data = JSON.parse(e.data);
         const p = state.pending[data.id];
         if (p) {
@@ -65,7 +92,26 @@ function connect() {
     };
 }
 
+function rejectAllPending(reason) {
+    for (const id of Object.keys(state.pending)) {
+        const p = state.pending[id];
+        clearTimeout(p.timer);
+        p.reject(new Error(reason));
+    }
+    state.pending = {};
+}
+
+function scheduleReconnect() {
+    const delay = state.reconnectDelay;
+    state.reconnectDelay = Math.min(delay * 2, 16000);
+    setStatus('Reconnecting in ' + (delay / 1000) + 's...', 'error');
+    state.reconnectTimer = setTimeout(connect, delay);
+}
+
 function send(cmd, params) {
+    if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
+        return Promise.reject(new Error('not connected'));
+    }
     const id = state.nextId++;
     const msg = JSON.stringify({ id, cmd, ...params });
     return new Promise((resolve, reject) => {
@@ -106,28 +152,32 @@ async function refresh() {
 }
 
 async function refreshChart() {
-    const data = await send('aas', {
-        from: state.viewFrom,
-        to: state.viewTo,
-        buckets: Math.min(Math.floor(chartEl.clientWidth / 4), 300),
-        filters: state.filters,
-    });
-    renderChart(data);
+    try {
+        const data = await send('aas', {
+            from: state.viewFrom,
+            to: state.viewTo,
+            buckets: Math.min(Math.floor(chartEl.clientWidth / 4), 300),
+            filters: state.filters,
+        });
+        renderChart(data);
+    } catch (e) { /* ignore on disconnect */ }
 }
 
 async function refreshTable() {
-    const cmdMap = {
-        overview: 'time_model',
-        events: 'top_events',
-        sessions: 'top_sessions',
-        queries: 'top_queries',
-    };
-    const data = await send(cmdMap[state.activeTab], {
-        from: state.viewFrom,
-        to: state.viewTo,
-        filters: state.filters,
-    });
-    renderTable(state.activeTab, data);
+    try {
+        const cmdMap = {
+            overview: 'time_model',
+            events: 'top_events',
+            sessions: 'top_sessions',
+            queries: 'top_queries',
+        };
+        const data = await send(cmdMap[state.activeTab], {
+            from: state.viewFrom,
+            to: state.viewTo,
+            filters: state.filters,
+        });
+        renderTable(state.activeTab, data);
+    } catch (e) { /* ignore on disconnect */ }
 }
 
 // -- UI helpers ---------------------------------------------------------------
@@ -177,6 +227,41 @@ function fmtUs(us) {
     if (us >= 1e6) return (us / 1e6).toFixed(1) + 's';
     if (us >= 1000) return (us / 1000).toFixed(1) + 'ms';
     return us.toFixed(0) + '\u00b5s';
+}
+
+// -- Color dots ---------------------------------------------------------------
+
+function classColor(name) {
+    if (!name) return null;
+    // Try exact match first (e.g. "IO", "cpu")
+    const lower = name.toLowerCase();
+    if (CLASS_COLOR_MAP[lower]) return CLASS_COLOR_MAP[lower];
+    // Extract class from "ClassName:EventName"
+    const colon = name.indexOf(':');
+    if (colon > 0) {
+        const cls = name.substring(0, colon).toLowerCase();
+        if (CLASS_COLOR_MAP[cls]) return CLASS_COLOR_MAP[cls];
+    }
+    // "CPU*" -> "cpu"
+    const stripped = lower.replace('*', '');
+    if (CLASS_COLOR_MAP[stripped]) return CLASS_COLOR_MAP[stripped];
+    return null;
+}
+
+function dot(name) {
+    const color = classColor(name);
+    if (!color) return '';
+    return '<span class="class-dot" style="background:' + color + '"></span>';
+}
+
+// -- Percentage bar -----------------------------------------------------------
+
+function pctBar(pct, color) {
+    const w = Math.min(Math.max(pct, 0), 100);
+    const c = color || '#4fc3f7';
+    return '<div class="pct-bar">' +
+        '<div class="pct-fill" style="width:' + w.toFixed(1) + '%;background:' + c + '"></div>' +
+        '<span>' + pct.toFixed(1) + '%</span></div>';
 }
 
 // -- Tabs ---------------------------------------------------------------------
@@ -273,17 +358,19 @@ function renderChart(data) {
                 if (!params.length) return '';
                 let t = fmtTime(params[0].axisValue);
                 let total = 0;
-                let lines = [];
+                let items = [];
                 for (let i = params.length - 1; i >= 0; i--) {
                     const p = params[i];
                     if (p.value > 0.001) {
-                        lines.push(
-                            '<span style="color:' + p.color + '">\u25cf</span> ' +
-                            p.seriesName + ': <b>' + p.value.toFixed(2) + '</b>'
-                        );
+                        items.push({ name: p.seriesName, value: p.value, color: p.color });
                         total += p.value;
                     }
                 }
+                let lines = items.map(function(it) {
+                    const pct = total > 0 ? (it.value / total * 100).toFixed(0) : '0';
+                    return '<span style="color:' + it.color + '">\u25cf</span> ' +
+                        it.name + ': <b>' + it.value.toFixed(2) + '</b> (' + pct + '%)';
+                });
                 return '<b>' + t + '</b><br>Total AAS: <b>' +
                     total.toFixed(2) + '</b><br>' + lines.join('<br>');
             },
@@ -352,9 +439,16 @@ function renderChart(data) {
 const TABLE_CONFIGS = {
     overview: {
         columns: [
-            { key: 'name', label: 'Stat Name', format: (r) => r.name },
+            { key: 'name', label: 'Stat Name', format: (r) => {
+                if (r.indent >= 1) return dot(r.name) + esc(r.name);
+                return esc(r.name);
+            }},
             { key: 'ms', label: 'Time', cls: 'num', format: (r) => fmtMs(r.ms) },
-            { key: 'pct', label: '%DB Time', cls: 'num', format: (r) => fmtPct(r.pct) },
+            { key: 'pct', label: '%DB Time', cls: 'num', format: (r) => {
+                if (r.indent === 0 && r.name === 'DB Time') return fmtPct(r.pct);
+                const color = classColor(r.name) || '#4fc3f7';
+                return pctBar(r.pct, color);
+            }},
             { key: 'aas', label: 'AAS', cls: 'num', format: (r) => fmtAas(r.aas) },
         ],
         rowClass: (r) => {
@@ -365,19 +459,21 @@ const TABLE_CONFIGS = {
         },
         onClick: (r) => {
             if (r.indent !== 1) return;
-            // Class row -> drill to events filtered by class
             const cls = r.name.replace('*', '');
             drillDown('class', cls, cls);
         },
     },
     events: {
         columns: [
-            { key: 'name', label: 'Wait Event', format: (r) => r.name },
+            { key: 'name', label: 'Wait Event', format: (r) => dot(r.name) + esc(r.name) },
             { key: 'count', label: 'Count', cls: 'num', format: (r) => fmtCount(r.count) },
             { key: 'total_ms', label: 'Total', cls: 'num', format: (r) => fmtMs(r.total_ms) },
             { key: 'avg_us', label: 'Avg', cls: 'num', format: (r) => fmtUs(r.avg_us) },
             { key: 'max_us', label: 'Max', cls: 'num', format: (r) => fmtUs(r.max_us) },
-            { key: 'pct', label: '%DB', cls: 'num', format: (r) => fmtPct(r.pct) },
+            { key: 'pct', label: '%DB', cls: 'num', format: (r) => {
+                const color = classColor(r.name) || '#4fc3f7';
+                return pctBar(r.pct, color);
+            }},
             { key: 'aas', label: 'AAS', cls: 'num', format: (r) => fmtAas(r.aas) },
         ],
         rowClass: () => 'clickable',
@@ -389,9 +485,12 @@ const TABLE_CONFIGS = {
         columns: [
             { key: 'pid', label: 'PID', format: (r) => r.pid },
             { key: 'db_time_ms', label: 'DB Time', cls: 'num', format: (r) => fmtMs(r.db_time_ms) },
-            { key: 'cpu_pct', label: 'CPU%', cls: 'num', format: (r) => fmtPct(r.cpu_pct) },
-            { key: 'wait_pct', label: 'Wait%', cls: 'num', format: (r) => fmtPct(r.wait_pct) },
-            { key: 'top_wait', label: 'Top Wait', format: (r) => r.top_wait },
+            { key: 'cpu_pct', label: 'CPU%', cls: 'num', format: (r) => pctBar(r.cpu_pct, '#4CAF50') },
+            { key: 'wait_pct', label: 'Wait%', cls: 'num', format: (r) => {
+                const color = classColor(r.top_wait) || '#F44336';
+                return pctBar(r.wait_pct, color);
+            }},
+            { key: 'top_wait', label: 'Top Wait', format: (r) => dot(r.top_wait) + esc(r.top_wait) },
         ],
         rowClass: () => 'clickable',
         onClick: (r) => {
@@ -404,8 +503,8 @@ const TABLE_CONFIGS = {
             { key: 'count', label: 'Count', cls: 'num', format: (r) => fmtCount(r.count) },
             { key: 'total_ms', label: 'Total', cls: 'num', format: (r) => fmtMs(r.total_ms) },
             { key: 'avg_us', label: 'Avg', cls: 'num', format: (r) => fmtUs(r.avg_us) },
-            { key: 'pct', label: '%DB', cls: 'num', format: (r) => fmtPct(r.pct) },
-            { key: 'top_wait', label: 'Top Wait', format: (r) => r.top_wait },
+            { key: 'pct', label: '%DB', cls: 'num', format: (r) => pctBar(r.pct, '#4fc3f7') },
+            { key: 'top_wait', label: 'Top Wait', format: (r) => dot(r.top_wait) + esc(r.top_wait) },
         ],
         rowClass: () => 'clickable',
         onClick: (r) => {
@@ -414,12 +513,58 @@ const TABLE_CONFIGS = {
     },
 };
 
+// -- Summary bar (above overview table) ---------------------------------------
+
+function renderSummary(data) {
+    const el = document.getElementById('summary-bar');
+    if (!data || !data.rows || data.rows.length === 0) {
+        el.innerHTML = '';
+        return;
+    }
+
+    const dbRow = data.rows[0]; // "DB Time" is always first
+    const idleRow = data.rows.find(r => r.indent === 0 && r.name.indexOf('Idle') >= 0);
+
+    let html = '<div class="metric"><span class="metric-label">DB Time</span>' +
+        '<span class="metric-value">' + fmtMs(dbRow.ms) + '</span></div>';
+
+    if (data.wall_ms) {
+        html += '<div class="metric"><span class="metric-label">Wall</span>' +
+            '<span class="metric-value">' + fmtMs(data.wall_ms) + '</span></div>';
+    }
+
+    html += '<div class="metric"><span class="metric-label">AAS</span>' +
+        '<span class="metric-value">' + fmtAas(dbRow.aas) + '</span></div>';
+
+    if (idleRow) {
+        html += '<div class="metric"><span class="metric-label">Idle</span>' +
+            '<span class="metric-value">' + fmtMs(idleRow.ms) + '</span></div>';
+    }
+
+    html += '<div class="metric"><span class="metric-label">CPUs</span>' +
+        '<span class="metric-value">' + state.numCpus + '</span></div>';
+
+    el.innerHTML = html;
+}
+
+// -- Table rendering ----------------------------------------------------------
+
 function renderTable(tab, data) {
     const container = document.getElementById('table-container');
+    const summaryEl = document.getElementById('summary-bar');
     const config = TABLE_CONFIGS[tab];
+
     if (!config || !data) {
+        summaryEl.innerHTML = '';
         container.innerHTML = '<div class="loading">No data</div>';
         return;
+    }
+
+    // Summary bar only for overview
+    if (tab === 'overview') {
+        renderSummary(data);
+    } else {
+        summaryEl.innerHTML = '';
     }
 
     const rows = data.rows || [];
@@ -428,9 +573,9 @@ function renderTable(tab, data) {
         return;
     }
 
-    // Sort
+    // Sort (skip overview — it has a meaningful hierarchy)
     const sortKey = state.sortCol[tab];
-    if (sortKey) {
+    if (sortKey && tab !== 'overview') {
         const asc = state.sortAsc[tab];
         rows.sort((a, b) => {
             const va = a[sortKey], vb = b[sortKey];
@@ -450,9 +595,10 @@ function renderTable(tab, data) {
     }
     html += '</tr></thead><tbody>';
 
-    for (const row of rows) {
+    for (let ri = 0; ri < rows.length; ri++) {
+        const row = rows[ri];
         const cls = config.rowClass ? config.rowClass(row) : '';
-        html += '<tr class="' + cls + '" data-row="' + rows.indexOf(row) + '">';
+        html += '<tr class="' + cls + '" data-row="' + ri + '">';
         for (const col of config.columns) {
             html += '<td class="' + (col.cls || '') + '">' + col.format(row) + '</td>';
         }
@@ -532,7 +678,8 @@ function updateBreadcrumb() {
     let html = '';
     state.breadcrumbs.forEach((crumb, i) => {
         if (i > 0) html += '<span class="crumb-sep">\u203a</span>';
-        html += '<span class="crumb" data-idx="' + i + '">' + esc(crumb.label) + '</span>';
+        html += '<span class="crumb" data-idx="' + i + '">' +
+            dot(crumb.label) + esc(crumb.label) + '</span>';
     });
 
     // Current filter

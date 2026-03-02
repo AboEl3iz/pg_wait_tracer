@@ -236,6 +236,7 @@ make pgwt-server
 
 ```bash
 cd web
+go mod tidy    # downloads dependencies, generates go.sum
 go build -o pgwt .
 ```
 

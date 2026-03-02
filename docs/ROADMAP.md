@@ -72,7 +72,7 @@ The centerpiece visual — Average Active Sessions over time.
 
 ---
 
-## PRIORITY: Phase F — Web Investigation Client
+## Phase F: Web Investigation Client (DONE)
 
 **Goal**: Oracle ASH / RDS Performance Insights-class interactive
 investigation tool with a rich web UI, running on the DBA's laptop and
@@ -84,7 +84,7 @@ connecting to the DB server over SSH.
 [DBA laptop]                              [DB server]
 pgwt (Go binary)                          pgwt-server (C binary)
   ├─ spawns: ssh user@host pgwt-server    ├─ reads trace files (reuses event_reader.c)
-  ├─ localhost HTTP server (net/http)     ├─ computes aggregates (reuses replay.c,
+  ├─ localhost HTTP server (net/http)     ├─ computes aggregates (reuses compute.c,
   ├─ WebSocket bridge: browser ↔ SSH      │   map_reader.c, wait_event.c)
   ├─ static assets (//go:embed)           └─ JSON lines on stdin/stdout
   └─ auto-opens browser
@@ -102,13 +102,13 @@ pgwt (Go binary)                          pgwt-server (C binary)
 
 **Usage**:
 ```bash
-pgwt ssh root@db-server /var/lib/pgwt/traces
+pgwt root@db-server
 # Browser opens http://localhost:8384 automatically
 ```
 
-### F.1: Server side — `pgwt-server` (C)
+### F.1: Server side — `pgwt-server` (C) — DONE
 
-New binary: `src/server.c` (+ `src/server_compute.c`)
+Binary: `src/server.c` (+ `src/compute.c`)
 
 Reuses existing modules directly:
 - `event_reader.c` — trace file reading, LZ4 decompression, block index
@@ -119,27 +119,28 @@ Reuses existing modules directly:
 **Protocol** (JSON lines over stdin/stdout):
 
 ```
---> {"cmd":"info"}
-<-- {"from_ns":1709000000,"to_ns":1709036000,"num_events":284000,"num_cpus":8}
+--> {"id":1,"cmd":"info"}
+<-- {"id":1,"from_ns":1709000000,"to_ns":1709036000,"num_events":284000,"num_cpus":8}
 
---> {"cmd":"aas","from":1709000000,"to":1709003600,"buckets":120,"filters":{}}
-<-- {"buckets":[{"t":1709000000,"cpu":2.1,"io":0.8,"lock":0.3,...},...],
+--> {"id":2,"cmd":"aas","from":1709000000,"to":1709003600,"buckets":120,"filters":{}}
+<-- {"id":2,"buckets":[{"t":1709000000,"cpu":2.1,"io":0.8,"lock":0.3,...},...],
      "max_aas":4.2}
 
---> {"cmd":"top_events","from":1709000000,"to":1709003600,"filters":{"class":"IO"}}
-<-- {"rows":[{"event_id":167772161,"name":"IO:DataFileRead","count":4521,
-     "total_ms":892.3,"avg_us":197.4,"max_us":12400,"pct":34.2,"aas":0.25},...],
-     "db_time_ms":2608.1}
+--> {"id":3,"cmd":"top_events","from":1709000000,"to":1709003600,"filters":{"class":"IO"}}
+<-- {"id":3,"rows":[{"event_id":167772161,"name":"IO:DataFileRead","class":"IO",
+     "count":4521,"total_ms":892.3,"avg_us":197.4,"max_us":12400,"pct":34.2,
+     "aas":0.25},...], "db_time_ms":2608.1}
 
---> {"cmd":"top_sessions","from":...,"to":...,"filters":{}}
-<-- {"rows":[{"pid":1234,"db_time_ms":450.2,"cpu_pct":62.1,"top_wait":"IO:DataFileRead"},...]}
+--> {"id":4,"cmd":"top_sessions","from":...,"to":...,"filters":{}}
+<-- {"id":4,"rows":[{"pid":1234,"db_time_ms":450.2,"cpu_pct":62.1,
+     "top_wait":"IO:DataFileRead"},...]}
 
---> {"cmd":"top_queries","from":...,"to":...,"filters":{}}
-<-- {"rows":[{"query_id":123456789,"count":891,"total_ms":1200.5,"pct":46.0,
+--> {"id":5,"cmd":"top_queries","from":...,"to":...,"filters":{}}
+<-- {"id":5,"rows":[{"query_id":123456789,"count":891,"total_ms":1200.5,"pct":46.0,
      "top_wait":"Lock:transactionid"},...]}
 
---> {"cmd":"time_model","from":...,"to":...,"filters":{}}
-<-- {"db_time_ms":2608.1,"idle_time_ms":45000,"aas":2.61,
+--> {"id":6,"cmd":"time_model","from":...,"to":...,"filters":{}}
+<-- {"id":6,"db_time_ms":2608.1,"idle_time_ms":45000,"aas":2.61,
      "classes":[{"name":"CPU","ms":1200,"pct":46.0,"aas":1.2},...],"wall_ms":1000}
 ```
 
@@ -151,9 +152,9 @@ Reuses existing modules directly:
 **Build**: compiled alongside the daemon by the existing Makefile.
 Linked against same object files. No new dependencies.
 
-### F.2: Client side — `pgwt` (Go)
+### F.2: Client side — `pgwt` (Go) — DONE
 
-New directory: `web/` (Go module)
+Directory: `web/` (Go module)
 
 ```
 web/
@@ -161,8 +162,7 @@ web/
   ├── bridge.go        # WebSocket ↔ SSH stdin/stdout bridge
   ├── static/          # Embedded web assets
   │   ├── index.html   # Single-page app
-  │   ├── app.js       # Main application logic
-  │   ├── chart.js     # ECharts stacked area chart
+  │   ├── app.js       # Main application logic (chart + tables + drill-down)
   │   └── style.css    # Layout and styling
   ├── go.mod
   └── go.sum
@@ -186,67 +186,59 @@ stdout, _ := cmd.StdoutPipe()  // read responses
 - Go forwards to browser via WebSocket
 - Requests/responses matched by `"id"` field for concurrency
 
-### F.3: Web frontend (HTML + JS + ECharts)
-
-**UX design** (Oracle ASH / RDS Performance Insights inspired):
+### F.3: Web frontend (HTML + JS + ECharts) — DONE
 
 **Layout**:
 ```
 ┌──────────────────────────────────────────────┐
-│ pgwt — db-server   14:00–14:30 (30m)  [8cpu] │  header
+│ pgwt       [Connected]        14:00–14:30    │  header
 ├──────────────────────────────────────────────┤
 │ ▓▓▓▓▓▓▓▓▓▓████████▓▓▓▓▓▓░░░░░░░░░░░▓▓▓▓▓▓ │  AAS stacked
 │ ▓▓▓▓▓▓████████████▓▓▓▓░░░░░░░░░░░░░░▓▓▓▓▓▓ │  area chart
 │ ▓▓▓▓████████████▓▓▓▓░░░░░░░░░░░░░░░░░▓▓▓▓▓ │  (ECharts)
-│ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 8 cpu ━━━━━━━ │
-│ ▓▓████████▓▓▓▓░░░░░░░░░░░░░░░░░░░░░░░░░▓▓▓ │
-├──────────────────────────────────────────────┤
-│ Slice by: [Waits ▼]   Filters: class=IO  ✕  │  controls
 ├──────────────────────────────────────────────┤
 │ [Overview] [Events] [Sessions] [Queries]     │  tabs
 ├──────────────────────────────────────────────┤
+│ ● IO > IO:DataFileRead                    ✕  │  breadcrumbs
+├──────────────────────────────────────────────┤
+│ DB Time: 2.3s  Wall: 2m 47s  AAS: 1.38      │  summary bar
+├──────────────────────────────────────────────┤
 │ #  Wait Event         Count  Total  %DB  AAS │  data table
-│ 1  IO:DataFileRead    4521   892ms  34%  0.25│  (click = drill)
-│ 2  Lock:transaction   1203   450ms  17%  0.13│
+│ 1  ● IO:DataFileRead  4521   892ms  ██ 34%   │  (click = drill)
+│ 2  ● Lock:transaction 1203   450ms  █  17%   │
 │ ...                                          │
-│ 10 Other (42 events)         120ms   5%  0.03│
 └──────────────────────────────────────────────┘
 ```
 
-**Chart features** (ECharts provides all of these):
-- Stacked area chart with 11 wait class colors
-- Brush selection — drag on chart to select time range, all tables update
-- Zoom — mouse wheel or toolbar buttons
-- Max CPU reference line (markLine)
-- Tooltip — hover shows AAS breakdown at that point
-- Filtered context outline — dim unfiltered total behind filtered chart
-- Legend — click to toggle wait classes
+**Chart features**:
+- Stacked area chart with 11 wait class colors (ECharts)
+- Tooltip with per-class AAS breakdown and percentages
+- Interactive drag-to-zoom
+- Responsive resize
 
 **Table features**:
 - Click row to drill down (adds filter, pivots to next view)
-- Breadcrumb trail: `Overview > IO > IO:DataFileRead > PID 1234`
-- "Other" rollup row (top 9 + Other)
-- Mini wait-breakdown color bars per row (inline `<div>` bars)
+- Breadcrumb trail with colored dots: `● IO > ● IO:DataFileRead > PID 1234`
+- Color-coded dots next to wait class/event names in all tables
+- Percentage bars (visual bar behind `%DB`, `CPU%`, `Wait%` columns)
+- Summary header above overview table (DB Time, Wall, AAS, Idle, CPUs)
 - Sortable columns (click header)
-- "Slice by" dropdown: Waits / Events / SQL / Sessions
 
-**Time navigation**:
-- Chart brush select (drag) — primary method
-- Zoom buttons / mouse wheel
-- Reset button (full time range)
-- Time range display in header
+**Connectivity**:
+- WebSocket auto-reconnect with exponential backoff (2s → 16s max)
+- Connection status indicator (Connecting / Connected / Reconnecting)
 
-### F.4: Implementation order
+### F.4: Implementation steps (all DONE)
 
-| Step | What | Deliverable |
-|------|------|-------------|
-| 1 | `pgwt-server` — info + aas commands | C binary, reads traces, JSON stdout |
-| 2 | `pgwt` Go skeleton — SSH + HTTP + WS bridge | Go binary, connects to server |
-| 3 | AAS stacked area chart in browser | ECharts chart with time brush |
-| 4 | `pgwt-server` — all 4 compute commands | time_model, top_events/sessions/queries |
-| 5 | Data tables + drill-down | Click row → filter → next view |
-| 6 | Filters, breadcrumbs, "slice by" | Full investigation workflow |
-| 7 | Polish: CPU line, "Other" row, mini bars | RDS PI-quality UX |
+| Step | What | Status |
+|------|------|--------|
+| 1 | `pgwt-server` — info + aas commands | DONE |
+| 2 | `pgwt` Go skeleton — SSH + HTTP + WS bridge | DONE |
+| 3 | AAS stacked area chart in browser | DONE |
+| 4 | `pgwt-server` — all 6 commands | DONE |
+| 5 | Data tables + drill-down + breadcrumbs | DONE |
+| 6 | Color dots, percentage bars, summary header | DONE |
+| 7 | Auto-reconnect, tooltip %, style polish | DONE |
 
 ---
 

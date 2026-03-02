@@ -11,7 +11,8 @@ Key capabilities:
 - **6 diagnostic views**: time_model, system_event, session_event, histogram,
   query_event, active
 - **Web investigation client** (`pgwt`): browser UI with ECharts AAS chart,
-  drill-down tables, connects to DB server over SSH — runs from your laptop
+  color-coded drill-down tables, percentage bars, summary metrics — connects
+  to DB server over SSH, runs from your laptop
 - **TUI investigation client** (`pgwt-cli`): Rust TUI with AAS stacked
   bar chart, drill-down navigation, and pixel-perfect rendering on supported
   terminals (iTerm2, Kitty, WezTerm, Sixel)
@@ -154,12 +155,20 @@ pgwt (Go binary)                     pgwt-server (C binary)
 **Features:**
 
 - **AAS stacked area chart** (ECharts) — 11 wait class colors, interactive
-  zoom with drag-to-select, tooltip with per-class AAS breakdown
+  zoom with drag-to-select, tooltip with per-class AAS breakdown and percentages
 - **4 table views**: Overview (time model), Events, Sessions, Queries
 - **Drill-down navigation**: click a wait class → see its events → click an
   event → see sessions → click a session → see queries. Breadcrumb trail
-  shows filter stack with click-to-go-back.
+  with colored dots shows filter stack with click-to-go-back.
+- **Color-coded dots**: wait class colors shown next to event/class names
+  in all 4 tables
+- **Percentage bars**: visual bar fills behind `%DB`, `CPU%`, `Wait%` columns,
+  colored by wait class
+- **Summary metrics**: DB Time, Wall clock, AAS, Idle time, CPUs shown
+  above the overview table
 - **Sortable columns**: click any column header to sort ascending/descending
+- **Auto-reconnect**: WebSocket reconnects with exponential backoff on
+  connection loss
 - **Zero config**: auto-discovers trace files, auto-opens browser
 
 **Prerequisites on DB server:** `pgwt-server` binary and trace files from the
@@ -233,10 +242,7 @@ See [INSTALL.md](INSTALL.md) for build instructions and
 **Planned features** (see roadmap for details):
 - Query text capture from `st_activity` in shared memory
 - Plan identifier capture (`st_plan_id`, PG18+) for plan regression detection
-- Drill-down filter system (Oracle ASH-style filter+pivot investigation)
-- Time navigation (zoom, shift, click-to-zoom)
-- Histogram view and Activity Over Time view
-- Live mode (connect pgwt-cli to running daemon via Unix socket)
+- Live mode (connect web client to running daemon for real-time streaming)
 
 ## CLI Reference
 
