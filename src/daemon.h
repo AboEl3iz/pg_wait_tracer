@@ -5,6 +5,7 @@
 #include "pg_wait_tracer.h"
 #include "backend.h"
 #include "event_writer.h"
+#include "summary_writer.h"
 #include "map_reader.h"
 #include "snapshot.h"
 
@@ -85,7 +86,8 @@ struct pgwt_daemon {
     const char *trace_dir;                  /* NULL = disabled */
     int         trace_retention;            /* hours, default 24 */
     const char *trace_group;                /* group for trace files, default "dba" */
-    struct pgwt_event_writer *event_writer; /* NULL if disabled */
+    struct pgwt_event_writer *event_writer;     /* NULL if disabled */
+    struct pgwt_summary_writer *summary_writer; /* NULL if disabled */
 
     /* Time windows */
 #define PGWT_MAX_WINDOWS 3

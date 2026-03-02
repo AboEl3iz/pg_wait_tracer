@@ -148,4 +148,34 @@ void pgwt_compute_top_queries(const struct pgwt_trace_event *events, int count,
                               const struct pgwt_filter *f, double wall_ms,
                               struct pgwt_queries_result *out);
 
+/* ── Summary-based compute (pre-aggregated 1-second records) ── */
+
+struct pgwt_summary_accum;   /* forward decl, defined in summary_writer.h */
+
+void pgwt_compute_aas_from_summaries(
+    const struct pgwt_summary_accum *records, int count,
+    const struct pgwt_filter *f,
+    uint64_t from_ns, uint64_t to_ns, int num_buckets,
+    struct pgwt_aas_result *out);
+
+void pgwt_compute_time_model_from_summaries(
+    const struct pgwt_summary_accum *records, int count,
+    const struct pgwt_filter *f, double wall_ms,
+    struct pgwt_tm_result *out);
+
+void pgwt_compute_top_events_from_summaries(
+    const struct pgwt_summary_accum *records, int count,
+    const struct pgwt_filter *f, double wall_ms,
+    struct pgwt_events_result *out);
+
+void pgwt_compute_top_sessions_from_summaries(
+    const struct pgwt_summary_accum *records, int count,
+    const struct pgwt_filter *f, double wall_ms,
+    struct pgwt_sessions_result *out);
+
+void pgwt_compute_top_queries_from_summaries(
+    const struct pgwt_summary_accum *records, int count,
+    const struct pgwt_filter *f, double wall_ms,
+    struct pgwt_queries_result *out);
+
 #endif /* PGWT_COMPUTE_H */

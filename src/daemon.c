@@ -99,6 +99,12 @@ static void handle_timer(struct pgwt_daemon *d)
         if (d->tick > 0 && d->tick % 60 == 0)
             pgwt_writer_cleanup_old_files(d->event_writer);
     }
+    if (d->summary_writer) {
+        pgwt_summary_flush(d->summary_writer);
+        pgwt_summary_check_rotation(d->summary_writer);
+        if (d->tick > 0 && d->tick % 60 == 0)
+            pgwt_summary_cleanup_old_files(d->summary_writer);
+    }
 
     d->tick++;
     if (d->count > 0 && d->tick >= d->count)
@@ -215,6 +221,21 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
         if (d->verbose)
             fprintf(stderr, "INFO: trace writer: %s (retention %dh)\n",
                     d->trace_dir, ret);
+
+        /* Init summary writer (alongside event writer) */
+        d->summary_writer = calloc(1, sizeof(*d->summary_writer));
+        if (!d->summary_writer) {
+            fprintf(stderr, "FATAL: cannot allocate summary writer\n");
+            goto fail;
+        }
+        if (pgwt_summary_writer_init(d->summary_writer, d->trace_dir,
+                                      ret, d->trace_group) != 0) {
+            fprintf(stderr, "FATAL: cannot initialize summary writer\n");
+            free(d->summary_writer);
+            d->summary_writer = NULL;
+            goto fail;
+        }
+        d->summary_writer->verbose = d->verbose;
     }
 
     /* Scan existing backends (tracepoints are already attached,
@@ -347,6 +368,12 @@ int pgwt_daemon_run(struct pgwt_daemon *d)
 
 void pgwt_daemon_cleanup(struct pgwt_daemon *d)
 {
+    if (d->summary_writer) {
+        pgwt_summary_close(d->summary_writer);
+        pgwt_summary_destroy(d->summary_writer);
+        free(d->summary_writer);
+        d->summary_writer = NULL;
+    }
     if (d->event_writer) {
         pgwt_writer_close(d->event_writer);
         pgwt_writer_destroy(d->event_writer);
