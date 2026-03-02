@@ -40,6 +40,7 @@ static void usage(const char *prog)
         "Recording:\n"
         "  -T, --trace-dir <DIR>      Write raw trace files to DIR\n"
         "  -R, --trace-retention <H>  Keep trace files for H hours (default: 24)\n"
+        "      --trace-group <GROUP>  Group for trace file access (default: dba)\n"
         "\n"
         "Replay (offline analysis — no root, no PostgreSQL needed):\n"
         "      --replay               Replay trace files instead of live tracing\n"
@@ -155,7 +156,8 @@ static enum pgwt_format parse_format(const char *s)
 #define OPT_REPLAY 256
 #define OPT_FROM   257
 #define OPT_TO     258
-#define OPT_DAEMON 259
+#define OPT_DAEMON       259
+#define OPT_TRACE_GROUP  260
 
 static struct option long_opts[] = {
     {"pid",        required_argument, NULL, 'p'},
@@ -176,6 +178,7 @@ static struct option long_opts[] = {
     {"from",            required_argument, NULL, OPT_FROM},
     {"to",              required_argument, NULL, OPT_TO},
     {"daemon",          no_argument,       NULL, OPT_DAEMON},
+    {"trace-group",     required_argument, NULL, OPT_TRACE_GROUP},
     {"verbose",         no_argument,       NULL, 'v'},
     {"help",            no_argument,       NULL, 'h'},
     {NULL, 0, NULL, 0},
@@ -229,11 +232,16 @@ int main(int argc, char **argv)
         case OPT_FROM:   from_str = optarg; break;
         case OPT_TO:     to_str = optarg; break;
         case OPT_DAEMON: daemon_mode = true; break;
+        case OPT_TRACE_GROUP: d->trace_group = optarg; break;
         case 'v': d->verbose = true; break;
         case 'h': usage(argv[0]); free(d); return 0;
         default:  usage(argv[0]); free(d); return 1;
         }
     }
+
+    /* Default trace group to "dba" when trace recording is enabled */
+    if (d->trace_dir && !d->trace_group)
+        d->trace_group = "dba";
 
     /* TTY auto-detect: tui for terminal, text for pipe */
     if (!format_set)

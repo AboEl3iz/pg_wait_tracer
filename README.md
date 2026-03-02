@@ -287,6 +287,7 @@ per interval, no screen clearing).
 |------|-------|---------|-------------|
 | `--trace-dir <DIR>` | `-T` | disabled | Directory for trace files (enables recording) |
 | `--trace-retention <H>` | `-R` | 24 | Keep trace files for H hours |
+| `--trace-group <GROUP>` | — | `dba` | Unix group for trace file access |
 
 ### Replay
 

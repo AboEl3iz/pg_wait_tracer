@@ -260,6 +260,31 @@ This produces the `pgwt` binary. Run it from your laptop:
 - `pgwt-server` binary on the DB server (either in PATH or specified with
   `--server-path`)
 - Trace files on the DB server (produced by `pg_wait_tracer --daemon -T <dir>`)
+- SSH user must be in the trace file group (default `dba`) — see below
+
+**Setting up trace file access for non-root users:**
+
+The daemon runs as root but creates trace files readable by a configurable Unix
+group (default: `dba`). SSH users connecting via `pgwt` need to be in this group:
+
+```bash
+# Create the group (once)
+sudo groupadd dba
+
+# Add your SSH user to the group
+sudo usermod -aG dba youruser
+
+# The user must log out and back in for the group change to take effect
+```
+
+The daemon sets permissions automatically:
+- Trace directory: `0750` (`rwxr-x---`), owned by `root:dba`
+- Trace files: `0640` (`rw-r-----`), owned by `root:dba`
+
+To use a different group name:
+```bash
+sudo ./pg_wait_tracer --daemon -T /var/lib/pgwt/traces --trace-group mygroup
+```
 
 ### TUI Investigation Client (Rust)
 

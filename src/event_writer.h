@@ -8,6 +8,7 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <sys/types.h>
 
 /* ── On-disk format constants ─────────────────────────────── */
 
@@ -49,6 +50,7 @@ struct pgwt_event_writer {
     char          trace_dir[256];
     int           pg_version;
     int           retention_hours;
+    gid_t         trace_gid;      /* group for trace files, (gid_t)-1 = no chown */
     bool          enabled;
     bool          verbose;
 
@@ -82,7 +84,8 @@ struct pgwt_event_writer {
 /* ── Public API ───────────────────────────────────────────── */
 
 int  pgwt_writer_init(struct pgwt_event_writer *w, const char *trace_dir,
-                      int pg_version, int retention_hours);
+                      int pg_version, int retention_hours,
+                      const char *group_name);
 int  pgwt_writer_push_event(struct pgwt_event_writer *w,
                             const struct pgwt_trace_event *evt);
 int  pgwt_writer_check_rotation(struct pgwt_event_writer *w);

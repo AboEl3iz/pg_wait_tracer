@@ -204,7 +204,8 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
         }
         int ret = d->trace_retention > 0 ? d->trace_retention : 24;
         if (pgwt_writer_init(d->event_writer, d->trace_dir,
-                             d->pg_major_version, ret) != 0) {
+                             d->pg_major_version, ret,
+                             d->trace_group) != 0) {
             fprintf(stderr, "FATAL: cannot initialize trace writer\n");
             free(d->event_writer);
             d->event_writer = NULL;

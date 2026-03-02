@@ -11,6 +11,7 @@
 #include <sys/stat.h>
 #include <dirent.h>
 #include <unistd.h>
+#include <grp.h>
 #include <lz4.h>
 
 /* ── Varint (unsigned LEB128) ─────────────────────────────── */
@@ -119,6 +120,12 @@ static int open_trace_file(struct pgwt_event_writer *w, uint64_t first_mono_ns)
         return -1;
     }
 
+    /* Set group ownership and permissions for non-root access */
+    if (w->trace_gid != (gid_t)-1) {
+        fchown(fileno(w->fp), (uid_t)-1, w->trace_gid);
+        fchmod(fileno(w->fp), 0640);
+    }
+
     /* Capture wall-clock and monotonic timestamps */
     struct timespec wall, mono;
     clock_gettime(CLOCK_REALTIME, &wall);
@@ -215,7 +222,8 @@ static int flush_block(struct pgwt_event_writer *w)
 /* ── Public API ───────────────────────────────────────────── */
 
 int pgwt_writer_init(struct pgwt_event_writer *w, const char *trace_dir,
-                     int pg_version, int retention_hours)
+                     int pg_version, int retention_hours,
+                     const char *group_name)
 {
     memset(w, 0, sizeof(*w));
     snprintf(w->trace_dir, sizeof(w->trace_dir), "%s", trace_dir);
@@ -223,8 +231,25 @@ int pgwt_writer_init(struct pgwt_event_writer *w, const char *trace_dir,
     w->retention_hours = retention_hours;
     w->enabled = true;
     w->current_hour = -1;
+    w->trace_gid = (gid_t)-1;
 
-    mkdir(w->trace_dir, 0755);  /* ignore EEXIST */
+    /* Resolve trace group name → GID */
+    if (group_name) {
+        struct group *gr = getgrnam(group_name);
+        if (gr) {
+            w->trace_gid = gr->gr_gid;
+        } else {
+            fprintf(stderr, "WARN: group '%s' not found — "
+                    "trace files will be readable by root only\n", group_name);
+        }
+    }
+
+    /* Create trace directory with group-readable permissions */
+    mkdir(w->trace_dir, 0750);  /* ignore EEXIST */
+    if (w->trace_gid != (gid_t)-1) {
+        chown(w->trace_dir, (uid_t)-1, w->trace_gid);
+        chmod(w->trace_dir, 0750);
+    }
 
     /* Allocate scratch buffers */
     w->encode_buf_size = PGWT_BLOCK_EVENTS * 36 + PGWT_BLOCK_EVENTS * 10;
