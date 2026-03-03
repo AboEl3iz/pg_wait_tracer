@@ -6,7 +6,7 @@ const WAIT_CLASSES = [
     { key: 'cpu',       label: 'CPU',       color: '#4CAF50' },
     { key: 'io',        label: 'IO',        color: '#2196F3' },
     { key: 'lock',      label: 'Lock',      color: '#F44336' },
-    { key: 'lwlock',    label: 'LwLock',    color: '#FF9800' },
+    { key: 'lwlock',    label: 'LWLock',    color: '#FF9800' },
     { key: 'ipc',       label: 'IPC',       color: '#9C27B0' },
     { key: 'client',    label: 'Client',    color: '#00BCD4' },
     { key: 'timeout',   label: 'Timeout',   color: '#795548' },
