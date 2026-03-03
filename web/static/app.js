@@ -233,7 +233,7 @@ function zoomOut() {
 function fmtTime(ns, bucketNs) {
     if (!ns) return '--';
     const d = new Date(ns / 1e6);
-    const hms = d.toLocaleTimeString();
+    const hms = d.toUTCString().slice(17, 25);  // "HH:MM:SS" in UTC
     if (!bucketNs || bucketNs >= 1000000000) return hms;
     const frac = (ns % 1000000000) / 1e9;
     if (bucketNs >= 1000000) return hms + '.' + frac.toFixed(3).slice(2);       // ms
@@ -497,8 +497,8 @@ function initTimePicker() {
         const fromStr = document.getElementById('tp-from').value;
         const toStr = document.getElementById('tp-to').value;
         if (!fromStr || !toStr) return;
-        const fromNs = new Date(fromStr).getTime() * 1e6;
-        const toNs = new Date(toStr).getTime() * 1e6;
+        const fromNs = new Date(fromStr + 'Z').getTime() * 1e6;
+        const toNs = new Date(toStr + 'Z').getTime() * 1e6;
         if (fromNs >= toNs) return;
         picker.style.display = 'none';
         picker.querySelectorAll('.tp-quick button').forEach(b => b.classList.remove('active'));
@@ -513,8 +513,8 @@ function nsToDatetimeLocal(ns) {
     const d = new Date(ns / 1e6);
     // Format as YYYY-MM-DDTHH:MM:SS for datetime-local input
     const pad = (n) => String(n).padStart(2, '0');
-    return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) +
-        'T' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
+    return d.getUTCFullYear() + '-' + pad(d.getUTCMonth() + 1) + '-' + pad(d.getUTCDate()) +
+        'T' + pad(d.getUTCHours()) + ':' + pad(d.getUTCMinutes()) + ':' + pad(d.getUTCSeconds());
 }
 
 function renderChart(data) {
