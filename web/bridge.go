@@ -108,6 +108,8 @@ func (b *Bridge) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	defer conn.Close()
 	log.Println("Browser connected via WebSocket")
 
+	var wsMu sync.Mutex // protects conn.WriteMessage
+
 	for {
 		_, msg, err := conn.ReadMessage()
 		if err != nil {
@@ -127,26 +129,30 @@ func (b *Bridge) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(b.stdin, "%s\n", msg)
 		b.mu.Unlock()
 
-		// Wait for response or timeout
-		var resp []byte
-		select {
-		case r, ok := <-ch:
-			if ok {
-				resp = r
-			} else {
-				resp = []byte(`{"id":` + strconv.FormatInt(id, 10) + `,"error":"connection lost"}`)
+		// Handle response asynchronously so we don't block the read loop
+		go func(id int64, ch chan []byte) {
+			var resp []byte
+			select {
+			case r, ok := <-ch:
+				if ok {
+					resp = r
+				} else {
+					resp = []byte(`{"id":` + strconv.FormatInt(id, 10) + `,"error":"connection lost"}`)
+				}
+			case <-time.After(30 * time.Second):
+				resp = []byte(`{"id":` + strconv.FormatInt(id, 10) + `,"error":"timeout"}`)
+			case <-b.dead:
+				resp = []byte(`{"id":` + strconv.FormatInt(id, 10) + `,"error":"server disconnected"}`)
 			}
-		case <-time.After(30 * time.Second):
-			resp = []byte(`{"id":` + strconv.FormatInt(id, 10) + `,"error":"timeout"}`)
-		case <-b.dead:
-			resp = []byte(`{"id":` + strconv.FormatInt(id, 10) + `,"error":"server disconnected"}`)
-		}
 
-		b.pendMu.Lock()
-		delete(b.pending, id)
-		b.pendMu.Unlock()
+			b.pendMu.Lock()
+			delete(b.pending, id)
+			b.pendMu.Unlock()
 
-		conn.WriteMessage(websocket.TextMessage, resp)
+			wsMu.Lock()
+			conn.WriteMessage(websocket.TextMessage, resp)
+			wsMu.Unlock()
+		}(id, ch)
 	}
 }
 
