@@ -185,7 +185,10 @@ int pgwt_scan_summary_files(const char *trace_dir,
     while ((ent = readdir(dir)) != NULL && n < max_entries) {
         struct pgwt_summary_file_entry *e = &entries[n];
 
-        if (sscanf(ent->d_name, "%4d-%2d-%2d_%2d.summary.lz4",
+        /* Check suffix explicitly — sscanf returns 4 for ANY .*.lz4 file */
+        const char *suffix = strstr(ent->d_name, ".summary.lz4");
+        if (suffix && suffix[12] == '\0' &&
+            sscanf(ent->d_name, "%4d-%2d-%2d_%2d.summary.lz4",
                    &e->year, &e->month, &e->day, &e->hour) == 4) {
             snprintf(e->path, sizeof(e->path), "%s/%s", trace_dir, ent->d_name);
             struct tm tm = {0};

@@ -47,41 +47,65 @@ int pgwt_reader_open(struct pgwt_event_reader *r, const char *path)
     r->mono_to_wall = (int64_t)r->header.start_time_ns
                     - (int64_t)r->header.clock_offset_ns;
 
-    /* Read footer: last 4 bytes = num_blocks */
-    if (fseek(r->fp, -4, SEEK_END) != 0) {
-        fprintf(stderr, "WARN: cannot seek to footer in %s\n", path);
-        fclose(r->fp); r->fp = NULL;
-        return -1;
+    /* Try reading footer: last 4 bytes = num_blocks.
+     * Falls back to sequential block scan for files still being written
+     * (e.g. current.trace which has no footer yet). */
+    int have_footer = 0;
+    uint32_t nb = 0;
+
+    if (fseek(r->fp, -4, SEEK_END) == 0 &&
+        fread(&nb, sizeof(nb), 1, r->fp) == 1 && nb > 0) {
+        long index_start = ftell(r->fp) - 4
+                         - (long)nb * (long)sizeof(struct pgwt_block_index_entry);
+        if (index_start >= (long)sizeof(struct pgwt_trace_file_header)) {
+            fseek(r->fp, index_start, SEEK_SET);
+            r->block_index = malloc(nb * sizeof(struct pgwt_block_index_entry));
+            if (r->block_index &&
+                fread(r->block_index, sizeof(struct pgwt_block_index_entry),
+                      nb, r->fp) == nb) {
+                r->num_blocks = (int)nb;
+                have_footer = 1;
+            } else {
+                free(r->block_index);
+                r->block_index = NULL;
+            }
+        }
     }
 
-    uint32_t nb;
-    if (fread(&nb, sizeof(nb), 1, r->fp) != 1 || nb == 0) {
-        fprintf(stderr, "WARN: cannot read block count from %s\n", path);
-        fclose(r->fp); r->fp = NULL;
-        return -1;
-    }
-    r->num_blocks = (int)nb;
-
-    /* Read block index entries */
-    long index_start = ftell(r->fp) - 4
-                     - (long)nb * (long)sizeof(struct pgwt_block_index_entry);
-    if (index_start < (long)sizeof(struct pgwt_trace_file_header)) {
-        fprintf(stderr, "WARN: invalid block index in %s\n", path);
-        fclose(r->fp); r->fp = NULL;
-        return -1;
-    }
-    fseek(r->fp, index_start, SEEK_SET);
-
-    r->block_index = malloc(nb * sizeof(struct pgwt_block_index_entry));
-    if (!r->block_index) {
-        fclose(r->fp); r->fp = NULL;
-        return -1;
-    }
-    if (fread(r->block_index, sizeof(struct pgwt_block_index_entry), nb, r->fp) != nb) {
-        fprintf(stderr, "WARN: cannot read block index from %s\n", path);
-        free(r->block_index); r->block_index = NULL;
-        fclose(r->fp); r->fp = NULL;
-        return -1;
+    /* Fallback: scan blocks sequentially from start of data */
+    if (!have_footer) {
+        fseek(r->fp, (long)sizeof(struct pgwt_trace_file_header), SEEK_SET);
+        int cap = 128;
+        r->block_index = malloc(cap * sizeof(struct pgwt_block_index_entry));
+        if (!r->block_index) {
+            fclose(r->fp); r->fp = NULL;
+            return -1;
+        }
+        r->num_blocks = 0;
+        struct pgwt_trace_block_header bh;
+        while (fread(&bh, sizeof(bh), 1, r->fp) == 1 &&
+               bh.compressed_size > 0 && bh.num_events > 0) {
+            if (r->num_blocks >= cap) {
+                cap *= 2;
+                struct pgwt_block_index_entry *tmp =
+                    realloc(r->block_index, cap * sizeof(*tmp));
+                if (!tmp) break;
+                r->block_index = tmp;
+            }
+            long block_offset = ftell(r->fp) - (long)sizeof(bh);
+            r->block_index[r->num_blocks++] = (struct pgwt_block_index_entry){
+                .timestamp_ns = bh.first_timestamp_ns,
+                .file_offset = (uint64_t)block_offset,
+            };
+            /* Skip compressed payload */
+            if (fseek(r->fp, (long)bh.compressed_size, SEEK_CUR) != 0)
+                break;
+        }
+        if (r->num_blocks == 0) {
+            free(r->block_index); r->block_index = NULL;
+            fclose(r->fp); r->fp = NULL;
+            return -1;
+        }
     }
 
     /* Allocate scratch buffers */
@@ -237,7 +261,10 @@ int pgwt_scan_trace_files(const char *trace_dir,
     while ((ent = readdir(dir)) != NULL && n < max_entries) {
         struct pgwt_trace_file_entry *e = &entries[n];
 
-        if (sscanf(ent->d_name, "%4d-%2d-%2d_%2d.trace.lz4",
+        /* Check suffix explicitly — sscanf returns 4 for ANY .*.lz4 file */
+        const char *suffix = strstr(ent->d_name, ".trace.lz4");
+        if (suffix && suffix[10] == '\0' &&
+            sscanf(ent->d_name, "%4d-%2d-%2d_%2d.trace.lz4",
                    &e->year, &e->month, &e->day, &e->hour) == 4) {
             snprintf(e->path, sizeof(e->path), "%s/%s", trace_dir, ent->d_name);
             struct tm tm = {0};

@@ -418,16 +418,14 @@ static int server_init(struct pgwt_server *srv, const char *trace_dir)
 
 /* ── Summary threshold ────────────────────────────────────── */
 
-#define SUMMARY_THRESHOLD_NS  (120ULL * 1000000000ULL)  /* 120 seconds */
-
-/* Check if summaries should be used for this request's time range.
- * Returns 1 if summaries are preferred, 0 if raw events should be used. */
+/* Summary path disabled: pgwt_summary_accum is ~280 KB and bulk-loading
+ * thousands of them OOMs.  Raw events are ~40 bytes each, so even 1 hour
+ * (~1 M events ≈ 40 MB) is fine.  TODO: rewrite summary loader to stream
+ * or use a compact struct before re-enabling. */
 static int should_use_summaries(struct pgwt_server *srv, struct pgwt_request *req)
 {
-    uint64_t from = req->from_ns ? req->from_ns : srv->earliest_wall_ns;
-    uint64_t to   = req->to_ns   ? req->to_ns   : srv->latest_wall_ns;
-    if (to <= from) return 0;
-    return (to - from) >= SUMMARY_THRESHOLD_NS;
+    (void)srv; (void)req;
+    return 0;
 }
 
 /* ── Command handlers ─────────────────────────────────────── */
