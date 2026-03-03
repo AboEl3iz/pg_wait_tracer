@@ -272,6 +272,9 @@ int pgwt_handle_exit(struct pgwt_daemon *d, pid_t pid)
     if (d->verbose)
         fprintf(stderr, "INFO: PID %d exited (%s)\n",
                 pid, pgwt_backend_type_name(be->meta.backend_type));
+
+    /* Reset PID so the slot can be reused by alloc_backend() */
+    be->pid = 0;
     return 0;
 }
 
