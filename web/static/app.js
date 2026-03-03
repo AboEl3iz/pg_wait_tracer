@@ -230,10 +230,14 @@ function zoomOut() {
     refresh();
 }
 
-function fmtTime(ns) {
+function fmtTime(ns, bucketNs) {
     if (!ns) return '--';
     const d = new Date(ns / 1e6);
-    return d.toLocaleTimeString();
+    const hms = d.toLocaleTimeString();
+    if (!bucketNs || bucketNs >= 1000000000) return hms;
+    const frac = (ns % 1000000000) / 1e9;
+    if (bucketNs >= 1000000) return hms + '.' + frac.toFixed(3).slice(2);       // ms
+    return hms + '.' + frac.toFixed(6).slice(2);                                // us
 }
 
 function fmtDuration(ns) {
@@ -516,6 +520,7 @@ function nsToDatetimeLocal(ns) {
 function renderChart(data) {
     if (!chart || !data.buckets || data.buckets.length === 0) return;
 
+    const bns = data.bucket_ns || 0;
     const times = data.buckets.map(b => b.t);
 
     const series = WAIT_CLASSES.map(wc => ({
@@ -561,7 +566,7 @@ function renderChart(data) {
             textStyle: { color: '#e0e0e0', fontSize: 12 },
             formatter: function(params) {
                 if (!params.length) return '';
-                let t = fmtTime(params[0].axisValue);
+                let t = fmtTime(params[0].axisValue, bns);
                 let total = 0;
                 let items = [];
                 for (let i = params.length - 1; i >= 0; i--) {
@@ -599,7 +604,7 @@ function renderChart(data) {
             axisLabel: {
                 color: '#888',
                 fontSize: 10,
-                formatter: function(v) { return fmtTime(v); },
+                formatter: function(v) { return fmtTime(v, bns); },
             },
             axisLine: { lineStyle: { color: '#333' } },
         },
@@ -1093,7 +1098,8 @@ function renderHeatmap(data) {
         window.addEventListener('resize', () => { if (heatmapChart) heatmapChart.resize(); });
     }
 
-    const timeLabels = data.times.map(t => fmtTime(t));
+    const hbns = data.bucket_ns || 0;
+    const timeLabels = data.times.map(t => fmtTime(t, hbns));
     const latLabels = data.labels || [];
 
     // Convert sparse cells to echarts format [x, y, value]
