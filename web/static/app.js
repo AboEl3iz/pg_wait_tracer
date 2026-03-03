@@ -872,6 +872,7 @@ function positionTooltip(tip, e) {
         y = e.clientY - rect.height - pad;
     tip.style.left = x + 'px';
     tip.style.top = y + 'px';
+}
 
 // -- Drill-down ---------------------------------------------------------------
 
