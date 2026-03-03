@@ -87,10 +87,10 @@ void pgwt_compute_aas(const struct pgwt_trace_event *events, int count,
         return;
     }
 
-    /* bucket_ns = max(1s, ceil(range / num_buckets)) */
+    /* Raw events have ns precision — no minimum bucket width */
     uint64_t bucket_ns = (range_ns + (uint64_t)num_buckets - 1) / (uint64_t)num_buckets;
-    if (bucket_ns < 1000000000ULL)
-        bucket_ns = 1000000000ULL;
+    if (bucket_ns == 0)
+        bucket_ns = 1;
 
     int actual_buckets = (int)((range_ns + bucket_ns - 1) / bucket_ns);
     struct pgwt_aas_bucket *buckets = calloc(actual_buckets, sizeof(*buckets));
@@ -651,10 +651,10 @@ void pgwt_compute_heatmap(const struct pgwt_trace_event *events, int count,
     if (range_ns == 0 || num_buckets <= 0)
         return;
 
-    /* Same time bucketing as AAS */
+    /* Raw events have ns precision — no minimum bucket width */
     uint64_t bucket_ns = (range_ns + (uint64_t)num_buckets - 1) / (uint64_t)num_buckets;
-    if (bucket_ns < 1000000000ULL)
-        bucket_ns = 1000000000ULL;
+    if (bucket_ns == 0)
+        bucket_ns = 1;
 
     int actual_buckets = (int)((range_ns + bucket_ns - 1) / bucket_ns);
     int grid_size = actual_buckets * HISTOGRAM_BUCKETS;

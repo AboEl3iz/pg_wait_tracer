@@ -1140,8 +1140,8 @@ function renderHeatmap(data) {
             itemHeight: 120,
             textStyle: { color: '#888', fontSize: 10 },
             inRange: {
-                color: ['#1a1a2e', '#1a3a5a', '#1a6296', '#2196F3',
-                        '#4CAF50', '#FFEB3B', '#FF9800', '#F44336'],
+                color: ['#1a5276', '#2196F3', '#4CAF50',
+                        '#FFEB3B', '#FF9800', '#F44336'],
             },
         },
         series: [{
