@@ -18,7 +18,7 @@ header {
 }
 .header-left { display: flex; align-items: center; gap: 16px; }
 h1 { font-size: 18px; font-weight: 600; color: #fff; }
-.header-right { font-size: 13px; color: #888; }
+.header-right { font-size: 13px; color: #888; position: relative; display: flex; align-items: center; gap: 8px; }
 
 .status {
   font-size: 12px;
@@ -30,11 +30,119 @@ h1 { font-size: 18px; font-weight: 600; color: #fff; }
 .status.connected  { background: #1a3d1a; color: #4caf50; }
 .status.error      { background: #3d1a1a; color: #f44336; }
 
+/* Time range button + picker */
+.time-range-btn {
+  cursor: pointer;
+  padding: 4px 10px;
+  border-radius: 4px;
+  transition: background 0.2s;
+}
+.time-range-btn:hover { background: #2a2a4a; }
+
+.zoom-out-btn {
+  background: none;
+  border: 1px solid #444;
+  color: #888;
+  font-size: 16px;
+  width: 28px;
+  height: 28px;
+  border-radius: 4px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.2s, color 0.2s;
+}
+.zoom-out-btn:hover { background: #2a2a4a; color: #ccc; }
+
+.time-picker {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  margin-top: 4px;
+  background: #1e1e3a;
+  border: 1px solid #3a3a5a;
+  border-radius: 8px;
+  padding: 12px;
+  min-width: 260px;
+  z-index: 100;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+}
+.tp-section { margin-bottom: 10px; }
+.tp-section:last-child { margin-bottom: 0; }
+.tp-label {
+  font-size: 11px;
+  color: #666;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 6px;
+}
+.tp-quick {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.tp-quick button {
+  background: #2a2a4a;
+  border: none;
+  color: #ccc;
+  padding: 4px 10px;
+  border-radius: 4px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+.tp-quick button:hover { background: #3a3a6a; }
+.tp-quick button.active { background: #1a5276; color: #4fc3f7; }
+.tp-custom label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+  font-size: 12px;
+  color: #888;
+}
+.tp-custom input {
+  background: #2a2a4a;
+  border: 1px solid #3a3a5a;
+  color: #e0e0e0;
+  padding: 4px 6px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-family: inherit;
+}
+.tp-apply {
+  background: #1a5276;
+  border: none;
+  color: #4fc3f7;
+  padding: 5px 16px;
+  border-radius: 4px;
+  font-size: 12px;
+  cursor: pointer;
+  width: 100%;
+  margin-top: 4px;
+}
+.tp-apply:hover { background: #1a6296; }
+
+/* Brush overlay */
+.brush-overlay {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  background: rgba(79, 195, 247, 0.15);
+  border-left: 1px solid rgba(79, 195, 247, 0.4);
+  border-right: 1px solid rgba(79, 195, 247, 0.4);
+  pointer-events: none;
+  display: none;
+  z-index: 10;
+}
+
 /* Chart */
 #chart-container {
   height: 300px;
   padding: 10px 20px;
   background: #1e1e3a;
+  position: relative;
 }
 
 /* Tabs */

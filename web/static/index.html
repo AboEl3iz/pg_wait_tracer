@@ -13,7 +13,34 @@
     <h1>pgwt</h1>
     <span id="status" class="status connecting">Connecting...</span>
   </div>
-  <div id="time-range" class="header-right"></div>
+  <div class="header-right">
+    <button id="zoom-out-btn" class="zoom-out-btn" title="Zoom out">&#x2296;</button>
+    <span id="time-range" class="time-range-btn"></span>
+    <div id="time-picker" class="time-picker" style="display:none">
+      <div class="tp-section">
+        <div class="tp-label">Quick ranges</div>
+        <div class="tp-quick">
+          <button data-range="300">5m</button>
+          <button data-range="900">15m</button>
+          <button data-range="1800">30m</button>
+          <button data-range="3600" class="active">1h</button>
+          <button data-range="10800">3h</button>
+          <button data-range="21600">6h</button>
+          <button data-range="43200">12h</button>
+          <button data-range="86400">24h</button>
+          <button data-range="0">All</button>
+        </div>
+      </div>
+      <div class="tp-section">
+        <div class="tp-label">Custom range</div>
+        <div class="tp-custom">
+          <label>From <input type="datetime-local" id="tp-from" step="1"></label>
+          <label>To <input type="datetime-local" id="tp-to" step="1"></label>
+          <button id="tp-apply" class="tp-apply">Apply</button>
+        </div>
+      </div>
+    </div>
+  </div>
 </header>
 
 <div id="chart-container"></div>

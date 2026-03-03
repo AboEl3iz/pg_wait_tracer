@@ -49,6 +49,9 @@ const state = {
     sortCol: {},
     sortAsc: {},
 
+    // Zoom history
+    zoomHistory: [],
+
     // Reconnect
     reconnectDelay: 2000,
     reconnectTimer: null,
@@ -140,6 +143,7 @@ async function init() {
         updateTimeRange();
         initChart();
         initTabs();
+        initTimePicker();
         await refresh();
     } catch (e) {
         setStatus('Error: ' + e.message, 'error');
@@ -195,6 +199,30 @@ function updateTimeRange() {
     const to = fmtTime(state.viewTo);
     const dur = fmtDuration(state.viewTo - state.viewFrom);
     el.textContent = from + ' \u2013 ' + to + ' (' + dur + ')';
+}
+
+function zoomTo(from, to) {
+    state.zoomHistory.push({ from: state.viewFrom, to: state.viewTo });
+    if (state.zoomHistory.length > 10) state.zoomHistory.shift();
+    state.viewFrom = from;
+    state.viewTo = to;
+    updateTimeRange();
+    refresh();
+}
+
+function zoomOut() {
+    if (state.zoomHistory.length > 0) {
+        const prev = state.zoomHistory.pop();
+        state.viewFrom = prev.from;
+        state.viewTo = prev.to;
+    } else {
+        const mid = (state.viewFrom + state.viewTo) / 2;
+        const halfSpan = state.viewTo - state.viewFrom;
+        state.viewFrom = Math.max(state.fromNs, mid - halfSpan);
+        state.viewTo = Math.min(state.toNs, mid + halfSpan);
+    }
+    updateTimeRange();
+    refresh();
 }
 
 function fmtTime(ns) {
@@ -309,21 +337,141 @@ function initChart() {
     chart = echarts.init(chartEl, 'dark');
     window.addEventListener('resize', () => chart.resize());
 
-    // Brush/zoom -> update time range
-    chart.on('datazoom', (params) => {
+    // -- Brush selection (Grafana-style click-drag zoom) --
+    const overlay = document.createElement('div');
+    overlay.className = 'brush-overlay';
+    chartEl.appendChild(overlay);
+
+    let brushStart = null;
+
+    chartEl.addEventListener('mousedown', (e) => {
+        if (e.button !== 0 || !chart) return;
+        // Only start brush inside the chart grid area
+        const rect = chartEl.getBoundingClientRect();
+        const x = e.clientX - rect.left;
+        const gridRect = chart.getModel().getComponent('grid').coordinateSystem.getRect();
+        if (x < gridRect.x || x > gridRect.x + gridRect.width) return;
+        const y = e.clientY - rect.top;
+        if (y < gridRect.y || y > gridRect.y + gridRect.height) return;
+
+        brushStart = { x: x, gridLeft: gridRect.x, gridWidth: gridRect.width };
+        overlay.style.left = x + 'px';
+        overlay.style.width = '0px';
+        overlay.style.top = gridRect.y + 'px';
+        overlay.style.height = gridRect.height + 'px';
+        overlay.style.display = 'block';
+        e.preventDefault();
+    });
+
+    document.addEventListener('mousemove', (e) => {
+        if (!brushStart) return;
+        const rect = chartEl.getBoundingClientRect();
+        let x = e.clientX - rect.left;
+        x = Math.max(brushStart.gridLeft, Math.min(x, brushStart.gridLeft + brushStart.gridWidth));
+        const left = Math.min(brushStart.x, x);
+        const width = Math.abs(x - brushStart.x);
+        overlay.style.left = left + 'px';
+        overlay.style.width = width + 'px';
+    });
+
+    document.addEventListener('mouseup', (e) => {
+        if (!brushStart) return;
+        overlay.style.display = 'none';
+        const rect = chartEl.getBoundingClientRect();
+        let endX = e.clientX - rect.left;
+        endX = Math.max(brushStart.gridLeft, Math.min(endX, brushStart.gridLeft + brushStart.gridWidth));
+        const minX = Math.min(brushStart.x, endX);
+        const maxX = Math.max(brushStart.x, endX);
+        brushStart = null;
+
+        // Minimum drag of 5px to avoid accidental clicks
+        if (maxX - minX < 5) return;
+
+        // Convert pixel to data index
         const opt = chart.getOption();
         if (!opt.xAxis || !opt.xAxis[0] || !opt.xAxis[0].data) return;
         const data = opt.xAxis[0].data;
-        const dz = opt.dataZoom[0];
-        const startIdx = Math.floor(data.length * dz.start / 100);
-        const endIdx = Math.ceil(data.length * dz.end / 100) - 1;
+        const startIdx = chart.convertFromPixel({ xAxisIndex: 0 }, minX);
+        const endIdx = chart.convertFromPixel({ xAxisIndex: 0 }, maxX);
         if (startIdx >= 0 && endIdx < data.length && startIdx < endIdx) {
-            state.viewFrom = data[startIdx];
-            state.viewTo = data[endIdx];
-            updateTimeRange();
-            refreshTable(); // only refresh table, chart already zoomed
+            zoomTo(data[startIdx], data[endIdx]);
         }
     });
+
+    // Double-click to zoom out
+    chartEl.addEventListener('dblclick', (e) => {
+        e.preventDefault();
+        zoomOut();
+    });
+}
+
+// -- Time picker ----------------------------------------------------------
+
+function initTimePicker() {
+    const rangeBtn = document.getElementById('time-range');
+    const picker = document.getElementById('time-picker');
+    const zoomOutBtn = document.getElementById('zoom-out-btn');
+
+    // Toggle picker on time range click
+    rangeBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const visible = picker.style.display !== 'none';
+        picker.style.display = visible ? 'none' : 'block';
+        if (!visible) {
+            // Pre-fill custom inputs
+            document.getElementById('tp-from').value = nsToDatetimeLocal(state.viewFrom);
+            document.getElementById('tp-to').value = nsToDatetimeLocal(state.viewTo);
+        }
+    });
+
+    // Close picker on outside click
+    document.addEventListener('click', (e) => {
+        if (!picker.contains(e.target) && e.target !== rangeBtn) {
+            picker.style.display = 'none';
+        }
+    });
+    picker.addEventListener('click', (e) => e.stopPropagation());
+
+    // Quick range buttons
+    picker.querySelectorAll('.tp-quick button').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const secs = parseInt(btn.dataset.range);
+            picker.style.display = 'none';
+            // Update active class
+            picker.querySelectorAll('.tp-quick button').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            if (secs === 0) {
+                zoomTo(state.fromNs, state.toNs);
+            } else {
+                const from = Math.max(state.fromNs, state.toNs - secs * 1e9);
+                zoomTo(from, state.toNs);
+            }
+        });
+    });
+
+    // Custom range apply
+    document.getElementById('tp-apply').addEventListener('click', () => {
+        const fromStr = document.getElementById('tp-from').value;
+        const toStr = document.getElementById('tp-to').value;
+        if (!fromStr || !toStr) return;
+        const fromNs = new Date(fromStr).getTime() * 1e6;
+        const toNs = new Date(toStr).getTime() * 1e6;
+        if (fromNs >= toNs) return;
+        picker.style.display = 'none';
+        picker.querySelectorAll('.tp-quick button').forEach(b => b.classList.remove('active'));
+        zoomTo(Math.max(state.fromNs, fromNs), Math.min(state.toNs, toNs));
+    });
+
+    // Zoom out button
+    zoomOutBtn.addEventListener('click', () => zoomOut());
+}
+
+function nsToDatetimeLocal(ns) {
+    const d = new Date(ns / 1e6);
+    // Format as YYYY-MM-DDTHH:MM:SS for datetime-local input
+    const pad = (n) => String(n).padStart(2, '0');
+    return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) +
+        'T' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
 }
 
 function renderChart(data) {
@@ -401,18 +549,10 @@ function renderChart(data) {
             itemHeight: 8,
         },
         grid: {
-            left: 50, right: 20, top: 20, bottom: 60,
+            left: 50, right: 20, top: 20, bottom: 40,
         },
         dataZoom: [
-            { type: 'inside', xAxisIndex: 0 },
-            {
-                type: 'slider', xAxisIndex: 0, bottom: 25,
-                height: 20,
-                backgroundColor: '#1a1a2e',
-                borderColor: '#333',
-                fillerColor: 'rgba(79,195,247,0.15)',
-                textStyle: { color: '#888' },
-            },
+            { type: 'inside', xAxisIndex: 0, zoomOnMouseWheel: false, moveOnMouseWheel: false },
         ],
         xAxis: {
             type: 'category',
