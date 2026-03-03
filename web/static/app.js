@@ -3,17 +3,17 @@
 // -- Wait class colors (Oracle ASH / RDS PI inspired) -------------------------
 
 const WAIT_CLASSES = [
-    { key: 'cpu',       label: 'CPU',       color: '#4CAF50' },
-    { key: 'io',        label: 'IO',        color: '#2196F3' },
-    { key: 'lock',      label: 'Lock',      color: '#F44336' },
-    { key: 'lwlock',    label: 'LWLock',    color: '#FF9800' },
-    { key: 'ipc',       label: 'IPC',       color: '#9C27B0' },
-    { key: 'client',    label: 'Client',    color: '#00BCD4' },
-    { key: 'timeout',   label: 'Timeout',   color: '#795548' },
-    { key: 'bufferpin', label: 'BufferPin', color: '#FF5722' },
-    { key: 'activity',  label: 'Activity',  color: '#9E9E9E' },
-    { key: 'extension', label: 'Extension', color: '#607D8B' },
-    { key: 'unknown',   label: 'Unknown',   color: '#BDBDBD' },
+    { key: 'cpu',       label: 'CPU',       color: 'rgb(80,250,123)' },
+    { key: 'io',        label: 'IO',        color: 'rgb(30,100,255)' },
+    { key: 'lock',      label: 'Lock',      color: 'rgb(255,85,85)' },
+    { key: 'lwlock',    label: 'LWLock',    color: 'rgb(255,121,198)' },
+    { key: 'ipc',       label: 'IPC',       color: 'rgb(0,200,255)' },
+    { key: 'client',    label: 'Client',    color: 'rgb(255,220,100)' },
+    { key: 'timeout',   label: 'Timeout',   color: 'rgb(255,165,0)' },
+    { key: 'bufferpin', label: 'BufferPin', color: 'rgb(0,210,180)' },
+    { key: 'activity',  label: 'Activity',  color: 'rgb(150,100,255)' },
+    { key: 'extension', label: 'Extension', color: 'rgb(190,150,255)' },
+    { key: 'unknown',   label: 'Unknown',   color: 'rgb(180,180,180)' },
 ];
 
 const CLASS_COLOR_MAP = {};
