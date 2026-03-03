@@ -1163,6 +1163,7 @@ struct tq_summary_ht_entry {
     uint64_t total_ns;
     uint32_t top_wait_id;
     uint64_t top_wait_ns;
+    uint64_t class_ns[PGWT_NUM_CLASSES];
 };
 
 struct tq_summary_ctx {
@@ -1193,6 +1194,9 @@ static int tq_summary_visitor(const struct pgwt_summary_accum *rec, void *arg)
         }
         ctx->ht[h].count += sq->count;
         ctx->ht[h].total_ns += sq->total_ns;
+        /* Attribute this second's time to top_wait's class */
+        int cls = pgwt_wait_class_index(sq->top_wait_id);
+        ctx->ht[h].class_ns[cls] += sq->total_ns;
         if (sq->top_wait_ns > ctx->ht[h].top_wait_ns) {
             ctx->ht[h].top_wait_id = sq->top_wait_id;
             ctx->ht[h].top_wait_ns = sq->top_wait_ns;
@@ -1240,6 +1244,8 @@ void pgwt_compute_top_queries_from_summaries(
         else
             pgwt_event_full_name(ctx.ht[i].top_wait_id, row->top_wait,
                                   sizeof(row->top_wait));
+        for (int c = 0; c < PGWT_NUM_CLASSES; c++)
+            row->class_ms[c] = (double)ctx.ht[i].class_ns[c] / 1e6;
         nr++;
     }
 
