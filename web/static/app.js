@@ -699,18 +699,19 @@ const TABLE_CONFIGS = {
     },
     queries: {
         columns: [
-            { key: 'query_id', label: 'Query', format: (r) => {
-                const id = '<span class="query-id">' + r.query_id + '</span>';
-                if (r.text) return dot(r.top_wait) + esc(r.text.substring(0, 80)) +
-                    (r.text.length > 80 ? '...' : '');
-                return dot(r.top_wait) + id;
+            { key: 'query_id', label: 'Query ID', format: (r) =>
+                '<span class="query-id">' + r.query_id + '</span>' },
+            { key: 'text', label: 'Query Text', format: (r) => {
+                if (!r.text) return '<span style="color:#555">—</span>';
+                return dot(r.top_wait) + esc(r.text.substring(0, 120)) +
+                    (r.text.length > 120 ? '...' : '');
             }},
             { key: 'total_ms', label: 'Time', cls: 'num', format: (r) => fmtMs(r.total_ms) },
             { key: 'pct', label: '%DB', cls: 'num', format: (r) => fmtPct(r.pct) },
             { key: 'classes', label: 'Wait Profile', format: (r) =>
                 stackedBar(r.classes, r.total_ms) },
-            { key: 'count', label: 'Calls', cls: 'num', format: (r) => fmtCount(r.count) },
-            { key: 'avg_us', label: 'Avg', cls: 'num', format: (r) => fmtUs(r.avg_us) },
+            { key: 'count', label: 'Waits', cls: 'num', format: (r) => fmtCount(r.count) },
+            { key: 'avg_us', label: 'Avg Wait', cls: 'num', format: (r) => fmtUs(r.avg_us) },
         ],
         rowClass: () => 'clickable',
         onClick: (r) => {
@@ -848,7 +849,7 @@ function drillDown(filterKey, filterValue, label) {
     state.filters[filterKey] = filterValue;
 
     // Auto-pivot
-    const pivotMap = { class: 'events', event_id: 'histogram', pid: 'queries' };
+    const pivotMap = { class: 'events', event_id: 'histogram', pid: 'queries', query_id: 'events' };
     if (pivotMap[filterKey]) {
         switchTab(pivotMap[filterKey]);
     }

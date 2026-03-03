@@ -22,7 +22,7 @@
 
 struct qt_entry {
     uint64_t query_id;
-    char     text[256];   /* truncated SQL text */
+    char     text[1024];  /* SQL text (up to QT_MAX_TEXT) */
 };
 
 /* ── Backend metadata map ─────────────────────────────────── */
@@ -259,7 +259,7 @@ static void server_load_query_texts(struct pgwt_server *srv)
         tp += 5;
 
         /* Extract text, handling JSON escapes minimally */
-        char text[256];
+        char text[1024];
         int ti = 0;
         while (*tp && *tp != '"' && ti < (int)sizeof(text) - 1) {
             if (*tp == '\\' && tp[1]) {
