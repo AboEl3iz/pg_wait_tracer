@@ -155,6 +155,22 @@ void pgwt_compute_top_queries(const struct pgwt_trace_event *events, int count,
                               const struct pgwt_filter *f, double wall_ms,
                               struct pgwt_queries_result *out);
 
+/* ── Heatmap (latency distribution over time) ─────────────── */
+
+struct pgwt_heatmap_result {
+    uint64_t *grid;        /* malloc'd [num_buckets * HISTOGRAM_BUCKETS] */
+    int      num_buckets;  /* time buckets */
+    uint64_t bucket_ns;    /* time bucket width */
+    uint64_t *times;       /* malloc'd [num_buckets] start timestamps */
+    uint64_t max_count;    /* max cell value (for color scaling) */
+    uint64_t total_events; /* total events in heatmap */
+};
+
+void pgwt_compute_heatmap(const struct pgwt_trace_event *events, int count,
+                          const struct pgwt_filter *f,
+                          uint64_t from_ns, uint64_t to_ns, int num_buckets,
+                          struct pgwt_heatmap_result *out);
+
 /* ── Summary-based compute (pre-aggregated 1-second records) ── */
 
 struct pgwt_summary_accum;   /* forward decl, defined in summary_writer.h */

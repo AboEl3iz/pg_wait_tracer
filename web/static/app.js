@@ -170,6 +170,10 @@ async function refreshChart() {
 }
 
 async function refreshTable() {
+    if (state.activeTab === 'histogram') {
+        await refreshHistogram();
+        return;
+    }
     try {
         const cmdMap = {
             overview: 'time_model',
@@ -322,6 +326,10 @@ function initTabs() {
 }
 
 function switchTab(tab) {
+    // Clean up heatmap when leaving histogram tab
+    if (state.activeTab === 'histogram' && tab !== 'histogram') {
+        if (heatmapChart) { heatmapChart.dispose(); heatmapChart = null; }
+    }
     state.activeTab = tab;
     document.querySelectorAll('.tab').forEach(b => {
         b.classList.toggle('active', b.dataset.tab === tab);
@@ -837,7 +845,7 @@ function drillDown(filterKey, filterValue, label) {
     state.filters[filterKey] = filterValue;
 
     // Auto-pivot
-    const pivotMap = { class: 'events', event_id: 'sessions', pid: 'queries' };
+    const pivotMap = { class: 'events', event_id: 'histogram', pid: 'queries' };
     if (pivotMap[filterKey]) {
         switchTab(pivotMap[filterKey]);
     }
@@ -904,6 +912,209 @@ function updateBreadcrumb() {
 
 function esc(s) {
     return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// -- Histogram heatmap --------------------------------------------------------
+
+let heatmapChart = null;
+let heatmapEvents = []; // cached event list for selector
+
+async function refreshHistogram() {
+    const container = document.getElementById('table-container');
+    const summaryEl = document.getElementById('summary-bar');
+    summaryEl.innerHTML = '';
+
+    // Build the selector + heatmap container if not present
+    if (!document.getElementById('heatmap-container')) {
+        container.innerHTML =
+            '<div class="event-selector">' +
+            '  <label>Class</label>' +
+            '  <select id="hm-class"><option value="">All</option></select>' +
+            '  <label>Event</label>' +
+            '  <select id="hm-event"><option value="">All</option></select>' +
+            '</div>' +
+            '<div id="heatmap-container"></div>';
+
+        document.getElementById('hm-class').addEventListener('change', onClassChange);
+        document.getElementById('hm-event').addEventListener('change', onEventChange);
+    }
+
+    // Fetch event list (for selector)
+    try {
+        const evData = await send('top_events', {
+            from: state.viewFrom, to: state.viewTo, filters: {},
+        });
+        heatmapEvents = evData.rows || [];
+        populateSelectors();
+    } catch (e) { /* ignore */ }
+
+    await fetchAndRenderHeatmap();
+}
+
+function populateSelectors() {
+    const classSelect = document.getElementById('hm-class');
+    const eventSelect = document.getElementById('hm-event');
+    if (!classSelect || !eventSelect) return;
+
+    // Gather unique classes
+    const classes = new Set();
+    heatmapEvents.forEach(r => { if (r.class) classes.add(r.class); });
+
+    const prevClass = classSelect.value;
+    classSelect.innerHTML = '<option value="">All</option>';
+    for (const cls of classes) {
+        const opt = document.createElement('option');
+        opt.value = cls;
+        opt.textContent = cls;
+        classSelect.appendChild(opt);
+    }
+
+    // Restore class selection from filter
+    if (state.filters.class) {
+        classSelect.value = state.filters.class;
+    } else if (prevClass) {
+        classSelect.value = prevClass;
+    }
+
+    // Populate events filtered by selected class
+    populateEventSelect();
+}
+
+function populateEventSelect() {
+    const classSelect = document.getElementById('hm-class');
+    const eventSelect = document.getElementById('hm-event');
+    if (!classSelect || !eventSelect) return;
+
+    const selClass = classSelect.value;
+    const filtered = selClass
+        ? heatmapEvents.filter(r => r.class === selClass)
+        : heatmapEvents;
+
+    const prevEvent = eventSelect.value;
+    eventSelect.innerHTML = '<option value="">All' + (selClass ? ' ' + selClass : '') + '</option>';
+    for (const ev of filtered.slice(0, 50)) {
+        const opt = document.createElement('option');
+        opt.value = ev.event_id;
+        opt.textContent = ev.name + ' (' + fmtCount(ev.count) + ')';
+        eventSelect.appendChild(opt);
+    }
+
+    // Restore event selection from filter
+    if (state.filters.event_id) {
+        eventSelect.value = state.filters.event_id;
+    } else if (prevEvent) {
+        eventSelect.value = prevEvent;
+    }
+}
+
+function onClassChange() {
+    populateEventSelect();
+    document.getElementById('hm-event').value = '';
+    fetchAndRenderHeatmap();
+}
+
+function onEventChange() {
+    fetchAndRenderHeatmap();
+}
+
+async function fetchAndRenderHeatmap() {
+    const classSelect = document.getElementById('hm-class');
+    const eventSelect = document.getElementById('hm-event');
+    if (!classSelect || !eventSelect) return;
+
+    // Build filters combining existing breadcrumb filters + selector
+    const filters = { ...state.filters };
+    if (classSelect.value) filters.class = classSelect.value;
+    if (eventSelect.value) filters.event_id = parseInt(eventSelect.value);
+
+    try {
+        const data = await send('heatmap', {
+            from: state.viewFrom,
+            to: state.viewTo,
+            buckets: Math.min(Math.floor(window.innerWidth / 6), 300),
+            filters: filters,
+        });
+        renderHeatmap(data);
+    } catch (e) { /* ignore */ }
+}
+
+function renderHeatmap(data) {
+    const el = document.getElementById('heatmap-container');
+    if (!el) return;
+
+    if (!data || !data.cells || data.cells.length === 0) {
+        if (heatmapChart) { heatmapChart.dispose(); heatmapChart = null; }
+        el.innerHTML = '<div class="loading">No data for selected event/range</div>';
+        return;
+    }
+
+    if (!heatmapChart) {
+        heatmapChart = echarts.init(el, 'dark');
+        window.addEventListener('resize', () => { if (heatmapChart) heatmapChart.resize(); });
+    }
+
+    const timeLabels = data.times.map(t => fmtTime(t));
+    const latLabels = data.labels || [];
+
+    // Convert sparse cells to echarts format [x, y, value]
+    const hmData = data.cells.map(c => [c[0], c[1], c[2]]);
+
+    const option = {
+        backgroundColor: 'transparent',
+        tooltip: {
+            position: 'top',
+            backgroundColor: '#1e1e3a',
+            borderColor: '#333',
+            textStyle: { color: '#e0e0e0', fontSize: 12 },
+            formatter: function(p) {
+                return '<b>' + timeLabels[p.data[0]] + '</b><br>' +
+                    'Latency: ' + latLabels[p.data[1]] + '<br>' +
+                    'Count: <b>' + p.data[2].toLocaleString() + '</b>';
+            },
+        },
+        grid: {
+            left: 90, right: 40, top: 10, bottom: 60,
+        },
+        xAxis: {
+            type: 'category',
+            data: timeLabels,
+            axisLabel: { color: '#888', fontSize: 10 },
+            axisLine: { lineStyle: { color: '#333' } },
+            splitArea: { show: false },
+        },
+        yAxis: {
+            type: 'category',
+            data: latLabels,
+            axisLabel: { color: '#888', fontSize: 10 },
+            axisLine: { lineStyle: { color: '#333' } },
+            splitArea: { show: false },
+        },
+        visualMap: {
+            min: 0,
+            max: data.max_count || 1,
+            calculable: false,
+            orient: 'horizontal',
+            left: 'center',
+            bottom: 0,
+            itemWidth: 12,
+            itemHeight: 120,
+            textStyle: { color: '#888', fontSize: 10 },
+            inRange: {
+                color: ['#1a1a2e', '#1a3a5a', '#1a6296', '#2196F3',
+                        '#4CAF50', '#FFEB3B', '#FF9800', '#F44336'],
+            },
+        },
+        series: [{
+            type: 'heatmap',
+            data: hmData,
+            emphasis: {
+                itemStyle: { borderColor: '#fff', borderWidth: 1 },
+            },
+            itemStyle: { borderWidth: 0 },
+        }],
+    };
+
+    heatmapChart.setOption(option, true);
 }
 
 // -- Start --------------------------------------------------------------------

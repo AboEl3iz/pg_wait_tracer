@@ -324,6 +324,37 @@ tr.clickable:hover td { background: #2a3a6a; }
   color: #888;
 }
 
+/* Histogram tab */
+#heatmap-container {
+  height: 350px;
+  padding: 10px 20px;
+}
+
+.event-selector {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 20px;
+  font-size: 13px;
+}
+.event-selector label {
+  color: #888;
+}
+.event-selector select {
+  background: #2a2a4a;
+  border: 1px solid #3a3a5a;
+  color: #e0e0e0;
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-size: 13px;
+  font-family: inherit;
+  min-width: 140px;
+}
+.event-selector select:focus {
+  outline: none;
+  border-color: #4fc3f7;
+}
+
 /* Loading */
 .loading {
   text-align: center;

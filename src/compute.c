@@ -11,6 +11,25 @@
 #include <string.h>
 #include <stdio.h>
 
+/* pgwt_duration_to_bucket: log2 latency bucket for heatmap.
+ * In daemon build this comes from map_reader.c; inline it here for server. */
+#ifdef PGWT_SERVER
+static uint32_t compute_duration_to_bucket(uint64_t ns)
+{
+    if (ns < 1000) return 0;
+    uint64_t us = ns / 1000;
+    uint32_t b = 0;
+    while (us > 1 && b < HISTOGRAM_BUCKETS - 1) {
+        us >>= 1;
+        b++;
+    }
+    return b;
+}
+#else
+#include "map_reader.h"
+#define compute_duration_to_bucket pgwt_duration_to_bucket
+#endif
+
 /* ── Wait class mapping ───────────────────────────────────── */
 
 int pgwt_wait_class_index(uint32_t event_id)
@@ -616,6 +635,74 @@ void pgwt_compute_top_queries(const struct pgwt_trace_event *events, int count,
     out->rows       = rows;
     out->num_rows   = nr;
     out->db_time_ms = db_time_ms;
+}
+
+/* ── Heatmap (latency distribution over time) ─────────────── */
+
+void pgwt_compute_heatmap(const struct pgwt_trace_event *events, int count,
+                          const struct pgwt_filter *f,
+                          uint64_t from_ns, uint64_t to_ns, int num_buckets,
+                          struct pgwt_heatmap_result *out)
+{
+    memset(out, 0, sizeof(*out));
+
+    uint64_t range_ns = to_ns - from_ns;
+    if (range_ns == 0 || num_buckets <= 0)
+        return;
+
+    /* Same time bucketing as AAS */
+    uint64_t bucket_ns = (range_ns + (uint64_t)num_buckets - 1) / (uint64_t)num_buckets;
+    if (bucket_ns < 1000000000ULL)
+        bucket_ns = 1000000000ULL;
+
+    int actual_buckets = (int)((range_ns + bucket_ns - 1) / bucket_ns);
+    int grid_size = actual_buckets * HISTOGRAM_BUCKETS;
+
+    uint64_t *grid = calloc(grid_size, sizeof(uint64_t));
+    uint64_t *times = malloc(actual_buckets * sizeof(uint64_t));
+    if (!grid || !times) {
+        free(grid);
+        free(times);
+        return;
+    }
+
+    for (int i = 0; i < actual_buckets; i++)
+        times[i] = from_ns + (uint64_t)i * bucket_ns;
+
+    uint64_t total = 0;
+
+    for (int i = 0; i < count; i++) {
+        const struct pgwt_trace_event *ev = &events[i];
+        if (!pgwt_filter_matches(f, ev) || pgwt_is_idle_event(ev->old_event))
+            continue;
+
+        uint64_t ev_ts = ev->timestamp_ns;
+        if (ev_ts < from_ns || ev_ts >= to_ns)
+            continue;
+
+        int time_b = (int)((ev_ts - from_ns) / bucket_ns);
+        if (time_b >= actual_buckets)
+            time_b = actual_buckets - 1;
+
+        int lat_b = (int)compute_duration_to_bucket(ev->duration_ns);
+
+        grid[time_b * HISTOGRAM_BUCKETS + lat_b]++;
+        total++;
+    }
+
+    /* Find max cell for color scaling */
+    uint64_t max_count = 0;
+    for (int i = 0; i < grid_size; i++) {
+        if (grid[i] > max_count)
+            max_count = grid[i];
+    }
+
+    out->grid         = grid;
+    out->num_buckets  = actual_buckets;
+    out->bucket_ns    = bucket_ns;
+    out->times        = times;
+    out->max_count    = max_count;
+    out->total_events = total;
 }
 
 /* ══════════════════════════════════════════════════════════════

@@ -701,6 +701,64 @@ static void handle_top_queries(struct pgwt_server *srv, struct pgwt_request *req
     free(res.rows);
 }
 
+static void handle_heatmap(struct pgwt_server *srv, struct pgwt_request *req)
+{
+    uint64_t from = req->from_ns ? req->from_ns : srv->earliest_wall_ns;
+    uint64_t to   = req->to_ns   ? req->to_ns   : srv->latest_wall_ns;
+
+    int count;
+    struct pgwt_trace_event *events =
+        server_load_events(srv, req->from_ns, req->to_ns, &count);
+
+    struct pgwt_heatmap_result res;
+    pgwt_compute_heatmap(events, count, &req->filter,
+                         from, to, req->num_buckets > 0 ? req->num_buckets : 200,
+                         &res);
+    free(events);
+
+    /* Latency bucket labels */
+    static const char *labels[HISTOGRAM_BUCKETS] = {
+        "<1\\u00b5s", "1-2\\u00b5s", "2-4\\u00b5s", "4-8\\u00b5s",
+        "8-16\\u00b5s", "16-32\\u00b5s", "32-64\\u00b5s", "64-128\\u00b5s",
+        "128-256\\u00b5s", "256-512\\u00b5s", "0.5-1ms", "1-2ms",
+        "2-4ms", "4-8ms", "8-16ms", "\\u226516ms"
+    };
+
+    printf("{\"id\":%lld,\"times\":[", (long long)req->id);
+    for (int i = 0; i < res.num_buckets; i++) {
+        if (i > 0) putchar(',');
+        printf("%llu", (unsigned long long)res.times[i]);
+    }
+
+    printf("],\"labels\":[");
+    for (int i = 0; i < HISTOGRAM_BUCKETS; i++) {
+        if (i > 0) putchar(',');
+        printf("\"%s\"", labels[i]);
+    }
+
+    /* Sparse cells: only emit non-zero [time_idx, latency_idx, count] */
+    printf("],\"cells\":[");
+    int first = 1;
+    for (int t = 0; t < res.num_buckets; t++) {
+        for (int l = 0; l < HISTOGRAM_BUCKETS; l++) {
+            uint64_t v = res.grid[t * HISTOGRAM_BUCKETS + l];
+            if (v == 0) continue;
+            if (!first) putchar(',');
+            printf("[%d,%d,%llu]", t, l, (unsigned long long)v);
+            first = 0;
+        }
+    }
+
+    printf("],\"max_count\":%llu,\"total_events\":%llu,"
+           "\"bucket_ns\":%llu}\n",
+           (unsigned long long)res.max_count,
+           (unsigned long long)res.total_events,
+           (unsigned long long)res.bucket_ns);
+
+    free(res.grid);
+    free(res.times);
+}
+
 /* ── Dispatch ─────────────────────────────────────────────── */
 
 static void dispatch(struct pgwt_server *srv, struct pgwt_request *req)
@@ -717,6 +775,8 @@ static void dispatch(struct pgwt_server *srv, struct pgwt_request *req)
         handle_top_sessions(srv, req);
     else if (strcmp(req->cmd, "top_queries") == 0)
         handle_top_queries(srv, req);
+    else if (strcmp(req->cmd, "heatmap") == 0)
+        handle_heatmap(srv, req);
     else
         printf("{\"id\":%lld,\"error\":\"unknown command: %s\"}\n",
                (long long)req->id, req->cmd);
