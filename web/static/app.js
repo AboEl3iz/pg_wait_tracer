@@ -142,6 +142,7 @@ async function init() {
         setStatus(info.num_cpus + ' CPUs, ~' + fmtCount(info.num_events) + ' events', 'connected');
         updateTimeRange();
         initChart();
+        initChartResize();
         initTabs();
         initTimePicker();
         await refresh();
@@ -405,6 +406,36 @@ function initChart() {
     });
 }
 
+// -- Chart resize handle --------------------------------------------------
+
+function initChartResize() {
+    const handle = document.getElementById('chart-resize');
+    let startY = 0, startH = 0;
+
+    handle.addEventListener('mousedown', (e) => {
+        e.preventDefault();
+        startY = e.clientY;
+        startH = chartEl.offsetHeight;
+        document.addEventListener('mousemove', onDrag);
+        document.addEventListener('mouseup', onUp);
+        document.body.style.cursor = 'ns-resize';
+        document.body.style.userSelect = 'none';
+    });
+
+    function onDrag(e) {
+        const h = Math.max(120, startH + e.clientY - startY);
+        chartEl.style.height = h + 'px';
+        if (chart) chart.resize();
+    }
+
+    function onUp() {
+        document.removeEventListener('mousemove', onDrag);
+        document.removeEventListener('mouseup', onUp);
+        document.body.style.cursor = '';
+        document.body.style.userSelect = '';
+    }
+}
+
 // -- Time picker ----------------------------------------------------------
 
 function initTimePicker() {
@@ -549,7 +580,7 @@ function renderChart(data) {
             itemHeight: 8,
         },
         grid: {
-            left: 50, right: 20, top: 20, bottom: 40,
+            left: 50, right: 20, top: 30, bottom: 40,
         },
         dataZoom: [
             { type: 'inside', xAxisIndex: 0, zoomOnMouseWheel: false, moveOnMouseWheel: false },

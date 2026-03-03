@@ -145,6 +145,18 @@ h1 { font-size: 18px; font-weight: 600; color: #fff; }
   position: relative;
 }
 
+/* Chart resize handle */
+#chart-resize {
+  height: 6px;
+  background: #16213e;
+  cursor: ns-resize;
+  border-bottom: 1px solid #2a2a4a;
+  transition: background 0.2s;
+}
+#chart-resize:hover {
+  background: #2a3a5a;
+}
+
 /* Tabs */
 #tabs {
   display: flex;
