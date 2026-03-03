@@ -26,6 +26,12 @@ static const char *pgwt_class_names[PGWT_NUM_CLASSES] = {
     "timeout", "bufferpin", "activity", "extension", "unknown"
 };
 
+/* Display names matching PostgreSQL conventions */
+static const char *pgwt_class_display[PGWT_NUM_CLASSES] = {
+    "CPU", "IO", "Lock", "LWLock", "IPC", "Client",
+    "Timeout", "BufferPin", "Activity", "Extension", "Unknown"
+};
+
 /* Map wait_event_info → class index (0–10) */
 int pgwt_wait_class_index(uint32_t event_id);
 

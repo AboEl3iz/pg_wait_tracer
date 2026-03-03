@@ -244,15 +244,18 @@ void pgwt_compute_time_model(const struct pgwt_trace_event *events, int count,
         double cls_ms = classes[c].total_ns / 1e6;
         double pct = db_time_ms > 0 ? cls_ms / db_time_ms * 100.0 : 0;
 
-        /* Class name: capitalize, add * for CPU */
+        /* Class display name from lookup table */
+        const char *display = classes[c].name;
+        for (int k = 0; k < PGWT_NUM_CLASSES; k++) {
+            if (strcasecmp(classes[c].name, pgwt_class_names[k]) == 0) {
+                display = pgwt_class_display[k];
+                break;
+            }
+        }
         if (strcasecmp(classes[c].name, "cpu") == 0)
             snprintf(rows[nr].name, sizeof(rows[nr].name), "CPU*");
-        else {
-            /* Capitalize first letter */
-            snprintf(rows[nr].name, sizeof(rows[nr].name), "%.31s", classes[c].name);
-            if (rows[nr].name[0] >= 'a' && rows[nr].name[0] <= 'z')
-                rows[nr].name[0] -= 32;
-        }
+        else
+            snprintf(rows[nr].name, sizeof(rows[nr].name), "%.31s", display);
         rows[nr].time_ms     = cls_ms;
         rows[nr].pct_db_time = pct;
         rows[nr].aas         = wall_ms > 0 ? cls_ms / wall_ms : 0;
@@ -822,13 +825,17 @@ void pgwt_compute_time_model_from_summaries(
         double cls_ms = classes[c].total_ns / 1e6;
         double pct = db_time_ms > 0 ? cls_ms / db_time_ms * 100.0 : 0;
 
+        const char *display2 = classes[c].name;
+        for (int k = 0; k < PGWT_NUM_CLASSES; k++) {
+            if (strcasecmp(classes[c].name, pgwt_class_names[k]) == 0) {
+                display2 = pgwt_class_display[k];
+                break;
+            }
+        }
         if (strcasecmp(classes[c].name, "cpu") == 0)
             snprintf(rows[nr].name, sizeof(rows[nr].name), "CPU*");
-        else {
-            snprintf(rows[nr].name, sizeof(rows[nr].name), "%.31s", classes[c].name);
-            if (rows[nr].name[0] >= 'a' && rows[nr].name[0] <= 'z')
-                rows[nr].name[0] -= 32;
-        }
+        else
+            snprintf(rows[nr].name, sizeof(rows[nr].name), "%.31s", display2);
         rows[nr].time_ms     = cls_ms;
         rows[nr].pct_db_time = pct;
         rows[nr].aas         = wall_ms > 0 ? cls_ms / wall_ms : 0;
