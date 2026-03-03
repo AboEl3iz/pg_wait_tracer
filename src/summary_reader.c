@@ -233,24 +233,21 @@ int pgwt_scan_summary_files(const char *trace_dir,
     return n;
 }
 
-/* ── Bulk load ─────────────────────────────────────────── */
+/* ── Streaming visitor ─────────────────────────────────── */
 
-int pgwt_load_summaries(const char *trace_dir,
-                         uint64_t from_wall_ns, uint64_t to_wall_ns,
-                         struct pgwt_summary_accum **out)
+int pgwt_visit_summaries(const char *trace_dir,
+                          uint64_t from_wall_ns, uint64_t to_wall_ns,
+                          pgwt_summary_visitor visitor, void *ctx)
 {
-    *out = NULL;
-
     /* Scan available summary files */
     struct pgwt_summary_file_entry files[256];
     int nfiles = pgwt_scan_summary_files(trace_dir, files, 256);
     if (nfiles <= 0)
         return nfiles;
 
-    /* Estimate max records: up to 3600 per file × nfiles */
-    int max_records = nfiles * 3600;
-    struct pgwt_summary_accum *records = malloc(max_records * sizeof(*records));
-    if (!records) return -1;
+    /* Single reusable decode buffer (~280KB) */
+    struct pgwt_summary_accum *record = malloc(sizeof(*record));
+    if (!record) return -1;
 
     int total = 0;
 
@@ -271,39 +268,31 @@ int pgwt_load_summaries(const char *trace_dir,
         if (from_wall_ns > 0)
             start_blk = pgwt_summary_reader_find_block(&reader, from_wall_ns);
 
-        for (int b = start_blk; b < reader.num_blocks; b++) {
+        int stop = 0;
+        for (int b = start_blk; b < reader.num_blocks && !stop; b++) {
             /* Check if block is past the end of range */
             if (to_wall_ns > 0 &&
                 reader.block_index[b].timestamp_ns > to_wall_ns)
                 break;
 
-            if (total >= max_records) {
-                /* Grow array */
-                max_records *= 2;
-                struct pgwt_summary_accum *tmp =
-                    realloc(records, max_records * sizeof(*records));
-                if (!tmp) {
-                    pgwt_summary_reader_close(&reader);
-                    *out = records;
-                    return total;
-                }
-                records = tmp;
-            }
-
-            if (pgwt_summary_reader_decode_block(&reader, b, &records[total]) == 0) {
+            if (pgwt_summary_reader_decode_block(&reader, b, record) == 0) {
                 /* Filter by exact time range */
-                uint64_t rec_ns = records[total].second_wall_ns;
+                uint64_t rec_ns = record->second_wall_ns;
                 if (from_wall_ns > 0 && rec_ns < from_wall_ns)
                     continue;
                 if (to_wall_ns > 0 && rec_ns > to_wall_ns)
                     continue;
+
+                if (visitor(record, ctx) != 0)
+                    stop = 1;
                 total++;
             }
         }
 
         pgwt_summary_reader_close(&reader);
+        if (stop) break;
     }
 
-    *out = records;
+    free(record);
     return total;
 }

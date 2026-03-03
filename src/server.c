@@ -559,14 +559,15 @@ static int server_init(struct pgwt_server *srv, const char *trace_dir)
 
 /* ── Summary threshold ────────────────────────────────────── */
 
-/* Summary path disabled: pgwt_summary_accum is ~280 KB and bulk-loading
- * thousands of them OOMs.  Raw events are ~40 bytes each, so even 1 hour
- * (~1 M events ≈ 40 MB) is fine.  TODO: rewrite summary loader to stream
- * or use a compact struct before re-enabling. */
+/* Use summary path for ranges >= 120s (instant response, ~300KB peak memory).
+ * Raw events used for ranges < 120s (exact per-event resolution). */
 static int should_use_summaries(struct pgwt_server *srv, struct pgwt_request *req)
 {
-    (void)srv; (void)req;
-    return 0;
+    uint64_t from = req->from_ns ? req->from_ns : srv->earliest_wall_ns;
+    uint64_t to   = req->to_ns   ? req->to_ns   : srv->latest_wall_ns;
+    if (to <= from) return 0;
+    uint64_t range_ns = to - from;
+    return (range_ns >= 120ULL * 1000000000ULL);
 }
 
 /* ── Command handlers ─────────────────────────────────────── */
@@ -624,17 +625,8 @@ static void handle_aas(struct pgwt_server *srv, struct pgwt_request *req)
     struct pgwt_aas_result aas;
 
     if (should_use_summaries(srv, req)) {
-        struct pgwt_summary_accum *records;
-        int rcount = pgwt_load_summaries(srv->trace_dir, from, to, &records);
-        if (rcount > 0) {
-            pgwt_compute_aas_from_summaries(records, rcount, &req->filter,
-                                             from, to, num_buckets, &aas);
-            free(records);
-        } else {
-            memset(&aas, 0, sizeof(aas));
-            aas.bucket_ns = 1000000000ULL;
-            free(records);
-        }
+        pgwt_compute_aas_from_summaries(srv->trace_dir, from, to,
+                                         &req->filter, num_buckets, &aas);
     } else {
         int count;
         struct pgwt_trace_event *events =
@@ -667,11 +659,8 @@ static void handle_time_model(struct pgwt_server *srv, struct pgwt_request *req)
     struct pgwt_tm_result tm;
 
     if (should_use_summaries(srv, req)) {
-        struct pgwt_summary_accum *records;
-        int rcount = pgwt_load_summaries(srv->trace_dir, from, to, &records);
-        pgwt_compute_time_model_from_summaries(
-            records, rcount > 0 ? rcount : 0, &req->filter, wall_ms, &tm);
-        free(records);
+        pgwt_compute_time_model_from_summaries(srv->trace_dir, from, to,
+                                                &req->filter, wall_ms, &tm);
     } else {
         int count;
         struct pgwt_trace_event *events =
@@ -705,11 +694,8 @@ static void handle_top_events(struct pgwt_server *srv, struct pgwt_request *req)
     struct pgwt_events_result res;
 
     if (should_use_summaries(srv, req)) {
-        struct pgwt_summary_accum *records;
-        int rcount = pgwt_load_summaries(srv->trace_dir, from, to, &records);
-        pgwt_compute_top_events_from_summaries(
-            records, rcount > 0 ? rcount : 0, &req->filter, wall_ms, &res);
-        free(records);
+        pgwt_compute_top_events_from_summaries(srv->trace_dir, from, to,
+                                                &req->filter, wall_ms, &res);
     } else {
         int count;
         struct pgwt_trace_event *events =
@@ -746,11 +732,8 @@ static void handle_top_sessions(struct pgwt_server *srv, struct pgwt_request *re
     struct pgwt_sessions_result res;
 
     if (should_use_summaries(srv, req)) {
-        struct pgwt_summary_accum *records;
-        int rcount = pgwt_load_summaries(srv->trace_dir, from, to, &records);
-        pgwt_compute_top_sessions_from_summaries(
-            records, rcount > 0 ? rcount : 0, &req->filter, wall_ms, &res);
-        free(records);
+        pgwt_compute_top_sessions_from_summaries(srv->trace_dir, from, to,
+                                                  &req->filter, wall_ms, &res);
     } else {
         int count;
         struct pgwt_trace_event *events =
@@ -790,11 +773,8 @@ static void handle_top_queries(struct pgwt_server *srv, struct pgwt_request *req
     struct pgwt_queries_result res;
 
     if (should_use_summaries(srv, req)) {
-        struct pgwt_summary_accum *records;
-        int rcount = pgwt_load_summaries(srv->trace_dir, from, to, &records);
-        pgwt_compute_top_queries_from_summaries(
-            records, rcount > 0 ? rcount : 0, &req->filter, wall_ms, &res);
-        free(records);
+        pgwt_compute_top_queries_from_summaries(srv->trace_dir, from, to,
+                                                 &req->filter, wall_ms, &res);
     } else {
         int count;
         struct pgwt_trace_event *events =
@@ -855,16 +835,21 @@ static void handle_heatmap(struct pgwt_server *srv, struct pgwt_request *req)
 {
     uint64_t from = req->from_ns ? req->from_ns : srv->earliest_wall_ns;
     uint64_t to   = req->to_ns   ? req->to_ns   : srv->latest_wall_ns;
-
-    int count;
-    struct pgwt_trace_event *events =
-        server_load_events(srv, req->from_ns, req->to_ns, &count);
+    int num_buckets = req->num_buckets > 0 ? req->num_buckets : 200;
 
     struct pgwt_heatmap_result res;
-    pgwt_compute_heatmap(events, count, &req->filter,
-                         from, to, req->num_buckets > 0 ? req->num_buckets : 200,
-                         &res);
-    free(events);
+
+    if (should_use_summaries(srv, req)) {
+        pgwt_compute_heatmap_from_summaries(srv->trace_dir, from, to,
+                                             &req->filter, num_buckets, &res);
+    } else {
+        int count;
+        struct pgwt_trace_event *events =
+            server_load_events(srv, req->from_ns, req->to_ns, &count);
+        pgwt_compute_heatmap(events, count, &req->filter,
+                             from, to, num_buckets, &res);
+        free(events);
+    }
 
     /* Latency bucket labels */
     static const char *labels[HISTOGRAM_BUCKETS] = {

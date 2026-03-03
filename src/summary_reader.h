@@ -59,14 +59,17 @@ int pgwt_scan_summary_files(const char *trace_dir,
                              struct pgwt_summary_file_entry *entries,
                              int max_entries);
 
-/* ── Bulk load: read all summary records in a time range ── */
+/* ── Streaming visitor: decode records one at a time ────── */
 
-/* Load summary records from files in trace_dir covering [from_ns, to_ns].
- * Allocates and returns array of pgwt_summary_accum records.
- * Caller must free(*out) when done.
- * Returns count of records loaded, or -1 on error. */
-int pgwt_load_summaries(const char *trace_dir,
-                         uint64_t from_wall_ns, uint64_t to_wall_ns,
-                         struct pgwt_summary_accum **out);
+/* Visitor callback: called once per decoded summary record.
+ * Return 0 to continue, non-zero to stop early. */
+typedef int (*pgwt_summary_visitor)(const struct pgwt_summary_accum *record,
+                                     void *ctx);
+
+/* Stream summary records in [from_ns, to_ns], calling visitor for each.
+ * Returns number of records visited, or -1 on error. */
+int pgwt_visit_summaries(const char *trace_dir,
+                          uint64_t from_wall_ns, uint64_t to_wall_ns,
+                          pgwt_summary_visitor visitor, void *ctx);
 
 #endif /* PGWT_SUMMARY_READER_H */

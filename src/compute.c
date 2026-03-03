@@ -5,6 +5,7 @@
  */
 #include "compute.h"
 #include "summary_writer.h"
+#include "summary_reader.h"
 #include "wait_event.h"
 
 #include <stdlib.h>
@@ -726,10 +727,53 @@ static int summary_event_matches_filter(const struct pgwt_filter *f,
 
 /* ── AAS from summaries ───────────────────────────────────── */
 
+struct aas_summary_ctx {
+    struct pgwt_aas_bucket *buckets;
+    int      actual_buckets;
+    uint64_t from_ns;
+    uint64_t bucket_ns;
+    const struct pgwt_filter *f;
+    int has_class_filter;
+    int has_event_filter;
+    int has_pid_filter;
+    int has_query_filter;
+};
+
+static int aas_summary_visitor(const struct pgwt_summary_accum *rec, void *arg)
+{
+    struct aas_summary_ctx *ctx = arg;
+    uint64_t wall = rec->second_wall_ns;
+
+    int bi = (int)((wall - ctx->from_ns) / ctx->bucket_ns);
+    if (bi >= ctx->actual_buckets) bi = ctx->actual_buckets - 1;
+    if (bi < 0) bi = 0;
+
+    /* PID or query filter: summaries don't correlate per-PID to class.
+     * Skip — summaries give full system view. */
+    if (ctx->has_pid_filter || ctx->has_query_filter)
+        return 0;
+
+    if (!ctx->has_class_filter && !ctx->has_event_filter) {
+        for (int c = 0; c < PGWT_NUM_CLASSES; c++) {
+            if (c == PGWT_CLASS_ACTIVITY) continue;
+            ctx->buckets[bi].class_aas[c] += (double)rec->class_ns[c];
+        }
+    } else {
+        for (int e = 0; e < SUMMARY_MAX_EVENTS; e++) {
+            const struct pgwt_summary_event *se = &rec->events[e];
+            if (se->event_id == 0 && se->count == 0) continue;
+            if (pgwt_is_idle_event(se->event_id)) continue;
+            if (!summary_event_matches_filter(ctx->f, se->event_id)) continue;
+            int cls = pgwt_wait_class_index(se->event_id);
+            ctx->buckets[bi].class_aas[cls] += (double)se->total_ns;
+        }
+    }
+    return 0;
+}
+
 void pgwt_compute_aas_from_summaries(
-    const struct pgwt_summary_accum *records, int count,
-    const struct pgwt_filter *f,
-    uint64_t from_ns, uint64_t to_ns, int num_buckets,
+    const char *trace_dir, uint64_t from_ns, uint64_t to_ns,
+    const struct pgwt_filter *f, int num_buckets,
     struct pgwt_aas_result *out)
 {
     memset(out, 0, sizeof(*out));
@@ -751,53 +795,19 @@ void pgwt_compute_aas_from_summaries(
     for (int i = 0; i < actual_buckets; i++)
         buckets[i].start_ns = from_ns + (uint64_t)i * bucket_ns;
 
-    int has_class_filter = (f->class_name[0] != '\0');
-    int has_event_filter = (f->event_id != 0);
-    int has_pid_filter   = (f->pid != 0);
-    int has_query_filter = (f->query_id != 0);
+    struct aas_summary_ctx ctx = {
+        .buckets = buckets,
+        .actual_buckets = actual_buckets,
+        .from_ns = from_ns,
+        .bucket_ns = bucket_ns,
+        .f = f,
+        .has_class_filter = (f->class_name[0] != '\0'),
+        .has_event_filter = (f->event_id != 0),
+        .has_pid_filter   = (f->pid != 0),
+        .has_query_filter = (f->query_id != 0),
+    };
 
-    for (int r = 0; r < count; r++) {
-        const struct pgwt_summary_accum *rec = &records[r];
-        uint64_t wall = rec->second_wall_ns;
-
-        if (wall < from_ns || wall >= to_ns)
-            continue;
-
-        int bi = (int)((wall - from_ns) / bucket_ns);
-        if (bi >= actual_buckets) bi = actual_buckets - 1;
-
-        /* PID or query filter: we can't use class_ns directly because we
-         * don't know which PIDs/queries contributed to each class.
-         * Fall back to summing from per-event stats (still fast). */
-        if (has_pid_filter || has_query_filter) {
-            /* For PID filter: use session data → approximate with full events */
-            /* For query filter: use query data → approximate with event totals */
-            /* In summary mode these filters are approximate:
-             * we can filter sessions/queries but not correlate to class exactly.
-             * Skip for now — summaries give full system view. */
-            continue;
-        }
-
-        if (!has_class_filter && !has_event_filter) {
-            /* No filter: directly use class_ns (fast path) */
-            for (int c = 0; c < PGWT_NUM_CLASSES; c++) {
-                if (c == PGWT_CLASS_ACTIVITY)
-                    continue; /* exclude idle */
-                buckets[bi].class_aas[c] += (double)rec->class_ns[c];
-            }
-        } else {
-            /* Class/event filter: iterate per-event entries */
-            for (int e = 0; e < SUMMARY_MAX_EVENTS; e++) {
-                const struct pgwt_summary_event *se = &rec->events[e];
-                if (se->event_id == 0 && se->count == 0) continue;
-                if (pgwt_is_idle_event(se->event_id)) continue;
-                if (!summary_event_matches_filter(f, se->event_id)) continue;
-
-                int cls = pgwt_wait_class_index(se->event_id);
-                buckets[bi].class_aas[cls] += (double)se->total_ns;
-            }
-        }
-    }
+    pgwt_visit_summaries(trace_dir, from_ns, to_ns, aas_summary_visitor, &ctx);
 
     /* Convert ns → AAS */
     double max_aas = 0.0;
@@ -818,78 +828,88 @@ void pgwt_compute_aas_from_summaries(
 
 /* ── Time Model from summaries ────────────────────────────── */
 
+struct tm_summary_ctx {
+    struct class_accum classes[PGWT_NUM_CLASSES];
+    struct event_accum *ev_accum;
+    int    num_ev_accum;
+    double db_time_ns;
+    double idle_time_ns;
+    const struct pgwt_filter *f;
+};
+
+static int tm_summary_visitor(const struct pgwt_summary_accum *rec, void *arg)
+{
+    struct tm_summary_ctx *ctx = arg;
+    const struct pgwt_filter *f = ctx->f;
+
+    /* If no class/event filter: use class_ns directly */
+    if (f->class_name[0] == '\0' && f->event_id == 0) {
+        for (int c = 0; c < PGWT_NUM_CLASSES; c++) {
+            if (c == PGWT_CLASS_ACTIVITY)
+                ctx->idle_time_ns += (double)rec->class_ns[c];
+            else {
+                ctx->classes[c].total_ns += (double)rec->class_ns[c];
+                ctx->db_time_ns += (double)rec->class_ns[c];
+            }
+        }
+    }
+
+    /* Per-event stats: iterate event entries */
+    for (int e = 0; e < SUMMARY_MAX_EVENTS; e++) {
+        const struct pgwt_summary_event *se = &rec->events[e];
+        if (se->event_id == 0 && se->count == 0) continue;
+        if (!summary_event_matches_filter(f, se->event_id)) continue;
+        if (pgwt_is_idle_event(se->event_id)) continue;
+
+        int cls_idx = pgwt_wait_class_index(se->event_id);
+
+        /* With filter: accumulate class totals from events */
+        if (f->class_name[0] != '\0' || f->event_id != 0) {
+            ctx->classes[cls_idx].total_ns += (double)se->total_ns;
+            ctx->db_time_ns += (double)se->total_ns;
+        }
+
+        /* Sub-event accumulation */
+        int found = -1;
+        for (int j = 0; j < ctx->num_ev_accum; j++) {
+            if (ctx->ev_accum[j].event_id == se->event_id) {
+                found = j; break;
+            }
+        }
+        if (found >= 0) {
+            ctx->ev_accum[found].total_ns += (double)se->total_ns;
+        } else if (ctx->num_ev_accum < MAX_DISTINCT_EVENTS) {
+            snprintf(ctx->ev_accum[ctx->num_ev_accum].class_name,
+                     sizeof(ctx->ev_accum[ctx->num_ev_accum].class_name),
+                     "%s", pgwt_class_names[cls_idx]);
+            ctx->ev_accum[ctx->num_ev_accum].event_id = se->event_id;
+            ctx->ev_accum[ctx->num_ev_accum].total_ns = (double)se->total_ns;
+            ctx->num_ev_accum++;
+        }
+    }
+    return 0;
+}
+
 void pgwt_compute_time_model_from_summaries(
-    const struct pgwt_summary_accum *records, int count,
+    const char *trace_dir, uint64_t from_ns, uint64_t to_ns,
     const struct pgwt_filter *f, double wall_ms,
     struct pgwt_tm_result *out)
 {
     memset(out, 0, sizeof(*out));
     out->wall_ms = wall_ms;
 
-    struct class_accum classes[PGWT_NUM_CLASSES];
-    memset(classes, 0, sizeof(classes));
+    struct tm_summary_ctx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.f = f;
     for (int i = 0; i < PGWT_NUM_CLASSES; i++)
-        snprintf(classes[i].name, sizeof(classes[i].name), "%s",
+        snprintf(ctx.classes[i].name, sizeof(ctx.classes[i].name), "%s",
                  pgwt_class_names[i]);
+    ctx.ev_accum = calloc(MAX_DISTINCT_EVENTS, sizeof(*ctx.ev_accum));
 
-    struct event_accum *ev_accum = calloc(MAX_DISTINCT_EVENTS, sizeof(*ev_accum));
-    int num_ev_accum = 0;
-    double db_time_ns = 0.0;
-    double idle_time_ns = 0.0;
+    pgwt_visit_summaries(trace_dir, from_ns, to_ns, tm_summary_visitor, &ctx);
 
-    for (int r = 0; r < count; r++) {
-        const struct pgwt_summary_accum *rec = &records[r];
-
-        /* If no class/event filter: use class_ns directly */
-        if (f->class_name[0] == '\0' && f->event_id == 0) {
-            for (int c = 0; c < PGWT_NUM_CLASSES; c++) {
-                if (c == PGWT_CLASS_ACTIVITY)
-                    idle_time_ns += (double)rec->class_ns[c];
-                else {
-                    classes[c].total_ns += (double)rec->class_ns[c];
-                    db_time_ns += (double)rec->class_ns[c];
-                }
-            }
-        }
-
-        /* Per-event stats: iterate event entries */
-        for (int e = 0; e < SUMMARY_MAX_EVENTS; e++) {
-            const struct pgwt_summary_event *se = &rec->events[e];
-            if (se->event_id == 0 && se->count == 0) continue;
-            if (!summary_event_matches_filter(f, se->event_id)) continue;
-
-            if (pgwt_is_idle_event(se->event_id)) continue;
-
-            int cls_idx = pgwt_wait_class_index(se->event_id);
-
-            /* With filter: accumulate class totals from events */
-            if (f->class_name[0] != '\0' || f->event_id != 0) {
-                classes[cls_idx].total_ns += (double)se->total_ns;
-                db_time_ns += (double)se->total_ns;
-            }
-
-            /* Sub-event accumulation */
-            int found = -1;
-            for (int j = 0; j < num_ev_accum; j++) {
-                if (ev_accum[j].event_id == se->event_id) {
-                    found = j; break;
-                }
-            }
-            if (found >= 0) {
-                ev_accum[found].total_ns += (double)se->total_ns;
-            } else if (num_ev_accum < MAX_DISTINCT_EVENTS) {
-                snprintf(ev_accum[num_ev_accum].class_name,
-                         sizeof(ev_accum[num_ev_accum].class_name),
-                         "%s", pgwt_class_names[cls_idx]);
-                ev_accum[num_ev_accum].event_id = se->event_id;
-                ev_accum[num_ev_accum].total_ns = (double)se->total_ns;
-                num_ev_accum++;
-            }
-        }
-    }
-
-    double db_time_ms = db_time_ns / 1e6;
-    double idle_ms    = idle_time_ns / 1e6;
+    double db_time_ms = ctx.db_time_ns / 1e6;
+    double idle_ms    = ctx.idle_time_ns / 1e6;
 
     /* Build result rows (same format as raw compute) */
     int max_rows = 1 + PGWT_NUM_CLASSES * 4;
@@ -903,23 +923,23 @@ void pgwt_compute_time_model_from_summaries(
     rows[nr].indent      = 0;
     nr++;
 
-    qsort(classes, PGWT_NUM_CLASSES, sizeof(classes[0]), cmp_class_desc);
-    qsort(ev_accum, num_ev_accum, sizeof(ev_accum[0]), cmp_event_desc);
+    qsort(ctx.classes, PGWT_NUM_CLASSES, sizeof(ctx.classes[0]), cmp_class_desc);
+    qsort(ctx.ev_accum, ctx.num_ev_accum, sizeof(ctx.ev_accum[0]), cmp_event_desc);
 
     for (int c = 0; c < PGWT_NUM_CLASSES; c++) {
-        if (classes[c].total_ns <= 0) continue;
+        if (ctx.classes[c].total_ns <= 0) continue;
 
-        double cls_ms = classes[c].total_ns / 1e6;
+        double cls_ms = ctx.classes[c].total_ns / 1e6;
         double pct = db_time_ms > 0 ? cls_ms / db_time_ms * 100.0 : 0;
 
-        const char *display2 = classes[c].name;
+        const char *display2 = ctx.classes[c].name;
         for (int k = 0; k < PGWT_NUM_CLASSES; k++) {
-            if (strcasecmp(classes[c].name, pgwt_class_names[k]) == 0) {
+            if (strcasecmp(ctx.classes[c].name, pgwt_class_names[k]) == 0) {
                 display2 = pgwt_class_display[k];
                 break;
             }
         }
-        if (strcasecmp(classes[c].name, "cpu") == 0)
+        if (strcasecmp(ctx.classes[c].name, "cpu") == 0)
             snprintf(rows[nr].name, sizeof(rows[nr].name), "CPU*");
         else
             snprintf(rows[nr].name, sizeof(rows[nr].name), "%.31s", display2);
@@ -929,18 +949,18 @@ void pgwt_compute_time_model_from_summaries(
         rows[nr].indent      = 1;
         nr++;
 
-        if (strcasecmp(classes[c].name, "cpu") == 0) continue;
+        if (strcasecmp(ctx.classes[c].name, "cpu") == 0) continue;
 
         int sub_count = 0;
-        for (int j = 0; j < num_ev_accum && sub_count < 3; j++) {
-            if (strcasecmp(ev_accum[j].class_name, classes[c].name) != 0)
+        for (int j = 0; j < ctx.num_ev_accum && sub_count < 3; j++) {
+            if (strcasecmp(ctx.ev_accum[j].class_name, ctx.classes[c].name) != 0)
                 continue;
-            double sub_ms  = ev_accum[j].total_ns / 1e6;
+            double sub_ms  = ctx.ev_accum[j].total_ns / 1e6;
             double sub_pct = db_time_ms > 0 ? sub_ms / db_time_ms * 100.0 : 0;
             if (sub_pct < 0.1) break;
 
             char buf[64];
-            pgwt_event_full_name(ev_accum[j].event_id, buf, sizeof(buf));
+            pgwt_event_full_name(ctx.ev_accum[j].event_id, buf, sizeof(buf));
             snprintf(rows[nr].name, sizeof(rows[nr].name), "%s", buf);
             rows[nr].time_ms     = sub_ms;
             rows[nr].pct_db_time = sub_pct;
@@ -951,7 +971,7 @@ void pgwt_compute_time_model_from_summaries(
         }
     }
 
-    free(ev_accum);
+    free(ctx.ev_accum);
 
     out->rows         = rows;
     out->num_rows     = nr;
@@ -962,70 +982,84 @@ void pgwt_compute_time_model_from_summaries(
 
 /* ── Top Events from summaries ────────────────────────────── */
 
+struct te_summary_ctx {
+    struct top_event_accum *ht;
+    int      num_entries;
+    uint64_t db_time_ns;
+    const struct pgwt_filter *f;
+};
+
+static int te_summary_visitor(const struct pgwt_summary_accum *rec, void *arg)
+{
+    struct te_summary_ctx *ctx = arg;
+
+    for (int e = 0; e < SUMMARY_MAX_EVENTS; e++) {
+        const struct pgwt_summary_event *se = &rec->events[e];
+        if (se->event_id == 0 && se->count == 0) continue;
+        if (pgwt_is_idle_event(se->event_id)) continue;
+        if (!summary_event_matches_filter(ctx->f, se->event_id)) continue;
+
+        ctx->db_time_ns += se->total_ns;
+
+        uint32_t h = se->event_id & EVENT_HT_MASK;
+        while (ctx->ht[h].count > 0 && ctx->ht[h].event_id != se->event_id)
+            h = (h + 1) & EVENT_HT_MASK;
+
+        if (ctx->ht[h].count == 0) {
+            ctx->ht[h].event_id = se->event_id;
+            ctx->num_entries++;
+        }
+        ctx->ht[h].count += se->count;
+        ctx->ht[h].total_ns += se->total_ns;
+        if (se->max_ns > ctx->ht[h].max_ns)
+            ctx->ht[h].max_ns = se->max_ns;
+    }
+    return 0;
+}
+
 void pgwt_compute_top_events_from_summaries(
-    const struct pgwt_summary_accum *records, int count,
+    const char *trace_dir, uint64_t from_ns, uint64_t to_ns,
     const struct pgwt_filter *f, double wall_ms,
     struct pgwt_events_result *out)
 {
     memset(out, 0, sizeof(*out));
 
-    /* Merge per-event stats across all summary records */
-    struct top_event_accum *ht = calloc(EVENT_HT_SIZE, sizeof(*ht));
-    int num_entries = 0;
-    uint64_t db_time_ns = 0;
+    struct te_summary_ctx ctx = {
+        .ht = calloc(EVENT_HT_SIZE, sizeof(*ctx.ht)),
+        .num_entries = 0,
+        .db_time_ns = 0,
+        .f = f,
+    };
+    if (!ctx.ht) return;
 
-    for (int r = 0; r < count; r++) {
-        const struct pgwt_summary_accum *rec = &records[r];
+    pgwt_visit_summaries(trace_dir, from_ns, to_ns, te_summary_visitor, &ctx);
 
-        for (int e = 0; e < SUMMARY_MAX_EVENTS; e++) {
-            const struct pgwt_summary_event *se = &rec->events[e];
-            if (se->event_id == 0 && se->count == 0) continue;
-            if (pgwt_is_idle_event(se->event_id)) continue;
-            if (!summary_event_matches_filter(f, se->event_id)) continue;
+    double db_time_ms = (double)ctx.db_time_ns / 1e6;
 
-            db_time_ns += se->total_ns;
-
-            uint32_t h = se->event_id & EVENT_HT_MASK;
-            while (ht[h].count > 0 && ht[h].event_id != se->event_id)
-                h = (h + 1) & EVENT_HT_MASK;
-
-            if (ht[h].count == 0) {
-                ht[h].event_id = se->event_id;
-                num_entries++;
-            }
-            ht[h].count += se->count;
-            ht[h].total_ns += se->total_ns;
-            if (se->max_ns > ht[h].max_ns)
-                ht[h].max_ns = se->max_ns;
-        }
-    }
-
-    double db_time_ms = (double)db_time_ns / 1e6;
-
-    struct pgwt_event_row *rows = calloc(num_entries, sizeof(*rows));
+    struct pgwt_event_row *rows = calloc(ctx.num_entries, sizeof(*rows));
     int nr = 0;
 
     for (int i = 0; i < EVENT_HT_SIZE; i++) {
-        if (ht[i].count == 0) continue;
+        if (ctx.ht[i].count == 0) continue;
 
         struct pgwt_event_row *row = &rows[nr];
-        row->event_id = ht[i].event_id;
-        row->count    = ht[i].count;
-        row->total_ms = (double)ht[i].total_ns / 1e6;
-        row->avg_us   = ht[i].count > 0
-                       ? (double)ht[i].total_ns / (double)ht[i].count / 1000.0 : 0;
-        row->max_us   = (double)ht[i].max_ns / 1000.0;
+        row->event_id = ctx.ht[i].event_id;
+        row->count    = ctx.ht[i].count;
+        row->total_ms = (double)ctx.ht[i].total_ns / 1e6;
+        row->avg_us   = ctx.ht[i].count > 0
+                       ? (double)ctx.ht[i].total_ns / (double)ctx.ht[i].count / 1000.0 : 0;
+        row->max_us   = (double)ctx.ht[i].max_ns / 1000.0;
         row->pct_db   = db_time_ms > 0 ? row->total_ms / db_time_ms * 100.0 : 0;
         row->aas      = wall_ms > 0 ? row->total_ms / wall_ms : 0;
 
-        if (ht[i].event_id == 0)
+        if (ctx.ht[i].event_id == 0)
             snprintf(row->name, sizeof(row->name), "CPU*");
         else
-            pgwt_event_full_name(ht[i].event_id, row->name, sizeof(row->name));
+            pgwt_event_full_name(ctx.ht[i].event_id, row->name, sizeof(row->name));
         nr++;
     }
 
-    free(ht);
+    free(ctx.ht);
     qsort(rows, nr, sizeof(rows[0]), cmp_event_row_desc);
 
     out->rows       = rows;
@@ -1035,71 +1069,86 @@ void pgwt_compute_top_events_from_summaries(
 
 /* ── Top Sessions from summaries ──────────────────────────── */
 
+struct ts_summary_ht_entry {
+    uint32_t pid;
+    uint64_t db_time_ns;
+    uint64_t cpu_ns;
+    uint32_t top_wait_id;
+    uint64_t top_wait_ns;
+};
+
+struct ts_summary_ctx {
+    struct ts_summary_ht_entry *ht;
+    int num_entries;
+    const struct pgwt_filter *f;
+};
+
+static int ts_summary_visitor(const struct pgwt_summary_accum *rec, void *arg)
+{
+    struct ts_summary_ctx *ctx = arg;
+
+    for (int s = 0; s < SUMMARY_MAX_SESSIONS; s++) {
+        const struct pgwt_summary_session *ss = &rec->sessions[s];
+        if (ss->pid == 0 && ss->db_time_ns == 0) continue;
+        if (ctx->f->pid != 0 && ss->pid != ctx->f->pid) continue;
+
+        uint32_t h = ss->pid % SESSION_HT_SIZE;
+        while (ctx->ht[h].pid != 0 && ctx->ht[h].pid != ss->pid)
+            h = (h + 1) % SESSION_HT_SIZE;
+
+        if (ctx->ht[h].pid == 0) {
+            ctx->ht[h].pid = ss->pid;
+            ctx->num_entries++;
+        }
+        ctx->ht[h].db_time_ns += ss->db_time_ns;
+        ctx->ht[h].cpu_ns += ss->cpu_ns;
+        if (ss->top_wait_ns > ctx->ht[h].top_wait_ns) {
+            ctx->ht[h].top_wait_id = ss->top_wait_id;
+            ctx->ht[h].top_wait_ns = ss->top_wait_ns;
+        }
+    }
+    return 0;
+}
+
 void pgwt_compute_top_sessions_from_summaries(
-    const struct pgwt_summary_accum *records, int count,
+    const char *trace_dir, uint64_t from_ns, uint64_t to_ns,
     const struct pgwt_filter *f, double wall_ms,
     struct pgwt_sessions_result *out)
 {
-    (void)f; (void)wall_ms;
+    (void)wall_ms;
     memset(out, 0, sizeof(*out));
 
-    /* Merge per-PID stats.  Use simple open-addressing HT. */
-    struct {
-        uint32_t pid;
-        uint64_t db_time_ns;
-        uint64_t cpu_ns;
-        uint32_t top_wait_id;
-        uint64_t top_wait_ns;
-    } *ht = calloc(SESSION_HT_SIZE, sizeof(*ht));
-    int num_entries = 0;
+    struct ts_summary_ctx ctx = {
+        .ht = calloc(SESSION_HT_SIZE, sizeof(*ctx.ht)),
+        .num_entries = 0,
+        .f = f,
+    };
+    if (!ctx.ht) return;
 
-    for (int r = 0; r < count; r++) {
-        const struct pgwt_summary_accum *rec = &records[r];
+    pgwt_visit_summaries(trace_dir, from_ns, to_ns, ts_summary_visitor, &ctx);
 
-        for (int s = 0; s < SUMMARY_MAX_SESSIONS; s++) {
-            const struct pgwt_summary_session *ss = &rec->sessions[s];
-            if (ss->pid == 0 && ss->db_time_ns == 0) continue;
-            if (f->pid != 0 && ss->pid != f->pid) continue;
-
-            uint32_t h = ss->pid % SESSION_HT_SIZE;
-            while (ht[h].pid != 0 && ht[h].pid != ss->pid)
-                h = (h + 1) % SESSION_HT_SIZE;
-
-            if (ht[h].pid == 0) {
-                ht[h].pid = ss->pid;
-                num_entries++;
-            }
-            ht[h].db_time_ns += ss->db_time_ns;
-            ht[h].cpu_ns += ss->cpu_ns;
-            if (ss->top_wait_ns > ht[h].top_wait_ns) {
-                ht[h].top_wait_id = ss->top_wait_id;
-                ht[h].top_wait_ns = ss->top_wait_ns;
-            }
-        }
-    }
-
-    struct pgwt_session_row *rows = calloc(num_entries, sizeof(*rows));
+    struct pgwt_session_row *rows = calloc(ctx.num_entries, sizeof(*rows));
     int nr = 0;
 
     for (int i = 0; i < SESSION_HT_SIZE; i++) {
-        if (ht[i].pid == 0) continue;
+        if (ctx.ht[i].pid == 0) continue;
 
         struct pgwt_session_row *row = &rows[nr];
-        row->pid        = ht[i].pid;
-        row->db_time_ms = (double)ht[i].db_time_ns / 1e6;
-        double db = (double)ht[i].db_time_ns;
-        row->cpu_pct  = db > 0 ? (double)ht[i].cpu_ns / db * 100.0 : 0;
+        row->pid        = ctx.ht[i].pid;
+        row->db_time_ms = (double)ctx.ht[i].db_time_ns / 1e6;
+        double db = (double)ctx.ht[i].db_time_ns;
+        row->cpu_pct  = db > 0 ? (double)ctx.ht[i].cpu_ns / db * 100.0 : 0;
         row->wait_pct = 100.0 - row->cpu_pct;
-        row->top_wait_id = ht[i].top_wait_id;
-        if (ht[i].top_wait_id == 0)
+        row->top_wait_id = ctx.ht[i].top_wait_id;
+        if (ctx.ht[i].top_wait_id == 0)
             snprintf(row->top_wait, sizeof(row->top_wait), "CPU*");
         else
-            pgwt_event_full_name(ht[i].top_wait_id, row->top_wait,
+            pgwt_event_full_name(ctx.ht[i].top_wait_id, row->top_wait,
                                   sizeof(row->top_wait));
         nr++;
     }
 
-    free(ht);
+    free(ctx.ht);
     qsort(rows, nr, sizeof(rows[0]), cmp_session_row_desc);
 
     out->rows     = rows;
@@ -1108,79 +1157,182 @@ void pgwt_compute_top_sessions_from_summaries(
 
 /* ── Top Queries from summaries ───────────────────────────── */
 
+struct tq_summary_ht_entry {
+    uint64_t query_id;
+    uint64_t count;
+    uint64_t total_ns;
+    uint32_t top_wait_id;
+    uint64_t top_wait_ns;
+};
+
+struct tq_summary_ctx {
+    struct tq_summary_ht_entry *ht;
+    int      num_entries;
+    uint64_t db_time_ns;
+    const struct pgwt_filter *f;
+};
+
+static int tq_summary_visitor(const struct pgwt_summary_accum *rec, void *arg)
+{
+    struct tq_summary_ctx *ctx = arg;
+
+    for (int q = 0; q < SUMMARY_MAX_QUERIES; q++) {
+        const struct pgwt_summary_query *sq = &rec->queries[q];
+        if (sq->query_id == 0 && sq->count == 0) continue;
+        if (ctx->f->query_id != 0 && sq->query_id != ctx->f->query_id) continue;
+
+        ctx->db_time_ns += sq->total_ns;
+
+        uint32_t h = (uint32_t)(sq->query_id ^ (sq->query_id >> 32)) & QUERY_HT_MASK;
+        while (ctx->ht[h].count > 0 && ctx->ht[h].query_id != sq->query_id)
+            h = (h + 1) & QUERY_HT_MASK;
+
+        if (ctx->ht[h].count == 0) {
+            ctx->ht[h].query_id = sq->query_id;
+            ctx->num_entries++;
+        }
+        ctx->ht[h].count += sq->count;
+        ctx->ht[h].total_ns += sq->total_ns;
+        if (sq->top_wait_ns > ctx->ht[h].top_wait_ns) {
+            ctx->ht[h].top_wait_id = sq->top_wait_id;
+            ctx->ht[h].top_wait_ns = sq->top_wait_ns;
+        }
+    }
+    return 0;
+}
+
 void pgwt_compute_top_queries_from_summaries(
-    const struct pgwt_summary_accum *records, int count,
+    const char *trace_dir, uint64_t from_ns, uint64_t to_ns,
     const struct pgwt_filter *f, double wall_ms,
     struct pgwt_queries_result *out)
 {
     (void)wall_ms;
     memset(out, 0, sizeof(*out));
 
-    struct {
-        uint64_t query_id;
-        uint64_t count;
-        uint64_t total_ns;
-        uint32_t top_wait_id;
-        uint64_t top_wait_ns;
-    } *ht = calloc(QUERY_HT_SIZE, sizeof(*ht));
-    int num_entries = 0;
-    uint64_t db_time_ns = 0;
+    struct tq_summary_ctx ctx = {
+        .ht = calloc(QUERY_HT_SIZE, sizeof(*ctx.ht)),
+        .num_entries = 0,
+        .db_time_ns = 0,
+        .f = f,
+    };
+    if (!ctx.ht) return;
 
-    for (int r = 0; r < count; r++) {
-        const struct pgwt_summary_accum *rec = &records[r];
+    pgwt_visit_summaries(trace_dir, from_ns, to_ns, tq_summary_visitor, &ctx);
 
-        for (int q = 0; q < SUMMARY_MAX_QUERIES; q++) {
-            const struct pgwt_summary_query *sq = &rec->queries[q];
-            if (sq->query_id == 0 && sq->count == 0) continue;
-            if (f->query_id != 0 && sq->query_id != f->query_id) continue;
+    double db_time_ms = (double)ctx.db_time_ns / 1e6;
 
-            db_time_ns += sq->total_ns;
-
-            uint32_t h = (uint32_t)(sq->query_id ^ (sq->query_id >> 32)) & QUERY_HT_MASK;
-            while (ht[h].count > 0 && ht[h].query_id != sq->query_id)
-                h = (h + 1) & QUERY_HT_MASK;
-
-            if (ht[h].count == 0) {
-                ht[h].query_id = sq->query_id;
-                num_entries++;
-            }
-            ht[h].count += sq->count;
-            ht[h].total_ns += sq->total_ns;
-            if (sq->top_wait_ns > ht[h].top_wait_ns) {
-                ht[h].top_wait_id = sq->top_wait_id;
-                ht[h].top_wait_ns = sq->top_wait_ns;
-            }
-        }
-    }
-
-    double db_time_ms = (double)db_time_ns / 1e6;
-
-    struct pgwt_query_row *rows = calloc(num_entries, sizeof(*rows));
+    struct pgwt_query_row *rows = calloc(ctx.num_entries, sizeof(*rows));
     int nr = 0;
 
     for (int i = 0; i < QUERY_HT_SIZE; i++) {
-        if (ht[i].count == 0) continue;
+        if (ctx.ht[i].count == 0) continue;
 
         struct pgwt_query_row *row = &rows[nr];
-        row->query_id = ht[i].query_id;
-        row->count    = ht[i].count;
-        row->total_ms = (double)ht[i].total_ns / 1e6;
-        row->avg_us   = ht[i].count > 0
-                       ? (double)ht[i].total_ns / (double)ht[i].count / 1000.0 : 0;
+        row->query_id = ctx.ht[i].query_id;
+        row->count    = ctx.ht[i].count;
+        row->total_ms = (double)ctx.ht[i].total_ns / 1e6;
+        row->avg_us   = ctx.ht[i].count > 0
+                       ? (double)ctx.ht[i].total_ns / (double)ctx.ht[i].count / 1000.0 : 0;
         row->pct_db   = db_time_ms > 0 ? row->total_ms / db_time_ms * 100.0 : 0;
-        row->top_wait_id = ht[i].top_wait_id;
-        if (ht[i].top_wait_id == 0)
+        row->top_wait_id = ctx.ht[i].top_wait_id;
+        if (ctx.ht[i].top_wait_id == 0)
             snprintf(row->top_wait, sizeof(row->top_wait), "CPU*");
         else
-            pgwt_event_full_name(ht[i].top_wait_id, row->top_wait,
+            pgwt_event_full_name(ctx.ht[i].top_wait_id, row->top_wait,
                                   sizeof(row->top_wait));
         nr++;
     }
 
-    free(ht);
+    free(ctx.ht);
     qsort(rows, nr, sizeof(rows[0]), cmp_query_row_desc);
 
     out->rows       = rows;
     out->num_rows   = nr;
     out->db_time_ms = db_time_ms;
+}
+
+/* ── Heatmap from summaries ──────────────────────────────── */
+
+struct hm_summary_ctx {
+    uint64_t *grid;        /* [num_buckets * HISTOGRAM_BUCKETS] */
+    uint64_t *times;       /* [num_buckets] */
+    int      num_buckets;
+    uint64_t from_ns;
+    uint64_t bucket_ns;
+    uint64_t max_count;
+    uint64_t total_events;
+    const struct pgwt_filter *f;
+};
+
+static int hm_summary_visitor(const struct pgwt_summary_accum *rec, void *arg)
+{
+    struct hm_summary_ctx *ctx = arg;
+    uint64_t wall = rec->second_wall_ns;
+
+    int bi = (int)((wall - ctx->from_ns) / ctx->bucket_ns);
+    if (bi >= ctx->num_buckets) bi = ctx->num_buckets - 1;
+    if (bi < 0) bi = 0;
+
+    for (int e = 0; e < SUMMARY_MAX_EVENTS; e++) {
+        const struct pgwt_summary_event *se = &rec->events[e];
+        if (se->event_id == 0 && se->count == 0) continue;
+        if (pgwt_is_idle_event(se->event_id)) continue;
+        if (!summary_event_matches_filter(ctx->f, se->event_id)) continue;
+
+        for (int b = 0; b < HISTOGRAM_BUCKETS; b++) {
+            uint64_t v = se->histogram[b];
+            if (v == 0) continue;
+
+            uint64_t idx = (uint64_t)bi * HISTOGRAM_BUCKETS + b;
+            ctx->grid[idx] += v;
+            ctx->total_events += v;
+
+            if (ctx->grid[idx] > ctx->max_count)
+                ctx->max_count = ctx->grid[idx];
+        }
+    }
+    return 0;
+}
+
+void pgwt_compute_heatmap_from_summaries(
+    const char *trace_dir, uint64_t from_ns, uint64_t to_ns,
+    const struct pgwt_filter *f, int num_buckets,
+    struct pgwt_heatmap_result *out)
+{
+    memset(out, 0, sizeof(*out));
+
+    uint64_t range_ns = to_ns - from_ns;
+    if (range_ns == 0 || num_buckets <= 0) return;
+
+    uint64_t bucket_ns = (range_ns + (uint64_t)num_buckets - 1) / (uint64_t)num_buckets;
+    if (bucket_ns < 1000000000ULL)
+        bucket_ns = 1000000000ULL;
+
+    int actual_buckets = (int)((range_ns + bucket_ns - 1) / bucket_ns);
+    uint64_t *grid = calloc((size_t)actual_buckets * HISTOGRAM_BUCKETS, sizeof(uint64_t));
+    uint64_t *times = calloc(actual_buckets, sizeof(uint64_t));
+    if (!grid || !times) { free(grid); free(times); return; }
+
+    for (int i = 0; i < actual_buckets; i++)
+        times[i] = from_ns + (uint64_t)i * bucket_ns;
+
+    struct hm_summary_ctx ctx = {
+        .grid = grid,
+        .times = times,
+        .num_buckets = actual_buckets,
+        .from_ns = from_ns,
+        .bucket_ns = bucket_ns,
+        .max_count = 0,
+        .total_events = 0,
+        .f = f,
+    };
+
+    pgwt_visit_summaries(trace_dir, from_ns, to_ns, hm_summary_visitor, &ctx);
+
+    out->grid         = grid;
+    out->num_buckets  = actual_buckets;
+    out->bucket_ns    = bucket_ns;
+    out->times        = times;
+    out->max_count    = ctx.max_count;
+    out->total_events = ctx.total_events;
 }
