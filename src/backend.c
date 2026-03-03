@@ -4,6 +4,7 @@
 #include "perf_event.h"
 #include "discovery.h"
 #include "cmdline.h"
+#include "backend_meta.h"
 #include "pg_wait_tracer.h"
 
 #include <stdio.h>
@@ -131,6 +132,8 @@ int pgwt_scan_existing_backends(struct pgwt_daemon *d)
 
         be->attach_ts = now_ns();
         pgwt_parse_cmdline(pid, &be->meta);
+        if (d->backend_meta)
+            pgwt_bm_write(d->backend_meta, pid, &be->meta);
 
         /* Pre-initialize BPF state_map so the first watchpoint fire
          * ACCUMULATES the current wait state instead of just initializing.
@@ -243,6 +246,8 @@ int pgwt_handle_init(struct pgwt_daemon *d, pid_t pid, uint64_t addr)
 
     be->attach_ts = now_ns();
     pgwt_parse_cmdline(pid, &be->meta);
+    if (d->backend_meta)
+        pgwt_bm_write(d->backend_meta, pid, &be->meta);
 
     if (d->verbose)
         fprintf(stderr, "INFO: PID %d initialized (%s), real watchpoint at 0x%lx\n",

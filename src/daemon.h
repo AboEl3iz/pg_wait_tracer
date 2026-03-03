@@ -7,6 +7,7 @@
 #include "event_writer.h"
 #include "summary_writer.h"
 #include "query_text.h"
+#include "backend_meta.h"
 #include "map_reader.h"
 #include "snapshot.h"
 
@@ -91,6 +92,7 @@ struct pgwt_daemon {
     struct pgwt_event_writer *event_writer;     /* NULL if disabled */
     struct pgwt_summary_writer *summary_writer; /* NULL if disabled */
     struct pgwt_query_text_capture *query_text_capture; /* NULL if disabled */
+    struct pgwt_backend_meta_writer *backend_meta;       /* NULL if disabled */
 
     /* Time windows */
 #define PGWT_MAX_WINDOWS 3

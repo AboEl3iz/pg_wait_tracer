@@ -36,7 +36,8 @@ USER_SRCS  = $(SRC_DIR)/pg_wait_tracer.c \
              $(SRC_DIR)/event_reader.c \
              $(SRC_DIR)/replay.c \
              $(SRC_DIR)/summary_writer.c \
-             $(SRC_DIR)/query_text.c
+             $(SRC_DIR)/query_text.c \
+             $(SRC_DIR)/backend_meta.c
 
 USER_OBJS  = $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(USER_SRCS))
 
@@ -47,7 +48,9 @@ SERVER_SRCS = $(SRC_DIR)/server.c \
               $(SRC_DIR)/event_writer.c \
               $(SRC_DIR)/summary_writer.c \
               $(SRC_DIR)/summary_reader.c \
-              $(SRC_DIR)/wait_event.c
+              $(SRC_DIR)/wait_event.c \
+              $(SRC_DIR)/cmdline.c \
+              $(SRC_DIR)/backend_meta.c
 SERVER_OBJS = $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/server_%.o,$(SERVER_SRCS))
 SERVER_LDFLAGS = -lz -llz4
 

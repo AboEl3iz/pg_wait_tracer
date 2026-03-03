@@ -681,8 +681,11 @@ const TABLE_CONFIGS = {
     sessions: {
         columns: [
             { key: 'pid', label: 'PID', format: (r) => r.pid },
+            { key: 'type', label: 'Backend', format: (r) => esc(r.type || 'unknown') },
+            { key: 'user', label: 'User', format: (r) => esc(r.user || '') },
+            { key: 'db', label: 'Database', format: (r) => esc(r.db || '') },
             { key: 'db_time_ms', label: 'DB Time', cls: 'num', format: (r) => fmtMs(r.db_time_ms) },
-            { key: 'cpu_pct', label: 'CPU%', cls: 'num', format: (r) => pctBar(r.cpu_pct, '#4CAF50') },
+            { key: 'cpu_pct', label: 'CPU%', cls: 'num', format: (r) => pctBar(r.cpu_pct, 'rgb(80,250,123)') },
             { key: 'wait_pct', label: 'Wait%', cls: 'num', format: (r) => {
                 const color = classColor(r.top_wait) || '#F44336';
                 return pctBar(r.wait_pct, color);

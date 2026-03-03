@@ -253,6 +253,17 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
                 }
             }
         }
+
+        /* Init backend metadata writer */
+        d->backend_meta = calloc(1, sizeof(*d->backend_meta));
+        if (d->backend_meta) {
+            if (pgwt_bm_init(d->backend_meta, d->trace_dir) != 0) {
+                free(d->backend_meta);
+                d->backend_meta = NULL;
+            } else if (d->verbose) {
+                fprintf(stderr, "INFO: backend metadata writer enabled\n");
+            }
+        }
     }
 
     /* Scan existing backends (tracepoints are already attached,
@@ -385,6 +396,11 @@ int pgwt_daemon_run(struct pgwt_daemon *d)
 
 void pgwt_daemon_cleanup(struct pgwt_daemon *d)
 {
+    if (d->backend_meta) {
+        pgwt_bm_close(d->backend_meta);
+        free(d->backend_meta);
+        d->backend_meta = NULL;
+    }
     if (d->query_text_capture) {
         if (d->query_text_capture->verbose)
             fprintf(stderr, "INFO: query text capture: %d unique queries captured\n",

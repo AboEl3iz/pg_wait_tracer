@@ -8,6 +8,7 @@
 #include "summary_reader.h"
 #include "compute.h"
 #include "wait_event.h"
+#include "cmdline.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,6 +25,17 @@ struct qt_entry {
     char     text[256];   /* truncated SQL text */
 };
 
+/* ── Backend metadata map ─────────────────────────────────── */
+
+#define BM_MAP_SIZE 4096
+
+struct bm_entry {
+    uint32_t pid;
+    char     type[32];
+    char     user[64];
+    char     db[64];
+};
+
 /* ── Server state ─────────────────────────────────────────── */
 
 struct pgwt_server {
@@ -38,6 +50,10 @@ struct pgwt_server {
     /* Query text map: query_id → SQL text */
     struct qt_entry qt_map[QT_MAP_SIZE];
     int  qt_count;
+
+    /* Backend metadata map: pid → type/user/db */
+    struct bm_entry bm_map[BM_MAP_SIZE];
+    int  bm_count;
 };
 
 /* ── JSON request parsing (hand-written, no library) ──────── */
@@ -276,6 +292,107 @@ static void server_load_query_texts(struct pgwt_server *srv)
         fprintf(stderr, "pgwt-server: loaded %d query texts\n", srv->qt_count);
 }
 
+/* ── Backend metadata map ─────────────────────────────────── */
+
+static void bm_map_insert(struct pgwt_server *srv, uint32_t pid,
+                            const char *type, const char *user, const char *db)
+{
+    uint32_t idx = pid & (BM_MAP_SIZE - 1);
+    for (int i = 0; i < BM_MAP_SIZE; i++) {
+        struct bm_entry *e = &srv->bm_map[idx];
+        if (e->pid == 0) {
+            e->pid = pid;
+            snprintf(e->type, sizeof(e->type), "%s", type);
+            snprintf(e->user, sizeof(e->user), "%s", user ? user : "");
+            snprintf(e->db, sizeof(e->db), "%s", db ? db : "");
+            srv->bm_count++;
+            return;
+        }
+        if (e->pid == pid) {
+            /* Update with latest info */
+            snprintf(e->type, sizeof(e->type), "%s", type);
+            if (user && user[0]) snprintf(e->user, sizeof(e->user), "%s", user);
+            if (db && db[0]) snprintf(e->db, sizeof(e->db), "%s", db);
+            return;
+        }
+        idx = (idx + 1) & (BM_MAP_SIZE - 1);
+    }
+}
+
+static const struct bm_entry *bm_map_lookup(const struct pgwt_server *srv,
+                                             uint32_t pid)
+{
+    if (pid == 0) return NULL;
+    uint32_t idx = pid & (BM_MAP_SIZE - 1);
+    for (int i = 0; i < BM_MAP_SIZE; i++) {
+        const struct bm_entry *e = &srv->bm_map[idx];
+        if (e->pid == pid) return e;
+        if (e->pid == 0) return NULL;
+        idx = (idx + 1) & (BM_MAP_SIZE - 1);
+    }
+    return NULL;
+}
+
+/* Load backends.jsonl from trace dir.
+ * Format: {"pid":<int>,"type":"<str>","user":"<str>","db":"<str>"} */
+static void server_load_backends(struct pgwt_server *srv)
+{
+    char path[600];
+    snprintf(path, sizeof(path), "%s/backends.jsonl", srv->trace_dir);
+
+    FILE *fp = fopen(path, "r");
+    if (!fp) return;
+
+    char line[512];
+    while (fgets(line, sizeof(line), fp)) {
+        /* Parse "pid":<number> */
+        const char *pp = strstr(line, "\"pid\":");
+        if (!pp) continue;
+        uint32_t pid = (uint32_t)strtoul(pp + 6, NULL, 10);
+        if (pid == 0) continue;
+
+        /* Parse "type":"<str>" */
+        char type[32] = "unknown";
+        const char *tp = strstr(line, "\"type\":\"");
+        if (tp) {
+            tp += 8;
+            int i = 0;
+            while (*tp && *tp != '"' && i < (int)sizeof(type) - 1)
+                type[i++] = *tp++;
+            type[i] = '\0';
+        }
+
+        /* Parse "user":"<str>" */
+        char user[64] = "";
+        const char *up = strstr(line, "\"user\":\"");
+        if (up) {
+            up += 8;
+            int i = 0;
+            while (*up && *up != '"' && i < (int)sizeof(user) - 1)
+                user[i++] = *up++;
+            user[i] = '\0';
+        }
+
+        /* Parse "db":"<str>" */
+        char db[64] = "";
+        const char *dp = strstr(line, "\"db\":\"");
+        if (dp) {
+            dp += 6;
+            int i = 0;
+            while (*dp && *dp != '"' && i < (int)sizeof(db) - 1)
+                db[i++] = *dp++;
+            db[i] = '\0';
+        }
+
+        bm_map_insert(srv, pid, type, user, db);
+    }
+
+    fclose(fp);
+    if (srv->bm_count > 0)
+        fprintf(stderr, "pgwt-server: loaded %d backend metadata entries\n",
+                srv->bm_count);
+}
+
 /* ── Event loading ────────────────────────────────────────── */
 
 /*
@@ -412,6 +529,7 @@ static int server_init(struct pgwt_server *srv, const char *trace_dir)
             srv->num_files, srv->num_cpus, srv->total_events);
 
     server_load_query_texts(srv);
+    server_load_backends(srv);
 
     return 0;
 }
@@ -435,10 +553,13 @@ static void handle_info(struct pgwt_server *srv, struct pgwt_request *req)
     /* Re-scan for new files */
     srv->num_files = pgwt_scan_trace_files(srv->trace_dir, srv->files, 256);
 
-    /* Re-load query texts (picks up newly captured queries) */
+    /* Re-load query texts and backend metadata */
     memset(srv->qt_map, 0, sizeof(srv->qt_map));
     srv->qt_count = 0;
     server_load_query_texts(srv);
+    memset(srv->bm_map, 0, sizeof(srv->bm_map));
+    srv->bm_count = 0;
+    server_load_backends(srv);
 
     /* Re-compute time range */
     srv->earliest_wall_ns = 0;
@@ -621,10 +742,17 @@ static void handle_top_sessions(struct pgwt_server *srv, struct pgwt_request *re
         if (i > 0) putchar(',');
         printf("{\"pid\":%u,\"db_time_ms\":%.2f,"
                "\"cpu_pct\":%.1f,\"wait_pct\":%.1f,"
-               "\"top_wait\":\"%s\",\"top_wait_id\":%u}",
+               "\"top_wait\":\"%s\",\"top_wait_id\":%u",
                res.rows[i].pid, res.rows[i].db_time_ms,
                res.rows[i].cpu_pct, res.rows[i].wait_pct,
                res.rows[i].top_wait, res.rows[i].top_wait_id);
+        const struct bm_entry *bm = bm_map_lookup(srv, res.rows[i].pid);
+        if (bm) {
+            printf(",\"type\":\"%s\"", bm->type);
+            if (bm->user[0]) printf(",\"user\":\"%s\"", bm->user);
+            if (bm->db[0]) printf(",\"db\":\"%s\"", bm->db);
+        }
+        putchar('}');
     }
     printf("]}\n");
 
