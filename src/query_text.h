@@ -18,8 +18,8 @@
 /* Hash table size for seen query_ids (must be power of 2) */
 #define QT_HT_SIZE 4096
 
-/* Max length of captured query text */
-#define QT_MAX_TEXT 1024
+/* Max length of captured query text (matches PG's max track_activity_query_size) */
+#define QT_MAX_TEXT (1024 * 1024)
 
 struct pgwt_query_text_capture {
     char          trace_dir[256];
@@ -32,6 +32,8 @@ struct pgwt_query_text_capture {
     /* Addresses for reading st_activity_raw */
     uint64_t      my_be_entry_addr;     /* MyBEEntry symbol VA */
     int           st_activity_offset;   /* offset of st_activity_raw in PgBackendStatus */
+
+    char         *read_buf;              /* reusable read buffer (QT_MAX_TEXT bytes) */
 
     bool          enabled;
     bool          verbose;

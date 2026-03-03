@@ -703,8 +703,11 @@ const TABLE_CONFIGS = {
                 '<span class="query-id">' + r.query_id + '</span>' },
             { key: 'text', label: 'Query Text', format: (r) => {
                 if (!r.text) return '<span style="color:#555">—</span>';
-                return dot(r.top_wait) + esc(r.text.substring(0, 120)) +
+                const truncated = esc(r.text.substring(0, 120)) +
                     (r.text.length > 120 ? '...' : '');
+                return '<span class="qt-hover" data-fulltext="' +
+                    esc(r.text).replace(/"/g, '&quot;') + '">' +
+                    dot(r.top_wait) + truncated + '</span>';
             }},
             { key: 'total_ms', label: 'Time', cls: 'num', format: (r) => fmtMs(r.total_ms) },
             { key: 'pct', label: '%DB', cls: 'num', format: (r) => fmtPct(r.pct) },
@@ -836,7 +839,39 @@ function renderTable(tab, data) {
             }
         });
     });
+
+    // Query text tooltip
+    container.querySelectorAll('.qt-hover').forEach(el => {
+        el.addEventListener('mouseenter', (e) => {
+            const text = el.getAttribute('data-fulltext');
+            if (!text || text.length <= 120) return;
+            const tip = document.getElementById('query-tooltip');
+            tip.textContent = text;
+            tip.style.display = 'block';
+            positionTooltip(tip, e);
+        });
+        el.addEventListener('mousemove', (e) => {
+            const tip = document.getElementById('query-tooltip');
+            if (tip.style.display === 'block') positionTooltip(tip, e);
+        });
+        el.addEventListener('mouseleave', () => {
+            document.getElementById('query-tooltip').style.display = 'none';
+        });
+    });
 }
+
+function positionTooltip(tip, e) {
+    const pad = 12;
+    let x = e.clientX + pad;
+    let y = e.clientY + pad;
+    // Keep within viewport
+    const rect = tip.getBoundingClientRect();
+    if (x + rect.width > window.innerWidth - pad)
+        x = e.clientX - rect.width - pad;
+    if (y + rect.height > window.innerHeight - pad)
+        y = e.clientY - rect.height - pad;
+    tip.style.left = x + 'px';
+    tip.style.top = y + 'px';
 
 // -- Drill-down ---------------------------------------------------------------
 

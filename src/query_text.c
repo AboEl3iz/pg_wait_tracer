@@ -127,6 +127,14 @@ int pgwt_qt_init(struct pgwt_query_text_capture *qt,
     qt->st_activity_offset = st_activity_offset;
     qt->enabled = true;
 
+    /* Allocate reusable read buffer (1 MB on heap, not stack) */
+    qt->read_buf = malloc(QT_MAX_TEXT);
+    if (!qt->read_buf) {
+        fprintf(stderr, "WARN: cannot allocate %d byte read buffer\n", QT_MAX_TEXT);
+        qt->enabled = false;
+        return -1;
+    }
+
     /* Open (truncate) query_texts.jsonl */
     char path[512];
     snprintf(path, sizeof(path), "%s/query_texts.jsonl", trace_dir);
@@ -151,8 +159,7 @@ void pgwt_qt_check(struct pgwt_query_text_capture *qt,
         return;
 
     /* New query_id — read st_activity_raw from the backend */
-    char activity[QT_MAX_TEXT];
-    int len = read_activity(qt, pid, activity, sizeof(activity));
+    int len = read_activity(qt, pid, qt->read_buf, QT_MAX_TEXT);
     if (len <= 0) {
         if (qt->verbose)
             fprintf(stderr, "WARN: cannot read st_activity for PID %d query_id %llu\n",
@@ -169,14 +176,14 @@ void pgwt_qt_check(struct pgwt_query_text_capture *qt,
 
     /* Write JSONL line: {"q":<query_id>,"t":"<text>","ts":<wall_ns>} */
     fprintf(qt->fp, "{\"q\":%llu,\"t\":", (unsigned long long)query_id);
-    write_json_string(qt->fp, activity, len);
+    write_json_string(qt->fp, qt->read_buf, len);
     fprintf(qt->fp, ",\"ts\":%llu}\n", (unsigned long long)wall_ns);
     fflush(qt->fp);
 
     if (qt->verbose)
         fprintf(stderr, "INFO: captured query text for query_id %llu: %.60s%s\n",
                 (unsigned long long)query_id,
-                activity,
+                qt->read_buf,
                 len > 60 ? "..." : "");
 }
 
@@ -186,5 +193,7 @@ void pgwt_qt_close(struct pgwt_query_text_capture *qt)
         fclose(qt->fp);
         qt->fp = NULL;
     }
+    free(qt->read_buf);
+    qt->read_buf = NULL;
     qt->enabled = false;
 }

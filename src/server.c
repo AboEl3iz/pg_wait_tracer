@@ -22,7 +22,7 @@
 
 struct qt_entry {
     uint64_t query_id;
-    char     text[1024];  /* SQL text (up to QT_MAX_TEXT) */
+    char    *text;        /* heap-allocated SQL text */
 };
 
 /* ── Backend metadata map ─────────────────────────────────── */
@@ -205,7 +205,7 @@ static void qt_map_insert(struct pgwt_server *srv, uint64_t query_id,
         struct qt_entry *e = &srv->qt_map[idx];
         if (e->query_id == 0) {
             e->query_id = query_id;
-            snprintf(e->text, sizeof(e->text), "%s", text);
+            e->text = strdup(text);
             srv->qt_count++;
             return;
         }
@@ -213,6 +213,16 @@ static void qt_map_insert(struct pgwt_server *srv, uint64_t query_id,
             return;  /* already present */
         idx = (idx + 1) & (QT_MAP_SIZE - 1);
     }
+}
+
+/* Free all heap-allocated text strings and reset the map */
+static void qt_map_clear(struct pgwt_server *srv)
+{
+    for (int i = 0; i < QT_MAP_SIZE; i++) {
+        free(srv->qt_map[i].text);
+    }
+    memset(srv->qt_map, 0, sizeof(srv->qt_map));
+    srv->qt_count = 0;
 }
 
 static const char *qt_map_lookup(const struct pgwt_server *srv, uint64_t query_id)
@@ -243,8 +253,11 @@ static void server_load_query_texts(struct pgwt_server *srv)
     if (!fp)
         return;
 
-    char line[4096];
-    while (fgets(line, sizeof(line), fp)) {
+    char *line = NULL;
+    size_t line_cap = 0;
+    ssize_t line_len;
+
+    while ((line_len = getline(&line, &line_cap, fp)) > 0) {
         /* Parse "q":<number> */
         const char *qp = strstr(line, "\"q\":");
         if (!qp) continue;
@@ -258,10 +271,18 @@ static void server_load_query_texts(struct pgwt_server *srv)
         if (!tp) continue;
         tp += 5;
 
-        /* Extract text, handling JSON escapes minimally */
-        char text[1024];
+        /* Extract text into dynamic buffer, handling JSON escapes */
+        int text_cap = (line_len > 256) ? (int)line_len : 256;
+        char *text = malloc(text_cap);
+        if (!text) continue;
         int ti = 0;
-        while (*tp && *tp != '"' && ti < (int)sizeof(text) - 1) {
+        while (*tp && *tp != '"') {
+            if (ti >= text_cap - 1) {
+                text_cap *= 2;
+                char *tmp = realloc(text, text_cap);
+                if (!tmp) break;
+                text = tmp;
+            }
             if (*tp == '\\' && tp[1]) {
                 tp++;
                 switch (*tp) {
@@ -285,8 +306,10 @@ static void server_load_query_texts(struct pgwt_server *srv)
         text[ti] = '\0';
 
         qt_map_insert(srv, qid, text);
+        free(text);
     }
 
+    free(line);
     fclose(fp);
     if (srv->qt_count > 0)
         fprintf(stderr, "pgwt-server: loaded %d query texts\n", srv->qt_count);
@@ -554,8 +577,7 @@ static void handle_info(struct pgwt_server *srv, struct pgwt_request *req)
     srv->num_files = pgwt_scan_trace_files(srv->trace_dir, srv->files, 256);
 
     /* Re-load query texts and backend metadata */
-    memset(srv->qt_map, 0, sizeof(srv->qt_map));
-    srv->qt_count = 0;
+    qt_map_clear(srv);
     server_load_query_texts(srv);
     memset(srv->bm_map, 0, sizeof(srv->bm_map));
     srv->bm_count = 0;
