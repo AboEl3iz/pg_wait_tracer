@@ -167,9 +167,15 @@ static void parse_filters(const char *json, struct pgwt_filter *f)
     if (json_int64(buf, "pid", &v))
         f->pid = (uint32_t)v;
 
-    uint64_t uv;
-    if (json_uint64(buf, "query_id", &uv))
-        f->query_id = uv;
+    /* query_id sent as string to avoid JS precision loss on uint64 */
+    char qid_str[32] = {0};
+    if (json_string(buf, "query_id", qid_str, sizeof(qid_str)) && qid_str[0])
+        f->query_id = strtoull(qid_str, NULL, 10);
+    else {
+        uint64_t uv;
+        if (json_uint64(buf, "query_id", &uv))
+            f->query_id = uv;
+    }
 }
 
 static void parse_request(const char *line, struct pgwt_request *req)
@@ -560,9 +566,13 @@ static int server_init(struct pgwt_server *srv, const char *trace_dir)
 /* ── Summary threshold ────────────────────────────────────── */
 
 /* Use summary path for ranges >= 120s (instant response, ~300KB peak memory).
- * Raw events used for ranges < 120s (exact per-event resolution). */
+ * Raw events used for ranges < 120s (exact per-event resolution).
+ * Force raw events when pid filter is active — summaries don't have
+ * per-PID event/class breakdown. query_id is handled via v2 per-query data. */
 static int should_use_summaries(struct pgwt_server *srv, struct pgwt_request *req)
 {
+    if (req->filter.pid != 0)
+        return 0;
     uint64_t from = req->from_ns ? req->from_ns : srv->earliest_wall_ns;
     uint64_t to   = req->to_ns   ? req->to_ns   : srv->latest_wall_ns;
     if (to <= from) return 0;
@@ -786,7 +796,7 @@ static void handle_top_queries(struct pgwt_server *srv, struct pgwt_request *req
     printf("{\"id\":%lld,\"rows\":[", (long long)req->id);
     for (int i = 0; i < res.num_rows; i++) {
         if (i > 0) putchar(',');
-        printf("{\"query_id\":%llu,\"count\":%llu,"
+        printf("{\"query_id\":\"%llu\",\"count\":%llu,"
                "\"total_ms\":%.2f,\"avg_us\":%.2f,"
                "\"pct\":%.2f,\"top_wait\":\"%s\",\"top_wait_id\":%u",
                (unsigned long long)res.rows[i].query_id,
@@ -839,7 +849,8 @@ static void handle_heatmap(struct pgwt_server *srv, struct pgwt_request *req)
 
     struct pgwt_heatmap_result res;
 
-    if (should_use_summaries(srv, req)) {
+    /* Heatmap + query_id: summaries lack per-query histograms, use raw events */
+    if (should_use_summaries(srv, req) && req->filter.query_id == 0) {
         pgwt_compute_heatmap_from_summaries(srv->trace_dir, from, to,
                                              &req->filter, num_buckets, &res);
     } else {

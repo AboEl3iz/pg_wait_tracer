@@ -748,10 +748,24 @@ static int aas_summary_visitor(const struct pgwt_summary_accum *rec, void *arg)
     if (bi >= ctx->actual_buckets) bi = ctx->actual_buckets - 1;
     if (bi < 0) bi = 0;
 
-    /* PID or query filter: summaries don't correlate per-PID to class.
-     * Skip — summaries give full system view. */
-    if (ctx->has_pid_filter || ctx->has_query_filter)
+    /* PID filter: summaries don't have per-PID class breakdown */
+    if (ctx->has_pid_filter)
         return 0;
+
+    /* Query filter: use per-query class_ns (v2 data) */
+    if (ctx->has_query_filter) {
+        for (int q = 0; q < SUMMARY_MAX_QUERIES; q++) {
+            const struct pgwt_summary_query *sq = &rec->queries[q];
+            if (sq->query_id == 0 && sq->count == 0) continue;
+            if (sq->query_id != ctx->f->query_id) continue;
+            for (int c = 0; c < PGWT_NUM_CLASSES; c++) {
+                if (c == PGWT_CLASS_ACTIVITY) continue;
+                ctx->buckets[bi].class_aas[c] += (double)sq->class_ns[c];
+            }
+            break;
+        }
+        return 0;
+    }
 
     if (!ctx->has_class_filter && !ctx->has_event_filter) {
         for (int c = 0; c < PGWT_NUM_CLASSES; c++) {
@@ -841,6 +855,46 @@ static int tm_summary_visitor(const struct pgwt_summary_accum *rec, void *arg)
 {
     struct tm_summary_ctx *ctx = arg;
     const struct pgwt_filter *f = ctx->f;
+
+    /* Query filter: use per-query class_ns + top_events */
+    if (f->query_id != 0) {
+        for (int q = 0; q < SUMMARY_MAX_QUERIES; q++) {
+            const struct pgwt_summary_query *sq = &rec->queries[q];
+            if (sq->query_id == 0 && sq->count == 0) continue;
+            if (sq->query_id != f->query_id) continue;
+
+            for (int c = 0; c < PGWT_NUM_CLASSES; c++) {
+                if (c == PGWT_CLASS_ACTIVITY)
+                    ctx->idle_time_ns += (double)sq->class_ns[c];
+                else {
+                    ctx->classes[c].total_ns += (double)sq->class_ns[c];
+                    ctx->db_time_ns += (double)sq->class_ns[c];
+                }
+            }
+            for (int j = 0; j < sq->num_top_events; j++) {
+                uint32_t eid = sq->top_events[j].event_id;
+                if (pgwt_is_idle_event(eid)) continue;
+                double ns = (double)sq->top_events[j].total_ns;
+                int cls_idx = pgwt_wait_class_index(eid);
+                int found = -1;
+                for (int k = 0; k < ctx->num_ev_accum; k++) {
+                    if (ctx->ev_accum[k].event_id == eid) { found = k; break; }
+                }
+                if (found >= 0) {
+                    ctx->ev_accum[found].total_ns += ns;
+                } else if (ctx->num_ev_accum < MAX_DISTINCT_EVENTS) {
+                    snprintf(ctx->ev_accum[ctx->num_ev_accum].class_name,
+                             sizeof(ctx->ev_accum[ctx->num_ev_accum].class_name),
+                             "%s", pgwt_class_names[cls_idx]);
+                    ctx->ev_accum[ctx->num_ev_accum].event_id = eid;
+                    ctx->ev_accum[ctx->num_ev_accum].total_ns = ns;
+                    ctx->num_ev_accum++;
+                }
+            }
+            break;
+        }
+        return 0;
+    }
 
     /* If no class/event filter: use class_ns directly */
     if (f->class_name[0] == '\0' && f->event_id == 0) {
@@ -992,6 +1046,36 @@ struct te_summary_ctx {
 static int te_summary_visitor(const struct pgwt_summary_accum *rec, void *arg)
 {
     struct te_summary_ctx *ctx = arg;
+
+    /* Query filter: use per-query top_events */
+    if (ctx->f->query_id != 0) {
+        for (int q = 0; q < SUMMARY_MAX_QUERIES; q++) {
+            const struct pgwt_summary_query *sq = &rec->queries[q];
+            if (sq->query_id == 0 && sq->count == 0) continue;
+            if (sq->query_id != ctx->f->query_id) continue;
+
+            for (int j = 0; j < sq->num_top_events; j++) {
+                uint32_t eid = sq->top_events[j].event_id;
+                if (pgwt_is_idle_event(eid)) continue;
+                if (!summary_event_matches_filter(ctx->f, eid)) continue;
+
+                ctx->db_time_ns += sq->top_events[j].total_ns;
+
+                uint32_t h = eid & EVENT_HT_MASK;
+                while (ctx->ht[h].count > 0 && ctx->ht[h].event_id != eid)
+                    h = (h + 1) & EVENT_HT_MASK;
+
+                if (ctx->ht[h].count == 0) {
+                    ctx->ht[h].event_id = eid;
+                    ctx->num_entries++;
+                }
+                ctx->ht[h].count += sq->top_events[j].count;
+                ctx->ht[h].total_ns += sq->top_events[j].total_ns;
+            }
+            break;
+        }
+        return 0;
+    }
 
     for (int e = 0; e < SUMMARY_MAX_EVENTS; e++) {
         const struct pgwt_summary_event *se = &rec->events[e];
@@ -1194,9 +1278,16 @@ static int tq_summary_visitor(const struct pgwt_summary_accum *rec, void *arg)
         }
         ctx->ht[h].count += sq->count;
         ctx->ht[h].total_ns += sq->total_ns;
-        /* Attribute this second's time to top_wait's class */
-        int cls = pgwt_wait_class_index(sq->top_wait_id);
-        ctx->ht[h].class_ns[cls] += sq->total_ns;
+        /* Use exact per-class breakdown (v2), fall back to approximation (v1) */
+        int has_class_ns = 0;
+        for (int c = 0; c < PGWT_NUM_CLASSES; c++) {
+            ctx->ht[h].class_ns[c] += sq->class_ns[c];
+            if (sq->class_ns[c] > 0) has_class_ns = 1;
+        }
+        if (!has_class_ns) {
+            int cls = pgwt_wait_class_index(sq->top_wait_id);
+            ctx->ht[h].class_ns[cls] += sq->total_ns;
+        }
         if (sq->top_wait_ns > ctx->ht[h].top_wait_ns) {
             ctx->ht[h].top_wait_id = sq->top_wait_id;
             ctx->ht[h].top_wait_ns = sq->top_wait_ns;

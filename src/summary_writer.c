@@ -189,6 +189,25 @@ static void accum_event(struct pgwt_summary_accum *acc,
     if (sq) {
         sq->count++;
         sq->total_ns += dur;
+        /* Per-class breakdown */
+        if (cls >= 0 && cls < PGWT_NUM_CLASSES)
+            sq->class_ns[cls] += dur;
+        /* Per-event top-8 tracking */
+        if (old_ev != 0) {
+            int found = -1;
+            for (int j = 0; j < sq->num_top_events; j++) {
+                if (sq->top_events[j].event_id == old_ev) { found = j; break; }
+            }
+            if (found >= 0) {
+                sq->top_events[found].count++;
+                sq->top_events[found].total_ns += dur;
+            } else if (sq->num_top_events < SUMMARY_QUERY_TOP_EVENTS) {
+                sq->top_events[sq->num_top_events].event_id = old_ev;
+                sq->top_events[sq->num_top_events].count = 1;
+                sq->top_events[sq->num_top_events].total_ns = dur;
+                sq->num_top_events++;
+            }
+        }
         if (old_ev != 0 && dur > sq->top_wait_ns) {
             sq->top_wait_id = old_ev;
             sq->top_wait_ns = dur;
@@ -235,7 +254,7 @@ size_t pgwt_summary_serialize(const struct pgwt_summary_accum *acc,
         /* 4 + 8 + 8 + 4 + 8 = 32 bytes per session */
     }
 
-    /* Per-query entries: only non-empty */
+    /* Per-query entries (v2): base 36 + class_ns 88 + 1 + top_events n×20 */
     for (int i = 0; i < SUMMARY_MAX_QUERIES; i++) {
         const struct pgwt_summary_query *q = &acc->queries[i];
         if (q->query_id == 0 && q->count == 0) continue;
@@ -245,14 +264,25 @@ size_t pgwt_summary_serialize(const struct pgwt_summary_accum *acc,
         memcpy(p, &q->total_ns, 8);      p += 8;
         memcpy(p, &q->top_wait_id, 4);   p += 4;
         memcpy(p, &q->top_wait_ns, 8);   p += 8;
-        /* 8 + 8 + 8 + 4 + 8 = 36 bytes per query */
+        /* v2: class_ns */
+        memcpy(p, q->class_ns, sizeof(q->class_ns));
+        p += sizeof(q->class_ns);
+        /* v2: top_events (variable length) */
+        uint8_t nte = (uint8_t)q->num_top_events;
+        *p = nte;  p += 1;
+        for (int j = 0; j < nte; j++) {
+            memcpy(p, &q->top_events[j].event_id, 4);   p += 4;
+            memcpy(p, &q->top_events[j].count, 8);       p += 8;
+            memcpy(p, &q->top_events[j].total_ns, 8);    p += 8;
+        }
     }
 
     return (size_t)(p - out);
 }
 
 int pgwt_summary_deserialize(const uint8_t *in, size_t in_size,
-                              struct pgwt_summary_accum *acc)
+                              struct pgwt_summary_accum *acc,
+                              int version)
 {
     const uint8_t *p = in;
     const uint8_t *end = in + in_size;
@@ -315,12 +345,37 @@ int pgwt_summary_deserialize(const uint8_t *in, size_t in_size,
         memcpy(&query_id, p, 8);  p += 8;
 
         struct pgwt_summary_query *q = find_or_insert_query(acc, query_id);
-        if (!q) { p += 28; continue; }
+        if (!q) {
+            p += 28;  /* skip base fields */
+            if (version >= 2) {
+                p += sizeof(uint64_t) * PGWT_NUM_CLASSES;  /* class_ns */
+                if (p + 1 <= end) {
+                    uint8_t nte = *p;  p += 1;
+                    p += nte * 20;     /* top_events */
+                }
+            }
+            continue;
+        }
 
         memcpy(&q->count, p, 8);         p += 8;
         memcpy(&q->total_ns, p, 8);      p += 8;
         memcpy(&q->top_wait_id, p, 4);   p += 4;
         memcpy(&q->top_wait_ns, p, 8);   p += 8;
+
+        if (version >= 2) {
+            if (p + sizeof(q->class_ns) + 1 > end) return -1;
+            memcpy(q->class_ns, p, sizeof(q->class_ns));
+            p += sizeof(q->class_ns);
+            q->num_top_events = *p;  p += 1;
+            if (q->num_top_events > SUMMARY_QUERY_TOP_EVENTS)
+                q->num_top_events = SUMMARY_QUERY_TOP_EVENTS;
+            for (int j = 0; j < q->num_top_events; j++) {
+                if (p + 20 > end) return -1;
+                memcpy(&q->top_events[j].event_id, p, 4);   p += 4;
+                memcpy(&q->top_events[j].count, p, 8);       p += 8;
+                memcpy(&q->top_events[j].total_ns, p, 8);    p += 8;
+            }
+        }
     }
 
     return 0;
@@ -493,7 +548,7 @@ int pgwt_summary_writer_init(struct pgwt_summary_writer *w,
     /* Allocate scratch buffers.
      * Worst case: 1024 events × 156 + 1024 sessions × 32 + 2048 queries × 36
      *           = 159744 + 32768 + 73728 = ~260 KB uncompressed */
-    w->encode_buf_size = 300 * 1024;
+    w->encode_buf_size = 800 * 1024;
     w->encode_buf = malloc(w->encode_buf_size);
 
     w->compress_buf_size = LZ4_compressBound((int)w->encode_buf_size);

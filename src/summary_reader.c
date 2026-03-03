@@ -34,7 +34,7 @@ int pgwt_summary_reader_open(struct pgwt_summary_reader *r, const char *path)
         fclose(r->fp); r->fp = NULL;
         return -1;
     }
-    if (r->header.version != PGWT_SUMMARY_VERSION) {
+    if (r->header.version != 1 && r->header.version != 2) {
         fprintf(stderr, "WARN: unsupported summary version %d in %s\n",
                 r->header.version, path);
         fclose(r->fp); r->fp = NULL;
@@ -168,7 +168,8 @@ int pgwt_summary_reader_decode_block(struct pgwt_summary_reader *r,
     out->num_queries = bh.num_queries;
 
     /* Deserialize payload */
-    if (pgwt_summary_deserialize(r->decode_buf, (size_t)decompressed, out) != 0)
+    if (pgwt_summary_deserialize(r->decode_buf, (size_t)decompressed, out,
+                                  r->header.version) != 0)
         return -1;
 
     return 0;

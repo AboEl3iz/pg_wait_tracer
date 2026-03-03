@@ -39,7 +39,7 @@
 /* ── On-disk format constants ─────────────────────────────── */
 
 #define PGWT_SUMMARY_MAGIC    0x53574750   /* "PGWS" little-endian */
-#define PGWT_SUMMARY_VERSION  1
+#define PGWT_SUMMARY_VERSION  2
 
 /* Limits for per-second accumulator hash tables */
 #define SUMMARY_MAX_EVENTS    1024
@@ -64,12 +64,24 @@ struct pgwt_summary_session {
     uint64_t top_wait_ns;
 };
 
+#define SUMMARY_QUERY_TOP_EVENTS 8
+
+struct pgwt_summary_query_event {
+    uint32_t event_id;
+    uint64_t count;
+    uint64_t total_ns;
+};
+
 struct pgwt_summary_query {
     uint64_t query_id;         /* 0 = unused slot */
     uint64_t count;
     uint64_t total_ns;
     uint32_t top_wait_id;
     uint64_t top_wait_ns;
+    /* v2: per-class time breakdown + top events */
+    uint64_t class_ns[PGWT_NUM_CLASSES];
+    struct pgwt_summary_query_event top_events[SUMMARY_QUERY_TOP_EVENTS];
+    int      num_top_events;
 };
 
 struct pgwt_summary_accum {
@@ -177,6 +189,7 @@ size_t pgwt_summary_serialize(const struct pgwt_summary_accum *acc,
 
 /* Deserialize buffer into accumulator. Returns 0 on success. */
 int pgwt_summary_deserialize(const uint8_t *in, size_t in_size,
-                              struct pgwt_summary_accum *acc);
+                              struct pgwt_summary_accum *acc,
+                              int version);
 
 #endif /* PGWT_SUMMARY_WRITER_H */
