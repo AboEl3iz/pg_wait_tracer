@@ -22,6 +22,14 @@ WAIT_CLASSES.forEach(c => {
     CLASS_COLOR_MAP[c.key] = c.color;
 });
 
+// Palette for per-event series in drill-down charts
+const EVENT_PALETTE = [
+    'rgb(30,144,255)', 'rgb(255,99,71)', 'rgb(50,205,50)', 'rgb(255,215,0)',
+    'rgb(138,43,226)', 'rgb(0,206,209)', 'rgb(255,140,0)', 'rgb(220,20,60)',
+    'rgb(0,191,255)', 'rgb(255,105,180)', 'rgb(127,255,0)', 'rgb(255,69,0)',
+    'rgb(75,0,130)', 'rgb(0,250,154)', 'rgb(255,182,193)', 'rgb(100,149,237)',
+];
+
 // -- State --------------------------------------------------------------------
 
 const state = {
@@ -51,6 +59,9 @@ const state = {
 
     // Zoom history
     zoomHistory: [],
+
+    // Event series info for chart click handler (null = class mode)
+    chartEventSeries: null,
 
     // Reconnect
     reconnectDelay: 2000,
@@ -159,12 +170,17 @@ async function refresh() {
 
 async function refreshChart() {
     try {
-        const data = await send('aas', {
+        const params = {
             from: state.viewFrom,
             to: state.viewTo,
             buckets: Math.min(Math.floor(chartEl.clientWidth / 4), 300),
             filters: state.filters,
-        });
+        };
+        // Request per-event breakdown when drilled into a class (but not a specific event)
+        if (state.filters.class && !state.filters.event_id) {
+            params.detail = 'events';
+        }
+        const data = await send('aas', params);
         renderChart(data);
     } catch (e) { /* ignore on disconnect */ }
 }
@@ -416,6 +432,25 @@ function initChart() {
         e.preventDefault();
         zoomOut();
     });
+
+    // Click on chart series to drill down
+    chart.on('click', (params) => {
+        if (!params.seriesName || params.seriesName === '_cpu_line') return;
+
+        if (state.chartEventSeries) {
+            // Event-breakdown mode: click event → drill to event_id
+            const evSeries = state.chartEventSeries.find(s => s.name === params.seriesName);
+            if (evSeries) {
+                drillDown('event_id', evSeries.event_id, params.seriesName);
+            }
+        } else {
+            // Class mode: click class → drill to class
+            const wc = WAIT_CLASSES.find(c => c.label === params.seriesName);
+            if (wc) {
+                drillDown('class', wc.key, wc.label);
+            }
+        }
+    });
 }
 
 // -- Chart resize handle --------------------------------------------------
@@ -522,18 +557,43 @@ function renderChart(data) {
 
     const bns = data.bucket_ns || 0;
     const times = data.buckets.map(b => b.t);
+    const isEventBreakdown = data.breakdown === 'events' && data.series;
 
-    const series = WAIT_CLASSES.map(wc => ({
-        name: wc.label,
-        type: 'line',
-        stack: 'aas',
-        areaStyle: { opacity: 0.85 },
-        lineStyle: { width: 0 },
-        emphasis: { focus: 'series' },
-        symbol: 'none',
-        color: wc.color,
-        data: data.buckets.map(b => +(b[wc.key] || 0).toFixed(4)),
-    }));
+    // Store event series info for click handler
+    state.chartEventSeries = isEventBreakdown ? data.series : null;
+
+    let series;
+    let legendData;
+
+    if (isEventBreakdown) {
+        // Per-event breakdown mode: dynamic series from server
+        series = data.series.map((s, idx) => ({
+            name: s.name,
+            type: 'line',
+            stack: 'aas',
+            areaStyle: { opacity: 0.85 },
+            lineStyle: { width: 0 },
+            emphasis: { focus: 'series' },
+            symbol: 'none',
+            color: EVENT_PALETTE[idx % EVENT_PALETTE.length],
+            data: data.buckets.map(b => +(b.aas[idx] || 0).toFixed(4)),
+        }));
+        legendData = data.series.map(s => s.name);
+    } else {
+        // Class breakdown mode (default)
+        series = WAIT_CLASSES.map(wc => ({
+            name: wc.label,
+            type: 'line',
+            stack: 'aas',
+            areaStyle: { opacity: 0.85 },
+            lineStyle: { width: 0 },
+            emphasis: { focus: 'series' },
+            symbol: 'none',
+            color: wc.color,
+            data: data.buckets.map(b => +(b[wc.key] || 0).toFixed(4)),
+        }));
+        legendData = WAIT_CLASSES.map(c => c.label);
+    }
 
     // CPU reference line
     const markData = [];
@@ -586,7 +646,7 @@ function renderChart(data) {
             },
         },
         legend: {
-            data: WAIT_CLASSES.map(c => c.label),
+            data: legendData,
             bottom: 0,
             textStyle: { color: '#888', fontSize: 11 },
             itemWidth: 12,

@@ -54,16 +54,30 @@ struct pgwt_aas_bucket {
     double   class_aas[PGWT_NUM_CLASSES];
 };
 
+#define AAS_MAX_EVENT_SERIES 16
+
+struct pgwt_aas_event_series {
+    uint32_t event_id;
+    char     name[64];     /* "IO:DataFileRead" */
+    double   total_aas;    /* sum across all buckets, for sorting */
+};
+
 struct pgwt_aas_result {
     struct pgwt_aas_bucket *buckets;   /* malloc'd, caller frees */
     int      num_buckets;
     uint64_t bucket_ns;
     double   max_aas;
+
+    /* Per-event breakdown (populated when detail_events=1) */
+    int      num_event_series;   /* 0 = class mode (default) */
+    struct pgwt_aas_event_series event_series[AAS_MAX_EVENT_SERIES];
+    double  *event_aas;          /* malloc'd [num_buckets * num_event_series] */
 };
 
 void pgwt_compute_aas(const struct pgwt_trace_event *events, int count,
                       const struct pgwt_filter *f,
                       uint64_t from_ns, uint64_t to_ns, int num_buckets,
+                      int detail_events, int max_series,
                       struct pgwt_aas_result *out);
 
 /* ── Time Model ───────────────────────────────────────────── */

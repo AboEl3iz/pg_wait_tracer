@@ -74,9 +74,26 @@ int pgwt_filter_matches(const struct pgwt_filter *f,
 
 /* ── AAS Buckets ──────────────────────────────────────────── */
 
+/* Hash table entry for per-event total accumulation (pass 1) */
+struct aas_event_accum {
+    uint32_t event_id;
+    uint64_t total_ns;
+};
+
+#define AAS_EVT_HT_SIZE 512
+#define AAS_EVT_HT_MASK (AAS_EVT_HT_SIZE - 1)
+
+static int cmp_aas_event_series(const void *a, const void *b)
+{
+    double da = ((const struct pgwt_aas_event_series *)a)->total_aas;
+    double db = ((const struct pgwt_aas_event_series *)b)->total_aas;
+    return (db > da) - (db < da);
+}
+
 void pgwt_compute_aas(const struct pgwt_trace_event *events, int count,
                       const struct pgwt_filter *f,
                       uint64_t from_ns, uint64_t to_ns, int num_buckets,
+                      int detail_events, int max_series,
                       struct pgwt_aas_result *out)
 {
     memset(out, 0, sizeof(*out));
@@ -99,6 +116,13 @@ void pgwt_compute_aas(const struct pgwt_trace_event *events, int count,
 
     for (int i = 0; i < actual_buckets; i++)
         buckets[i].start_ns = from_ns + (uint64_t)i * bucket_ns;
+
+    /* Pass 1: accumulate class AAS + per-event totals (if detail requested) */
+    struct aas_event_accum *evt_ht = NULL;
+    if (detail_events) {
+        evt_ht = calloc(AAS_EVT_HT_SIZE, sizeof(*evt_ht));
+        if (!evt_ht) { free(buckets); return; }
+    }
 
     for (int i = 0; i < count; i++) {
         const struct pgwt_trace_event *ev = &events[i];
@@ -128,9 +152,18 @@ void pgwt_compute_aas(const struct pgwt_trace_event *events, int count,
             if (o_end > o_start)
                 buckets[b].class_aas[class_idx] += (double)(o_end - o_start);
         }
+
+        /* Per-event total for sorting (pass 1) */
+        if (evt_ht) {
+            uint32_t h = ev->old_event & AAS_EVT_HT_MASK;
+            while (evt_ht[h].total_ns > 0 && evt_ht[h].event_id != ev->old_event)
+                h = (h + 1) & AAS_EVT_HT_MASK;
+            evt_ht[h].event_id = ev->old_event;
+            evt_ht[h].total_ns += ev->duration_ns;
+        }
     }
 
-    /* Convert accumulated ns → AAS */
+    /* Convert accumulated ns → AAS (class buckets) */
     double max_aas = 0.0;
     for (int i = 0; i < actual_buckets; i++) {
         double total = 0.0;
@@ -146,6 +179,87 @@ void pgwt_compute_aas(const struct pgwt_trace_event *events, int count,
     out->num_buckets = actual_buckets;
     out->bucket_ns   = bucket_ns;
     out->max_aas     = max_aas;
+
+    /* Per-event breakdown: sort top N, then pass 2 for per-bucket data */
+    if (evt_ht) {
+        if (max_series <= 0) max_series = AAS_MAX_EVENT_SERIES;
+        if (max_series > AAS_MAX_EVENT_SERIES) max_series = AAS_MAX_EVENT_SERIES;
+
+        /* Collect all events from hash table into event_series for sorting */
+        struct pgwt_aas_event_series all[AAS_EVT_HT_SIZE];
+        int n_all = 0;
+        for (int i = 0; i < AAS_EVT_HT_SIZE; i++) {
+            if (evt_ht[i].total_ns == 0) continue;
+            all[n_all].event_id = evt_ht[i].event_id;
+            all[n_all].total_aas = (double)evt_ht[i].total_ns / (double)range_ns;
+            pgwt_event_full_name(evt_ht[i].event_id, all[n_all].name,
+                                 sizeof(all[n_all].name));
+            n_all++;
+        }
+        free(evt_ht);
+
+        qsort(all, n_all, sizeof(all[0]), cmp_aas_event_series);
+
+        int ns = n_all < max_series ? n_all : max_series;
+        out->num_event_series = ns;
+        for (int i = 0; i < ns; i++)
+            out->event_series[i] = all[i];
+
+        if (ns > 0) {
+            /* Build lookup: event_id → series index (linear, ns is small) */
+            out->event_aas = calloc((size_t)actual_buckets * ns, sizeof(double));
+            if (!out->event_aas) { out->num_event_series = 0; return; }
+
+            /* Pass 2: accumulate per-event per-bucket */
+            for (int i = 0; i < count; i++) {
+                const struct pgwt_trace_event *ev = &events[i];
+                if (!pgwt_filter_matches(f, ev) || pgwt_is_idle_event(ev->old_event))
+                    continue;
+
+                /* Find series index for this event */
+                int si = -1;
+                for (int s = 0; s < ns; s++) {
+                    if (out->event_series[s].event_id == ev->old_event) {
+                        si = s; break;
+                    }
+                }
+                if (si < 0) continue;  /* not in top N */
+
+                uint64_t ev_start = ev->timestamp_ns;
+                uint64_t ev_end   = ev->timestamp_ns + ev->duration_ns;
+                if (ev_end <= from_ns || ev_start >= to_ns)
+                    continue;
+
+                int first_b = (ev_start <= from_ns) ? 0
+                             : (int)((ev_start - from_ns) / bucket_ns);
+                int last_b  = (ev_end >= to_ns) ? actual_buckets - 1
+                             : (int)(((ev_end - from_ns) - 1) / bucket_ns);
+                if (last_b >= actual_buckets)
+                    last_b = actual_buckets - 1;
+
+                for (int b = first_b; b <= last_b; b++) {
+                    uint64_t b_start = from_ns + (uint64_t)b * bucket_ns;
+                    uint64_t b_end   = b_start + bucket_ns;
+                    uint64_t o_start = ev_start > b_start ? ev_start : b_start;
+                    uint64_t o_end   = ev_end < b_end ? ev_end : b_end;
+                    if (o_end > o_start)
+                        out->event_aas[b * ns + si] += (double)(o_end - o_start);
+                }
+            }
+
+            /* Convert ns → AAS and compute max */
+            double evt_max = 0.0;
+            for (int b = 0; b < actual_buckets; b++) {
+                double total = 0.0;
+                for (int s = 0; s < ns; s++) {
+                    out->event_aas[b * ns + s] /= (double)bucket_ns;
+                    total += out->event_aas[b * ns + s];
+                }
+                if (total > evt_max) evt_max = total;
+            }
+            out->max_aas = evt_max;  /* override with event-level max */
+        }
+    }
 }
 
 /* ── Time Model ───────────────────────────────────────────── */

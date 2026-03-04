@@ -86,6 +86,7 @@ struct pgwt_request {
     uint64_t from_ns;
     uint64_t to_ns;
     int      num_buckets;
+    char     detail[16];       /* "events" for per-event AAS breakdown */
     struct pgwt_filter filter;
 };
 
@@ -212,6 +213,7 @@ static void parse_request(const char *line, struct pgwt_request *req)
     json_uint64(line, "from", &req->from_ns);
     json_uint64(line, "to", &req->to_ns);
     json_int(line, "buckets", &req->num_buckets);
+    json_string(line, "detail", req->detail, sizeof(req->detail));
     parse_filters(line, &req->filter);
 }
 
@@ -677,30 +679,62 @@ static void handle_aas(struct pgwt_server *srv, struct pgwt_request *req)
     uint64_t from = req->from_ns ? req->from_ns : srv->earliest_wall_ns;
     uint64_t to   = req->to_ns   ? req->to_ns   : srv->latest_wall_ns;
 
+    int detail_events = (strcmp(req->detail, "events") == 0);
+
     struct pgwt_aas_result aas;
 
-    if (should_use_summaries(srv, req)) {
+    /* Event-detail mode always uses raw events (no summary path yet) */
+    if (!detail_events && should_use_summaries(srv, req)) {
         pgwt_compute_aas_from_summaries(srv->trace_dir, from, to,
                                          &req->filter, num_buckets, &aas);
     } else {
         int count;
         struct pgwt_trace_event *events =
             server_load_events(srv, req->from_ns, req->to_ns, &count);
-        pgwt_compute_aas(events, count, &req->filter, from, to, num_buckets, &aas);
+        pgwt_compute_aas(events, count, &req->filter, from, to, num_buckets,
+                         detail_events, AAS_MAX_EVENT_SERIES, &aas);
         free(events);
     }
 
     /* Emit JSON */
-    printf("{\"id\":%lld,\"buckets\":[", (long long)req->id);
-    for (int i = 0; i < aas.num_buckets; i++) {
-        if (i > 0) putchar(',');
-        printf("{\"t\":%llu", (unsigned long long)aas.buckets[i].start_ns);
-        for (int c = 0; c < PGWT_NUM_CLASSES; c++)
-            printf(",\"%s\":%.4f", pgwt_class_names[c], aas.buckets[i].class_aas[c]);
-        putchar('}');
+    if (aas.num_event_series > 0) {
+        /* Event-breakdown mode */
+        int ns = aas.num_event_series;
+        printf("{\"id\":%lld,\"breakdown\":\"events\",\"series\":[",
+               (long long)req->id);
+        for (int s = 0; s < ns; s++) {
+            if (s > 0) putchar(',');
+            printf("{\"event_id\":%u,\"name\":\"%s\"}",
+                   aas.event_series[s].event_id, aas.event_series[s].name);
+        }
+        printf("],\"buckets\":[");
+        for (int i = 0; i < aas.num_buckets; i++) {
+            if (i > 0) putchar(',');
+            printf("{\"t\":%llu,\"aas\":[",
+                   (unsigned long long)aas.buckets[i].start_ns);
+            for (int s = 0; s < ns; s++) {
+                if (s > 0) putchar(',');
+                printf("%.4f", aas.event_aas[i * ns + s]);
+            }
+            printf("]}");
+        }
+        printf("],\"max_aas\":%.4f,\"bucket_ns\":%llu}\n",
+               aas.max_aas, (unsigned long long)aas.bucket_ns);
+        free(aas.event_aas);
+    } else {
+        /* Class-breakdown mode (default) */
+        printf("{\"id\":%lld,\"buckets\":[", (long long)req->id);
+        for (int i = 0; i < aas.num_buckets; i++) {
+            if (i > 0) putchar(',');
+            printf("{\"t\":%llu", (unsigned long long)aas.buckets[i].start_ns);
+            for (int c = 0; c < PGWT_NUM_CLASSES; c++)
+                printf(",\"%s\":%.4f", pgwt_class_names[c],
+                       aas.buckets[i].class_aas[c]);
+            putchar('}');
+        }
+        printf("],\"max_aas\":%.4f,\"bucket_ns\":%llu}\n",
+               aas.max_aas, (unsigned long long)aas.bucket_ns);
     }
-    printf("],\"max_aas\":%.4f,\"bucket_ns\":%llu}\n",
-           aas.max_aas, (unsigned long long)aas.bucket_ns);
 
     free(aas.buckets);
 }
