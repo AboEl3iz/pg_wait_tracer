@@ -20,6 +20,7 @@ enum pgwt_backend_type {
     PGWT_BT_LOGGER,
     PGWT_BT_PARALLEL_WORKER,
     PGWT_BT_IO_WORKER,
+    PGWT_BT_BG_WORKER,
     PGWT_BT_UNKNOWN,
 };
 

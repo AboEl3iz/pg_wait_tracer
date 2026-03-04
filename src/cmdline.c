@@ -23,6 +23,7 @@ static const char *bt_names[] = {
     [PGWT_BT_LOGGER]          = "logger",
     [PGWT_BT_PARALLEL_WORKER] = "parallel_worker",
     [PGWT_BT_IO_WORKER]       = "io_worker",
+    [PGWT_BT_BG_WORKER]      = "bg_worker",
     [PGWT_BT_UNKNOWN]         = "unknown",
 };
 
@@ -127,10 +128,20 @@ int pgwt_parse_cmdline(pid_t pid, struct pgwt_metadata *meta)
         meta->leader_pid = atoi(p + 24);
     } else if (strncmp(p, "io worker", 9) == 0) {
         meta->backend_type = PGWT_BT_IO_WORKER;
-    } else {
+    } else if (strchr(p, '(')) {
         /* Client backend: "user db host(port) state" */
         meta->backend_type = PGWT_BT_CLIENT;
         parse_connection_fields(p, meta);
+    } else {
+        /* Background worker (extension or custom): store name as app_name */
+        meta->backend_type = PGWT_BT_BG_WORKER;
+        /* Copy the worker description (e.g. "pg_wait_sampling collector") */
+        size_t len = strlen(p);
+        /* Trim trailing spaces (cmdline padding) */
+        while (len > 0 && p[len - 1] == ' ') len--;
+        if (len >= sizeof(meta->usename)) len = sizeof(meta->usename) - 1;
+        memcpy(meta->usename, p, len);
+        meta->usename[len] = '\0';
     }
 
     return 0;
