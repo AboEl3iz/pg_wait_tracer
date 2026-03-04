@@ -741,7 +741,8 @@ static void handle_top_sessions(struct pgwt_server *srv, struct pgwt_request *re
 
     struct pgwt_sessions_result res;
 
-    if (should_use_summaries(srv, req)) {
+    /* Sessions + query_id: summaries lack per-session query data, use raw events */
+    if (should_use_summaries(srv, req) && req->filter.query_id == 0) {
         pgwt_compute_top_sessions_from_summaries(srv->trace_dir, from, to,
                                                   &req->filter, wall_ms, &res);
     } else {
