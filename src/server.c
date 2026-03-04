@@ -16,9 +16,31 @@
 #include <unistd.h>
 #include <ctype.h>
 
-/* ── Query text map ───────────────────────────────────────── */
+/* ── Utility ──────────────────────────────────────────────── */
 
-#define QT_MAP_SIZE 8192
+/* Count lines in a file. Returns 0 if file doesn't exist. */
+static int count_lines(const char *path)
+{
+    FILE *fp = fopen(path, "r");
+    if (!fp) return 0;
+    int n = 0;
+    char buf[4096];
+    while (fgets(buf, sizeof(buf), fp))
+        n++;
+    fclose(fp);
+    return n;
+}
+
+/* Next power-of-2 >= n, minimum 256 */
+static int next_pow2(int n)
+{
+    if (n < 256) return 256;
+    int p = 256;
+    while (p < n) p <<= 1;
+    return p;
+}
+
+/* ── Query text map ───────────────────────────────────────── */
 
 struct qt_entry {
     uint64_t query_id;
@@ -26,8 +48,6 @@ struct qt_entry {
 };
 
 /* ── Backend metadata map ─────────────────────────────────── */
-
-#define BM_MAP_SIZE 4096
 
 struct bm_entry {
     uint32_t pid;
@@ -47,12 +67,14 @@ struct pgwt_server {
     uint64_t latest_wall_ns;
     int  total_events;
 
-    /* Query text map: query_id → SQL text */
-    struct qt_entry qt_map[QT_MAP_SIZE];
+    /* Query text map: query_id → SQL text (dynamic, power-of-2 sized) */
+    struct qt_entry *qt_map;
+    int  qt_capacity;
     int  qt_count;
 
-    /* Backend metadata map: pid → type/user/db */
-    struct bm_entry bm_map[BM_MAP_SIZE];
+    /* Backend metadata map: pid → type/user/db (dynamic, power-of-2 sized) */
+    struct bm_entry *bm_map;
+    int  bm_capacity;
     int  bm_count;
 };
 
@@ -206,8 +228,10 @@ static uint64_t qt_hash64(uint64_t x)
 static void qt_map_insert(struct pgwt_server *srv, uint64_t query_id,
                            const char *text)
 {
-    uint32_t idx = (uint32_t)(qt_hash64(query_id) & (QT_MAP_SIZE - 1));
-    for (int i = 0; i < QT_MAP_SIZE; i++) {
+    if (!srv->qt_map) return;
+    int mask = srv->qt_capacity - 1;
+    uint32_t idx = (uint32_t)(qt_hash64(query_id) & mask);
+    for (int i = 0; i < srv->qt_capacity; i++) {
         struct qt_entry *e = &srv->qt_map[idx];
         if (e->query_id == 0) {
             e->query_id = query_id;
@@ -217,32 +241,36 @@ static void qt_map_insert(struct pgwt_server *srv, uint64_t query_id,
         }
         if (e->query_id == query_id)
             return;  /* already present */
-        idx = (idx + 1) & (QT_MAP_SIZE - 1);
+        idx = (idx + 1) & mask;
     }
 }
 
 /* Free all heap-allocated text strings and reset the map */
 static void qt_map_clear(struct pgwt_server *srv)
 {
-    for (int i = 0; i < QT_MAP_SIZE; i++) {
-        free(srv->qt_map[i].text);
+    if (srv->qt_map) {
+        for (int i = 0; i < srv->qt_capacity; i++)
+            free(srv->qt_map[i].text);
+        free(srv->qt_map);
+        srv->qt_map = NULL;
     }
-    memset(srv->qt_map, 0, sizeof(srv->qt_map));
+    srv->qt_capacity = 0;
     srv->qt_count = 0;
 }
 
 static const char *qt_map_lookup(const struct pgwt_server *srv, uint64_t query_id)
 {
-    if (query_id == 0)
+    if (query_id == 0 || !srv->qt_map)
         return NULL;
-    uint32_t idx = (uint32_t)(qt_hash64(query_id) & (QT_MAP_SIZE - 1));
-    for (int i = 0; i < QT_MAP_SIZE; i++) {
+    int mask = srv->qt_capacity - 1;
+    uint32_t idx = (uint32_t)(qt_hash64(query_id) & mask);
+    for (int i = 0; i < srv->qt_capacity; i++) {
         const struct qt_entry *e = &srv->qt_map[idx];
         if (e->query_id == query_id)
             return e->text;
         if (e->query_id == 0)
             return NULL;
-        idx = (idx + 1) & (QT_MAP_SIZE - 1);
+        idx = (idx + 1) & mask;
     }
     return NULL;
 }
@@ -254,6 +282,12 @@ static void server_load_query_texts(struct pgwt_server *srv)
 {
     char path[600];
     snprintf(path, sizeof(path), "%s/query_texts.jsonl", srv->trace_dir);
+
+    /* Size the hash map to fit the file */
+    int lines = count_lines(path);
+    srv->qt_capacity = next_pow2(lines * 2);
+    srv->qt_map = calloc(srv->qt_capacity, sizeof(struct qt_entry));
+    if (!srv->qt_map) { srv->qt_capacity = 0; return; }
 
     FILE *fp = fopen(path, "r");
     if (!fp)
@@ -326,8 +360,10 @@ static void server_load_query_texts(struct pgwt_server *srv)
 static void bm_map_insert(struct pgwt_server *srv, uint32_t pid,
                             const char *type, const char *user, const char *db)
 {
-    uint32_t idx = pid & (BM_MAP_SIZE - 1);
-    for (int i = 0; i < BM_MAP_SIZE; i++) {
+    if (!srv->bm_map) return;
+    int mask = srv->bm_capacity - 1;
+    uint32_t idx = pid & mask;
+    for (int i = 0; i < srv->bm_capacity; i++) {
         struct bm_entry *e = &srv->bm_map[idx];
         if (e->pid == 0) {
             e->pid = pid;
@@ -344,20 +380,21 @@ static void bm_map_insert(struct pgwt_server *srv, uint32_t pid,
             if (db && db[0]) snprintf(e->db, sizeof(e->db), "%s", db);
             return;
         }
-        idx = (idx + 1) & (BM_MAP_SIZE - 1);
+        idx = (idx + 1) & mask;
     }
 }
 
 static const struct bm_entry *bm_map_lookup(const struct pgwt_server *srv,
                                              uint32_t pid)
 {
-    if (pid == 0) return NULL;
-    uint32_t idx = pid & (BM_MAP_SIZE - 1);
-    for (int i = 0; i < BM_MAP_SIZE; i++) {
+    if (pid == 0 || !srv->bm_map) return NULL;
+    int mask = srv->bm_capacity - 1;
+    uint32_t idx = pid & mask;
+    for (int i = 0; i < srv->bm_capacity; i++) {
         const struct bm_entry *e = &srv->bm_map[idx];
         if (e->pid == pid) return e;
         if (e->pid == 0) return NULL;
-        idx = (idx + 1) & (BM_MAP_SIZE - 1);
+        idx = (idx + 1) & mask;
     }
     return NULL;
 }
@@ -368,6 +405,12 @@ static void server_load_backends(struct pgwt_server *srv)
 {
     char path[600];
     snprintf(path, sizeof(path), "%s/backends.jsonl", srv->trace_dir);
+
+    /* Size the hash map to fit the file */
+    int lines = count_lines(path);
+    srv->bm_capacity = next_pow2(lines * 2);
+    srv->bm_map = calloc(srv->bm_capacity, sizeof(struct bm_entry));
+    if (!srv->bm_map) { srv->bm_capacity = 0; return; }
 
     FILE *fp = fopen(path, "r");
     if (!fp) return;
@@ -590,7 +633,9 @@ static void handle_info(struct pgwt_server *srv, struct pgwt_request *req)
     /* Re-load query texts and backend metadata */
     qt_map_clear(srv);
     server_load_query_texts(srv);
-    memset(srv->bm_map, 0, sizeof(srv->bm_map));
+    free(srv->bm_map);
+    srv->bm_map = NULL;
+    srv->bm_capacity = 0;
     srv->bm_count = 0;
     server_load_backends(srv);
 
