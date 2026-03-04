@@ -413,8 +413,11 @@ function initChart() {
         const maxX = Math.max(brushStart.x, endX);
         brushStart = null;
 
-        // Minimum drag of 5px to avoid accidental clicks
-        if (maxX - minX < 5) return;
+        // Small drag (< 5px) = click → drill down into class/event
+        if (maxX - minX < 5) {
+            handleChartClick(minX, e.clientY - rect.top);
+            return;
+        }
 
         // Convert pixel to data index
         const opt = chart.getOption();
@@ -433,24 +436,58 @@ function initChart() {
         zoomOut();
     });
 
-    // Click on chart series to drill down
-    chart.on('click', (params) => {
-        if (!params.seriesName || params.seriesName === '_cpu_line') return;
+}
 
-        if (state.chartEventSeries) {
-            // Event-breakdown mode: click event → drill to event_id
-            const evSeries = state.chartEventSeries.find(s => s.name === params.seriesName);
-            if (evSeries) {
-                drillDown('event_id', evSeries.event_id, params.seriesName);
-            }
-        } else {
-            // Class mode: click class → drill to class
-            const wc = WAIT_CLASSES.find(c => c.label === params.seriesName);
-            if (wc) {
-                drillDown('class', wc.key, wc.label);
-            }
+// Handle a click on the chart at pixel (px, py) — find the topmost series
+function handleChartClick(px, py) {
+    if (!chart) return;
+    const opt = chart.getOption();
+    if (!opt.xAxis || !opt.xAxis[0] || !opt.xAxis[0].data) return;
+    const xData = opt.xAxis[0].data;
+
+    // Get grid rect for pixel → data conversion
+    const grid = chart.getModel().getComponent('grid');
+    if (!grid || !grid.coordinateSystem) return;
+    const gridRect = grid.coordinateSystem.getRect();
+
+    // X: pixel → data index
+    const xRatio = (px - gridRect.x) / gridRect.width;
+    const dataIdx = Math.round(xRatio * (xData.length - 1));
+    if (dataIdx < 0 || dataIdx >= xData.length) return;
+
+    // Y: pixel → AAS value (y-axis is inverted: top=max, bottom=0)
+    const yRatio = 1 - (py - gridRect.y) / gridRect.height;
+    const yMax = opt.yAxis[0].max || 1;
+    const yVal = yRatio * yMax;
+    if (yVal < 0) return;
+
+    // Walk stacked series bottom-to-top: find which series the click lands in
+    const seriesList = opt.series.filter(s => s.stack === 'aas');
+    let cumulative = 0;
+    let clickedSeries = null;
+    for (const s of seriesList) {
+        const val = s.data[dataIdx] || 0;
+        cumulative += val;
+        if (yVal <= cumulative) {
+            clickedSeries = s;
+            break;
         }
-    });
+    }
+    if (!clickedSeries) return;
+
+    if (state.chartEventSeries) {
+        // Event-breakdown mode: click event → drill to event_id
+        const evSeries = state.chartEventSeries.find(s => s.name === clickedSeries.name);
+        if (evSeries) {
+            drillDown('event_id', evSeries.event_id, clickedSeries.name);
+        }
+    } else {
+        // Class mode: click class → drill to class
+        const wc = WAIT_CLASSES.find(c => c.label === clickedSeries.name);
+        if (wc) {
+            drillDown('class', wc.key, wc.label);
+        }
+    }
 }
 
 // -- Chart resize handle --------------------------------------------------
