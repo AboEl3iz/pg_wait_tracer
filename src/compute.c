@@ -740,6 +740,28 @@ void pgwt_compute_top_queries(const struct pgwt_trace_event *events, int count,
         for (int c = 0; c < PGWT_NUM_CLASSES; c++)
             r->class_ms[c] = (double)ht[i].class_ns[c] / 1e6;
 
+        /* Per-event breakdown: sort by time desc, pick top 16 */
+        r->num_events = 0;
+        if (ht[i].num_waits > 0) {
+            /* Simple selection sort for top 16 */
+            uint8_t used[64] = {0};
+            for (int k = 0; k < 16 && k < ht[i].num_waits; k++) {
+                int best = -1;
+                uint64_t best_ns = 0;
+                for (int j = 0; j < ht[i].num_waits; j++) {
+                    if (!used[j] && ht[i].wait_ns[j] > best_ns) {
+                        best_ns = ht[i].wait_ns[j];
+                        best = j;
+                    }
+                }
+                if (best < 0) break;
+                used[best] = 1;
+                r->event_ids[k] = ht[i].wait_ids[best];
+                r->event_ms[k]  = (double)ht[i].wait_ns[best] / 1e6;
+                r->num_events++;
+            }
+        }
+
         nr++;
     }
 

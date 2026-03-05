@@ -860,9 +860,13 @@ static void handle_top_queries(struct pgwt_server *srv, struct pgwt_request *req
     uint64_t to   = req->to_ns   ? req->to_ns   : srv->latest_wall_ns;
     double wall_ms = (double)(to - from) / 1e6;
 
+    /* Force raw events when class/event filter active (need per-event breakdown) */
+    int has_event_filter = (req->filter.class_name[0] != '\0' ||
+                            req->filter.event_id != 0);
+
     struct pgwt_queries_result res;
 
-    if (should_use_summaries(srv, req)) {
+    if (!has_event_filter && should_use_summaries(srv, req)) {
         pgwt_compute_top_queries_from_summaries(srv->trace_dir, from, to,
                                                  &req->filter, wall_ms, &res);
     } else {
@@ -913,6 +917,23 @@ static void handle_top_queries(struct pgwt_server *srv, struct pgwt_request *req
             printf("%.2f", res.rows[i].class_ms[c]);
         }
         putchar(']');
+
+        /* Per-event breakdown (when available from raw events path) */
+        if (res.rows[i].num_events > 0) {
+            char ename[64];
+            printf(",\"events\":[");
+            for (int e = 0; e < res.rows[i].num_events; e++) {
+                if (e > 0) putchar(',');
+                uint32_t eid = res.rows[i].event_ids[e];
+                if (eid == 0)
+                    snprintf(ename, sizeof(ename), "CPU");
+                else
+                    pgwt_event_full_name(eid, ename, sizeof(ename));
+                printf("{\"id\":%u,\"name\":\"%s\",\"ms\":%.2f}",
+                       eid, ename, res.rows[i].event_ms[e]);
+            }
+            putchar(']');
+        }
 
         putchar('}');
     }

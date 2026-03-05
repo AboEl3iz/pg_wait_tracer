@@ -157,6 +157,10 @@ struct pgwt_query_row {
     char     top_wait[64];
     uint32_t top_wait_id;
     double   class_ms[PGWT_NUM_CLASSES];  /* per-class time breakdown */
+    /* Per-event breakdown (populated from raw events path) */
+    int      num_events;
+    uint32_t event_ids[16];
+    double   event_ms[16];
 };
 
 struct pgwt_queries_result {

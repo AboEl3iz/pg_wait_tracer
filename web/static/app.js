@@ -335,6 +335,22 @@ function stackedBar(classes, total) {
     return html;
 }
 
+function eventStackedBar(events, total) {
+    if (!events || !events.length || !total || total <= 0) return '';
+    let html = '<div class="stacked-bar">';
+    for (let i = 0; i < events.length; i++) {
+        const pct = events[i].ms / total * 100;
+        if (pct < 0.3) continue;
+        const color = EVENT_PALETTE[i % EVENT_PALETTE.length];
+        html += '<div class="bar-seg" style="width:' + pct.toFixed(1) +
+                '%;background:' + color + '" title="' +
+                esc(events[i].name) + ': ' + fmtMs(events[i].ms) +
+                ' (' + pct.toFixed(1) + '%)"></div>';
+    }
+    html += '</div>';
+    return html;
+}
+
 // -- Tabs ---------------------------------------------------------------------
 
 function initTabs() {
@@ -814,7 +830,8 @@ const TABLE_CONFIGS = {
             { key: 'total_ms', label: 'Time', cls: 'num', format: (r) => fmtMs(r.total_ms) },
             { key: 'pct', label: '%DB', cls: 'num', format: (r) => fmtPct(r.pct) },
             { key: 'classes', label: 'Wait Profile', format: (r) =>
-                stackedBar(r.classes, r.total_ms) },
+                r.events ? eventStackedBar(r.events, r.total_ms)
+                         : stackedBar(r.classes, r.total_ms) },
             { key: 'count', label: 'Waits', cls: 'num', format: (r) => fmtCount(r.count) },
             { key: 'avg_us', label: 'Avg Wait', cls: 'num', format: (r) => fmtUs(r.avg_us) },
         ],
