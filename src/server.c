@@ -65,7 +65,7 @@ struct pgwt_server {
     int  num_files;
     uint64_t earliest_wall_ns;
     uint64_t latest_wall_ns;
-    int  total_events;
+    int64_t total_events;
 
     /* Query text map: query_id → SQL text (dynamic, power-of-2 sized) */
     struct qt_entry *qt_map;
@@ -599,8 +599,8 @@ static int server_init(struct pgwt_server *srv, const char *trace_dir)
         pgwt_reader_close(&reader);
     }
 
-    fprintf(stderr, "pgwt-server: %d trace files, %d CPUs, ~%d events\n",
-            srv->num_files, srv->num_cpus, srv->total_events);
+    fprintf(stderr, "pgwt-server: %d trace files, %d CPUs, ~%lld events\n",
+            srv->num_files, srv->num_cpus, (long long)srv->total_events);
 
     server_load_query_texts(srv);
     server_load_backends(srv);
@@ -665,11 +665,11 @@ static void handle_info(struct pgwt_server *srv, struct pgwt_request *req)
     }
 
     printf("{\"id\":%lld,\"from_ns\":%llu,\"to_ns\":%llu,"
-           "\"num_events\":%d,\"num_cpus\":%d}\n",
+           "\"num_events\":%lld,\"num_cpus\":%d}\n",
            (long long)req->id,
            (unsigned long long)srv->earliest_wall_ns,
            (unsigned long long)srv->latest_wall_ns,
-           srv->total_events, srv->num_cpus);
+           (long long)srv->total_events, srv->num_cpus);
 }
 
 static void handle_aas(struct pgwt_server *srv, struct pgwt_request *req)
