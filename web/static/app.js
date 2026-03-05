@@ -987,7 +987,7 @@ function drillDown(filterKey, filterValue, label) {
     state.filters[filterKey] = filterValue;
 
     // Auto-pivot
-    const pivotMap = { class: 'events', event_id: 'histogram', pid: 'queries', query_id: 'events' };
+    const pivotMap = { class: 'events', event_id: 'queries', pid: 'queries', query_id: 'events' };
     if (pivotMap[filterKey]) {
         switchTab(pivotMap[filterKey]);
     }

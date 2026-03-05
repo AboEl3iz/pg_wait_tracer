@@ -1375,7 +1375,7 @@ static int tq_summary_visitor(const struct pgwt_summary_accum *rec, void *arg)
 {
     struct tq_summary_ctx *ctx = arg;
 
-    /* Resolve class filter index once (-1 = no filter) */
+    /* Resolve class filter index (-1 = no filter) */
     int filter_cls = -1;
     if (ctx->f->class_name[0] != '\0') {
         for (int c = 0; c < PGWT_NUM_CLASSES; c++) {
@@ -1384,7 +1384,7 @@ static int tq_summary_visitor(const struct pgwt_summary_accum *rec, void *arg)
                 break;
             }
         }
-        if (filter_cls < 0) return 0;  /* unknown class name */
+        if (filter_cls < 0) return 0;
     }
 
     for (int q = 0; q < SUMMARY_MAX_QUERIES; q++) {
@@ -1392,22 +1392,47 @@ static int tq_summary_visitor(const struct pgwt_summary_accum *rec, void *arg)
         if (sq->query_id == 0 && sq->count == 0) continue;
         if (ctx->f->query_id != 0 && sq->query_id != ctx->f->query_id) continue;
 
-        /* Determine effective time for this query record */
+        /* Determine effective time and top wait, respecting class+event filters */
         uint64_t effective_ns = sq->total_ns;
-        if (filter_cls >= 0) {
-            /* Check per-class breakdown (v2) */
-            int has_class_ns = 0;
-            for (int c = 0; c < PGWT_NUM_CLASSES; c++) {
-                if (sq->class_ns[c] > 0) { has_class_ns = 1; break; }
+        uint32_t rec_top_wait_id = sq->top_wait_id;
+        uint64_t rec_top_wait_ns = sq->top_wait_ns;
+
+        if (filter_cls >= 0 || ctx->f->event_id != 0) {
+            /* Use top_events[] to compute class/event-filtered totals */
+            effective_ns = 0;
+            rec_top_wait_id = 0;
+            rec_top_wait_ns = 0;
+
+            for (int j = 0; j < sq->num_top_events; j++) {
+                uint32_t eid = sq->top_events[j].event_id;
+                /* Class filter */
+                if (filter_cls >= 0 && pgwt_wait_class_index(eid) != filter_cls)
+                    continue;
+                /* Event filter */
+                if (ctx->f->event_id != 0 && eid != ctx->f->event_id)
+                    continue;
+
+                effective_ns += sq->top_events[j].total_ns;
+                if (sq->top_events[j].total_ns > rec_top_wait_ns) {
+                    rec_top_wait_ns = sq->top_events[j].total_ns;
+                    rec_top_wait_id = eid;
+                }
             }
-            if (has_class_ns) {
-                effective_ns = sq->class_ns[filter_cls];
-            } else {
-                /* v1 fallback: approximate via top_wait_id */
-                int cls = pgwt_wait_class_index(sq->top_wait_id);
-                effective_ns = (cls == filter_cls) ? sq->total_ns : 0;
+
+            /* If top_events didn't cover this class, fall back to class_ns */
+            if (effective_ns == 0 && filter_cls >= 0 && ctx->f->event_id == 0) {
+                int has_class_ns = 0;
+                for (int c = 0; c < PGWT_NUM_CLASSES; c++)
+                    if (sq->class_ns[c] > 0) { has_class_ns = 1; break; }
+                if (has_class_ns)
+                    effective_ns = sq->class_ns[filter_cls];
+                else if (pgwt_wait_class_index(sq->top_wait_id) == filter_cls)
+                    effective_ns = sq->total_ns;
+                rec_top_wait_id = sq->top_wait_id;
+                rec_top_wait_ns = effective_ns;
             }
-            if (effective_ns == 0) continue;  /* query has no time in this class */
+
+            if (effective_ns == 0) continue;
         }
 
         ctx->db_time_ns += effective_ns;
@@ -1422,7 +1447,7 @@ static int tq_summary_visitor(const struct pgwt_summary_accum *rec, void *arg)
         }
         ctx->ht[h].count += sq->count;
         ctx->ht[h].total_ns += effective_ns;
-        /* Use exact per-class breakdown (v2), fall back to approximation (v1) */
+        /* Per-class breakdown */
         int has_class_ns = 0;
         for (int c = 0; c < PGWT_NUM_CLASSES; c++) {
             ctx->ht[h].class_ns[c] += sq->class_ns[c];
@@ -1432,9 +1457,9 @@ static int tq_summary_visitor(const struct pgwt_summary_accum *rec, void *arg)
             int cls = pgwt_wait_class_index(sq->top_wait_id);
             ctx->ht[h].class_ns[cls] += sq->total_ns;
         }
-        if (sq->top_wait_ns > ctx->ht[h].top_wait_ns) {
-            ctx->ht[h].top_wait_id = sq->top_wait_id;
-            ctx->ht[h].top_wait_ns = sq->top_wait_ns;
+        if (rec_top_wait_ns > ctx->ht[h].top_wait_ns) {
+            ctx->ht[h].top_wait_id = rec_top_wait_id;
+            ctx->ht[h].top_wait_ns = rec_top_wait_ns;
         }
     }
     return 0;
