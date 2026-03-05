@@ -112,6 +112,9 @@ struct pgwt_event_row {
     double   total_ms;
     double   avg_us;
     double   max_us;
+    double   p50_us;
+    double   p95_us;
+    double   p99_us;
     double   pct_db;
     double   aas;
 };

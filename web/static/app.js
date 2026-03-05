@@ -190,6 +190,10 @@ async function refreshTable() {
         await refreshHistogram();
         return;
     }
+    if (state.activeTab === 'timeline') {
+        await refreshTimeline();
+        return;
+    }
     try {
         const cmdMap = {
             overview: 'time_model',
@@ -362,9 +366,12 @@ function initTabs() {
 }
 
 function switchTab(tab) {
-    // Clean up heatmap when leaving histogram tab
+    // Clean up charts when leaving custom tabs
     if (state.activeTab === 'histogram' && tab !== 'histogram') {
         if (heatmapChart) { heatmapChart.dispose(); heatmapChart = null; }
+    }
+    if (state.activeTab === 'timeline' && tab !== 'timeline') {
+        if (timelineChart) { timelineChart.dispose(); timelineChart = null; }
     }
     state.activeTab = tab;
     document.querySelectorAll('.tab').forEach(b => {
@@ -784,6 +791,9 @@ const TABLE_CONFIGS = {
             { key: 'count', label: 'Count', cls: 'num', format: (r) => fmtCount(r.count) },
             { key: 'total_ms', label: 'Total', cls: 'num', format: (r) => fmtMs(r.total_ms) },
             { key: 'avg_us', label: 'Avg', cls: 'num', format: (r) => fmtUs(r.avg_us) },
+            { key: 'p50_us', label: 'P50', cls: 'num', format: (r) => fmtUs(r.p50_us) },
+            { key: 'p95_us', label: 'P95', cls: 'num', format: (r) => fmtUs(r.p95_us) },
+            { key: 'p99_us', label: 'P99', cls: 'num', format: (r) => fmtUs(r.p99_us) },
             { key: 'max_us', label: 'Max', cls: 'num', format: (r) => fmtUs(r.max_us) },
             { key: 'pct', label: '%DB', cls: 'num', format: (r) => {
                 const color = classColor(r.name) || '#4fc3f7';
@@ -1004,7 +1014,7 @@ function drillDown(filterKey, filterValue, label) {
     state.filters[filterKey] = filterValue;
 
     // Auto-pivot
-    const pivotMap = { class: 'events', event_id: 'queries', pid: 'queries', query_id: 'events' };
+    const pivotMap = { class: 'events', event_id: 'queries', pid: 'timeline', query_id: 'events' };
     if (pivotMap[filterKey]) {
         switchTab(pivotMap[filterKey]);
     }
@@ -1275,6 +1285,138 @@ function renderHeatmap(data) {
     };
 
     heatmapChart.setOption(option, true);
+}
+
+// -- Session Timeline ---------------------------------------------------------
+
+let timelineChart = null;
+
+async function refreshTimeline() {
+    const container = document.getElementById('table-container');
+    const summaryEl = document.getElementById('summary-bar');
+    summaryEl.innerHTML = '';
+
+    if (!state.filters.pid && !state.filters.query_id) {
+        container.innerHTML = '<div style="padding:40px;text-align:center;color:#888">' +
+            'Select a session (PID) or query to view timeline</div>';
+        return;
+    }
+
+    try {
+        const data = await send('session_timeline', {
+            from: state.viewFrom,
+            to: state.viewTo,
+            filters: state.filters,
+        });
+        renderTimeline(container, data);
+    } catch (e) {
+        container.innerHTML = '<div style="padding:20px;color:#f44">Error: ' + esc(e.message) + '</div>';
+    }
+}
+
+function renderTimeline(container, data) {
+    if (!data || !data.events || data.events.length === 0) {
+        if (timelineChart) { timelineChart.dispose(); timelineChart = null; }
+        container.innerHTML = '<div style="padding:40px;text-align:center;color:#888">' +
+            'No events for selected session/range</div>';
+        return;
+    }
+
+    // Truncation warning + chart container
+    let html = '';
+    if (data.truncated) {
+        html += '<div style="padding:8px 20px;font-size:12px;color:#ffd700;background:#3d3200;' +
+            'border-bottom:1px solid #555">Showing ' + data.events.length + ' of ' +
+            data.total_count + ' events. Zoom in for more detail.</div>';
+    }
+    const numPids = data.pids.length;
+    const chartHeight = Math.max(200, numPids * 50 + 80);
+    html += '<div id="timeline-chart" style="height:' + chartHeight + 'px;padding:10px 20px"></div>';
+    container.innerHTML = html;
+
+    const el = document.getElementById('timeline-chart');
+    if (timelineChart) { timelineChart.dispose(); timelineChart = null; }
+    timelineChart = echarts.init(el, 'dark');
+    window.addEventListener('resize', () => { if (timelineChart) timelineChart.resize(); });
+
+    // Map PIDs to Y-axis categories
+    const pidLabels = data.pids.map(p => 'PID ' + p);
+    const pidIndexMap = {};
+    data.pids.forEach((p, i) => { pidIndexMap[p] = i; });
+
+    // Build data: [startNs, endNs, pidIdx, name, classIdx, queryId, durNs]
+    const barData = data.events.map(ev => [
+        ev.s, ev.s + ev.d, pidIndexMap[ev.p] || 0,
+        ev.n, ev.c, ev.q, ev.d
+    ]);
+
+    const option = {
+        backgroundColor: 'transparent',
+        tooltip: {
+            trigger: 'item',
+            backgroundColor: '#1e1e3a',
+            borderColor: '#333',
+            textStyle: { color: '#e0e0e0', fontSize: 12 },
+            formatter: function(params) {
+                const d = params.data;
+                let s = '<b>' + esc(d[3]) + '</b><br>';
+                s += 'Duration: <b>' + fmtUs(d[6] / 1000) + '</b><br>';
+                s += 'Start: ' + fmtTime(d[0]) + '<br>';
+                if (d[5] && d[5] !== '0') s += 'Query: ' + d[5];
+                return s;
+            },
+        },
+        grid: { left: 100, right: 20, top: 20, bottom: 40 },
+        xAxis: {
+            type: 'value',
+            min: state.viewFrom,
+            max: state.viewTo,
+            axisLabel: {
+                color: '#888', fontSize: 10,
+                formatter: function(v) { return fmtTime(v); },
+            },
+            axisLine: { lineStyle: { color: '#333' } },
+        },
+        yAxis: {
+            type: 'category',
+            data: pidLabels,
+            axisLabel: { color: '#aaa', fontSize: 11 },
+            axisLine: { lineStyle: { color: '#333' } },
+        },
+        series: [{
+            type: 'custom',
+            renderItem: function(params, api) {
+                const startVal = api.value(0);
+                const endVal = api.value(1);
+                const catIdx = api.value(2);
+                const classIdx = api.value(4);
+
+                const start = api.coord([startVal, catIdx]);
+                const end = api.coord([endVal, catIdx]);
+                const bandWidth = api.size([0, 1])[1];
+
+                const color = WAIT_CLASSES[classIdx] ? WAIT_CLASSES[classIdx].color : '#888';
+                const rectHeight = bandWidth * 0.6;
+                const width = Math.max(end[0] - start[0], 1);
+
+                return {
+                    type: 'rect',
+                    shape: {
+                        x: start[0],
+                        y: start[1] - rectHeight / 2,
+                        width: width,
+                        height: rectHeight,
+                    },
+                    style: { fill: color },
+                    styleEmphasis: { fill: color, opacity: 0.8, lineWidth: 1, stroke: '#fff' },
+                };
+            },
+            encode: { x: [0, 1], y: 2 },
+            data: barData,
+        }],
+    };
+
+    timelineChart.setOption(option, true);
 }
 
 // -- Start --------------------------------------------------------------------

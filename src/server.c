@@ -798,12 +798,15 @@ static void handle_top_events(struct pgwt_server *srv, struct pgwt_request *req)
         if (i > 0) putchar(',');
         printf("{\"event_id\":%u,\"name\":\"%s\","
                "\"class\":\"%s\",\"count\":%llu,"
-               "\"total_ms\":%.2f,\"avg_us\":%.2f,\"max_us\":%.2f,"
+               "\"total_ms\":%.2f,\"avg_us\":%.2f,"
+               "\"p50_us\":%.2f,\"p95_us\":%.2f,\"p99_us\":%.2f,"
+               "\"max_us\":%.2f,"
                "\"pct\":%.2f,\"aas\":%.4f}",
                res.rows[i].event_id, res.rows[i].name,
                pgwt_class_name(res.rows[i].event_id),
                (unsigned long long)res.rows[i].count,
                res.rows[i].total_ms, res.rows[i].avg_us,
+               res.rows[i].p50_us, res.rows[i].p95_us, res.rows[i].p99_us,
                res.rows[i].max_us, res.rows[i].pct_db,
                res.rows[i].aas);
     }
@@ -1006,6 +1009,83 @@ static void handle_heatmap(struct pgwt_server *srv, struct pgwt_request *req)
     free(res.times);
 }
 
+/* ── Session Timeline ─────────────────────────────────────── */
+
+#define TIMELINE_MAX_EVENTS 5000
+#define TIMELINE_MAX_PIDS   256
+
+static void handle_session_timeline(struct pgwt_server *srv, struct pgwt_request *req)
+{
+    int count;
+    struct pgwt_trace_event *events =
+        server_load_events(srv, req->from_ns, req->to_ns, &count);
+
+    /* First pass: count matching events and collect unique PIDs */
+    uint32_t pids[TIMELINE_MAX_PIDS];
+    int num_pids = 0;
+    int total_matching = 0;
+
+    for (int i = 0; i < count; i++) {
+        const struct pgwt_trace_event *ev = &events[i];
+        if (!pgwt_filter_matches(&req->filter, ev))
+            continue;
+        if (pgwt_is_idle_event(ev->old_event))
+            continue;
+        total_matching++;
+
+        int found = 0;
+        for (int p = 0; p < num_pids; p++) {
+            if (pids[p] == ev->pid) { found = 1; break; }
+        }
+        if (!found && num_pids < TIMELINE_MAX_PIDS)
+            pids[num_pids++] = ev->pid;
+    }
+
+    /* Emit PIDs array */
+    printf("{\"id\":%lld,\"pids\":[", (long long)req->id);
+    for (int p = 0; p < num_pids; p++) {
+        if (p > 0) putchar(',');
+        printf("%u", pids[p]);
+    }
+    printf("],\"events\":[");
+
+    /* Second pass: emit events (up to cap) */
+    int nr = 0;
+    int first = 1;
+    for (int i = 0; i < count && nr < TIMELINE_MAX_EVENTS; i++) {
+        const struct pgwt_trace_event *ev = &events[i];
+        if (!pgwt_filter_matches(&req->filter, ev))
+            continue;
+        if (pgwt_is_idle_event(ev->old_event))
+            continue;
+
+        if (!first) putchar(',');
+        first = 0;
+
+        char ename[64];
+        if (ev->old_event == 0)
+            snprintf(ename, sizeof(ename), "CPU");
+        else
+            pgwt_event_full_name(ev->old_event, ename, sizeof(ename));
+
+        printf("{\"s\":%llu,\"d\":%llu,\"e\":%u,\"n\":\"%s\","
+               "\"c\":%d,\"p\":%u,\"q\":\"%llu\"}",
+               (unsigned long long)ev->timestamp_ns,
+               (unsigned long long)ev->duration_ns,
+               ev->old_event, ename,
+               pgwt_wait_class_index(ev->old_event),
+               ev->pid,
+               (unsigned long long)ev->query_id);
+        nr++;
+    }
+
+    printf("],\"truncated\":%s,\"total_count\":%d}\n",
+           nr < total_matching ? "true" : "false",
+           total_matching);
+
+    free(events);
+}
+
 /* ── Dispatch ─────────────────────────────────────────────── */
 
 static void dispatch(struct pgwt_server *srv, struct pgwt_request *req)
@@ -1024,6 +1104,8 @@ static void dispatch(struct pgwt_server *srv, struct pgwt_request *req)
         handle_top_queries(srv, req);
     else if (strcmp(req->cmd, "heatmap") == 0)
         handle_heatmap(srv, req);
+    else if (strcmp(req->cmd, "session_timeline") == 0)
+        handle_session_timeline(srv, req);
     else
         printf("{\"id\":%lld,\"error\":\"unknown command: %s\"}\n",
                (long long)req->id, req->cmd);

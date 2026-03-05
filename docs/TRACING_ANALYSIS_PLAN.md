@@ -13,26 +13,49 @@ nanosecond precision (tracing, not sampling). Each phase builds on the previous.
 
 ## Phase 1 — Foundation (immediate value)
 
-### 1. Session Timeline — Gantt chart for a single PID
+### 1. Session Timeline — Gantt chart for a PID / query_id
 
-Click a session row → see every wait event as a colored bar on a time axis.
-The "EXPLAIN ANALYZE for wait events" — DBAs see exactly what happened during
-a slow query.
+The "EXPLAIN ANALYZE for wait events." Click a session or query → see every wait
+event as a colored bar on a time axis.
 
-- New server endpoint: `session_timeline` — returns raw events for a PID+time range
-- UI: ECharts custom series (gantt-style horizontal bars)
-- Color by wait class, tooltip shows event name + exact duration
-- Builds on existing event_reader / raw events path
+A PID (backend/connection) runs many queries over its lifetime. The timeline shows
+all events for the PID, with query_id boundaries marked (vertical lines when
+query_id changes). A DBA sees: "this connection ran query A (fast), then query B
+(stuck on lock for 3 seconds), then query C."
+
+**Entry points:**
+- Sessions tab → click PID → timeline for that backend, all queries visible
+- Queries tab → click query → all executions of that query_id across PIDs
+  (each PID as a separate swimlane — useful for parallel queries too)
+
+**Filtering:**
+- By PID (default from sessions drill-down)
+- By query_id (from queries drill-down) — shows only events for that query
+- Combined PID + query_id — single execution trace
+
+**Server:** new `session_timeline` endpoint — returns raw events for PID/query_id
+in time range, capped to reasonable count (e.g. 10K events, warn if truncated).
+
+**UI:** ECharts custom series (gantt-style horizontal bars). Color by wait class,
+tooltip shows event name + exact duration + query_id.
 
 ### 2. Wait Event Duration Percentiles — P50/P95/P99/max per event
 
-Extend the Events tab with exact percentile columns. With tracing, these are
-exact values, not estimates from sampling.
+Add exact percentile columns to the existing Events table. The heatmap shows
+distribution shape over time; percentiles give the single-number summary.
 
-- Server: collect all durations per event_id, compute percentiles
+```
+Event               Count     Total    Avg     P50      P95      P99      Max
+IO:DataFileRead     1.2M      45.2s    37μs    12μs     180μs    2.1ms    45ms
+LWLock:WALWrite     340K      12.1s    35μs    8μs      95μs     850μs    120ms
+```
+
+Instantly tells a DBA: "average is 37μs but P99 is 2.1ms — there's a long tail."
+
+- Server: collect all durations per event_id into a buffer, sort, pick percentiles
 - UI: add P50/P95/P99 columns to Events table
-- Optionally show distribution shape indicator (normal / bimodal / long-tail)
-- Pure computation on existing data, small change to `pgwt_compute_top_events`
+- Small change to `pgwt_compute_top_events`, raw events path only (summaries
+  don't preserve individual durations)
 
 ---
 

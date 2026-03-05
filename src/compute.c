@@ -438,10 +438,30 @@ struct top_event_accum {
     uint64_t count;
     uint64_t total_ns;
     uint64_t max_ns;
+    uint64_t hist[HISTOGRAM_BUCKETS];
 };
 
 #define EVENT_HT_SIZE 1024
 #define EVENT_HT_MASK (EVENT_HT_SIZE - 1)
+
+/* Histogram bucket upper boundaries in microseconds */
+static const uint64_t hist_upper_us[HISTOGRAM_BUCKETS] = {
+    1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 16384
+};
+
+static double hist_percentile(const uint64_t hist[HISTOGRAM_BUCKETS],
+                              uint64_t total, double pct)
+{
+    if (total == 0) return 0;
+    uint64_t threshold = (uint64_t)((double)total * pct);
+    uint64_t cumulative = 0;
+    for (int b = 0; b < HISTOGRAM_BUCKETS; b++) {
+        cumulative += hist[b];
+        if (cumulative >= threshold)
+            return (double)hist_upper_us[b];
+    }
+    return (double)hist_upper_us[HISTOGRAM_BUCKETS - 1];
+}
 
 static int cmp_event_row_desc(const void *a, const void *b)
 {
@@ -481,6 +501,7 @@ void pgwt_compute_top_events(const struct pgwt_trace_event *events, int count,
         ht[h].total_ns += ev->duration_ns;
         if (ev->duration_ns > ht[h].max_ns)
             ht[h].max_ns = ev->duration_ns;
+        ht[h].hist[compute_duration_to_bucket(ev->duration_ns)]++;
     }
 
     double db_time_ms = (double)db_time_ns / 1e6;
@@ -501,6 +522,9 @@ void pgwt_compute_top_events(const struct pgwt_trace_event *events, int count,
                      ? (double)ht[i].total_ns / (double)ht[i].count / 1000.0
                      : 0;
         r->max_us   = (double)ht[i].max_ns / 1000.0;
+        r->p50_us   = hist_percentile(ht[i].hist, ht[i].count, 0.50);
+        r->p95_us   = hist_percentile(ht[i].hist, ht[i].count, 0.95);
+        r->p99_us   = hist_percentile(ht[i].hist, ht[i].count, 0.99);
         r->pct_db   = db_time_ms > 0 ? r->total_ms / db_time_ms * 100.0 : 0;
         r->aas      = wall_ms > 0 ? r->total_ms / wall_ms : 0;
 
@@ -1233,6 +1257,8 @@ static int te_summary_visitor(const struct pgwt_summary_accum *rec, void *arg)
         ctx->ht[h].total_ns += se->total_ns;
         if (se->max_ns > ctx->ht[h].max_ns)
             ctx->ht[h].max_ns = se->max_ns;
+        for (int b = 0; b < HISTOGRAM_BUCKETS; b++)
+            ctx->ht[h].hist[b] += se->histogram[b];
     }
     return 0;
 }
@@ -1269,6 +1295,9 @@ void pgwt_compute_top_events_from_summaries(
         row->avg_us   = ctx.ht[i].count > 0
                        ? (double)ctx.ht[i].total_ns / (double)ctx.ht[i].count / 1000.0 : 0;
         row->max_us   = (double)ctx.ht[i].max_ns / 1000.0;
+        row->p50_us   = hist_percentile(ctx.ht[i].hist, ctx.ht[i].count, 0.50);
+        row->p95_us   = hist_percentile(ctx.ht[i].hist, ctx.ht[i].count, 0.95);
+        row->p99_us   = hist_percentile(ctx.ht[i].hist, ctx.ht[i].count, 0.99);
         row->pct_db   = db_time_ms > 0 ? row->total_ms / db_time_ms * 100.0 : 0;
         row->aas      = wall_ms > 0 ? row->total_ms / wall_ms : 0;
 
