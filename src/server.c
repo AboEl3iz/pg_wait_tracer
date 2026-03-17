@@ -1041,6 +1041,25 @@ static void handle_session_timeline(struct pgwt_server *srv, struct pgwt_request
             pids[num_pids++] = ev->pid;
     }
 
+    /* Compute coalesce gap: if too many events, merge adjacent same-class
+       events within same PID when gap between them is < coalesce_ns.
+       This reduces bar count while preserving the visual pattern. */
+    uint64_t range_ns = (req->to_ns && req->from_ns) ?
+                        (req->to_ns - req->from_ns) : 0;
+    if (range_ns == 0 && count > 0) {
+        /* Estimate range from actual events */
+        uint64_t min_ts = UINT64_MAX, max_ts = 0;
+        for (int i = 0; i < count; i++) {
+            if (events[i].timestamp_ns < min_ts) min_ts = events[i].timestamp_ns;
+            uint64_t end = events[i].timestamp_ns + events[i].duration_ns;
+            if (end > max_ts) max_ts = end;
+        }
+        range_ns = max_ts - min_ts;
+    }
+    /* Coalesce gap = range / (2 * max_events), so we get at most ~2*max visible bars */
+    uint64_t coalesce_ns = total_matching > TIMELINE_MAX_EVENTS ?
+                           range_ns / (TIMELINE_MAX_EVENTS * 2) : 0;
+
     /* Emit PIDs array */
     printf("{\"id\":%lld,\"pids\":[", (long long)req->id);
     for (int p = 0; p < num_pids; p++) {
@@ -1049,35 +1068,91 @@ static void handle_session_timeline(struct pgwt_server *srv, struct pgwt_request
     }
     printf("],\"events\":[");
 
-    /* Second pass: emit events (up to cap) */
+    /* Second pass: emit events with coalescing */
+    /* Track pending coalesced bar per PID */
+    struct {
+        uint32_t pid;
+        uint64_t start_ns;
+        uint64_t end_ns;
+        uint32_t event_id;
+        int      class_idx;
+        uint64_t query_id;
+        int      active;
+    } pending[TIMELINE_MAX_PIDS];
+    memset(pending, 0, sizeof(pending));
+
     int nr = 0;
     int first = 1;
-    for (int i = 0; i < count && nr < TIMELINE_MAX_EVENTS; i++) {
+
+    #define FLUSH_PENDING(pidx) do { \
+        if (pending[pidx].active && nr < TIMELINE_MAX_EVENTS) { \
+            if (!first) putchar(','); \
+            first = 0; \
+            char _ename[64]; \
+            if (pending[pidx].event_id == 0) \
+                snprintf(_ename, sizeof(_ename), "CPU"); \
+            else \
+                pgwt_event_full_name(pending[pidx].event_id, _ename, sizeof(_ename)); \
+            printf("{\"s\":%llu,\"d\":%llu,\"e\":%u,\"n\":\"%s\"," \
+                   "\"c\":%d,\"p\":%u,\"q\":\"%llu\"}", \
+                   (unsigned long long)pending[pidx].start_ns, \
+                   (unsigned long long)(pending[pidx].end_ns - pending[pidx].start_ns), \
+                   pending[pidx].event_id, _ename, \
+                   pending[pidx].class_idx, \
+                   pending[pidx].pid, \
+                   (unsigned long long)pending[pidx].query_id); \
+            nr++; \
+            pending[pidx].active = 0; \
+        } \
+    } while(0)
+
+    for (int i = 0; i < count; i++) {
         const struct pgwt_trace_event *ev = &events[i];
         if (!pgwt_filter_matches(&req->filter, ev))
             continue;
         if (pgwt_is_idle_event(ev->old_event))
             continue;
 
-        if (!first) putchar(',');
-        first = 0;
+        /* Find PID index */
+        int pidx = -1;
+        for (int p = 0; p < num_pids; p++) {
+            if (pids[p] == ev->pid) { pidx = p; break; }
+        }
+        if (pidx < 0) continue;
 
-        char ename[64];
-        if (ev->old_event == 0)
-            snprintf(ename, sizeof(ename), "CPU");
-        else
-            pgwt_event_full_name(ev->old_event, ename, sizeof(ename));
+        int cls = pgwt_wait_class_index(ev->old_event);
 
-        printf("{\"s\":%llu,\"d\":%llu,\"e\":%u,\"n\":\"%s\","
-               "\"c\":%d,\"p\":%u,\"q\":\"%llu\"}",
-               (unsigned long long)ev->timestamp_ns,
-               (unsigned long long)ev->duration_ns,
-               ev->old_event, ename,
-               pgwt_wait_class_index(ev->old_event),
-               ev->pid,
-               (unsigned long long)ev->query_id);
-        nr++;
+        if (pending[pidx].active) {
+            /* Can we merge? Same class + gap within threshold */
+            uint64_t gap = (ev->timestamp_ns > pending[pidx].end_ns) ?
+                           (ev->timestamp_ns - pending[pidx].end_ns) : 0;
+            if (pending[pidx].class_idx == cls && gap <= coalesce_ns) {
+                /* Extend the pending bar */
+                uint64_t ev_end = ev->timestamp_ns + ev->duration_ns;
+                if (ev_end > pending[pidx].end_ns)
+                    pending[pidx].end_ns = ev_end;
+                continue;
+            }
+            /* Different class or too big a gap — flush */
+            FLUSH_PENDING(pidx);
+            if (nr >= TIMELINE_MAX_EVENTS) break;
+        }
+
+        /* Start new pending bar */
+        pending[pidx].active = 1;
+        pending[pidx].pid = ev->pid;
+        pending[pidx].start_ns = ev->timestamp_ns;
+        pending[pidx].end_ns = ev->timestamp_ns + ev->duration_ns;
+        pending[pidx].event_id = ev->old_event;
+        pending[pidx].class_idx = cls;
+        pending[pidx].query_id = ev->query_id;
     }
+
+    /* Flush remaining */
+    for (int p = 0; p < num_pids && nr < TIMELINE_MAX_EVENTS; p++)
+        FLUSH_PENDING(p);
+
+    #undef FLUSH_PENDING
 
     printf("],\"truncated\":%s,\"total_count\":%d}\n",
            nr < total_matching ? "true" : "false",
