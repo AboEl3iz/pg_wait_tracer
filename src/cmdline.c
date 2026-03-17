@@ -128,8 +128,8 @@ int pgwt_parse_cmdline(pid_t pid, struct pgwt_metadata *meta)
         meta->leader_pid = atoi(p + 24);
     } else if (strncmp(p, "io worker", 9) == 0) {
         meta->backend_type = PGWT_BT_IO_WORKER;
-    } else if (strchr(p, '(')) {
-        /* Client backend: "user db host(port) state" */
+    } else if (strchr(p, '(') || strstr(p, "[local]")) {
+        /* Client backend: "user db host(port) state" or "user db [local] state" */
         meta->backend_type = PGWT_BT_CLIENT;
         parse_connection_fields(p, meta);
     } else {
