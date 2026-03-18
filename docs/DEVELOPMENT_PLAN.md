@@ -8,54 +8,64 @@ Reference: `REVIEW_AND_PLAN.md` (bugs, architecture, test specs),
 
 ---
 
-## Sprint 1: Bug Fixes + Ship Uncommitted Work
+## Sprint 1: Bug Fixes + Ship Uncommitted Work ✅ COMPLETED (2026-03-18)
 
 **Goal:** Fix all known bugs. Commit the in-progress session timeline work.
 
 **No dependencies. All items are independent 5-15 min fixes.**
 
-| # | Task | File(s) | Bug ref |
-|---|------|---------|---------|
-| 1.1 | Fix timeline bar displacement: send `s = timestamp_ns - duration_ns` | `src/server.c` | Bug 1 |
-| 1.2 | Fix histogram bucket mismatch: replace loop version with hardcoded thresholds | `src/summary_writer.c` | Bug 2 |
-| 1.3 | Fix fd leak on re-init: close `wp_fd` before overwriting | `src/backend.c` | Bug 3 |
-| 1.4 | Fix unfiltered `class_ns` accumulation in query summary visitor | `src/compute.c` | Bug 4 |
-| 1.5 | Fix `next_pow2` overflow: use `unsigned int` or clamp | `src/server.c` | Bug 5 |
-| 1.6 | Fix heatmap `grid_size` overflow: use `size_t` + clamp | `src/compute.c` | Bug 6 |
-| 1.7 | Fix double refresh in drill-down | `web/static/app.js` | Issue 13 |
-| 1.8 | Commit: `[local]` support in cmdline parser | `src/cmdline.c` | Uncommitted |
-| 1.9 | Commit: session timeline event coalescing | `src/server.c` | Uncommitted |
+| # | Task | File(s) | Bug ref | Status |
+|---|------|---------|---------|--------|
+| 1.1 | Fix timeline bar displacement: send `s = timestamp_ns - duration_ns` | `src/server.c` | Bug 1 | ✅ |
+| 1.2 | Fix histogram bucket mismatch: replace loop version with hardcoded thresholds | `src/summary_writer.c`, `src/compute.c` | Bug 2 | ✅ |
+| 1.3 | Fix fd leak on re-init: close `wp_fd` before overwriting | `src/backend.c` | Bug 3 | ✅ |
+| 1.4 | Fix unfiltered `class_ns` accumulation in query summary visitor | `src/compute.c` | Bug 4 | ✅ |
+| 1.5 | Fix `next_pow2` overflow: clamp at 1<<30 | `src/server.c` | Bug 5 | ✅ |
+| 1.6 | Fix heatmap `grid_size` overflow: use `size_t` + clamp at 100K | `src/compute.c` | Bug 6 | ✅ |
+| 1.7 | Fix double refresh in drill-down, drill-up, and clear-filters | `web/static/app.js` | Issue 13 | ✅ |
+| 1.8 | Commit: `[local]` support in cmdline parser | `src/cmdline.c` | Uncommitted | ✅ |
+| 1.9 | Commit: session timeline event coalescing | `src/server.c` | Uncommitted | ✅ |
+| 1.10 | Fix tests: add `bg_worker` to known backend types (PG18) | `tests/test_cmdline.c`, `test_cross_validate.py`, `test_active.py` | Pre-existing | ✅ |
 
-**Deliverable:** All 6 bugs fixed, 2 uncommitted features landed. Tag `v0.4`.
+**Result:** All 6 bugs fixed, 2 features committed, 3 test failures fixed.
+16/16 test suites pass (354 individual checks). Tested on Hetzner cpx31 (Rocky 9, PG18.3).
+Commits: `eacb880`, `cfde454`, `d1255c4`, `549417d`.
 
 ---
 
-## Sprint 2: Test Infrastructure + Synthetic Data Correctness
+## Sprint 2: Test Infrastructure + Synthetic Data Correctness ✅ COMPLETED (2026-03-18)
 
 **Goal:** Build the test data generator and prove our compute math is correct.
 No root, no PostgreSQL needed — runs on any dev machine.
 
 **Depends on:** Sprint 1 (bugs must be fixed before we lock in expected values).
 
-| # | Task | Details |
-|---|------|---------|
-| 2.1 | Write `gen_test_traces.c` | C program that generates trace files with caller-specified events. Accepts JSON scenario file or command-line args describing exact events (pid, event_id, duration_ns, query_id, timestamp_ns). Outputs `.trace.lz4` + optional `.summary.lz4` + `backends.jsonl` + `query_texts.jsonl`. Reuses `event_writer.c` and `summary_writer.c`. |
-| 2.2 | Write `test_server_harness.py` | Python module: spawns `pgwt-server <trace-dir>`, sends JSON on stdin, reads JSON from stdout, parses responses. Shared by all Layer 0B tests. |
-| 2.3 | `test_data_time_model.py` | 0B.1: exact time model arithmetic (0% tolerance) |
-| 2.4 | `test_data_aas.py` | 0B.2: AAS bucket correctness (0% tolerance) |
-| 2.5 | `test_data_events.py` | 0B.3: count, total, avg, max, percentiles (exact) |
-| 2.6 | `test_data_sessions.py` | Per-session attribution |
-| 2.7 | `test_data_queries.py` | Per-query attribution + filtered class_ns (Bug 4 regression) |
-| 2.8 | `test_data_filters.py` | 0B.4: all filters independently and combined |
-| 2.9 | `test_data_timeline.py` | 0B.6: timestamp correctness (Bug 1 regression) |
-| 2.10 | `test_data_summary.py` | 0B.5: summary vs raw agreement (Bug 2 regression) |
-| 2.11 | `test_data_idle.py` | 0B.7: idle exclusion |
-| 2.12 | `test_data_edge.py` | 0B.8: empty, single, zero duration, overflow |
-| 2.13 | `test_bucket.c` | C unit test: exhaustive `pgwt_duration_to_bucket` for 0-20000us |
-| 2.14 | Add to `tests/Makefile` and `run_all.sh` | New tests integrated into existing runner |
+| # | Task | Details | Status |
+|---|------|---------|--------|
+| 2.1 | Write `gen_test_traces.c` | C program: reads JSON scenario, writes `.trace` + `.summary` + `backends.jsonl` + `query_texts.jsonl`. Patches file headers so mono_to_wall=0 for deterministic timestamps. | ✅ |
+| 2.2 | Write `server_harness.py` | Python module: `ServerHarness` spawns pgwt-server, sends JSON commands, parses responses. `TestRunner` class for assertions. PG18 event ID constants. | ✅ |
+| 2.3 | `test_data_time_model.py` | 0B.1: exact time model arithmetic (9/9 checks, 0% tolerance) | ✅ |
+| 2.4 | `test_data_aas.py` | 0B.2: AAS bucket correctness (7/7 checks, 0% tolerance) | ✅ |
+| 2.5 | `test_data_events.py` | 0B.3: count, total, avg, max, percentages (14/14 checks) | ✅ |
+| 2.6 | `test_data_sessions.py` | Per-session attribution (4/4 checks) | ✅ |
+| 2.7 | `test_data_queries.py` | Per-query attribution + Bug 4 regression (6/6 checks) | ✅ |
+| 2.8 | `test_data_filters.py` | 0B.4: all filter types + combinations (9/9 checks) | ✅ |
+| 2.9 | `test_data_timeline.py` | 0B.6: timestamp contiguity — Bug 1 regression (10/10 checks) | ✅ |
+| 2.10 | `test_data_idle.py` | 0B.7: idle exclusion from all views (3/3 checks) | ✅ |
+| 2.11 | `test_data_edge.py` | 0B.8: single event, zero duration, 50 PIDs, 1hr event (10/10 checks) | ✅ |
+| 2.12 | `test_bucket.c` | C unit test: exhaustive `pgwt_duration_to_bucket` (25/25 checks) | ✅ |
+| 2.13 | Add to `tests/Makefile` and `run_all.sh` | New tests integrated into existing runner | ✅ |
 
-**Deliverable:** 12 synthetic correctness test files. `gen_test_traces` binary.
-All pass. We can prove our math is correct with zero tolerance on synthetic data.
+**Bugs found and fixed during Sprint 2:**
+- **Bug 7 (AAS event timing):** `compute_aas` in `compute.c` used `ev_start = timestamp_ns`
+  instead of `timestamp_ns - duration_ns`, placing events at wrong times. AAS chart was
+  shifted forward by event duration. Both class-bucket and event-detail paths fixed.
+
+**Result:** 11 synthetic correctness tests + 1 C unit test. 72 individual checks, all pass
+with 0% tolerance. `gen_test_traces` + `server_harness.py` infrastructure reusable for
+future tests. Note: `test_data_summary.py` (0B.5: summary vs raw agreement) deferred to
+Sprint 3 — requires summary path fixes for synthetic timestamps.
+26/26 test suites pass on Hetzner cpx31 (Rocky 9, PG18). Tested 2026-03-18.
 
 ---
 

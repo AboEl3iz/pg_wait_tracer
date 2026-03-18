@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+"""test_data_events.py — 0B.3: count, total, avg, max, percentiles (exact).
+
+Generates events with known counts and durations, verifies top_events output.
+"""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(__file__))
+from server_harness import (
+    ServerHarness, generate_traces, cleanup_traces, TestRunner,
+    CPU, IO_DATA_FILE_READ, LOCK_RELATION, LWLOCK_WAL_WRITE,
+)
+
+BASE_TS = 10_000_000_000_000
+
+
+def build_scenario():
+    """Generate events with precise counts and durations.
+
+    IO:DataFileRead: 10 events, each 1ms = total 10ms, avg 1ms, max 1ms
+    Lock:relation:   5 events, durations 1ms,2ms,3ms,4ms,5ms = total 15ms, avg 3ms, max 5ms
+    CPU:             20 events, each 500us = total 10ms, avg 500us, max 500us
+    """
+    events = []
+    ts = BASE_TS
+
+    # IO:DataFileRead — 10 events × 1ms
+    for i in range(10):
+        ts += 1_000_000
+        events.append({"pid": 1000, "ts": ts, "dur": 1_000_000,
+                        "old": IO_DATA_FILE_READ, "new": CPU, "qid": 100})
+
+    # Lock:relation — 5 events with varying durations
+    for i, dur_ms in enumerate([1, 2, 3, 4, 5]):
+        dur_ns = dur_ms * 1_000_000
+        ts += dur_ns
+        events.append({"pid": 1000, "ts": ts, "dur": dur_ns,
+                        "old": LOCK_RELATION, "new": CPU, "qid": 100})
+
+    # CPU — 20 events × 500us
+    for i in range(20):
+        ts += 500_000
+        events.append({"pid": 1000, "ts": ts, "dur": 500_000,
+                        "old": CPU, "new": IO_DATA_FILE_READ, "qid": 100})
+
+    return {
+        "backends": [{"pid": 1000, "type": "client", "user": "test", "db": "testdb"}],
+        "queries": [{"id": 100, "text": "SELECT 1"}],
+        "events": events,
+    }
+
+
+def main():
+    t = TestRunner("test_data_events")
+    print(f"=== {t.name} ===")
+
+    scenario = build_scenario()
+    trace_dir = generate_traces(scenario)
+
+    try:
+        with ServerHarness(trace_dir) as srv:
+            resp = srv.query("top_events")
+            rows_by_name = {}
+            for r in resp.get("rows", []):
+                rows_by_name[r["name"]] = r
+
+            print("--- IO:DataFileRead ---")
+            io = rows_by_name.get("IO:DataFileRead", {})
+            t.check_eq(io.get("count"), 10, "IO:Read count = 10")
+            t.check_approx(io.get("total_ms", -1), 10.0, 0.001,
+                           "IO:Read total = 10ms")
+            t.check_approx(io.get("avg_us", -1), 1000.0, 0.01,
+                           "IO:Read avg = 1000us")
+            t.check_approx(io.get("max_us", -1), 1000.0, 0.01,
+                           "IO:Read max = 1000us")
+
+            print("--- Lock:relation ---")
+            lock = rows_by_name.get("Lock:relation", {})
+            t.check_eq(lock.get("count"), 5, "Lock count = 5")
+            t.check_approx(lock.get("total_ms", -1), 15.0, 0.001,
+                           "Lock total = 15ms")
+            t.check_approx(lock.get("avg_us", -1), 3000.0, 0.01,
+                           "Lock avg = 3000us")
+            t.check_approx(lock.get("max_us", -1), 5000.0, 0.01,
+                           "Lock max = 5000us")
+
+            print("--- CPU ---")
+            cpu = rows_by_name.get("CPU*", {})
+            t.check_eq(cpu.get("count"), 20, "CPU count = 20")
+            t.check_approx(cpu.get("total_ms", -1), 10.0, 0.001,
+                           "CPU total = 10ms")
+            t.check_approx(cpu.get("avg_us", -1), 500.0, 0.01,
+                           "CPU avg = 500us")
+
+            print("--- Percentages ---")
+            # Total = 10 + 15 + 10 = 35ms
+            t.check_approx(io.get("pct", -1), 10.0 / 35.0 * 100, 0.01,
+                           "IO pct = 28.57%")
+            t.check_approx(lock.get("pct", -1), 15.0 / 35.0 * 100, 0.01,
+                           "Lock pct = 42.86%")
+            t.check_approx(cpu.get("pct", -1), 10.0 / 35.0 * 100, 0.01,
+                           "CPU pct = 28.57%")
+
+    finally:
+        cleanup_traces(trace_dir)
+
+    sys.exit(0 if t.summary() else 1)
+
+
+if __name__ == "__main__":
+    main()

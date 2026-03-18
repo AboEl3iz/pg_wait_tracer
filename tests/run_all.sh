@@ -74,6 +74,22 @@ make -C "$SCRIPT_DIR"
 # Step 2: C unit tests (no root needed)
 run_test "test_wait_event" "$SCRIPT_DIR/test_wait_event"
 run_test "test_cmdline" "$SCRIPT_DIR/test_cmdline"
+run_test "test_bucket" "$SCRIPT_DIR/test_bucket"
+
+# Step 2.5: Synthetic data correctness tests (no root needed, needs pgwt-server)
+if [[ -x "$PROJECT_DIR/pgwt-server" ]] && [[ -x "$SCRIPT_DIR/gen_test_traces" ]]; then
+    run_test "test_data_time_model" python3 "$SCRIPT_DIR/test_data_time_model.py"
+    run_test "test_data_aas" python3 "$SCRIPT_DIR/test_data_aas.py"
+    run_test "test_data_events" python3 "$SCRIPT_DIR/test_data_events.py"
+    run_test "test_data_sessions" python3 "$SCRIPT_DIR/test_data_sessions.py"
+    run_test "test_data_queries" python3 "$SCRIPT_DIR/test_data_queries.py"
+    run_test "test_data_filters" python3 "$SCRIPT_DIR/test_data_filters.py"
+    run_test "test_data_timeline" python3 "$SCRIPT_DIR/test_data_timeline.py"
+    run_test "test_data_idle" python3 "$SCRIPT_DIR/test_data_idle.py"
+    run_test "test_data_edge" python3 "$SCRIPT_DIR/test_data_edge.py"
+else
+    skip_test "test_data_*" "pgwt-server or gen_test_traces not built"
+fi
 
 # Step 3: CLI tests (needs root)
 if [[ $(id -u) -eq 0 ]]; then

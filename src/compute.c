@@ -140,8 +140,9 @@ void pgwt_compute_aas(const struct pgwt_trace_event *events, int count,
         if (!pgwt_filter_matches(f, ev) || pgwt_is_idle_event(ev->old_event))
             continue;
 
-        uint64_t ev_start = ev->timestamp_ns;
-        uint64_t ev_end   = ev->timestamp_ns + ev->duration_ns;
+        /* Event covers [timestamp_ns - duration_ns, timestamp_ns) */
+        uint64_t ev_start = ev->timestamp_ns - ev->duration_ns;
+        uint64_t ev_end   = ev->timestamp_ns;
 
         if (ev_end <= from_ns || ev_start >= to_ns)
             continue;
@@ -236,8 +237,8 @@ void pgwt_compute_aas(const struct pgwt_trace_event *events, int count,
                 }
                 if (si < 0) continue;  /* not in top N */
 
-                uint64_t ev_start = ev->timestamp_ns;
-                uint64_t ev_end   = ev->timestamp_ns + ev->duration_ns;
+                uint64_t ev_start = ev->timestamp_ns - ev->duration_ns;
+                uint64_t ev_end   = ev->timestamp_ns;
                 if (ev_end <= from_ns || ev_start >= to_ns)
                     continue;
 

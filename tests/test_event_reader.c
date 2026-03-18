@@ -41,7 +41,7 @@ static int write_test_file(const struct pgwt_trace_event *events,
                            int count, int pg_version)
 {
     struct pgwt_event_writer w;
-    if (pgwt_writer_init(&w, TEST_DIR, pg_version, 24) != 0)
+    if (pgwt_writer_init(&w, TEST_DIR, pg_version, 24, NULL) != 0)
         return -1;
 
     /* Rename current.trace to our test file name */
