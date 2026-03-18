@@ -464,8 +464,9 @@ void pgwt_print_system_event(struct pgwt_daemon *d)
     }
 
     /* Copy and sort */
-    struct pgwt_event_stats sorted[4096];
     int n = acc->num_system_events;
+    struct pgwt_event_stats *sorted = malloc(n * sizeof(*sorted));
+    if (!sorted) return;
     memcpy(sorted, acc->system_events, n * sizeof(sorted[0]));
     qsort(sorted, n, sizeof(sorted[0]), cmp_event_total);
 
@@ -496,6 +497,7 @@ void pgwt_print_system_event(struct pgwt_daemon *d)
                db ? 100.0 * sorted[i].total_ns / db : 0);
         shown++;
     }
+    free(sorted);
     printf("\n");
 }
 
@@ -1131,7 +1133,11 @@ void pgwt_print_active(struct pgwt_daemon *d)
     printf("%s\n\n", LINE);
 
     /* Build entry array from backend table */
-    struct active_entry entries[MAX_BACKENDS];
+    struct active_entry *entries = malloc(d->backends.count * sizeof(*entries));
+    if (!entries) {
+        printf("  (out of memory)\n\n");
+        return;
+    }
     int n = 0;
 
     for (int i = 0; i < d->backends.count; i++) {
@@ -1214,5 +1220,6 @@ void pgwt_print_active(struct pgwt_daemon *d)
                e->pid, state_str, event_str,
                wait_str, db_str, e->type_name);
     }
+    free(entries);
     printf("\n");
 }

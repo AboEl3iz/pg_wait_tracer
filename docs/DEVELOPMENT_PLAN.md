@@ -69,23 +69,38 @@ Sprint 3 — requires summary path fixes for synthetic timestamps.
 
 ---
 
-## Sprint 3: Code Hardening
+## Sprint 3: Code Hardening ✅ COMPLETED (2026-03-18)
 
 **Goal:** Fix fragile patterns identified in the review. These aren't bugs today
 but prevent bugs tomorrow.
 
 **Depends on:** Sprint 2 (tests catch any regressions from refactoring).
 
-| # | Task | File(s) | Issue ref |
-|---|------|---------|-----------|
-| 3.1 | Add JSON escaping for all server output strings | `src/server.c`, `src/backend_meta.c` | Issue 9 |
-| 3.2 | Fix `/proc/<pid>/stat` parsing: find last `)`, parse after | `src/backend.c`, `src/discovery.c` | Issue 7 |
-| 3.3 | Add state_map garbage collection: periodic sweep every 60s | `src/daemon.c`, `src/backend.c` | Arch 5 |
-| 3.4 | Move large stack arrays to `malloc` in `output.c` | `src/output.c` | Issue 12 |
-| 3.5 | Add WebSocket origin check (localhost only) | `web/bridge.go` | Issue 10 |
+| # | Task | File(s) | Issue ref | Status |
+|---|------|---------|-----------|--------|
+| 3.1 | Add JSON escaping for all server output strings | `src/server.c`, `src/backend_meta.c` | Issue 9 | ✅ |
+| 3.2 | Fix `/proc/<pid>/stat` parsing: find last `)`, parse after | `src/backend.c`, `src/discovery.c` | Issue 7 | ✅ |
+| 3.3 | Add state_map garbage collection: periodic sweep every 60s | `src/daemon.c` | Arch 5 | ✅ |
+| 3.4 | Move large stack arrays to `malloc` in `output.c` | `src/output.c` | Issue 12 | ✅ |
+| 3.5 | Add WebSocket origin check (localhost only) | `web/bridge.go` | Issue 10 | ✅ |
 
-**Deliverable:** All fragile patterns fixed. Re-run Sprint 2 tests to verify
-no regressions.
+**Details:**
+- **3.1:** Added `json_escape_stdout()` to server.c (~15 unescaped string outputs replaced) and
+  `json_escape_fp()` to backend_meta.c (4 outputs). Prevents JSON injection from backend metadata,
+  query text, or event names containing special characters.
+- **3.2:** Changed `/proc/pid/stat` parsing from `fscanf` (breaks on comm with spaces/parens) to
+  `fgets` + `strrchr(line, ')')` + `sscanf` after last paren. Fixed in both backend.c and discovery.c.
+- **3.3:** Added periodic sweep every 60 ticks in `handle_timer()` using `kill(pid, 0)` to detect
+  dead backends not caught by the exit tracepoint. Calls `pgwt_handle_exit()` to clean up state_map
+  entries and watchpoint fds.
+- **3.4:** Replaced two large stack arrays with malloc: `sorted[4096]` (40KB) in
+  `pgwt_print_system_event()` and `entries[MAX_BACKENDS]` (96KB) in `pgwt_print_active()`.
+  Also fixed a missing-braces bug in the error response path of `dispatch()`.
+- **3.5:** Replaced `CheckOrigin: func(r) bool { return true }` with localhost-only check.
+  Allows `http(s)://localhost` and `http(s)://127.0.0.1` with any port. Empty origin (non-browser
+  clients like curl) still allowed.
+
+**Result:** All 5 hardening tasks complete. No regressions in test suite.
 
 ---
 

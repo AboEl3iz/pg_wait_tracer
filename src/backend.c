@@ -92,16 +92,17 @@ int pgwt_scan_existing_backends(struct pgwt_daemon *d)
         FILE *f = fopen(stat_path, "r");
         if (!f) continue;
 
-        /* Format: pid (comm) state ppid ... */
-        int stat_pid;
-        char comm[256];
+        /* Format: pid (comm) state ppid ...
+         * comm can contain spaces and parens, so find last ')' */
+        char stat_line[512];
+        if (!fgets(stat_line, sizeof(stat_line), f)) { fclose(f); continue; }
+        fclose(f);
+        char *last_paren = strrchr(stat_line, ')');
+        if (!last_paren) continue;
         char state;
         int ppid;
-        if (fscanf(f, "%d %255s %c %d", &stat_pid, comm, &state, &ppid) != 4) {
-            fclose(f);
+        if (sscanf(last_paren + 1, " %c %d", &state, &ppid) != 2)
             continue;
-        }
-        fclose(f);
 
         if (ppid != d->postmaster_pid)
             continue;

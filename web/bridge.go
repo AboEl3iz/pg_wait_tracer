@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os/exec"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,7 +17,24 @@ import (
 )
 
 var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
+	CheckOrigin: func(r *http.Request) bool {
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			return true // non-browser clients (curl, etc.)
+		}
+		// Allow localhost origins only (with or without port)
+		for _, prefix := range []string{
+			"http://localhost",
+			"https://localhost",
+			"http://127.0.0.1",
+			"https://127.0.0.1",
+		} {
+			if origin == prefix || strings.HasPrefix(origin, prefix+":") {
+				return true
+			}
+		}
+		return false
+	},
 }
 
 // Bridge connects a browser WebSocket to a remote pgwt-server over SSH.

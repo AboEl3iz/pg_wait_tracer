@@ -453,12 +453,15 @@ pid_t pgwt_auto_discover_postmaster(bool verbose)
         FILE *f = fopen(stat_path, "r");
         if (!f) continue;
 
-        int stat_pid, ppid;
-        char stat_comm[256];
-        char state;
-        int ok = fscanf(f, "%d %255s %c %d", &stat_pid, stat_comm, &state, &ppid);
+        /* comm can contain spaces and parens, so find last ')' */
+        char stat_line[512];
+        if (!fgets(stat_line, sizeof(stat_line), f)) { fclose(f); continue; }
         fclose(f);
-        if (ok != 4) continue;
+        char *last_paren = strrchr(stat_line, ')');
+        if (!last_paren) continue;
+        int ppid;
+        char state;
+        if (sscanf(last_paren + 1, " %c %d", &state, &ppid) != 2) continue;
 
         /* If parent is also postgres, this is a child — skip */
         char parent_comm[64];

@@ -18,6 +18,26 @@
 
 /* ── Utility ──────────────────────────────────────────────── */
 
+/* Write a JSON-escaped string to stdout (without surrounding quotes). */
+static void json_escape_stdout(const char *s)
+{
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        switch (c) {
+        case '"':  fputs("\\\"", stdout); break;
+        case '\\': fputs("\\\\", stdout); break;
+        case '\n': fputs("\\n", stdout);  break;
+        case '\r': fputs("\\r", stdout);  break;
+        case '\t': fputs("\\t", stdout);  break;
+        default:
+            if (c < 0x20)
+                printf("\\u%04x", c);
+            else
+                putchar(c);
+        }
+    }
+}
+
 /* Count lines in a file. Returns 0 if file doesn't exist. */
 static int count_lines(const char *path)
 {
@@ -705,8 +725,9 @@ static void handle_aas(struct pgwt_server *srv, struct pgwt_request *req)
                (long long)req->id);
         for (int s = 0; s < ns; s++) {
             if (s > 0) putchar(',');
-            printf("{\"event_id\":%u,\"name\":\"%s\"}",
-                   aas.event_series[s].event_id, aas.event_series[s].name);
+            printf("{\"event_id\":%u,\"name\":\"", aas.event_series[s].event_id);
+            json_escape_stdout(aas.event_series[s].name);
+            printf("\"}");
         }
         printf("],\"buckets\":[");
         for (int i = 0; i < aas.num_buckets; i++) {
@@ -762,11 +783,12 @@ static void handle_time_model(struct pgwt_server *srv, struct pgwt_request *req)
     printf("{\"id\":%lld,\"rows\":[", (long long)req->id);
     for (int i = 0; i < tm.num_rows; i++) {
         if (i > 0) putchar(',');
-        printf("{\"name\":\"%s\",\"ms\":%.2f,\"pct\":%.2f,"
+        printf("{\"name\":\"");
+        json_escape_stdout(tm.rows[i].name);
+        printf("\",\"ms\":%.2f,\"pct\":%.2f,"
                "\"aas\":%.4f,\"indent\":%d}",
-               tm.rows[i].name, tm.rows[i].time_ms,
-               tm.rows[i].pct_db_time, tm.rows[i].aas,
-               tm.rows[i].indent);
+               tm.rows[i].time_ms, tm.rows[i].pct_db_time,
+               tm.rows[i].aas, tm.rows[i].indent);
     }
     printf("],\"db_time_ms\":%.2f,\"idle_time_ms\":%.2f,"
            "\"aas\":%.4f,\"wall_ms\":%.2f}\n",
@@ -797,14 +819,15 @@ static void handle_top_events(struct pgwt_server *srv, struct pgwt_request *req)
     printf("{\"id\":%lld,\"rows\":[", (long long)req->id);
     for (int i = 0; i < res.num_rows; i++) {
         if (i > 0) putchar(',');
-        printf("{\"event_id\":%u,\"name\":\"%s\","
-               "\"class\":\"%s\",\"count\":%llu,"
+        printf("{\"event_id\":%u,\"name\":\"", res.rows[i].event_id);
+        json_escape_stdout(res.rows[i].name);
+        printf("\",\"class\":\"");
+        json_escape_stdout(pgwt_class_name(res.rows[i].event_id));
+        printf("\",\"count\":%llu,"
                "\"total_ms\":%.2f,\"avg_us\":%.2f,"
                "\"p50_us\":%.2f,\"p95_us\":%.2f,\"p99_us\":%.2f,"
                "\"max_us\":%.2f,"
                "\"pct\":%.2f,\"aas\":%.4f}",
-               res.rows[i].event_id, res.rows[i].name,
-               pgwt_class_name(res.rows[i].event_id),
                (unsigned long long)res.rows[i].count,
                res.rows[i].total_ms, res.rows[i].avg_us,
                res.rows[i].p50_us, res.rows[i].p95_us, res.rows[i].p99_us,
@@ -841,15 +864,16 @@ static void handle_top_sessions(struct pgwt_server *srv, struct pgwt_request *re
         if (i > 0) putchar(',');
         printf("{\"pid\":%u,\"db_time_ms\":%.2f,"
                "\"cpu_pct\":%.1f,\"wait_pct\":%.1f,"
-               "\"top_wait\":\"%s\",\"top_wait_id\":%u",
+               "\"top_wait\":\"",
                res.rows[i].pid, res.rows[i].db_time_ms,
-               res.rows[i].cpu_pct, res.rows[i].wait_pct,
-               res.rows[i].top_wait, res.rows[i].top_wait_id);
+               res.rows[i].cpu_pct, res.rows[i].wait_pct);
+        json_escape_stdout(res.rows[i].top_wait);
+        printf("\",\"top_wait_id\":%u", res.rows[i].top_wait_id);
         const struct bm_entry *bm = bm_map_lookup(srv, res.rows[i].pid);
         if (bm) {
-            printf(",\"type\":\"%s\"", bm->type);
-            if (bm->user[0]) printf(",\"user\":\"%s\"", bm->user);
-            if (bm->db[0]) printf(",\"db\":\"%s\"", bm->db);
+            printf(",\"type\":\""); json_escape_stdout(bm->type); putchar('"');
+            if (bm->user[0]) { printf(",\"user\":\""); json_escape_stdout(bm->user); putchar('"'); }
+            if (bm->db[0]) { printf(",\"db\":\""); json_escape_stdout(bm->db); putchar('"'); }
         }
         putchar('}');
     }
@@ -886,31 +910,19 @@ static void handle_top_queries(struct pgwt_server *srv, struct pgwt_request *req
         if (i > 0) putchar(',');
         printf("{\"query_id\":\"%llu\",\"count\":%llu,"
                "\"total_ms\":%.2f,\"avg_us\":%.2f,"
-               "\"pct\":%.2f,\"top_wait\":\"%s\",\"top_wait_id\":%u",
+               "\"pct\":%.2f,\"top_wait\":\"",
                (unsigned long long)res.rows[i].query_id,
                (unsigned long long)res.rows[i].count,
                res.rows[i].total_ms, res.rows[i].avg_us,
-               res.rows[i].pct_db, res.rows[i].top_wait,
-               res.rows[i].top_wait_id);
+               res.rows[i].pct_db);
+        json_escape_stdout(res.rows[i].top_wait);
+        printf("\",\"top_wait_id\":%u", res.rows[i].top_wait_id);
 
         /* Add query text if available */
         const char *qt = qt_map_lookup(srv, res.rows[i].query_id);
         if (qt) {
             printf(",\"text\":\"");
-            for (const char *c = qt; *c; c++) {
-                switch (*c) {
-                case '"':  fputs("\\\"", stdout); break;
-                case '\\': fputs("\\\\", stdout); break;
-                case '\n': fputs("\\n", stdout);  break;
-                case '\r': fputs("\\r", stdout);  break;
-                case '\t': fputs("\\t", stdout);  break;
-                default:
-                    if ((unsigned char)*c < 0x20)
-                        printf("\\u%04x", (unsigned char)*c);
-                    else
-                        putchar(*c);
-                }
-            }
+            json_escape_stdout(qt);
             putchar('"');
         }
 
@@ -933,8 +945,9 @@ static void handle_top_queries(struct pgwt_server *srv, struct pgwt_request *req
                     snprintf(ename, sizeof(ename), "CPU");
                 else
                     pgwt_event_full_name(eid, ename, sizeof(ename));
-                printf("{\"id\":%u,\"name\":\"%s\",\"ms\":%.2f}",
-                       eid, ename, res.rows[i].event_ms[e]);
+                printf("{\"id\":%u,\"name\":\"", eid);
+                json_escape_stdout(ename);
+                printf("\",\"ms\":%.2f}", res.rows[i].event_ms[e]);
             }
             putchar(']');
         }
@@ -1094,11 +1107,12 @@ static void handle_session_timeline(struct pgwt_server *srv, struct pgwt_request
                 snprintf(_ename, sizeof(_ename), "CPU"); \
             else \
                 pgwt_event_full_name(pending[pidx].event_id, _ename, sizeof(_ename)); \
-            printf("{\"s\":%llu,\"d\":%llu,\"e\":%u,\"n\":\"%s\"," \
-                   "\"c\":%d,\"p\":%u,\"q\":\"%llu\"}", \
+            printf("{\"s\":%llu,\"d\":%llu,\"e\":%u,\"n\":\"", \
                    (unsigned long long)pending[pidx].start_ns, \
                    (unsigned long long)(pending[pidx].end_ns - pending[pidx].start_ns), \
-                   pending[pidx].event_id, _ename, \
+                   pending[pidx].event_id); \
+            json_escape_stdout(_ename); \
+            printf("\",\"c\":%d,\"p\":%u,\"q\":\"%llu\"}", \
                    pending[pidx].class_idx, \
                    pending[pidx].pid, \
                    (unsigned long long)pending[pidx].query_id); \
@@ -1182,9 +1196,11 @@ static void dispatch(struct pgwt_server *srv, struct pgwt_request *req)
         handle_heatmap(srv, req);
     else if (strcmp(req->cmd, "session_timeline") == 0)
         handle_session_timeline(srv, req);
-    else
-        printf("{\"id\":%lld,\"error\":\"unknown command: %s\"}\n",
-               (long long)req->id, req->cmd);
+    else {
+        printf("{\"id\":%lld,\"error\":\"unknown command: ", (long long)req->id);
+        json_escape_stdout(req->cmd);
+        printf("\"}\n");
+    }
 }
 
 /* ── Main ─────────────────────────────────────────────────── */

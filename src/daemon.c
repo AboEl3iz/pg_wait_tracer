@@ -93,6 +93,21 @@ static void handle_timer(struct pgwt_daemon *d)
     }
     fflush(stdout);
 
+    /* GC: sweep backend table every 60s for dead processes.
+     * Handles PIDs that exited without triggering on_exit tracepoint
+     * (e.g., SIGKILL, or race condition during high churn). */
+    if (d->tick > 0 && d->tick % 60 == 0) {
+        for (int i = 0; i < d->backends.count; i++) {
+            struct pgwt_backend *be = &d->backends.entries[i];
+            if (be->is_alive && be->pid > 0 && kill(be->pid, 0) != 0) {
+                if (d->verbose)
+                    fprintf(stderr, "INFO: GC: PID %d no longer alive, cleaning up\n",
+                            be->pid);
+                pgwt_handle_exit(d, be->pid);
+            }
+        }
+    }
+
     /* Trace file: check hourly rotation, periodic cleanup */
     if (d->event_writer) {
         pgwt_writer_check_rotation(d->event_writer);
