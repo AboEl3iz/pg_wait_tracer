@@ -1013,10 +1013,14 @@ function drillDown(filterKey, filterValue, label) {
     });
     state.filters[filterKey] = filterValue;
 
-    // Auto-pivot
+    // Auto-pivot: update tab state without triggering a separate refresh
     const pivotMap = { class: 'events', event_id: 'queries', pid: 'timeline', query_id: 'events' };
     if (pivotMap[filterKey]) {
-        switchTab(pivotMap[filterKey]);
+        const tab = pivotMap[filterKey];
+        state.activeTab = tab;
+        document.querySelectorAll('.tab').forEach(b => {
+            b.classList.toggle('active', b.dataset.tab === tab);
+        });
     }
 
     updateBreadcrumb();
@@ -1027,7 +1031,12 @@ function drillUp(index) {
     const crumb = state.breadcrumbs[index];
     state.filters = { ...crumb.filters };
     state.breadcrumbs = state.breadcrumbs.slice(0, index);
-    switchTab(crumb.tab);
+    // Set tab state without triggering a separate refreshTable
+    const tab = crumb.tab;
+    state.activeTab = tab;
+    document.querySelectorAll('.tab').forEach(b => {
+        b.classList.toggle('active', b.dataset.tab === tab);
+    });
     updateBreadcrumb();
     refresh();
 }
@@ -1036,7 +1045,11 @@ function clearFilters() {
     state.filters = {};
     state.breadcrumbs = [];
     updateBreadcrumb();
-    switchTab('overview');
+    // Set tab state without triggering a separate refreshTable
+    state.activeTab = 'overview';
+    document.querySelectorAll('.tab').forEach(b => {
+        b.classList.toggle('active', b.dataset.tab === 'overview');
+    });
     refresh();
 }
 

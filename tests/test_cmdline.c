@@ -33,6 +33,7 @@ static void test_backend_type_names(void)
         { PGWT_BT_LOGGER,           "logger" },
         { PGWT_BT_PARALLEL_WORKER,  "parallel_worker" },
         { PGWT_BT_IO_WORKER,        "io_worker" },
+        { PGWT_BT_BG_WORKER,       "bg_worker" },
         { PGWT_BT_UNKNOWN,          "unknown" },
     };
 
@@ -48,8 +49,8 @@ static void test_enum_coverage(void)
 {
     printf("--- Enum Coverage ---\n");
     /* PGWT_BT_UNKNOWN should be the last enum value */
-    CHECK(PGWT_BT_UNKNOWN == 15,
-          "PGWT_BT_UNKNOWN should be 15, got %d", PGWT_BT_UNKNOWN);
+    CHECK(PGWT_BT_UNKNOWN == 16,
+          "PGWT_BT_UNKNOWN should be 16, got %d", PGWT_BT_UNKNOWN);
     /* All values 0..PGWT_BT_UNKNOWN should return non-NULL */
     for (int i = 0; i <= PGWT_BT_UNKNOWN; i++) {
         const char *name = pgwt_backend_type_name((enum pgwt_backend_type)i);

@@ -11,16 +11,25 @@
 #ifdef PGWT_SERVER
 static uint32_t pgwt_duration_to_bucket(uint64_t ns)
 {
-    /* Log2 bucket: each bucket doubles in microseconds.
+    /* Hardcoded log2 buckets matching daemon (map_reader.c) exactly.
      * 0: <1us, 1: 1-2us, ..., 15: >=16ms */
-    if (ns < 1000) return 0;
     uint64_t us = ns / 1000;
-    uint32_t b = 0;
-    while (us > 1 && b < HISTOGRAM_BUCKETS - 1) {
-        us >>= 1;
-        b++;
-    }
-    return b;
+    if (us < 1)     return 0;
+    if (us < 2)     return 1;
+    if (us < 4)     return 2;
+    if (us < 8)     return 3;
+    if (us < 16)    return 4;
+    if (us < 32)    return 5;
+    if (us < 64)    return 6;
+    if (us < 128)   return 7;
+    if (us < 256)   return 8;
+    if (us < 512)   return 9;
+    if (us < 1024)  return 10;
+    if (us < 2048)  return 11;
+    if (us < 4096)  return 12;
+    if (us < 8192)  return 13;
+    if (us < 16384) return 14;
+    return 15;
 }
 #else
 #include "map_reader.h"     /* pgwt_duration_to_bucket */

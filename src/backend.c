@@ -233,6 +233,12 @@ int pgwt_handle_init(struct pgwt_daemon *d, pid_t pid, uint64_t addr)
         be->bootstrap_fd = -1;
     }
 
+    /* Close previous watchpoint if re-initializing */
+    if (be->wp_fd >= 0) {
+        pgwt_close_watchpoint(be->wp_fd);
+        be->wp_fd = -1;
+    }
+
     /* Attach real watchpoint on PGPROC->wait_event_info */
     be->wp_addr = addr;
     int wp_prog_fd = bpf_program__fd(d->skel->progs.on_watchpoint);

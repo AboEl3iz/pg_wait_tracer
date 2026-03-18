@@ -17,14 +17,25 @@
 #ifdef PGWT_SERVER
 static uint32_t compute_duration_to_bucket(uint64_t ns)
 {
-    if (ns < 1000) return 0;
+    /* Hardcoded log2 buckets matching daemon (map_reader.c) exactly.
+     * 0: <1us, 1: 1-2us, ..., 15: >=16ms */
     uint64_t us = ns / 1000;
-    uint32_t b = 0;
-    while (us > 1 && b < HISTOGRAM_BUCKETS - 1) {
-        us >>= 1;
-        b++;
-    }
-    return b;
+    if (us < 1)     return 0;
+    if (us < 2)     return 1;
+    if (us < 4)     return 2;
+    if (us < 8)     return 3;
+    if (us < 16)    return 4;
+    if (us < 32)    return 5;
+    if (us < 64)    return 6;
+    if (us < 128)   return 7;
+    if (us < 256)   return 8;
+    if (us < 512)   return 9;
+    if (us < 1024)  return 10;
+    if (us < 2048)  return 11;
+    if (us < 4096)  return 12;
+    if (us < 8192)  return 13;
+    if (us < 16384) return 14;
+    return 15;
 }
 #else
 #include "map_reader.h"
@@ -817,10 +828,11 @@ void pgwt_compute_heatmap(const struct pgwt_trace_event *events, int count,
         bucket_ns = 1;
 
     int actual_buckets = (int)((range_ns + bucket_ns - 1) / bucket_ns);
-    int grid_size = actual_buckets * HISTOGRAM_BUCKETS;
+    if (actual_buckets > 100000) actual_buckets = 100000;  /* sanity clamp */
+    size_t grid_size = (size_t)actual_buckets * HISTOGRAM_BUCKETS;
 
     uint64_t *grid = calloc(grid_size, sizeof(uint64_t));
-    uint64_t *times = malloc(actual_buckets * sizeof(uint64_t));
+    uint64_t *times = malloc((size_t)actual_buckets * sizeof(uint64_t));
     if (!grid || !times) {
         free(grid);
         free(times);
@@ -853,7 +865,7 @@ void pgwt_compute_heatmap(const struct pgwt_trace_event *events, int count,
 
     /* Find max cell for color scaling */
     uint64_t max_count = 0;
-    for (int i = 0; i < grid_size; i++) {
+    for (size_t i = 0; i < grid_size; i++) {
         if (grid[i] > max_count)
             max_count = grid[i];
     }
@@ -1498,15 +1510,19 @@ static int tq_summary_visitor(const struct pgwt_summary_accum *rec, void *arg)
         }
         ctx->ht[h].count += sq->count;
         ctx->ht[h].total_ns += effective_ns;
-        /* Per-class breakdown */
-        int has_class_ns = 0;
-        for (int c = 0; c < PGWT_NUM_CLASSES; c++) {
-            ctx->ht[h].class_ns[c] += sq->class_ns[c];
-            if (sq->class_ns[c] > 0) has_class_ns = 1;
-        }
-        if (!has_class_ns) {
-            int cls = pgwt_wait_class_index(sq->top_wait_id);
-            ctx->ht[h].class_ns[cls] += sq->total_ns;
+        /* Per-class breakdown — when filtering, only accumulate the filtered class */
+        if (filter_cls >= 0) {
+            ctx->ht[h].class_ns[filter_cls] += effective_ns;
+        } else {
+            int has_class_ns = 0;
+            for (int c = 0; c < PGWT_NUM_CLASSES; c++) {
+                ctx->ht[h].class_ns[c] += sq->class_ns[c];
+                if (sq->class_ns[c] > 0) has_class_ns = 1;
+            }
+            if (!has_class_ns) {
+                int cls = pgwt_wait_class_index(sq->top_wait_id);
+                ctx->ht[h].class_ns[cls] += sq->total_ns;
+            }
         }
         if (rec_top_wait_ns > ctx->ht[h].top_wait_ns) {
             ctx->ht[h].top_wait_id = rec_top_wait_id;

@@ -156,7 +156,7 @@ def test_backend_types(pm_pid):
         "client", "checkpointer", "bgwriter", "walwriter",
         "autovac_launcher", "autovac_worker", "walsender", "walreceiver",
         "startup", "logical_launcher", "logical_worker", "archiver",
-        "logger", "parallel_worker", "io_worker", "unknown",
+        "logger", "parallel_worker", "io_worker", "bg_worker", "unknown",
     }
 
     for s in tracer_sessions:

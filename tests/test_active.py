@@ -328,7 +328,7 @@ def test_backend_types(pm_pid):
                    'autovac_launcher', 'autovac_worker', 'walsender',
                    'walreceiver', 'startup', 'logical_launcher',
                    'logical_worker', 'archiver', 'logger',
-                   'parallel_worker', 'io_worker', 'unknown'}
+                   'parallel_worker', 'io_worker', 'bg_worker', 'unknown'}
 
     types_found = {r['type'] for r in rows}
     all_known = types_found.issubset(known_types)

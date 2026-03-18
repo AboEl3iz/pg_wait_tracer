@@ -31,10 +31,11 @@ static int count_lines(const char *path)
     return n;
 }
 
-/* Next power-of-2 >= n, minimum 256 */
+/* Next power-of-2 >= n, minimum 256, clamped to 1<<30 */
 static int next_pow2(int n)
 {
     if (n < 256) return 256;
+    if (n > (1 << 30)) return 1 << 30;
     int p = 256;
     while (p < n) p <<= 1;
     return p;
@@ -1124,13 +1125,13 @@ static void handle_session_timeline(struct pgwt_server *srv, struct pgwt_request
 
         if (pending[pidx].active) {
             /* Can we merge? Same class + gap within threshold */
-            uint64_t gap = (ev->timestamp_ns > pending[pidx].end_ns) ?
-                           (ev->timestamp_ns - pending[pidx].end_ns) : 0;
+            uint64_t ev_start = ev->timestamp_ns - ev->duration_ns;
+            uint64_t gap = (ev_start > pending[pidx].end_ns) ?
+                           (ev_start - pending[pidx].end_ns) : 0;
             if (pending[pidx].class_idx == cls && gap <= coalesce_ns) {
                 /* Extend the pending bar */
-                uint64_t ev_end = ev->timestamp_ns + ev->duration_ns;
-                if (ev_end > pending[pidx].end_ns)
-                    pending[pidx].end_ns = ev_end;
+                if (ev->timestamp_ns > pending[pidx].end_ns)
+                    pending[pidx].end_ns = ev->timestamp_ns;
                 continue;
             }
             /* Different class or too big a gap — flush */
@@ -1141,8 +1142,8 @@ static void handle_session_timeline(struct pgwt_server *srv, struct pgwt_request
         /* Start new pending bar */
         pending[pidx].active = 1;
         pending[pidx].pid = ev->pid;
-        pending[pidx].start_ns = ev->timestamp_ns;
-        pending[pidx].end_ns = ev->timestamp_ns + ev->duration_ns;
+        pending[pidx].start_ns = ev->timestamp_ns - ev->duration_ns;
+        pending[pidx].end_ns = ev->timestamp_ns;
         pending[pidx].event_id = ev->old_event;
         pending[pidx].class_idx = cls;
         pending[pidx].query_id = ev->query_id;
