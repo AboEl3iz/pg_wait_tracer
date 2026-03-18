@@ -598,12 +598,12 @@ def test_query_event_mode_b(pm_pid):
 
     output = run_tracer(pm_pid, interval=1, count=5, windows="1s,3s",
                         view="query_event",
-                        extra_args=["--event", "Client:ClientRead"])
+                        extra_args=["--event", "IO:DataFileRead"])
 
     pgbench.wait()
 
     # Header mentions the event
-    check("Top Queries for Client:ClientRead" in output,
+    check("Top Queries for IO:DataFileRead" in output,
           "query_event Mode B multi-window has correct header")
 
     # Section headers present

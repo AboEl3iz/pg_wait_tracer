@@ -529,5 +529,6 @@ void pgwt_event_full_name(uint32_t wei, char *buf, size_t bufsz)
 
 int pgwt_is_idle_event(uint32_t wei)
 {
-    return WE_CLASS(wei) == PG_WAIT_ACTIVITY;
+    return WE_CLASS(wei) == PG_WAIT_ACTIVITY ||
+           wei == PG_WAIT_CLIENT_READ;
 }

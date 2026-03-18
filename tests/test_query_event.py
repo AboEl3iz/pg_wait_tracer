@@ -306,7 +306,7 @@ def test_mode_b(pm_pid):
     tracer = subprocess.Popen(
         [TRACER, "--pid", str(pm_pid),
          "--interval", "8", "--duration", "12",
-         "--view", "query_event", "--event", "Client:ClientRead"],
+         "--view", "query_event", "--event", "IO:DataFileRead"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE
     )
 
@@ -321,7 +321,7 @@ def test_mode_b(pm_pid):
     output = STRIP_ANSI.sub('', stdout.decode('utf-8', errors='replace'))
 
     # Header should mention the event
-    check("Top Queries for Client:ClientRead" in output,
+    check("Top Queries for IO:DataFileRead" in output,
           "Mode B header contains event name")
 
     # % Event column present

@@ -10,7 +10,7 @@ import sys
 sys.path.insert(0, os.path.dirname(__file__))
 from server_harness import (
     ServerHarness, generate_traces, cleanup_traces, TestRunner,
-    CPU, IO_DATA_FILE_READ, ACTIVITY_IDLE,
+    CPU, IO_DATA_FILE_READ, ACTIVITY_IDLE, CLIENT_READ,
 )
 
 BASE_TS = 10_000_000_000_000
@@ -22,8 +22,9 @@ def build_scenario():
     PID 1000: IO:Read 5ms (active)
     PID 1001: Activity:Idle 50ms (should be excluded)
     PID 1002: CPU 3ms (active)
+    PID 1003: Client:ClientRead 20ms (idle — excluded from DB Time)
 
-    Expected DB Time = 5 + 3 = 8ms (not 58ms)
+    Expected DB Time = 5 + 3 = 8ms (not 78ms)
     """
     events = [
         {"pid": 1000, "ts": BASE_TS + 5_000_000, "dur": 5_000_000,
@@ -32,6 +33,8 @@ def build_scenario():
          "old": ACTIVITY_IDLE, "new": CPU, "qid": 0},
         {"pid": 1002, "ts": BASE_TS + 3_000_000, "dur": 3_000_000,
          "old": CPU, "new": IO_DATA_FILE_READ, "qid": 200},
+        {"pid": 1003, "ts": BASE_TS + 20_000_000, "dur": 20_000_000,
+         "old": CLIENT_READ, "new": CPU, "qid": 0},
     ]
 
     return {
@@ -39,6 +42,7 @@ def build_scenario():
             {"pid": 1000, "type": "client", "user": "test", "db": "testdb"},
             {"pid": 1001, "type": "client", "user": "test", "db": "testdb"},
             {"pid": 1002, "type": "client", "user": "test", "db": "testdb"},
+            {"pid": 1003, "type": "client", "user": "test", "db": "testdb"},
         ],
         "queries": [
             {"id": 100, "text": "SELECT 1"},
@@ -65,21 +69,23 @@ def main():
             t.check_approx(rows["DB Time"]["ms"], 8.0, 0.001,
                            "DB Time = 8ms (not 58ms)")
 
-            # top_events should not contain Activity:Idle (or if present, total=0)
+            # top_events should not contain idle events
             print("--- top_events excludes idle ---")
             resp_ev = srv.query("top_events")
             idle_rows = [r for r in resp_ev.get("rows", [])
                          if "Activity" in r.get("name", "")
-                         or "Idle" in r.get("name", "")]
+                         or "Idle" in r.get("name", "")
+                         or r.get("name", "") == "Client:ClientRead"]
             t.check(len(idle_rows) == 0,
-                    f"No Activity/Idle events in top_events (found {len(idle_rows)})")
+                    f"No idle events in top_events (found {len(idle_rows)})")
 
             # session_timeline should not show idle bars
             print("--- timeline excludes idle ---")
             resp_tl = srv.query("session_timeline")
             idle_bars = [e for e in resp_tl.get("events", [])
                          if "Activity" in e.get("n", "")
-                         or "Idle" in e.get("n", "")]
+                         or "Idle" in e.get("n", "")
+                         or e.get("n", "") == "Client:ClientRead"]
             t.check(len(idle_bars) == 0,
                     f"No idle bars in timeline (found {len(idle_bars)})")
 

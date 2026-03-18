@@ -108,8 +108,11 @@ struct pgwt_query_event_stats *pgwt_get_or_create_query_event(
 void pgwt_update_time_model(struct pgwt_time_model *tm, uint32_t event,
                              uint64_t duration_ns)
 {
-    if (event == 0) {
+    if (pgwt_is_idle_event(event)) {
+        tm->activity_time_ns += duration_ns;
+    } else if (event == 0) {
         tm->cpu_time_ns += duration_ns;
+        tm->db_time_ns += duration_ns;
     } else {
         int cls = WE_CLASS(event);
         switch (cls) {
@@ -123,9 +126,8 @@ void pgwt_update_time_model(struct pgwt_time_model *tm, uint32_t event,
         case PG_WAIT_EXTENSION: tm->extension_time_ns += duration_ns; break;
         case PG_WAIT_ACTIVITY:  tm->activity_time_ns += duration_ns; break;
         }
-    }
-    if (!pgwt_is_idle_event(event))
         tm->db_time_ns += duration_ns;
+    }
 }
 
 uint32_t pgwt_duration_to_bucket(uint64_t ns)

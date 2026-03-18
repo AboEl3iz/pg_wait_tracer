@@ -31,6 +31,7 @@ struct pgwt_pid_state {
     u32 last_event;     /* previous wait_event_info value (0 = on CPU) */
     u64 last_ts;        /* ktime_ns of last transition */
     u64 last_query_id;  /* query_id active during last_event */
+    u64 be_entry_ptr;   /* cached PgBackendStatus* (avoids 1 probe_read per event) */
 };
 
 /* ── Lifecycle Events (ring buffer) ───────────────────────── */
@@ -75,5 +76,8 @@ struct pgwt_trace_event {
 
 #define WE_CLASS(x)  (((x) >> 24) & 0xFF)
 #define WE_EVENT(x)  ((x) & 0x00FFFFFF)
+
+/* Client:ClientRead — idle between queries (like Oracle's SQL*Net message from client) */
+#define PG_WAIT_CLIENT_READ  ((PG_WAIT_CLIENT << 24) | 0x000000)
 
 #endif /* PG_WAIT_TRACER_H */

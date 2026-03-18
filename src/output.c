@@ -810,7 +810,8 @@ static void print_query_event_multi(struct pgwt_daemon *d)
             }
         } else if (mode_c) {
             for (int i = 0; i < deltas[w].num_query_events; i++)
-                if (deltas[w].query_events[i].query_id == d->query_id_filter)
+                if (deltas[w].query_events[i].query_id == d->query_id_filter &&
+                    !pgwt_is_idle_event(deltas[w].query_events[i].wait_event))
                     denom_ns += deltas[w].query_events[i].total_ns;
         }
 
@@ -964,7 +965,8 @@ void pgwt_print_query_event(struct pgwt_daemon *d)
         }
     } else if (mode_c) {
         for (int i = 0; i < n; i++)
-            if (sorted[i].query_id == d->query_id_filter)
+            if (sorted[i].query_id == d->query_id_filter &&
+                !pgwt_is_idle_event(sorted[i].wait_event))
                 denom_ns += sorted[i].total_ns;
     }
 

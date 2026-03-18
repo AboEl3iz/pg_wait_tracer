@@ -46,18 +46,32 @@ struct {
 
 /* ── Helpers ──────────────────────────────────────────────── */
 
-/* Read the current query_id from PgBackendStatus via MyBEEntry.
- * Double-dereference: my_be_entry_addr → PgBackendStatus* → st_query_id. */
-static __always_inline u64 read_query_id(void)
+/* Read query_id using cached be_entry pointer (1 probe_read instead of 2).
+ * Falls back to double-deref if cache is empty. */
+static __always_inline u64 read_query_id_cached(u64 cached_be_entry)
 {
-    if (!my_be_entry_addr || !st_query_id_offset) return 0;
-    u64 be_entry = 0;
-    bpf_probe_read_user(&be_entry, sizeof(be_entry), (void *)my_be_entry_addr);
-    if (!be_entry) return 0;
+    if (!st_query_id_offset) return 0;
+    u64 be_entry = cached_be_entry;
+    if (!be_entry) {
+        if (!my_be_entry_addr) return 0;
+        bpf_probe_read_user(&be_entry, sizeof(be_entry),
+                             (void *)my_be_entry_addr);
+        if (!be_entry) return 0;
+    }
     u64 qid = 0;
     bpf_probe_read_user(&qid, sizeof(qid),
                          (void *)(be_entry + st_query_id_offset));
     return qid;
+}
+
+/* Resolve and return PgBackendStatus* for caching in state_map. */
+static __always_inline u64 resolve_be_entry(void)
+{
+    if (!my_be_entry_addr) return 0;
+    u64 be_entry = 0;
+    bpf_probe_read_user(&be_entry, sizeof(be_entry),
+                         (void *)my_be_entry_addr);
+    return be_entry;
 }
 
 /* Read the current wait_event_info value via double-dereference.
@@ -82,13 +96,17 @@ SEC("perf_event")
 int on_watchpoint(struct bpf_perf_event_data *ctx)
 {
     u32 pid = bpf_get_current_pid_tgid() >> 32;
-    u64 now = bpf_ktime_get_ns();
     u32 new_event = read_wait_event();
-
-    u64 cur_query_id = read_query_id();
 
     struct pgwt_pid_state *st = bpf_map_lookup_elem(&state_map, &pid);
     if (st) {
+        /* Skip redundant writes — watchpoint fires even if value unchanged */
+        if (new_event == st->last_event)
+            return 0;
+
+        u64 now = bpf_ktime_get_ns();
+        u64 cur_query_id = read_query_id_cached(st->be_entry_ptr);
+
         /* Compute duration of PREVIOUS state */
         u64 duration = now - st->last_ts;
 
@@ -113,8 +131,9 @@ int on_watchpoint(struct bpf_perf_event_data *ctx)
         /* First event for this PID — initialize, no accumulation */
         struct pgwt_pid_state new_st = {
             .last_event = new_event,
-            .last_ts = now,
-            .last_query_id = cur_query_id,
+            .last_ts = bpf_ktime_get_ns(),
+            .last_query_id = 0,
+            .be_entry_ptr = resolve_be_entry(),
         };
         bpf_map_update_elem(&state_map, &pid, &new_st, BPF_ANY);
     }
