@@ -168,6 +168,13 @@ else
     fi
 fi
 
+# Step 5: Web UI tests (needs playwright + websockets, no root needed)
+if python3 -c "import playwright, websockets" 2>/dev/null; then
+    run_test "test_web_ui" python3 "$SCRIPT_DIR/test_web_ui.py"
+else
+    skip_test "test_web_ui" "playwright or websockets not installed"
+fi
+
 # Summary
 echo ""
 echo "════════════════════════════════════════"
