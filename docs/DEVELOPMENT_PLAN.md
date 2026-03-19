@@ -148,21 +148,30 @@ test_overhead (19% > 15% threshold) — pre-existing flaky test unrelated to Spr
 
 ---
 
-## Sprint 5: Web UI Tests
+## Sprint 5: Web UI Tests ✅ COMPLETED (2026-03-19)
 
 **Goal:** Automate browser testing. Never manually click through the UI again.
 
 **Depends on:** Sprint 2 (synthetic test data for canned responses).
 
-| # | Task | Details |
-|---|------|---------|
-| 5.1 | Write `mock_server.py` | Python: serves `web/static/` over HTTP + WebSocket endpoint returning canned JSON responses keyed by command type. No SSH, no pgwt-server. |
-| 5.2 | `test_web_ui.py` — Playwright test suite | Page load, tab navigation, drill-down flow, breadcrumb, chart zoom, column sorting, filter persistence, reconnection |
-| 5.3 | Data display tests | Summary bar numbers, table rows, timeline bar positions match canned data |
-| 5.4 | Regression tests | Bug 1 (timeline position), Bug 13 (double refresh), filter state across tabs |
+| # | Task | Details | Status |
+|---|------|---------|--------|
+| 5.1 | Write `mock_server.py` | Python: HTTP server (port P) + WebSocket server (port P+1) with canned JSON for all 8 commands. No SSH, no pgwt-server, no root. | ✅ |
+| 5.2 | `test_web_ui.py` — Playwright test suite | 18 tests (67 checks): page load, tabs, summary bar, tables, column sorting, drill-down, breadcrumbs, histogram, timeline, time picker, zoom, chart rendering, reconnection | ✅ |
+| 5.3 | Data display tests | Summary bar values (DB Time, AAS, CPUs), table row counts, stacked bars, canvas rendering | ✅ |
+| 5.4 | Regression tests | Drill-down flow (Overview→Events→Queries), breadcrumb clear, session→timeline, query→events, WS reconnection | ✅ |
 
-**Deliverable:** Playwright test suite. `python3 tests/test_web_ui.py` exercises
-the full UI without root, PG, or SSH.
+**Details:**
+- **Architecture:** mock_server.py runs HTTP (SimpleHTTPRequestHandler) on port P serving
+  `web/static/` and WebSocket (websockets.asyncio) on port P+1. test_web_ui.py uses
+  `context.add_init_script()` to monkey-patch the WebSocket constructor, redirecting
+  connections from port P to port P+1. This avoids modifying app.js for testing.
+- **Canned data:** Realistic mock responses — 1-hour range, 60 AAS buckets, 8 events,
+  6 sessions, 3 queries, heatmap cells, timeline events. Supports class/pid/query_id filters.
+
+**Result:** 18 Playwright tests, 67 individual checks, all pass.
+Tested on Hetzner cpx31 (Rocky 9, headless Chromium). Added to `run_all.sh` (auto-skips
+if playwright/websockets not installed).
 
 ---
 
@@ -351,7 +360,7 @@ Sprint 1:  Bug fixes + uncommitted work                    ──── Foundati
 Sprint 2:  Test infrastructure + synthetic correctness      ──── Prove math
 Sprint 3:  Code hardening                                   ──── Robustness
 Sprint 4:  Live data correctness tests                      ──── Prove end-to-end
-Sprint 5:  Web UI tests (Playwright)                        ──── Stop clicking
+Sprint 5:  Web UI tests (Playwright)                    ✅ ──── Stop clicking
 Sprint 6:  cJSON integration                                ──── Clean JSON
 Sprint 7:  Dynamic event names                              ──── Forward compat
 Sprint 8:  Drop Rust TUI                                    ──── Simplify

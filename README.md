@@ -908,6 +908,92 @@ Workflow for finding problematic queries:
 5. Correlate: a query with high `IO:DataFileRead` time may need better indexes;
    a query with high `Lock:Transaction` time is hitting contention.
 
+## Testing
+
+The test suite has 5 layers. Running the full suite requires root access and a
+running PostgreSQL instance. Individual layers can be run independently.
+
+### Quick start
+
+```bash
+# Run everything (root + running PG required for integration tests)
+sudo tests/run_all.sh
+
+# Auto-detect a specific PG version when multiple are installed
+sudo tests/run_all.sh --pg-version 18
+```
+
+### Test layers
+
+| Layer | Tests | Requires | What it proves |
+|-------|-------|----------|----------------|
+| **C unit tests** | `test_wait_event`, `test_cmdline`, `test_bucket` | `make -C tests` | Event ID parsing, CLI parser, histogram buckets |
+| **Synthetic data** | `test_data_*.py` (9 suites) | `pgwt-server` + `gen_test_traces` | Compute math is correct (0% tolerance) |
+| **CLI integration** | `test_cli.sh`, `test_lifecycle.sh` | Root + PG | CLI flags, daemon lifecycle |
+| **Live correctness** | `test_accuracy.py`, `test_percentage.py`, `test_aas_accuracy.py`, etc. (14 suites) | Root + PG + pgbench | BPF → file → compute pipeline against real workloads |
+| **Web UI** | `test_web_ui.py` | Python + playwright + websockets | Browser rendering, drill-down, reconnection (67 checks) |
+
+### Running individual layers
+
+```bash
+# C unit tests (no root needed)
+make -C tests
+tests/test_wait_event
+tests/test_cmdline
+tests/test_bucket
+
+# Synthetic data tests (no root, no PG — needs pgwt-server built)
+make                    # builds pgwt-server
+make -C tests           # builds gen_test_traces
+python3 tests/test_data_time_model.py
+python3 tests/test_data_aas.py
+# ... etc.
+
+# Live integration tests (root + running PG)
+sudo python3 tests/test_accuracy.py
+sudo python3 tests/test_aas_accuracy.py --pid <POSTMASTER_PID>
+
+# Web UI tests (no root, no PG, no SSH)
+python3 tests/test_web_ui.py
+```
+
+### Web UI test setup
+
+The web UI tests use a mock server (`tests/mock_server.py`) that serves
+static files and canned WebSocket responses — no database or pgwt binary
+needed.
+
+**Dependencies** (install on the test machine only):
+
+```bash
+pip install playwright websockets
+playwright install chromium
+```
+
+**What it tests:**
+- Page load and WebSocket connection
+- All 6 tabs (Overview, Events, Sessions, Queries, Histogram, Timeline)
+- Summary bar metrics (DB Time, AAS, CPUs)
+- Table rendering with correct row counts and data
+- Column sorting with direction indicators
+- Drill-down flow: Overview → Events → Queries (with breadcrumb)
+- Breadcrumb navigation and filter clear
+- Session → Timeline drill-down
+- Query → Events drill-down
+- Time picker and zoom out
+- ECharts canvas rendering (AAS chart, heatmap, timeline)
+- WebSocket reconnection after server restart
+
+**Running:**
+
+```bash
+python3 tests/test_web_ui.py
+# Output: 67/67 tests passed
+```
+
+The mock server starts automatically on port 18799 (HTTP) and 18800 (WS),
+runs all 18 tests, then shuts down. No cleanup needed.
+
 ## How It Works
 
 pg_wait_tracer uses a **CPU hardware debug register** (watchpoint) to trap
