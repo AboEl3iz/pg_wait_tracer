@@ -158,8 +158,8 @@ test_overhead (19% > 15% threshold) — pre-existing flaky test unrelated to Spr
 |---|------|---------|--------|
 | 5.1 | Write `mock_server.py` | Python: HTTP server (port P) + WebSocket server (port P+1) with canned JSON for all 8 commands. No SSH, no pgwt-server, no root. | ✅ |
 | 5.2 | `test_web_ui.py` — Playwright test suite | 18 tests (67 checks): page load, tabs, summary bar, tables, column sorting, drill-down, breadcrumbs, histogram, timeline, time picker, zoom, chart rendering, reconnection | ✅ |
-| 5.3 | Data display tests | Summary bar values (DB Time, AAS, CPUs), table row counts, stacked bars, canvas rendering | ✅ |
-| 5.4 | Regression tests | Drill-down flow (Overview→Events→Queries), breadcrumb clear, session→timeline, query→events, WS reconnection | ✅ |
+| 5.3 | Data display tests | Exact summary bar values (DB Time=12.5s, Wall=3600.0s, AAS=3.47, Idle=45.0s, CPUs=4), exact event/session/query cell values matching canned data, timeline bar positions with duration verification | ✅ |
+| 5.4 | Regression tests | Bug 1 (timeline bars start at `s`, not `s+d`, duration=50s matches canned data), Bug 13 (drill-down sends exactly 1 aas + 1 table request, not 2), filter persistence across manual tab switches (4 tabs verified) | ✅ |
 
 **Details:**
 - **Architecture:** mock_server.py runs HTTP (SimpleHTTPRequestHandler) on port P serving
@@ -169,7 +169,7 @@ test_overhead (19% > 15% threshold) — pre-existing flaky test unrelated to Spr
 - **Canned data:** Realistic mock responses — 1-hour range, 60 AAS buckets, 8 events,
   6 sessions, 3 queries, heatmap cells, timeline events. Supports class/pid/query_id filters.
 
-**Result:** 18 Playwright tests, 67 individual checks, all pass.
+**Result:** 25 Playwright tests, 98 individual checks, all pass.
 Tested on Hetzner cpx31 (Rocky 9, headless Chromium). Added to `run_all.sh` (auto-skips
 if playwright/websockets not installed).
 
