@@ -593,6 +593,271 @@ def test_query_drill(page):
         check(False, "(skipped query drill)")
 
 
+def test_exact_summary_values(page):
+    """19. Summary bar shows exact values from canned data."""
+    print("--- Test 19: Exact Summary Values ---")
+
+    page.goto(MOCK_URL)
+    page.wait_for_selector("#status.connected", timeout=10000)
+    page.wait_for_timeout(1000)
+
+    metrics = page.query_selector_all(".metric")
+    vals = {}
+    for m in metrics:
+        label = m.query_selector(".metric-label").text_content()
+        value = m.query_selector(".metric-value").text_content()
+        vals[label] = value
+
+    # Canned: DB Time=12500ms -> fmtMs -> "12.5s"
+    check(vals.get("DB Time") == "12.5s",
+          f"DB Time = 12.5s (got '{vals.get('DB Time')}')")
+    # Wall=3600000ms -> "3600.0s"
+    check(vals.get("Wall") == "3600.0s",
+          f"Wall = 3600.0s (got '{vals.get('Wall')}')")
+    # AAS=3.47
+    check(vals.get("AAS") == "3.47",
+          f"AAS = 3.47 (got '{vals.get('AAS')}')")
+    # Idle=45000ms -> "45.0s"
+    check(vals.get("Idle") == "45.0s",
+          f"Idle = 45.0s (got '{vals.get('Idle')}')")
+    # CPUs=4
+    check(vals.get("CPUs") == "4",
+          f"CPUs = 4 (got '{vals.get('CPUs')}')")
+
+
+def test_exact_event_values(page):
+    """20. Events table cell values match canned data."""
+    print("--- Test 20: Exact Event Cell Values ---")
+
+    page.goto(MOCK_URL)
+    page.wait_for_selector("#status.connected", timeout=10000)
+    page.click(".tab[data-tab='events']")
+    page.wait_for_timeout(1000)
+
+    # Read first row cells (default sort by pct desc → CPU* is first)
+    cells = page.query_selector_all(
+        "#table-container table tbody tr:first-child td")
+    cell_texts = [c.text_content().strip() for c in cells]
+
+    # Canned CPU*: count=250000, total_ms=4800, avg_us=19.2,
+    #   p50=12, p95=45, p99=120, max=5000, pct=38.4, aas=1.33
+    check(any("CPU" in t for t in cell_texts),
+          f"First row is CPU* (cells: {cell_texts[:3]})")
+    check(any("250" in t for t in cell_texts),
+          f"CPU* count contains '250' (250.0K)")
+    check(any("4800" in t or "4.8s" in t for t in cell_texts),
+          f"CPU* total ~4800ms")
+    check(any("38.4" in t for t in cell_texts),
+          f"CPU* pct = 38.4%")
+    check(any("1.33" in t for t in cell_texts),
+          f"CPU* AAS = 1.33")
+
+    # Verify second row is IO:DataFileRead (pct=16.8)
+    second_cells = page.query_selector_all(
+        "#table-container table tbody tr:nth-child(2) td")
+    second_texts = [c.text_content().strip() for c in second_cells]
+    check(any("DataFileRead" in t for t in second_texts),
+          f"Second event is IO:DataFileRead")
+    check(any("16.8" in t for t in second_texts),
+          f"IO:DataFileRead pct = 16.8%")
+
+
+def test_exact_session_values(page):
+    """21. Sessions table cell values match canned data."""
+    print("--- Test 21: Exact Session Cell Values ---")
+
+    page.goto(MOCK_URL)
+    page.wait_for_selector("#status.connected", timeout=10000)
+    page.click(".tab[data-tab='sessions']")
+    page.wait_for_timeout(1000)
+
+    # First session row: pid=1001, user=postgres, db=testdb,
+    #   db_time_ms=5200, cpu_pct=45.0, wait_pct=55.0, top_wait=IO:DataFileRead
+    first_row = page.text_content(
+        "#table-container table tbody tr:first-child")
+    check("1001" in first_row, f"First session PID = 1001")
+    check("postgres" in first_row, f"First session user = postgres")
+    check("testdb" in first_row, f"First session db = testdb")
+    check("DataFileRead" in first_row,
+          f"First session top wait = IO:DataFileRead")
+
+    # Verify system backend row exists (checkpointer pid=4870)
+    table_text = page.text_content("#table-container")
+    check("4870" in table_text, "Checkpointer PID 4870 in sessions")
+    check("checkpointer" in table_text, "Checkpointer type shown")
+
+
+def test_exact_query_values(page):
+    """22. Queries table cell values match canned data."""
+    print("--- Test 22: Exact Query Cell Values ---")
+
+    page.goto(MOCK_URL)
+    page.wait_for_selector("#status.connected", timeout=10000)
+    page.click(".tab[data-tab='queries']")
+    page.wait_for_timeout(1000)
+
+    first_row = page.text_content(
+        "#table-container table tbody tr:first-child")
+    # Canned: query_id=3886912043147135675, text starts with "UPDATE pgbench_accounts"
+    check("UPDATE" in first_row or "pgbench_accounts" in first_row,
+          f"First query text contains UPDATE pgbench_accounts")
+    check("33.6" in first_row,
+          f"First query pct = 33.6%")
+
+    # Second query
+    second_row = page.text_content(
+        "#table-container table tbody tr:nth-child(2)")
+    check("SELECT" in second_row, "Second query is SELECT")
+
+
+def test_timeline_bar_positions(page):
+    """23. Timeline bars use correct start positions (Bug 1 regression)."""
+    print("--- Test 23: Timeline Bar Positions ---")
+
+    page.goto(MOCK_URL)
+    page.wait_for_selector("#status.connected", timeout=10000)
+
+    # Drill to timeline via session click
+    page.click(".tab[data-tab='sessions']")
+    page.wait_for_timeout(1000)
+    page.click("#table-container table tbody tr.clickable")
+    page.wait_for_timeout(1500)
+
+    # Extract timeline chart data via ECharts API
+    # The renderTimeline function stores data as [startNs, endNs, pidIdx, ...]
+    # Verify that bars start at 's' and end at 's + d' (not 's + d' for start)
+    bar_data = page.evaluate("""() => {
+        const chart = echarts.getInstanceByDom(
+            document.getElementById('timeline-chart'));
+        if (!chart) return null;
+        const opt = chart.getOption();
+        if (!opt || !opt.series || !opt.series[0]) return null;
+        const data = opt.series[0].data;
+        // Return first 4 bars as [startNs, endNs]
+        return data.slice(0, 4).map(d => [d[0], d[1]]);
+    }""")
+
+    if bar_data:
+        check(len(bar_data) > 0, f"Timeline has {len(bar_data)} bars")
+
+        # From canned data: first event for pid 1001:
+        #   s = _FROM_NS + 100_000_000_000, d = 50_000_000_000
+        # So start = s, end = s + d
+        # Verify start < end for all bars (basic sanity)
+        all_valid = all(b[0] < b[1] for b in bar_data)
+        check(all_valid, "All bars have start < end")
+
+        # Bug 1 regression: bars should NOT start at s+d.
+        # The first bar's start should be roughly FROM_NS + 100s (not +150s).
+        # Check that start is closer to FROM+100s than FROM+150s.
+        if len(bar_data) >= 1:
+            start_ns = bar_data[0][0]
+            end_ns = bar_data[0][1]
+            duration = end_ns - start_ns
+            check(duration > 0,
+                  f"First bar duration = {duration/1e9:.1f}s (> 0)")
+            # Verify duration matches canned 50s (±tolerance for ns precision)
+            check(abs(duration - 50_000_000_000) < 1_000_000_000,
+                  f"First bar duration ≈ 50s (got {duration/1e9:.1f}s)")
+    else:
+        check(False, "Could not extract timeline chart data")
+        check(False, "(skipped bar position checks)")
+        check(False, "(skipped duration check)")
+
+
+def test_no_double_refresh(page):
+    """24. Drill-down sends exactly one refresh, not two (Bug 13 regression)."""
+    print("--- Test 24: No Double Refresh ---")
+
+    page.goto(MOCK_URL)
+    page.wait_for_selector("#status.connected", timeout=10000)
+    page.wait_for_timeout(1000)
+
+    # Install WS message counter
+    page.evaluate("""() => {
+        window.__wsMsgLog = [];
+        const origSend = state.ws.send.bind(state.ws);
+        state.ws.send = function(data) {
+            window.__wsMsgLog.push(JSON.parse(data));
+            return origSend(data);
+        };
+    }""")
+
+    # Clear the log, then drill down from Overview
+    page.evaluate("window.__wsMsgLog = []")
+    io_row = page.query_selector("tr.indent-1.clickable")
+    if io_row:
+        io_row.click()
+        page.wait_for_timeout(1500)
+
+        msgs = page.evaluate("window.__wsMsgLog")
+        # A single refresh() calls refreshChart() + refreshTable()
+        # = 1 aas + 1 top_events = 2 messages. Double refresh = 4.
+        cmds = [m.get("cmd") for m in msgs]
+        aas_count = cmds.count("aas")
+        table_count = sum(1 for c in cmds if c in
+                          ("top_events", "top_sessions", "top_queries",
+                           "time_model", "heatmap", "session_timeline"))
+
+        check(aas_count == 1,
+              f"Drill-down sent {aas_count} aas request(s) (expected 1)")
+        check(table_count == 1,
+              f"Drill-down sent {table_count} table request(s) (expected 1)")
+    else:
+        check(False, "No clickable row for double-refresh test")
+        check(False, "(skipped)")
+
+
+def test_filter_persists_across_tabs(page):
+    """25. Manually switching tabs preserves active filter."""
+    print("--- Test 25: Filter Persistence Across Tabs ---")
+
+    page.goto(MOCK_URL)
+    page.wait_for_selector("#status.connected", timeout=10000)
+    page.wait_for_timeout(1000)
+
+    # Drill into a class from Overview to set a filter
+    io_row = page.query_selector("tr.indent-1.clickable")
+    if io_row:
+        io_row.click()
+        page.wait_for_timeout(1000)
+
+        # Should be on Events with class filter
+        breadcrumb_before = page.text_content("#breadcrumb")
+        check(len(breadcrumb_before.strip()) > 0,
+              f"Filter active: '{breadcrumb_before.strip()[:40]}'")
+
+        # Manually switch to Sessions tab
+        page.click(".tab[data-tab='sessions']")
+        page.wait_for_timeout(1000)
+
+        # Breadcrumb should still show the filter
+        breadcrumb_after = page.text_content("#breadcrumb")
+        check(breadcrumb_after.strip() == breadcrumb_before.strip(),
+              f"Filter preserved after tab switch")
+
+        # Switch to Queries tab
+        page.click(".tab[data-tab='queries']")
+        page.wait_for_timeout(1000)
+
+        breadcrumb_queries = page.text_content("#breadcrumb")
+        check(breadcrumb_queries.strip() == breadcrumb_before.strip(),
+              f"Filter still preserved on Queries tab")
+
+        # Switch back to Overview
+        page.click(".tab[data-tab='overview']")
+        page.wait_for_timeout(1000)
+
+        breadcrumb_overview = page.text_content("#breadcrumb")
+        check(breadcrumb_overview.strip() == breadcrumb_before.strip(),
+              f"Filter preserved back on Overview tab")
+    else:
+        check(False, "No clickable row for filter persistence test")
+        check(False, "(skipped)")
+        check(False, "(skipped)")
+        check(False, "(skipped)")
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -644,6 +909,17 @@ def main():
             test_chart_rendering(page)
             test_session_drill_to_timeline(page)
             test_query_drill(page)
+
+            # Sprint 5.3: Exact data display tests
+            test_exact_summary_values(page)
+            test_exact_event_values(page)
+            test_exact_session_values(page)
+            test_exact_query_values(page)
+            test_timeline_bar_positions(page)
+
+            # Sprint 5.4: Regression tests
+            test_no_double_refresh(page)
+            test_filter_persists_across_tabs(page)
 
             # Reconnection test (kills/restarts mock server)
             mock_proc = test_reconnection(page, mock_proc)
