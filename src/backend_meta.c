@@ -1,26 +1,8 @@
 /* backend_meta.c — Write backend metadata to backends.jsonl */
 #include "backend_meta.h"
+#include "cJSON.h"
 #include <string.h>
 #include <stdio.h>
-
-static void json_escape_fp(FILE *fp, const char *s)
-{
-    for (; *s; s++) {
-        unsigned char c = (unsigned char)*s;
-        switch (c) {
-        case '"':  fputs("\\\"", fp); break;
-        case '\\': fputs("\\\\", fp); break;
-        case '\n': fputs("\\n", fp);  break;
-        case '\r': fputs("\\r", fp);  break;
-        case '\t': fputs("\\t", fp);  break;
-        default:
-            if (c < 0x20)
-                fprintf(fp, "\\u%04x", c);
-            else
-                fputc(c, fp);
-        }
-    }
-}
 
 int pgwt_bm_init(struct pgwt_backend_meta_writer *bm, const char *trace_dir)
 {
@@ -44,25 +26,22 @@ void pgwt_bm_write(struct pgwt_backend_meta_writer *bm,
 
     const char *type = pgwt_backend_type_name(meta->backend_type);
 
-    fprintf(bm->fp, "{\"pid\":%d,\"type\":\"", pid);
-    json_escape_fp(bm->fp, type);
-    fputc('"', bm->fp);
-    if (meta->usename[0]) {
-        fputs(",\"user\":\"", bm->fp);
-        json_escape_fp(bm->fp, meta->usename);
-        fputc('"', bm->fp);
+    cJSON *obj = cJSON_CreateObject();
+    cJSON_AddNumberToObject(obj, "pid", pid);
+    cJSON_AddStringToObject(obj, "type", type);
+    if (meta->usename[0])
+        cJSON_AddStringToObject(obj, "user", meta->usename);
+    if (meta->datname[0])
+        cJSON_AddStringToObject(obj, "db", meta->datname);
+    if (meta->client_addr[0])
+        cJSON_AddStringToObject(obj, "addr", meta->client_addr);
+
+    char *str = cJSON_PrintUnformatted(obj);
+    if (str) {
+        fprintf(bm->fp, "%s\n", str);
+        cJSON_free(str);
     }
-    if (meta->datname[0]) {
-        fputs(",\"db\":\"", bm->fp);
-        json_escape_fp(bm->fp, meta->datname);
-        fputc('"', bm->fp);
-    }
-    if (meta->client_addr[0]) {
-        fputs(",\"addr\":\"", bm->fp);
-        json_escape_fp(bm->fp, meta->client_addr);
-        fputc('"', bm->fp);
-    }
-    fprintf(bm->fp, "}\n");
+    cJSON_Delete(obj);
     fflush(bm->fp);
 }
 

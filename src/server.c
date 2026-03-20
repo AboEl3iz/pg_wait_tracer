@@ -9,6 +9,7 @@
 #include "compute.h"
 #include "wait_event.h"
 #include "cmdline.h"
+#include "cJSON.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,26 +18,6 @@
 #include <ctype.h>
 
 /* ── Utility ──────────────────────────────────────────────── */
-
-/* Write a JSON-escaped string to stdout (without surrounding quotes). */
-static void json_escape_stdout(const char *s)
-{
-    for (; *s; s++) {
-        unsigned char c = (unsigned char)*s;
-        switch (c) {
-        case '"':  fputs("\\\"", stdout); break;
-        case '\\': fputs("\\\\", stdout); break;
-        case '\n': fputs("\\n", stdout);  break;
-        case '\r': fputs("\\r", stdout);  break;
-        case '\t': fputs("\\t", stdout);  break;
-        default:
-            if (c < 0x20)
-                printf("\\u%04x", c);
-            else
-                putchar(c);
-        }
-    }
-}
 
 /* Count lines in a file. Returns 0 if file doesn't exist. */
 static int count_lines(const char *path)
@@ -59,6 +40,35 @@ static int next_pow2(int n)
     int p = 256;
     while (p < n) p <<= 1;
     return p;
+}
+
+/* ── cJSON helpers ────────────────────────────────────────── */
+
+/* Add uint64 as raw JSON number (avoids double precision loss for ns timestamps) */
+static void cjson_add_uint64(cJSON *obj, const char *name, uint64_t val)
+{
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%llu", (unsigned long long)val);
+    cJSON_AddRawToObject(obj, name, buf);
+}
+
+/* Create a raw uint64 item for arrays */
+static cJSON *cjson_create_uint64(uint64_t val)
+{
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%llu", (unsigned long long)val);
+    return cJSON_CreateRaw(buf);
+}
+
+/* Print cJSON to stdout as a single line and clean up */
+static void emit_json(cJSON *root)
+{
+    char *str = cJSON_PrintUnformatted(root);
+    if (str) {
+        puts(str);
+        cJSON_free(str);
+    }
+    cJSON_Delete(root);
 }
 
 /* ── Query text map ───────────────────────────────────────── */
@@ -99,7 +109,7 @@ struct pgwt_server {
     int  bm_count;
 };
 
-/* ── JSON request parsing (hand-written, no library) ──────── */
+/* ── JSON request parsing (cJSON) ─────────────────────────── */
 
 struct pgwt_request {
     int64_t  id;
@@ -111,131 +121,67 @@ struct pgwt_request {
     struct pgwt_filter filter;
 };
 
-/* Skip whitespace */
-static const char *skip_ws(const char *p)
-{
-    while (*p && isspace((unsigned char)*p)) p++;
-    return p;
-}
-
-/* Extract a JSON string value after "key": */
-static int json_string(const char *json, const char *key, char *out, int outsz)
-{
-    out[0] = '\0';
-    char pat[64];
-    snprintf(pat, sizeof(pat), "\"%s\"", key);
-    const char *p = strstr(json, pat);
-    if (!p) return 0;
-    p += strlen(pat);
-    p = skip_ws(p);
-    if (*p != ':') return 0;
-    p = skip_ws(p + 1);
-    if (*p != '"') return 0;
-    p++;
-    int i = 0;
-    while (*p && *p != '"' && i < outsz - 1)
-        out[i++] = *p++;
-    out[i] = '\0';
-    return 1;
-}
-
-/* Extract a JSON integer value after "key": */
-static int json_int64(const char *json, const char *key, int64_t *out)
-{
-    char pat[64];
-    snprintf(pat, sizeof(pat), "\"%s\"", key);
-    const char *p = strstr(json, pat);
-    if (!p) return 0;
-    p += strlen(pat);
-    p = skip_ws(p);
-    if (*p != ':') return 0;
-    p = skip_ws(p + 1);
-    char *end;
-    *out = strtoll(p, &end, 10);
-    return end != p;
-}
-
-static int json_uint64(const char *json, const char *key, uint64_t *out)
-{
-    char pat[64];
-    snprintf(pat, sizeof(pat), "\"%s\"", key);
-    const char *p = strstr(json, pat);
-    if (!p) return 0;
-    p += strlen(pat);
-    p = skip_ws(p);
-    if (*p != ':') return 0;
-    p = skip_ws(p + 1);
-    char *end;
-    *out = strtoull(p, &end, 10);
-    return end != p;
-}
-
-static int json_int(const char *json, const char *key, int *out)
-{
-    int64_t v;
-    if (!json_int64(json, key, &v)) return 0;
-    *out = (int)v;
-    return 1;
-}
-
-/* Parse filters sub-object */
-static void parse_filters(const char *json, struct pgwt_filter *f)
+static void parse_filters(cJSON *root, struct pgwt_filter *f)
 {
     memset(f, 0, sizeof(*f));
 
-    /* Find "filters" sub-object */
-    const char *p = strstr(json, "\"filters\"");
-    if (!p) return;
-    p += 9;
-    p = skip_ws(p);
-    if (*p != ':') return;
-    p = skip_ws(p + 1);
-    if (*p != '{') return;
+    cJSON *filters = cJSON_GetObjectItem(root, "filters");
+    if (!filters) return;
 
-    /* Extract from the sub-object (find matching }) */
-    const char *end = strchr(p, '}');
-    if (!end) return;
+    cJSON *cls = cJSON_GetObjectItem(filters, "class");
+    if (cJSON_IsString(cls) && cls->valuestring)
+        snprintf(f->class_name, sizeof(f->class_name), "%s", cls->valuestring);
 
-    /* Copy sub-object to temporary buffer for parsing */
-    int len = (int)(end - p + 1);
-    char buf[512];
-    if (len >= (int)sizeof(buf)) return;
-    memcpy(buf, p, len);
-    buf[len] = '\0';
+    cJSON *eid = cJSON_GetObjectItem(filters, "event_id");
+    if (cJSON_IsNumber(eid))
+        f->event_id = (uint32_t)eid->valuedouble;
 
-    json_string(buf, "class", f->class_name, sizeof(f->class_name));
-
-    int64_t v;
-    if (json_int64(buf, "event_id", &v))
-        f->event_id = (uint32_t)v;
-    if (json_int64(buf, "pid", &v))
-        f->pid = (uint32_t)v;
+    cJSON *pid = cJSON_GetObjectItem(filters, "pid");
+    if (cJSON_IsNumber(pid))
+        f->pid = (uint32_t)pid->valuedouble;
 
     /* query_id sent as string to avoid JS precision loss on uint64 */
-    char qid_str[32] = {0};
-    if (json_string(buf, "query_id", qid_str, sizeof(qid_str)) && qid_str[0])
-        f->query_id = strtoull(qid_str, NULL, 10);
-    else {
-        uint64_t uv;
-        if (json_uint64(buf, "query_id", &uv))
-            f->query_id = uv;
-    }
+    cJSON *qid = cJSON_GetObjectItem(filters, "query_id");
+    if (cJSON_IsString(qid) && qid->valuestring && qid->valuestring[0])
+        f->query_id = strtoull(qid->valuestring, NULL, 10);
+    else if (cJSON_IsNumber(qid))
+        f->query_id = (uint64_t)qid->valuedouble;
 }
 
 static void parse_request(const char *line, struct pgwt_request *req)
 {
     memset(req, 0, sizeof(*req));
 
-    int64_t id;
-    if (json_int64(line, "id", &id))
-        req->id = id;
+    cJSON *root = cJSON_Parse(line);
+    if (!root) return;
 
-    json_string(line, "cmd", req->cmd, sizeof(req->cmd));
-    json_uint64(line, "from", &req->from_ns);
-    json_uint64(line, "to", &req->to_ns);
-    json_int(line, "buckets", &req->num_buckets);
-    json_string(line, "detail", req->detail, sizeof(req->detail));
-    parse_filters(line, &req->filter);
+    cJSON *id = cJSON_GetObjectItem(root, "id");
+    if (cJSON_IsNumber(id))
+        req->id = (int64_t)id->valuedouble;
+
+    cJSON *cmd = cJSON_GetObjectItem(root, "cmd");
+    if (cJSON_IsString(cmd) && cmd->valuestring)
+        snprintf(req->cmd, sizeof(req->cmd), "%s", cmd->valuestring);
+
+    cJSON *from = cJSON_GetObjectItem(root, "from");
+    if (cJSON_IsNumber(from))
+        req->from_ns = (uint64_t)from->valuedouble;
+
+    cJSON *to = cJSON_GetObjectItem(root, "to");
+    if (cJSON_IsNumber(to))
+        req->to_ns = (uint64_t)to->valuedouble;
+
+    cJSON *buckets = cJSON_GetObjectItem(root, "buckets");
+    if (cJSON_IsNumber(buckets))
+        req->num_buckets = (int)buckets->valuedouble;
+
+    cJSON *detail = cJSON_GetObjectItem(root, "detail");
+    if (cJSON_IsString(detail) && detail->valuestring)
+        snprintf(req->detail, sizeof(req->detail), "%s", detail->valuestring);
+
+    parse_filters(root, &req->filter);
+
+    cJSON_Delete(root);
 }
 
 /* ── Query text loading ───────────────────────────────────── */
@@ -299,8 +245,7 @@ static const char *qt_map_lookup(const struct pgwt_server *srv, uint64_t query_i
 }
 
 /* Load query_texts.jsonl from trace dir into the hash map.
- * File format: {"q":<query_id>,"t":"<text>","ts":<wall_ns>} per line.
- * Simple hand-rolled parsing (no JSON library). */
+ * File format: {"q":<query_id>,"t":"<text>","ts":<wall_ns>} per line. */
 static void server_load_query_texts(struct pgwt_server *srv)
 {
     char path[600];
@@ -321,55 +266,22 @@ static void server_load_query_texts(struct pgwt_server *srv)
     ssize_t line_len;
 
     while ((line_len = getline(&line, &line_cap, fp)) > 0) {
-        /* Parse "q":<number> */
-        const char *qp = strstr(line, "\"q\":");
-        if (!qp) continue;
-        qp += 4;
-        char *end;
-        uint64_t qid = strtoull(qp, &end, 10);
-        if (end == qp || qid == 0) continue;
+        cJSON *root = cJSON_Parse(line);
+        if (!root) continue;
 
-        /* Parse "t":"<text>" */
-        const char *tp = strstr(line, "\"t\":\"");
-        if (!tp) continue;
-        tp += 5;
+        cJSON *q = cJSON_GetObjectItem(root, "q");
+        cJSON *t = cJSON_GetObjectItem(root, "t");
 
-        /* Extract text into dynamic buffer, handling JSON escapes */
-        int text_cap = (line_len > 256) ? (int)line_len : 256;
-        char *text = malloc(text_cap);
-        if (!text) continue;
-        int ti = 0;
-        while (*tp && *tp != '"') {
-            if (ti >= text_cap - 1) {
-                text_cap *= 2;
-                char *tmp = realloc(text, text_cap);
-                if (!tmp) break;
-                text = tmp;
-            }
-            if (*tp == '\\' && tp[1]) {
-                tp++;
-                switch (*tp) {
-                case 'n':  text[ti++] = ' '; break;  /* newlines → space */
-                case 'r':  break;
-                case 't':  text[ti++] = ' '; break;
-                case '"':  text[ti++] = '"'; break;
-                case '\\': text[ti++] = '\\'; break;
-                default:
-                    if (*tp == 'u' && tp[1] && tp[2] && tp[3] && tp[4]) {
-                        text[ti++] = ' ';  /* \uXXXX → space */
-                        tp += 4;
-                    }
-                    break;
-                }
-            } else {
-                text[ti++] = *tp;
-            }
-            tp++;
+        uint64_t qid = 0;
+        if (cJSON_IsNumber(q))
+            qid = (uint64_t)q->valuedouble;
+        if (qid == 0 || !cJSON_IsString(t) || !t->valuestring) {
+            cJSON_Delete(root);
+            continue;
         }
-        text[ti] = '\0';
 
-        qt_map_insert(srv, qid, text);
-        free(text);
+        qt_map_insert(srv, qid, t->valuestring);
+        cJSON_Delete(root);
     }
 
     free(line);
@@ -440,46 +352,24 @@ static void server_load_backends(struct pgwt_server *srv)
 
     char line[512];
     while (fgets(line, sizeof(line), fp)) {
-        /* Parse "pid":<number> */
-        const char *pp = strstr(line, "\"pid\":");
-        if (!pp) continue;
-        uint32_t pid = (uint32_t)strtoul(pp + 6, NULL, 10);
-        if (pid == 0) continue;
+        cJSON *root = cJSON_Parse(line);
+        if (!root) continue;
 
-        /* Parse "type":"<str>" */
-        char type[32] = "unknown";
-        const char *tp = strstr(line, "\"type\":\"");
-        if (tp) {
-            tp += 8;
-            int i = 0;
-            while (*tp && *tp != '"' && i < (int)sizeof(type) - 1)
-                type[i++] = *tp++;
-            type[i] = '\0';
-        }
+        cJSON *pid_item = cJSON_GetObjectItem(root, "pid");
+        if (!cJSON_IsNumber(pid_item)) { cJSON_Delete(root); continue; }
+        uint32_t pid = (uint32_t)pid_item->valuedouble;
+        if (pid == 0) { cJSON_Delete(root); continue; }
 
-        /* Parse "user":"<str>" */
-        char user[64] = "";
-        const char *up = strstr(line, "\"user\":\"");
-        if (up) {
-            up += 8;
-            int i = 0;
-            while (*up && *up != '"' && i < (int)sizeof(user) - 1)
-                user[i++] = *up++;
-            user[i] = '\0';
-        }
+        cJSON *type_item = cJSON_GetObjectItem(root, "type");
+        cJSON *user_item = cJSON_GetObjectItem(root, "user");
+        cJSON *db_item   = cJSON_GetObjectItem(root, "db");
 
-        /* Parse "db":"<str>" */
-        char db[64] = "";
-        const char *dp = strstr(line, "\"db\":\"");
-        if (dp) {
-            dp += 6;
-            int i = 0;
-            while (*dp && *dp != '"' && i < (int)sizeof(db) - 1)
-                db[i++] = *dp++;
-            db[i] = '\0';
-        }
+        const char *type = cJSON_IsString(type_item) ? type_item->valuestring : "unknown";
+        const char *user = cJSON_IsString(user_item) ? user_item->valuestring : "";
+        const char *db   = cJSON_IsString(db_item)   ? db_item->valuestring   : "";
 
         bm_map_insert(srv, pid, type, user, db);
+        cJSON_Delete(root);
     }
 
     fclose(fp);
@@ -685,12 +575,13 @@ static void handle_info(struct pgwt_server *srv, struct pgwt_request *req)
         pgwt_reader_close(&reader);
     }
 
-    printf("{\"id\":%lld,\"from_ns\":%llu,\"to_ns\":%llu,"
-           "\"num_events\":%lld,\"num_cpus\":%d}\n",
-           (long long)req->id,
-           (unsigned long long)srv->earliest_wall_ns,
-           (unsigned long long)srv->latest_wall_ns,
-           (long long)srv->total_events, srv->num_cpus);
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddNumberToObject(root, "id", (double)req->id);
+    cjson_add_uint64(root, "from_ns", srv->earliest_wall_ns);
+    cjson_add_uint64(root, "to_ns", srv->latest_wall_ns);
+    cJSON_AddNumberToObject(root, "num_events", (double)srv->total_events);
+    cJSON_AddNumberToObject(root, "num_cpus", srv->num_cpus);
+    emit_json(root);
 }
 
 static void handle_aas(struct pgwt_server *srv, struct pgwt_request *req)
@@ -717,46 +608,50 @@ static void handle_aas(struct pgwt_server *srv, struct pgwt_request *req)
         free(events);
     }
 
-    /* Emit JSON */
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddNumberToObject(root, "id", (double)req->id);
+
     if (aas.num_event_series > 0) {
         /* Event-breakdown mode */
         int ns = aas.num_event_series;
-        printf("{\"id\":%lld,\"breakdown\":\"events\",\"series\":[",
-               (long long)req->id);
+        cJSON_AddStringToObject(root, "breakdown", "events");
+
+        cJSON *series = cJSON_AddArrayToObject(root, "series");
         for (int s = 0; s < ns; s++) {
-            if (s > 0) putchar(',');
-            printf("{\"event_id\":%u,\"name\":\"", aas.event_series[s].event_id);
-            json_escape_stdout(aas.event_series[s].name);
-            printf("\"}");
+            cJSON *item = cJSON_CreateObject();
+            cJSON_AddNumberToObject(item, "event_id", aas.event_series[s].event_id);
+            cJSON_AddStringToObject(item, "name", aas.event_series[s].name);
+            cJSON_AddItemToArray(series, item);
         }
-        printf("],\"buckets\":[");
+
+        cJSON *buckets_arr = cJSON_AddArrayToObject(root, "buckets");
         for (int i = 0; i < aas.num_buckets; i++) {
-            if (i > 0) putchar(',');
-            printf("{\"t\":%llu,\"aas\":[",
-                   (unsigned long long)aas.buckets[i].start_ns);
-            for (int s = 0; s < ns; s++) {
-                if (s > 0) putchar(',');
-                printf("%.4f", aas.event_aas[i * ns + s]);
-            }
-            printf("]}");
+            cJSON *b = cJSON_CreateObject();
+            cjson_add_uint64(b, "t", aas.buckets[i].start_ns);
+            cJSON *aas_arr = cJSON_AddArrayToObject(b, "aas");
+            for (int s = 0; s < ns; s++)
+                cJSON_AddItemToArray(aas_arr,
+                    cJSON_CreateNumber(aas.event_aas[i * ns + s]));
+            cJSON_AddItemToArray(buckets_arr, b);
         }
-        printf("],\"max_aas\":%.4f,\"bucket_ns\":%llu}\n",
-               aas.max_aas, (unsigned long long)aas.bucket_ns);
+
         free(aas.event_aas);
     } else {
         /* Class-breakdown mode (default) */
-        printf("{\"id\":%lld,\"buckets\":[", (long long)req->id);
+        cJSON *buckets_arr = cJSON_AddArrayToObject(root, "buckets");
         for (int i = 0; i < aas.num_buckets; i++) {
-            if (i > 0) putchar(',');
-            printf("{\"t\":%llu", (unsigned long long)aas.buckets[i].start_ns);
+            cJSON *b = cJSON_CreateObject();
+            cjson_add_uint64(b, "t", aas.buckets[i].start_ns);
             for (int c = 0; c < PGWT_NUM_CLASSES; c++)
-                printf(",\"%s\":%.4f", pgwt_class_names[c],
-                       aas.buckets[i].class_aas[c]);
-            putchar('}');
+                cJSON_AddNumberToObject(b, pgwt_class_names[c],
+                                        aas.buckets[i].class_aas[c]);
+            cJSON_AddItemToArray(buckets_arr, b);
         }
-        printf("],\"max_aas\":%.4f,\"bucket_ns\":%llu}\n",
-               aas.max_aas, (unsigned long long)aas.bucket_ns);
     }
+
+    cJSON_AddNumberToObject(root, "max_aas", aas.max_aas);
+    cjson_add_uint64(root, "bucket_ns", aas.bucket_ns);
+    emit_json(root);
 
     free(aas.buckets);
 }
@@ -780,19 +675,25 @@ static void handle_time_model(struct pgwt_server *srv, struct pgwt_request *req)
         free(events);
     }
 
-    printf("{\"id\":%lld,\"rows\":[", (long long)req->id);
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddNumberToObject(root, "id", (double)req->id);
+
+    cJSON *rows = cJSON_AddArrayToObject(root, "rows");
     for (int i = 0; i < tm.num_rows; i++) {
-        if (i > 0) putchar(',');
-        printf("{\"name\":\"");
-        json_escape_stdout(tm.rows[i].name);
-        printf("\",\"ms\":%.2f,\"pct\":%.2f,"
-               "\"aas\":%.4f,\"indent\":%d}",
-               tm.rows[i].time_ms, tm.rows[i].pct_db_time,
-               tm.rows[i].aas, tm.rows[i].indent);
+        cJSON *r = cJSON_CreateObject();
+        cJSON_AddStringToObject(r, "name", tm.rows[i].name);
+        cJSON_AddNumberToObject(r, "ms", tm.rows[i].time_ms);
+        cJSON_AddNumberToObject(r, "pct", tm.rows[i].pct_db_time);
+        cJSON_AddNumberToObject(r, "aas", tm.rows[i].aas);
+        cJSON_AddNumberToObject(r, "indent", tm.rows[i].indent);
+        cJSON_AddItemToArray(rows, r);
     }
-    printf("],\"db_time_ms\":%.2f,\"idle_time_ms\":%.2f,"
-           "\"aas\":%.4f,\"wall_ms\":%.2f}\n",
-           tm.db_time_ms, tm.idle_time_ms, tm.aas, tm.wall_ms);
+
+    cJSON_AddNumberToObject(root, "db_time_ms", tm.db_time_ms);
+    cJSON_AddNumberToObject(root, "idle_time_ms", tm.idle_time_ms);
+    cJSON_AddNumberToObject(root, "aas", tm.aas);
+    cJSON_AddNumberToObject(root, "wall_ms", tm.wall_ms);
+    emit_json(root);
 
     free(tm.rows);
 }
@@ -816,25 +717,30 @@ static void handle_top_events(struct pgwt_server *srv, struct pgwt_request *req)
         free(events);
     }
 
-    printf("{\"id\":%lld,\"rows\":[", (long long)req->id);
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddNumberToObject(root, "id", (double)req->id);
+
+    cJSON *rows = cJSON_AddArrayToObject(root, "rows");
     for (int i = 0; i < res.num_rows; i++) {
-        if (i > 0) putchar(',');
-        printf("{\"event_id\":%u,\"name\":\"", res.rows[i].event_id);
-        json_escape_stdout(res.rows[i].name);
-        printf("\",\"class\":\"");
-        json_escape_stdout(pgwt_class_name(res.rows[i].event_id));
-        printf("\",\"count\":%llu,"
-               "\"total_ms\":%.2f,\"avg_us\":%.2f,"
-               "\"p50_us\":%.2f,\"p95_us\":%.2f,\"p99_us\":%.2f,"
-               "\"max_us\":%.2f,"
-               "\"pct\":%.2f,\"aas\":%.4f}",
-               (unsigned long long)res.rows[i].count,
-               res.rows[i].total_ms, res.rows[i].avg_us,
-               res.rows[i].p50_us, res.rows[i].p95_us, res.rows[i].p99_us,
-               res.rows[i].max_us, res.rows[i].pct_db,
-               res.rows[i].aas);
+        cJSON *r = cJSON_CreateObject();
+        cJSON_AddNumberToObject(r, "event_id", res.rows[i].event_id);
+        cJSON_AddStringToObject(r, "name", res.rows[i].name);
+        cJSON_AddStringToObject(r, "class",
+                                pgwt_class_name(res.rows[i].event_id));
+        cjson_add_uint64(r, "count", res.rows[i].count);
+        cJSON_AddNumberToObject(r, "total_ms", res.rows[i].total_ms);
+        cJSON_AddNumberToObject(r, "avg_us", res.rows[i].avg_us);
+        cJSON_AddNumberToObject(r, "p50_us", res.rows[i].p50_us);
+        cJSON_AddNumberToObject(r, "p95_us", res.rows[i].p95_us);
+        cJSON_AddNumberToObject(r, "p99_us", res.rows[i].p99_us);
+        cJSON_AddNumberToObject(r, "max_us", res.rows[i].max_us);
+        cJSON_AddNumberToObject(r, "pct", res.rows[i].pct_db);
+        cJSON_AddNumberToObject(r, "aas", res.rows[i].aas);
+        cJSON_AddItemToArray(rows, r);
     }
-    printf("],\"db_time_ms\":%.2f}\n", res.db_time_ms);
+
+    cJSON_AddNumberToObject(root, "db_time_ms", res.db_time_ms);
+    emit_json(root);
 
     free(res.rows);
 }
@@ -859,25 +765,28 @@ static void handle_top_sessions(struct pgwt_server *srv, struct pgwt_request *re
         free(events);
     }
 
-    printf("{\"id\":%lld,\"rows\":[", (long long)req->id);
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddNumberToObject(root, "id", (double)req->id);
+
+    cJSON *rows = cJSON_AddArrayToObject(root, "rows");
     for (int i = 0; i < res.num_rows; i++) {
-        if (i > 0) putchar(',');
-        printf("{\"pid\":%u,\"db_time_ms\":%.2f,"
-               "\"cpu_pct\":%.1f,\"wait_pct\":%.1f,"
-               "\"top_wait\":\"",
-               res.rows[i].pid, res.rows[i].db_time_ms,
-               res.rows[i].cpu_pct, res.rows[i].wait_pct);
-        json_escape_stdout(res.rows[i].top_wait);
-        printf("\",\"top_wait_id\":%u", res.rows[i].top_wait_id);
+        cJSON *r = cJSON_CreateObject();
+        cJSON_AddNumberToObject(r, "pid", res.rows[i].pid);
+        cJSON_AddNumberToObject(r, "db_time_ms", res.rows[i].db_time_ms);
+        cJSON_AddNumberToObject(r, "cpu_pct", res.rows[i].cpu_pct);
+        cJSON_AddNumberToObject(r, "wait_pct", res.rows[i].wait_pct);
+        cJSON_AddStringToObject(r, "top_wait", res.rows[i].top_wait);
+        cJSON_AddNumberToObject(r, "top_wait_id", res.rows[i].top_wait_id);
         const struct bm_entry *bm = bm_map_lookup(srv, res.rows[i].pid);
         if (bm) {
-            printf(",\"type\":\""); json_escape_stdout(bm->type); putchar('"');
-            if (bm->user[0]) { printf(",\"user\":\""); json_escape_stdout(bm->user); putchar('"'); }
-            if (bm->db[0]) { printf(",\"db\":\""); json_escape_stdout(bm->db); putchar('"'); }
+            cJSON_AddStringToObject(r, "type", bm->type);
+            if (bm->user[0]) cJSON_AddStringToObject(r, "user", bm->user);
+            if (bm->db[0]) cJSON_AddStringToObject(r, "db", bm->db);
         }
-        putchar('}');
+        cJSON_AddItemToArray(rows, r);
     }
-    printf("]}\n");
+
+    emit_json(root);
 
     free(res.rows);
 }
@@ -905,56 +814,60 @@ static void handle_top_queries(struct pgwt_server *srv, struct pgwt_request *req
         free(events);
     }
 
-    printf("{\"id\":%lld,\"rows\":[", (long long)req->id);
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddNumberToObject(root, "id", (double)req->id);
+
+    cJSON *rows = cJSON_AddArrayToObject(root, "rows");
     for (int i = 0; i < res.num_rows; i++) {
-        if (i > 0) putchar(',');
-        printf("{\"query_id\":\"%llu\",\"count\":%llu,"
-               "\"total_ms\":%.2f,\"avg_us\":%.2f,"
-               "\"pct\":%.2f,\"top_wait\":\"",
-               (unsigned long long)res.rows[i].query_id,
-               (unsigned long long)res.rows[i].count,
-               res.rows[i].total_ms, res.rows[i].avg_us,
-               res.rows[i].pct_db);
-        json_escape_stdout(res.rows[i].top_wait);
-        printf("\",\"top_wait_id\":%u", res.rows[i].top_wait_id);
+        cJSON *r = cJSON_CreateObject();
+
+        /* query_id as string to avoid JS precision loss */
+        char qid_str[32];
+        snprintf(qid_str, sizeof(qid_str), "%llu",
+                 (unsigned long long)res.rows[i].query_id);
+        cJSON_AddStringToObject(r, "query_id", qid_str);
+
+        cjson_add_uint64(r, "count", res.rows[i].count);
+        cJSON_AddNumberToObject(r, "total_ms", res.rows[i].total_ms);
+        cJSON_AddNumberToObject(r, "avg_us", res.rows[i].avg_us);
+        cJSON_AddNumberToObject(r, "pct", res.rows[i].pct_db);
+        cJSON_AddStringToObject(r, "top_wait", res.rows[i].top_wait);
+        cJSON_AddNumberToObject(r, "top_wait_id", res.rows[i].top_wait_id);
 
         /* Add query text if available */
         const char *qt = qt_map_lookup(srv, res.rows[i].query_id);
-        if (qt) {
-            printf(",\"text\":\"");
-            json_escape_stdout(qt);
-            putchar('"');
-        }
+        if (qt)
+            cJSON_AddStringToObject(r, "text", qt);
 
         /* Per-class time breakdown */
-        printf(",\"classes\":[");
-        for (int c = 0; c < 11; c++) {
-            if (c > 0) putchar(',');
-            printf("%.2f", res.rows[i].class_ms[c]);
-        }
-        putchar(']');
+        cJSON *classes = cJSON_AddArrayToObject(r, "classes");
+        for (int c = 0; c < 11; c++)
+            cJSON_AddItemToArray(classes,
+                cJSON_CreateNumber(res.rows[i].class_ms[c]));
 
         /* Per-event breakdown (when available from raw events path) */
         if (res.rows[i].num_events > 0) {
             char ename[64];
-            printf(",\"events\":[");
+            cJSON *events_arr = cJSON_AddArrayToObject(r, "events");
             for (int e = 0; e < res.rows[i].num_events; e++) {
-                if (e > 0) putchar(',');
                 uint32_t eid = res.rows[i].event_ids[e];
                 if (eid == 0)
                     snprintf(ename, sizeof(ename), "CPU");
                 else
                     pgwt_event_full_name(eid, ename, sizeof(ename));
-                printf("{\"id\":%u,\"name\":\"", eid);
-                json_escape_stdout(ename);
-                printf("\",\"ms\":%.2f}", res.rows[i].event_ms[e]);
+                cJSON *ev = cJSON_CreateObject();
+                cJSON_AddNumberToObject(ev, "id", eid);
+                cJSON_AddStringToObject(ev, "name", ename);
+                cJSON_AddNumberToObject(ev, "ms", res.rows[i].event_ms[e]);
+                cJSON_AddItemToArray(events_arr, ev);
             }
-            putchar(']');
         }
 
-        putchar('}');
+        cJSON_AddItemToArray(rows, r);
     }
-    printf("],\"db_time_ms\":%.2f}\n", res.db_time_ms);
+
+    cJSON_AddNumberToObject(root, "db_time_ms", res.db_time_ms);
+    emit_json(root);
 
     free(res.rows);
 }
@@ -980,44 +893,43 @@ static void handle_heatmap(struct pgwt_server *srv, struct pgwt_request *req)
         free(events);
     }
 
-    /* Latency bucket labels */
+    /* Latency bucket labels (UTF-8: µ = \xc2\xb5, ≥ = \xe2\x89\xa5) */
     static const char *labels[HISTOGRAM_BUCKETS] = {
-        "<1\\u00b5s", "1-2\\u00b5s", "2-4\\u00b5s", "4-8\\u00b5s",
-        "8-16\\u00b5s", "16-32\\u00b5s", "32-64\\u00b5s", "64-128\\u00b5s",
-        "128-256\\u00b5s", "256-512\\u00b5s", "0.5-1ms", "1-2ms",
-        "2-4ms", "4-8ms", "8-16ms", "\\u226516ms"
+        "<1\xc2\xb5s", "1-2\xc2\xb5s", "2-4\xc2\xb5s", "4-8\xc2\xb5s",
+        "8-16\xc2\xb5s", "16-32\xc2\xb5s", "32-64\xc2\xb5s", "64-128\xc2\xb5s",
+        "128-256\xc2\xb5s", "256-512\xc2\xb5s", "0.5-1ms", "1-2ms",
+        "2-4ms", "4-8ms", "8-16ms", "\xe2\x89\xa5" "16ms"
     };
 
-    printf("{\"id\":%lld,\"times\":[", (long long)req->id);
-    for (int i = 0; i < res.num_buckets; i++) {
-        if (i > 0) putchar(',');
-        printf("%llu", (unsigned long long)res.times[i]);
-    }
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddNumberToObject(root, "id", (double)req->id);
 
-    printf("],\"labels\":[");
-    for (int i = 0; i < HISTOGRAM_BUCKETS; i++) {
-        if (i > 0) putchar(',');
-        printf("\"%s\"", labels[i]);
-    }
+    cJSON *times_arr = cJSON_AddArrayToObject(root, "times");
+    for (int i = 0; i < res.num_buckets; i++)
+        cJSON_AddItemToArray(times_arr, cjson_create_uint64(res.times[i]));
+
+    cJSON *labels_arr = cJSON_AddArrayToObject(root, "labels");
+    for (int i = 0; i < HISTOGRAM_BUCKETS; i++)
+        cJSON_AddItemToArray(labels_arr, cJSON_CreateString(labels[i]));
 
     /* Sparse cells: only emit non-zero [time_idx, latency_idx, count] */
-    printf("],\"cells\":[");
-    int first = 1;
+    cJSON *cells_arr = cJSON_AddArrayToObject(root, "cells");
     for (int t = 0; t < res.num_buckets; t++) {
         for (int l = 0; l < HISTOGRAM_BUCKETS; l++) {
             uint64_t v = res.grid[t * HISTOGRAM_BUCKETS + l];
             if (v == 0) continue;
-            if (!first) putchar(',');
-            printf("[%d,%d,%llu]", t, l, (unsigned long long)v);
-            first = 0;
+            cJSON *cell = cJSON_CreateArray();
+            cJSON_AddItemToArray(cell, cJSON_CreateNumber(t));
+            cJSON_AddItemToArray(cell, cJSON_CreateNumber(l));
+            cJSON_AddItemToArray(cell, cjson_create_uint64(v));
+            cJSON_AddItemToArray(cells_arr, cell);
         }
     }
 
-    printf("],\"max_count\":%llu,\"total_events\":%llu,"
-           "\"bucket_ns\":%llu}\n",
-           (unsigned long long)res.max_count,
-           (unsigned long long)res.total_events,
-           (unsigned long long)res.bucket_ns);
+    cjson_add_uint64(root, "max_count", res.max_count);
+    cjson_add_uint64(root, "total_events", res.total_events);
+    cjson_add_uint64(root, "bucket_ns", res.bucket_ns);
+    emit_json(root);
 
     free(res.grid);
     free(res.times);
@@ -1074,16 +986,17 @@ static void handle_session_timeline(struct pgwt_server *srv, struct pgwt_request
     uint64_t coalesce_ns = total_matching > TIMELINE_MAX_EVENTS ?
                            range_ns / (TIMELINE_MAX_EVENTS * 2) : 0;
 
-    /* Emit PIDs array */
-    printf("{\"id\":%lld,\"pids\":[", (long long)req->id);
-    for (int p = 0; p < num_pids; p++) {
-        if (p > 0) putchar(',');
-        printf("%u", pids[p]);
-    }
-    printf("],\"events\":[");
+    /* Build JSON response */
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddNumberToObject(root, "id", (double)req->id);
+
+    cJSON *pids_arr = cJSON_AddArrayToObject(root, "pids");
+    for (int p = 0; p < num_pids; p++)
+        cJSON_AddItemToArray(pids_arr, cJSON_CreateNumber(pids[p]));
+
+    cJSON *events_arr = cJSON_AddArrayToObject(root, "events");
 
     /* Second pass: emit events with coalescing */
-    /* Track pending coalesced bar per PID */
     struct {
         uint32_t pid;
         uint64_t start_ns;
@@ -1096,26 +1009,26 @@ static void handle_session_timeline(struct pgwt_server *srv, struct pgwt_request
     memset(pending, 0, sizeof(pending));
 
     int nr = 0;
-    int first = 1;
 
+    /* Flush a pending bar to the events array */
     #define FLUSH_PENDING(pidx) do { \
         if (pending[pidx].active && nr < TIMELINE_MAX_EVENTS) { \
-            if (!first) putchar(','); \
-            first = 0; \
             char _ename[64]; \
             if (pending[pidx].event_id == 0) \
                 snprintf(_ename, sizeof(_ename), "CPU"); \
             else \
                 pgwt_event_full_name(pending[pidx].event_id, _ename, sizeof(_ename)); \
-            printf("{\"s\":%llu,\"d\":%llu,\"e\":%u,\"n\":\"", \
-                   (unsigned long long)pending[pidx].start_ns, \
-                   (unsigned long long)(pending[pidx].end_ns - pending[pidx].start_ns), \
-                   pending[pidx].event_id); \
-            json_escape_stdout(_ename); \
-            printf("\",\"c\":%d,\"p\":%u,\"q\":\"%llu\"}", \
-                   pending[pidx].class_idx, \
-                   pending[pidx].pid, \
-                   (unsigned long long)pending[pidx].query_id); \
+            cJSON *_ev = cJSON_CreateObject(); \
+            cjson_add_uint64(_ev, "s", pending[pidx].start_ns); \
+            cjson_add_uint64(_ev, "d", pending[pidx].end_ns - pending[pidx].start_ns); \
+            cJSON_AddNumberToObject(_ev, "e", pending[pidx].event_id); \
+            cJSON_AddStringToObject(_ev, "n", _ename); \
+            cJSON_AddNumberToObject(_ev, "c", pending[pidx].class_idx); \
+            cJSON_AddNumberToObject(_ev, "p", pending[pidx].pid); \
+            char _qbuf[32]; \
+            snprintf(_qbuf, sizeof(_qbuf), "%llu", (unsigned long long)pending[pidx].query_id); \
+            cJSON_AddStringToObject(_ev, "q", _qbuf); \
+            cJSON_AddItemToArray(events_arr, _ev); \
             nr++; \
             pending[pidx].active = 0; \
         } \
@@ -1169,9 +1082,9 @@ static void handle_session_timeline(struct pgwt_server *srv, struct pgwt_request
 
     #undef FLUSH_PENDING
 
-    printf("],\"truncated\":%s,\"total_count\":%d}\n",
-           nr < total_matching ? "true" : "false",
-           total_matching);
+    cJSON_AddBoolToObject(root, "truncated", nr < total_matching);
+    cJSON_AddNumberToObject(root, "total_count", total_matching);
+    emit_json(root);
 
     free(events);
 }
@@ -1197,9 +1110,12 @@ static void dispatch(struct pgwt_server *srv, struct pgwt_request *req)
     else if (strcmp(req->cmd, "session_timeline") == 0)
         handle_session_timeline(srv, req);
     else {
-        printf("{\"id\":%lld,\"error\":\"unknown command: ", (long long)req->id);
-        json_escape_stdout(req->cmd);
-        printf("\"}\n");
+        cJSON *root = cJSON_CreateObject();
+        cJSON_AddNumberToObject(root, "id", (double)req->id);
+        char errmsg[64];
+        snprintf(errmsg, sizeof(errmsg), "unknown command: %s", req->cmd);
+        cJSON_AddStringToObject(root, "error", errmsg);
+        emit_json(root);
     }
 }
 
@@ -1225,8 +1141,10 @@ int main(int argc, char **argv)
         parse_request(line, &req);
 
         if (req.cmd[0] == '\0') {
-            printf("{\"id\":%lld,\"error\":\"missing cmd\"}\n",
-                   (long long)req.id);
+            cJSON *root = cJSON_CreateObject();
+            cJSON_AddNumberToObject(root, "id", (double)req.id);
+            cJSON_AddStringToObject(root, "error", "missing cmd");
+            emit_json(root);
             continue;
         }
 
