@@ -50,6 +50,12 @@ static void usage(const char *prog)
         "Daemon:\n"
         "      --daemon               Run as daemon (reconnect on PG restart)\n"
         "\n"
+        "Performance tuning:\n"
+        "      --lightweight          BPF accumulator only (no per-event ringbuf).\n"
+        "                             Reduces overhead ~40%%, loses histogram/session/query views\n"
+        "      --skip-query-id        Skip query_id reads in BPF (saves ~1%% overhead).\n"
+        "                             Disables query_event view\n"
+        "\n"
         "Other:\n"
         "  -v, --verbose         Verbose output to stderr\n"
         "  -h, --help            Show this help\n"
@@ -158,6 +164,8 @@ static enum pgwt_format parse_format(const char *s)
 #define OPT_TO     258
 #define OPT_DAEMON       259
 #define OPT_TRACE_GROUP  260
+#define OPT_LIGHTWEIGHT  261
+#define OPT_SKIP_QID     262
 
 static struct option long_opts[] = {
     {"pid",        required_argument, NULL, 'p'},
@@ -179,6 +187,8 @@ static struct option long_opts[] = {
     {"to",              required_argument, NULL, OPT_TO},
     {"daemon",          no_argument,       NULL, OPT_DAEMON},
     {"trace-group",     required_argument, NULL, OPT_TRACE_GROUP},
+    {"lightweight",     no_argument,       NULL, OPT_LIGHTWEIGHT},
+    {"skip-query-id",   no_argument,       NULL, OPT_SKIP_QID},
     {"verbose",         no_argument,       NULL, 'v'},
     {"help",            no_argument,       NULL, 'h'},
     {NULL, 0, NULL, 0},
@@ -233,6 +243,8 @@ int main(int argc, char **argv)
         case OPT_TO:     to_str = optarg; break;
         case OPT_DAEMON: daemon_mode = true; break;
         case OPT_TRACE_GROUP: d->trace_group = optarg; break;
+        case OPT_LIGHTWEIGHT: d->lightweight_mode = 1; break;
+        case OPT_SKIP_QID:    d->skip_query_id = 1; break;
         case 'v': d->verbose = true; break;
         case 'h': usage(argv[0]); free(d); return 0;
         default:  usage(argv[0]); free(d); return 1;
@@ -280,6 +292,26 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    /* Validate: --lightweight cannot be used with views that need per-event data */
+    if (d->lightweight_mode &&
+        (d->view == PGWT_VIEW_HISTOGRAM ||
+         d->view == PGWT_VIEW_SESSION_EVENT ||
+         d->view == PGWT_VIEW_QUERY_EVENT)) {
+        fprintf(stderr, "ERROR: --lightweight is incompatible with %s view "
+                "(requires per-event data)\n",
+                d->view == PGWT_VIEW_HISTOGRAM ? "histogram" :
+                d->view == PGWT_VIEW_SESSION_EVENT ? "session_event" : "query_event");
+        free(d);
+        return 1;
+    }
+
+    /* Validate: --skip-query-id cannot be used with query_event view */
+    if (d->skip_query_id && d->view == PGWT_VIEW_QUERY_EVENT) {
+        fprintf(stderr, "ERROR: --skip-query-id is incompatible with query_event view\n");
+        free(d);
+        return 1;
+    }
+
     /* Check root */
     if (geteuid() != 0) {
         fprintf(stderr, "FATAL: must run as root (hardware watchpoints require CAP_SYS_ADMIN)\n");
@@ -289,16 +321,11 @@ int main(int argc, char **argv)
 
     d->daemon_mode = daemon_mode;
 
-    /* Use lightweight BPF mode (no ringbuf) when not recording traces.
-     * This reduces overhead by ~40% by skipping ringbuf + query_id reads.
-     * Views that need per-event data (histogram, session_event) require full mode. */
-    if (!d->trace_dir &&
-        d->view != PGWT_VIEW_HISTOGRAM &&
-        d->view != PGWT_VIEW_SESSION_EVENT &&
-        d->view != PGWT_VIEW_QUERY_EVENT) {
-        d->lightweight_mode = 1;
-        if (d->verbose)
-            fprintf(stderr, "INFO: using lightweight BPF mode (no ringbuf)\n");
+    if (d->verbose) {
+        if (d->lightweight_mode)
+            fprintf(stderr, "INFO: lightweight BPF mode (no ringbuf)\n");
+        if (d->skip_query_id)
+            fprintf(stderr, "INFO: skipping query_id reads in BPF\n");
     }
 
     /* Set up discovery state: pgdata, pre-set PID, or auto-discover.

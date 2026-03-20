@@ -18,21 +18,28 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 
+/* ringbuf submit flags (may not be in all header versions) */
+#ifndef BPF_RB_NO_WAKEUP
+#define BPF_RB_NO_WAKEUP (1ULL << 0)
+#endif
+
 /* ── Constants from userspace (set before load via .rodata) ── */
 volatile const u32 target_postmaster_pid = 0;
 volatile const u64 my_wait_ptr_addr = 0;
 volatile const u64 my_be_entry_addr = 0;  /* address of MyBEEntry global */
 volatile const u32 st_query_id_offset = 0; /* offsetof(PgBackendStatus, st_query_id) */
 volatile const u32 lightweight_mode = 0;   /* 0=full trace, 1=lightweight (no ringbuf) */
+volatile const u32 skip_query_id = 0;      /* 1=skip query_id reads (saves 1 probe_read) */
 
 /* ── Maps ─────────────────────────────────────────────────── */
 
 /* Per-PID state: last event + timestamp for duration computation.
  * Must be regular HASH (not PERCPU) because a backend can migrate
- * between CPUs — we need the same last_ts regardless of CPU. */
+ * between CPUs — we need the same last_ts regardless of CPU.
+ * 512 entries is enough for any PG deployment; smaller = better cache. */
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 4096);
+    __uint(max_entries, 512);
     __type(key, u32);
     __type(value, struct pgwt_pid_state);
 } state_map SEC(".maps");
@@ -154,22 +161,25 @@ int on_watchpoint(struct bpf_perf_event_data *ctx)
             /* Lightweight: accumulate in BPF map, no ringbuf */
             accum_add(st->last_event, duration);
         } else {
-            /* Full trace: emit per-event to ringbuf */
-            u64 cur_query_id = read_query_id_cached(st->be_entry_ptr);
-
-            struct pgwt_trace_event *evt =
-                bpf_ringbuf_reserve(&event_ringbuf, sizeof(*evt), 0);
-            if (evt) {
-                evt->timestamp_ns = now;
-                evt->pid = pid;
-                evt->old_event = st->last_event;
-                evt->new_event = new_event;
-                evt->duration_ns = duration;
-                evt->query_id = st->last_query_id;
-                bpf_ringbuf_submit(evt, 0);
+            /* Full trace: emit to ringbuf.
+             * Use bpf_ringbuf_output (1 helper call) instead of
+             * reserve+submit (2 calls). BPF_RB_NO_WAKEUP avoids
+             * per-event eventfd_signal — daemon polls at 10ms. */
+            if (!skip_query_id) {
+                u64 cur_query_id = read_query_id_cached(st->be_entry_ptr);
+                st->last_query_id = cur_query_id;
             }
 
-            st->last_query_id = cur_query_id;
+            struct pgwt_trace_event evt = {
+                .timestamp_ns = now,
+                .pid = pid,
+                .old_event = st->last_event,
+                .new_event = new_event,
+                .duration_ns = duration,
+                .query_id = st->last_query_id,
+            };
+            bpf_ringbuf_output(&event_ringbuf, &evt, sizeof(evt),
+                               BPF_RB_NO_WAKEUP);
         }
 
         /* Transition to new state */
@@ -262,17 +272,16 @@ int on_exit(struct trace_event_raw_sched_process_template *ctx)
         accum_add(st->last_event, duration);
     } else {
         /* Emit final trace event (exit sentinel) */
-        struct pgwt_trace_event *evt =
-            bpf_ringbuf_reserve(&event_ringbuf, sizeof(*evt), 0);
-        if (evt) {
-            evt->timestamp_ns = now;
-            evt->pid = pid;
-            evt->old_event = st->last_event;
-            evt->new_event = PGWT_EVENT_EXIT;
-            evt->duration_ns = duration;
-            evt->query_id = st->last_query_id;
-            bpf_ringbuf_submit(evt, 0);
-        }
+        struct pgwt_trace_event evt = {
+            .timestamp_ns = now,
+            .pid = pid,
+            .old_event = st->last_event,
+            .new_event = PGWT_EVENT_EXIT,
+            .duration_ns = duration,
+            .query_id = st->last_query_id,
+        };
+        bpf_ringbuf_output(&event_ringbuf, &evt, sizeof(evt),
+                           BPF_RB_NO_WAKEUP);
     }
 
     /* Notify daemon */

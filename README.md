@@ -25,8 +25,8 @@ Key capabilities:
 - **Offline replay**: analyze historical trace files without root or a
   running PostgreSQL instance
 
-Typical TPS overhead is under 5% in pgbench benchmarks (up to ~13% under
-heavy write contention).
+Typical TPS overhead is ~10% in full trace mode (pgbench, 8 vCPU, heavy write
+contention). See [Performance](#performance) for tuning flags and benchmarks.
 
 ## Quick Start
 
@@ -308,6 +308,13 @@ per interval, no screen clearing).
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
 | `--daemon` | — | off | Persistent mode with PostgreSQL restart detection |
+
+### Performance Tuning
+
+| Flag | Short | Default | Description |
+|------|-------|---------|-------------|
+| `--lightweight` | — | off | BPF accumulator only (no ringbuf). ~5.5% overhead, loses histogram/session/query views |
+| `--skip-query-id` | — | off | Skip query_id reads in BPF. Saves ~1.5% overhead, disables query_event view |
 
 ### Other
 
@@ -1016,9 +1023,70 @@ in columnar LZ4-compressed trace files.
 This design means:
 - **No PostgreSQL patches or extensions required** — works with stock binaries
 - **No sampling** — every event transition is captured exactly
-- **Low overhead** — BPF runs in nanoseconds, typically <5% TPS impact
+- **Low overhead** — BPF runs in nanoseconds, ~10% TPS impact in full trace mode
 - **No lock contention** — ring buffer is lock-free
 - **Historical analysis** — trace files enable offline replay of past events
+
+## Performance
+
+### Overhead
+
+pg_wait_tracer uses CPU hardware debug registers (watchpoints) to trap every
+write to `PGPROC->wait_event_info`. The overhead comes from the debug exception
+handler in the kernel, not from userspace processing.
+
+**Benchmark environment:** Hetzner cx43 (8 vCPU, 16 GB RAM), Rocky 9.7,
+PostgreSQL 18, pgbench scale 100, 8 clients, 60-second runs, 5 repetitions
+each.
+
+| Mode | TPS Overhead | What you get |
+|------|:---:|---|
+| **Full trace** (default) | ~10% | All 6 views, per-PID/per-query attribution, histogram, trace recording |
+| Full trace + `--skip-query-id` | ~8.5% | All views except query_event |
+| `--lightweight` | ~5.5% | time_model and system_event views only (no per-event ringbuf) |
+
+**Where the overhead comes from:**
+
+- ~3.4% — unavoidable hardware watchpoint cost (debug exception + context switch
+  register save/restore)
+- ~3-4% — lock amplification: extra nanoseconds in the BPF debug exception
+  handler extend lock hold times, causing cascading contention under high
+  concurrency
+- ~2% — BPF ring buffer output and query_id probe reads
+- ~0.2% — userspace ring buffer consumption (negligible)
+
+### Performance tuning flags
+
+| Flag | Effect | Trade-off |
+|------|--------|-----------|
+| `--skip-query-id` | Skips 1 `bpf_probe_read_user` per event (~100-200ns) | query_event view unavailable |
+| `--lightweight` | BPF accumulates in per-CPU hash map, no ring buffer | Only time_model and system_event views work. No per-PID, per-query, histogram, or trace recording |
+
+**Recommendations:**
+
+- **Default (full trace)** is appropriate for most production use. ~10% overhead
+  on an 8-client pgbench write-heavy workload is a worst case — real OLTP
+  workloads with mixed reads/writes typically see less.
+- Use `--skip-query-id` if you don't need per-query wait attribution and want
+  to save ~1.5%.
+- Use `--lightweight` for always-on monitoring where you only need time_model
+  and system_event views.
+
+### BPF optimizations
+
+The following optimizations are applied automatically:
+
+- **PERCPU hash map** for lightweight mode accumulator — eliminates atomic
+  operations and cache-line bouncing
+- **`BPF_RB_NO_WAKEUP`** — daemon polls the ring buffer every 10ms instead of
+  being woken per event, eliminating ~75K/sec `eventfd_signal()` calls
+- **`bpf_ringbuf_output`** — single BPF helper call instead of
+  reserve+submit (two calls)
+- **Cached `PgBackendStatus` pointer** — query_id reads use 1 `probe_read`
+  instead of 2 (double-dereference only on first event per PID)
+- **`exclude_kernel=1`, `exclude_hv=1`** on perf_event — skips kernel/hypervisor
+  writes to reduce false watchpoint fires
+- **Compact state_map** (512 entries) — better cache utilization
 
 ## Requirements
 

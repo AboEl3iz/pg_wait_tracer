@@ -27,8 +27,10 @@ int pgwt_open_watchpoint(pid_t pid, uint64_t addr, int bpf_prog_fd)
     attr.bp_addr        = addr;
     attr.bp_len         = HW_BREAKPOINT_LEN_4;
     attr.sample_period  = 1;
-    attr.sample_type    = PERF_SAMPLE_RAW;
-    attr.wakeup_events  = 1;
+    attr.sample_type    = 0;             /* no sample data needed (BPF reads directly) */
+    attr.wakeup_events  = 0;            /* BPF handles events, no perf buffer wakeup */
+    attr.exclude_kernel = 1;            /* PGPROC is userspace-only */
+    attr.exclude_hv     = 1;            /* no hypervisor writes */
 
     int fd = sys_perf_event_open(&attr, pid, -1, -1, PERF_FLAG_FD_CLOEXEC);
     if (fd < 0) {

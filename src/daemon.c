@@ -171,6 +171,7 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
     d->skel->rodata->my_be_entry_addr = d->my_be_entry_addr;
     d->skel->rodata->st_query_id_offset = d->st_query_id_offset;
     d->skel->rodata->lightweight_mode = d->lightweight_mode;
+    d->skel->rodata->skip_query_id = d->skip_query_id;
 
     /* Load BPF programs (runs verifier) */
     err = pg_wait_tracer_bpf__load(d->skel);
@@ -382,13 +383,19 @@ int pgwt_daemon_run(struct pgwt_daemon *d)
         deadline = (uint64_t)ts.tv_sec + d->duration;
     }
 
+    /* BPF uses BPF_RB_NO_WAKEUP for event_ringbuf to avoid per-event
+     * eventfd_signal overhead. We poll the ringbuf at 10ms intervals. */
+    int poll_ms = d->event_rb ? 10 : -1;
+
     while (d->running) {
-        int timeout_ms = -1;
+        int timeout_ms = poll_ms;
         if (deadline > 0) {
             struct timespec ts;
             clock_gettime(CLOCK_MONOTONIC, &ts);
             if ((uint64_t)ts.tv_sec >= deadline) break;
-            timeout_ms = (deadline - ts.tv_sec) * 1000;
+            int remaining = (deadline - ts.tv_sec) * 1000;
+            if (timeout_ms < 0 || remaining < timeout_ms)
+                timeout_ms = remaining;
         }
 
         int n = epoll_wait(d->epoll_fd, events, 8, timeout_ms);
@@ -409,6 +416,10 @@ int pgwt_daemon_run(struct pgwt_daemon *d)
                 handle_signal(d);
             }
         }
+
+        /* Drain event ringbuf on every iteration (poll-based with NO_WAKEUP) */
+        if (d->event_rb)
+            ring_buffer__consume(d->event_rb);
     }
 
     /* Drain remaining events before cleanup */
