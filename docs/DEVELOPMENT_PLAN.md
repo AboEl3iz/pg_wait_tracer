@@ -175,7 +175,7 @@ if playwright/websockets not installed).
 
 ---
 
-## Sprint 6: Integrate cJSON
+## Sprint 6: Integrate cJSON ✅ COMPLETED (2026-03-19)
 
 **Goal:** Replace hand-rolled JSON parsing and generation with cJSON. Eliminates
 the substring-matching parser (Issue 8) and all escaping bugs (Issue 9 remainder).
@@ -183,18 +183,27 @@ the substring-matching parser (Issue 8) and all escaping bugs (Issue 9 remainder
 **Depends on:** Sprint 2 (tests catch regressions), Sprint 3 (JSON escaping done
 as a stopgap — cJSON replaces it entirely).
 
-| # | Task | Details |
-|---|------|---------|
-| 6.1 | Vendor `cJSON.c` + `cJSON.h` into `src/` | Single .c/.h, MIT license, ~1000 lines |
-| 6.2 | Replace `json_string`/`json_int64`/`json_uint64` with cJSON parsing | `src/server.c` request parsing |
-| 6.3 | Replace `parse_filters` with cJSON | `src/server.c` filter parsing |
-| 6.4 | Replace all `printf("{\"...` with cJSON output construction | `src/server.c` response generation |
-| 6.5 | Replace JSON output in `backend_meta.c` | `src/backend_meta.c` |
-| 6.6 | Update Makefile to compile cJSON | `Makefile` |
-| 6.7 | Run all Sprint 2 + Sprint 5 tests | Verify no regressions |
+| # | Task | Details | Status |
+|---|------|---------|--------|
+| 6.1 | Vendor `cJSON.c` + `cJSON.h` into `src/` | cJSON v1.7.18, MIT license, 3443 lines | ✅ |
+| 6.2 | Replace `json_string`/`json_int64`/`json_uint64` with cJSON parsing | `cJSON_Parse` + `cJSON_GetObjectItem` for request parsing | ✅ |
+| 6.3 | Replace `parse_filters` with cJSON | `cJSON_GetObjectItem` on filters sub-object | ✅ |
+| 6.4 | Replace all `printf("{\"...` with cJSON output construction | All 8 handlers + dispatch + main errors use cJSON tree + `cJSON_PrintUnformatted` | ✅ |
+| 6.5 | Replace JSON output in `backend_meta.c` | `cJSON_CreateObject` + `cJSON_PrintUnformatted` replaces `json_escape_fp` | ✅ |
+| 6.6 | Update Makefile to compile cJSON | Added to both `USER_SRCS` and `SERVER_SRCS`, added `-lm` to server linker | ✅ |
+| 6.7 | Run all Sprint 2 + Sprint 5 tests | 33/33 test suites pass, 0 failures | ✅ |
 
-**Deliverable:** All JSON parsing/generation uses cJSON. `server.c` shrinks
-significantly. Entire class of JSON bugs eliminated.
+**Details:**
+- **Removed:** `json_escape_stdout`, `json_escape_fp`, `skip_ws`, `json_string`,
+  `json_int64`, `json_uint64`, `json_int`, hand-rolled `parse_filters`/`parse_request`
+- **Added:** `cjson_add_uint64` (raw number for ns timestamps to avoid double precision loss),
+  `cjson_create_uint64` (raw for arrays), `emit_json` (print + cleanup helper)
+- **.jsonl loading** also migrated: `query_texts.jsonl` and `backends.jsonl` now parsed with cJSON
+- **Heatmap labels** changed from JSON `\u00b5` escapes to UTF-8 (`\xc2\xb5`) since cJSON
+  handles string escaping automatically
+
+**Result:** server.c shrinks by 101 lines (-414/+313). All JSON parsing/generation uses cJSON.
+33/33 test suites pass on Hetzner cpx31 (Rocky 9, PG18).
 
 ---
 
@@ -361,7 +370,7 @@ Sprint 2:  Test infrastructure + synthetic correctness      ──── Prove m
 Sprint 3:  Code hardening                                   ──── Robustness
 Sprint 4:  Live data correctness tests                      ──── Prove end-to-end
 Sprint 5:  Web UI tests (Playwright)                    ✅ ──── Stop clicking
-Sprint 6:  cJSON integration                                ──── Clean JSON
+Sprint 6:  cJSON integration                            ✅ ──── Clean JSON
 Sprint 7:  Dynamic event names                              ──── Forward compat
 Sprint 8:  Drop Rust TUI                                    ──── Simplify
 Sprint 9:  Performance optimization + benchmarks            ──── Speed
