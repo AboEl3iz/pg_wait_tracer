@@ -61,6 +61,10 @@ static void handle_timer(struct pgwt_daemon *d)
         }
     }
 
+    /* In lightweight mode, read BPF accum_map into event_accum first */
+    if (d->lightweight_mode)
+        pgwt_read_accum_map(d);
+
     /* Copy cumulative event_accum to display accum,
      * then add open intervals from state_map */
     struct pgwt_time_model saved_tm = d->accum.tm;
@@ -166,6 +170,7 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
     d->skel->rodata->my_wait_ptr_addr = d->my_wait_ptr_addr;
     d->skel->rodata->my_be_entry_addr = d->my_be_entry_addr;
     d->skel->rodata->st_query_id_offset = d->st_query_id_offset;
+    d->skel->rodata->lightweight_mode = d->lightweight_mode;
 
     /* Load BPF programs (runs verifier) */
     err = pg_wait_tracer_bpf__load(d->skel);
@@ -208,12 +213,15 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
     }
     pgwt_accum_init(d->event_accum);
 
-    int event_rb_map_fd = bpf_map__fd(d->skel->maps.event_ringbuf);
-    d->event_rb = ring_buffer__new(event_rb_map_fd, pgwt_handle_trace_event, d, NULL);
-    if (!d->event_rb) {
-        fprintf(stderr, "FATAL: cannot create event ring buffer: %s\n",
-                strerror(errno));
-        goto fail;
+    /* In lightweight mode, skip event ringbuf consumer (BPF accumulates directly) */
+    if (!d->lightweight_mode) {
+        int event_rb_map_fd = bpf_map__fd(d->skel->maps.event_ringbuf);
+        d->event_rb = ring_buffer__new(event_rb_map_fd, pgwt_handle_trace_event, d, NULL);
+        if (!d->event_rb) {
+            fprintf(stderr, "FATAL: cannot create event ring buffer: %s\n",
+                    strerror(errno));
+            goto fail;
+        }
     }
 
     /* Init trace file writer (opt-in via --trace-dir) */
@@ -329,11 +337,14 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
     ev.data.fd = rb_fd;
     epoll_ctl(d->epoll_fd, EPOLL_CTL_ADD, rb_fd, &ev);
 
-    /* Add event ring buffer fd */
-    int event_rb_fd = ring_buffer__epoll_fd(d->event_rb);
-    ev.events = EPOLLIN;
-    ev.data.fd = event_rb_fd;
-    epoll_ctl(d->epoll_fd, EPOLL_CTL_ADD, event_rb_fd, &ev);
+    /* Add event ring buffer fd (skip in lightweight mode) */
+    int event_rb_fd = -1;
+    if (d->event_rb) {
+        event_rb_fd = ring_buffer__epoll_fd(d->event_rb);
+        ev.events = EPOLLIN;
+        ev.data.fd = event_rb_fd;
+        epoll_ctl(d->epoll_fd, EPOLL_CTL_ADD, event_rb_fd, &ev);
+    }
 
     /* Add timer fd */
     ev.events = EPOLLIN;
@@ -362,7 +373,7 @@ int pgwt_daemon_run(struct pgwt_daemon *d)
 {
     struct epoll_event events[8];
     int rb_fd = ring_buffer__epoll_fd(d->rb);
-    int event_rb_fd = ring_buffer__epoll_fd(d->event_rb);
+    int event_rb_fd = d->event_rb ? ring_buffer__epoll_fd(d->event_rb) : -1;
 
     uint64_t deadline = 0;
     if (d->duration > 0) {
@@ -401,7 +412,8 @@ int pgwt_daemon_run(struct pgwt_daemon *d)
     }
 
     /* Drain remaining events before cleanup */
-    ring_buffer__consume(d->event_rb);
+    if (d->event_rb)
+        ring_buffer__consume(d->event_rb);
     ring_buffer__consume(d->rb);
 
     if (d->exit_reason != PGWT_EXIT_PG_DEAD)

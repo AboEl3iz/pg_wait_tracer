@@ -82,6 +82,7 @@ struct pgwt_daemon {
     enum pgwt_sort_mode sort_mode;   /* sort mode for active view */
     bool        replay_mode;             /* true when running --replay */
     bool        daemon_mode;             /* true when running --daemon */
+    uint32_t    lightweight_mode;        /* 1 = BPF accumulator only (no ringbuf) */
     enum pgwt_exit_reason exit_reason;   /* why the event loop exited */
     char        pgdata[512];             /* stored for restart detection */
 

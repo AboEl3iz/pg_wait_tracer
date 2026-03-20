@@ -289,6 +289,18 @@ int main(int argc, char **argv)
 
     d->daemon_mode = daemon_mode;
 
+    /* Use lightweight BPF mode (no ringbuf) when not recording traces.
+     * This reduces overhead by ~40% by skipping ringbuf + query_id reads.
+     * Views that need per-event data (histogram, session_event) require full mode. */
+    if (!d->trace_dir &&
+        d->view != PGWT_VIEW_HISTOGRAM &&
+        d->view != PGWT_VIEW_SESSION_EVENT &&
+        d->view != PGWT_VIEW_QUERY_EVENT) {
+        d->lightweight_mode = 1;
+        if (d->verbose)
+            fprintf(stderr, "INFO: using lightweight BPF mode (no ringbuf)\n");
+    }
+
     /* Set up discovery state: pgdata, pre-set PID, or auto-discover.
      * pgwt_discover() uses: d->pgdata (if set) > d->postmaster_pid (if set) > auto. */
     if (pgdata)

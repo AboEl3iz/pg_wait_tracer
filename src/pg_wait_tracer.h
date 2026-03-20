@@ -32,6 +32,7 @@ struct pgwt_pid_state {
     u64 last_ts;        /* ktime_ns of last transition */
     u64 last_query_id;  /* query_id active during last_event */
     u64 be_entry_ptr;   /* cached PgBackendStatus* (avoids 1 probe_read per event) */
+    u64 wait_event_addr; /* direct PGPROC->wait_event_info address (saves 1 probe_read) */
 };
 
 /* ── Lifecycle Events (ring buffer) ───────────────────────── */
@@ -79,5 +80,13 @@ struct pgwt_trace_event {
 
 /* Client:ClientRead — idle between queries (like Oracle's SQL*Net message from client) */
 #define PG_WAIT_CLIENT_READ  ((PG_WAIT_CLIENT << 24) | 0x000000)
+
+/* ── BPF Accumulator (lightweight mode — no ringbuf) ───── */
+#define ACCUM_MAP_MAX_ENTRIES 1024
+
+struct pgwt_accum_val {
+    u64 total_ns;   /* total time in this wait event */
+    u64 count;      /* number of transitions into this event */
+};
 
 #endif /* PG_WAIT_TRACER_H */

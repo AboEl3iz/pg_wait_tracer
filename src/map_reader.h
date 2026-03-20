@@ -84,6 +84,9 @@ void pgwt_accum_init(struct pgwt_accumulator *acc);
 /* Read state_map for open intervals and current state (active view). */
 void pgwt_read_state_map(struct pgwt_daemon *d);
 
+/* Read BPF accum_map (lightweight mode) and merge into event_accum. */
+void pgwt_read_accum_map(struct pgwt_daemon *d);
+
 /* Find per-PID accumulator. Returns NULL if not found. */
 struct pgwt_pid_accum *pgwt_find_pid_accum(struct pgwt_accumulator *acc, uint32_t pid);
 

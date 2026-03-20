@@ -232,3 +232,35 @@ void pgwt_read_state_map(struct pgwt_daemon *d)
     }
 }
 
+/* Read BPF accum_map (lightweight mode) and merge into event_accum.
+ * Deletes entries after reading so next interval starts fresh. */
+void pgwt_read_accum_map(struct pgwt_daemon *d)
+{
+    int accum_fd = bpf_map__fd(d->skel->maps.accum_map);
+    struct pgwt_accumulator *acc = d->event_accum;
+
+    uint32_t key = 0, next_key = 0;
+    struct pgwt_accum_val val;
+
+    while (bpf_map_get_next_key(accum_fd, &key, &next_key) == 0) {
+        if (bpf_map_lookup_elem(accum_fd, &next_key, &val) == 0) {
+            uint32_t we = next_key;
+            uint64_t dur = val.total_ns;
+
+            /* Time model by class */
+            pgwt_update_time_model(&acc->tm, we, dur);
+
+            /* System-wide event stats */
+            struct pgwt_event_stats *se = pgwt_get_or_create_system_event(acc, we);
+            if (se) {
+                se->count += val.count;
+                se->total_ns += dur;
+            }
+
+            /* Delete after reading */
+            bpf_map_delete_elem(accum_fd, &next_key);
+        }
+        key = next_key;
+    }
+}
+

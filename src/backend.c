@@ -168,6 +168,7 @@ int pgwt_scan_existing_backends(struct pgwt_daemon *d)
                         .last_event = current_wei,
                         .last_ts = be->attach_ts,
                         .last_query_id = current_qid,
+                        .wait_event_addr = ptr,
                     };
                     uint32_t pid_key = pid;
                     bpf_map_update_elem(state_fd, &pid_key, &init_state,
