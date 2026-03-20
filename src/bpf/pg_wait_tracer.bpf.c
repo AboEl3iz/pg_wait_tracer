@@ -51,9 +51,10 @@ struct {
 
 /* Accumulator map for lightweight mode: per-event duration totals.
  * Key = wait_event_info (u32), Value = {total_ns, count}.
- * Daemon reads and zeroes this periodically. */
+ * PERCPU to avoid atomic ops and cache-line bouncing in BPF hot path.
+ * Daemon reads and zeroes this periodically, summing across CPUs. */
 struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(type, BPF_MAP_TYPE_PERCPU_HASH);
     __uint(max_entries, ACCUM_MAP_MAX_ENTRIES);
     __type(key, u32);
     __type(value, struct pgwt_accum_val);
@@ -115,13 +116,13 @@ static __always_inline u32 read_wait_event(u64 *out_addr)
     return val;
 }
 
-/* Accumulate duration for a wait event into accum_map. */
+/* Accumulate duration for a wait event into accum_map (PERCPU — no atomics). */
 static __always_inline void accum_add(u32 event, u64 duration)
 {
     struct pgwt_accum_val *av = bpf_map_lookup_elem(&accum_map, &event);
     if (av) {
-        __sync_fetch_and_add(&av->total_ns, duration);
-        __sync_fetch_and_add(&av->count, 1);
+        av->total_ns += duration;
+        av->count += 1;
     } else {
         struct pgwt_accum_val new_av = { .total_ns = duration, .count = 1 };
         bpf_map_update_elem(&accum_map, &event, &new_av, BPF_NOEXIST);

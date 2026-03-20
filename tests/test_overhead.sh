@@ -179,9 +179,14 @@ fi
 
 # ── Main benchmark loop ───────────────────────────────────────────
 
-# Initialize pgbench tables if needed
-echo "Initializing pgbench tables..."
-pgbench -U postgres -d postgres -i -q 2>&1 | tail -1
+# Check if pgbench tables exist; if not, initialize at scale 100
+SCALE=$(psql -U postgres -d postgres -tAc "SELECT count(*)/100000 FROM pgbench_accounts" 2>/dev/null || echo "0")
+if [[ "$SCALE" -lt 1 ]]; then
+    echo "Initializing pgbench tables (scale 100)..."
+    pgbench -U postgres -d postgres -i -s 100 -q 2>&1 | tail -1
+else
+    echo "pgbench tables found (scale $SCALE)"
+fi
 echo ""
 
 declare -A BASELINE_MEAN BASELINE_STDDEV TRACER_MEAN TRACER_STDDEV OVERHEAD_PCT

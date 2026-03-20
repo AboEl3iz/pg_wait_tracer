@@ -232,20 +232,31 @@ void pgwt_read_state_map(struct pgwt_daemon *d)
     }
 }
 
-/* Read BPF accum_map (lightweight mode) and merge into event_accum.
- * Deletes entries after reading so next interval starts fresh. */
+/* Read BPF accum_map (PERCPU lightweight mode) and merge into event_accum.
+ * Sums values across all CPUs, then deletes entries so next interval starts fresh. */
 void pgwt_read_accum_map(struct pgwt_daemon *d)
 {
     int accum_fd = bpf_map__fd(d->skel->maps.accum_map);
     struct pgwt_accumulator *acc = d->event_accum;
+    int num_cpus = libbpf_num_possible_cpus();
+    if (num_cpus <= 0) num_cpus = 1;
+
+    /* Per-CPU value buffer (VLA, bounded by MAX_CPUS) */
+    struct pgwt_accum_val pcpu_vals[num_cpus > MAX_CPUS ? MAX_CPUS : num_cpus];
 
     uint32_t key = 0, next_key = 0;
-    struct pgwt_accum_val val;
 
     while (bpf_map_get_next_key(accum_fd, &key, &next_key) == 0) {
-        if (bpf_map_lookup_elem(accum_fd, &next_key, &val) == 0) {
+        if (bpf_map_lookup_elem(accum_fd, &next_key, pcpu_vals) == 0) {
             uint32_t we = next_key;
-            uint64_t dur = val.total_ns;
+            uint64_t dur = 0, cnt = 0;
+
+            /* Sum across CPUs */
+            int nc = num_cpus > MAX_CPUS ? MAX_CPUS : num_cpus;
+            for (int i = 0; i < nc; i++) {
+                dur += pcpu_vals[i].total_ns;
+                cnt += pcpu_vals[i].count;
+            }
 
             /* Time model by class */
             pgwt_update_time_model(&acc->tm, we, dur);
@@ -253,7 +264,7 @@ void pgwt_read_accum_map(struct pgwt_daemon *d)
             /* System-wide event stats */
             struct pgwt_event_stats *se = pgwt_get_or_create_system_event(acc, we);
             if (se) {
-                se->count += val.count;
+                se->count += cnt;
                 se->total_ns += dur;
             }
 
