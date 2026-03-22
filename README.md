@@ -25,8 +25,9 @@ Key capabilities:
 - **Offline replay**: analyze historical trace files without root or a
   running PostgreSQL instance
 
-Typical TPS overhead is ~10% in full trace mode (pgbench, 8 vCPU, heavy write
-contention). See [Performance](#performance) for tuning flags and benchmarks.
+Overhead scales with wait event transition rate: ~6% on write-heavy OLTP,
+up to ~30% on read-heavy workloads with high buffer miss rates. See
+[Performance](#performance) for details.
 
 ## Quick Start
 
@@ -1023,7 +1024,7 @@ in columnar LZ4-compressed trace files.
 This design means:
 - **No PostgreSQL patches or extensions required** — works with stock binaries
 - **No sampling** — every event transition is captured exactly
-- **Low overhead** — BPF runs in nanoseconds, ~10% TPS impact in full trace mode
+- **Low overhead** — ~6% on write-heavy OLTP (see [Performance](#performance))
 - **No lock contention** — ring buffer is lock-free
 - **Historical analysis** — trace files enable offline replay of past events
 
@@ -1032,45 +1033,84 @@ This design means:
 ### Overhead
 
 pg_wait_tracer uses CPU hardware debug registers (watchpoints) to trap every
-write to `PGPROC->wait_event_info`. The overhead comes from the debug exception
-handler in the kernel, not from userspace processing.
+write to `PGPROC->wait_event_info`. The overhead is proportional to the **wait
+event transition rate** — how many times per second backends change wait state.
+The cost is almost entirely in the CPU's hardware debug exception handler, not
+in BPF or userspace processing.
 
 **Benchmark environment:** Hetzner cx43 (8 vCPU, 16 GB RAM), Rocky 9.7,
-PostgreSQL 18, pgbench scale 100, 8 clients, 60-second runs, 5 repetitions
-each.
+PostgreSQL 18, pgbench scale 100, 8 clients, 60-second runs, 5 repetitions.
 
-| Mode | TPS Overhead | What you get |
-|------|:---:|---|
-| **Full trace** (default) | ~10% | All 6 views, per-PID/per-query attribution, histogram, trace recording |
-| Full trace + `--skip-query-id` | ~8.5% | All views except query_event |
-| `--lightweight` | ~5.5% | time_model and system_event views only (no per-event ringbuf) |
+#### Write-heavy OLTP (pgbench TPC-B, shared_buffers = 2 GB)
 
-**Where the overhead comes from:**
+Baseline: ~5,000 TPS, ~40K transitions/sec.
 
-- ~3.4% — unavoidable hardware watchpoint cost (debug exception + context switch
-  register save/restore)
-- ~3-4% — lock amplification: extra nanoseconds in the BPF debug exception
-  handler extend lock hold times, causing cascading contention under high
-  concurrency
-- ~2% — BPF ring buffer output and query_id probe reads
-- ~0.2% — userspace ring buffer consumption (negligible)
+| Mode | TPS Overhead |
+|------|:---:|
+| **Full trace** (default) | **6%** |
+| Full trace + `--skip-query-id` | 5% |
+| `--lightweight` | 4% |
+
+#### Read-heavy with high buffer miss rate (pgbench SELECT-only, shared_buffers = 128 MB)
+
+Baseline: ~108,000 TPS, ~220K transitions/sec. Data fits in OS page cache
+so each IO:DataFileRead completes in microseconds, generating a very high
+transition rate.
+
+| Mode | TPS Overhead |
+|------|:---:|
+| **Full trace** (default) | **29%** |
+| Full trace + `--skip-query-id` | 26% |
+| `--lightweight` | 28% |
+
+The `--lightweight` and `--skip-query-id` flags save only 1-3 percentage points
+because the bottleneck is the hardware debug exception itself (~200-300 ns per
+fire), not the BPF work done inside it.
+
+#### What drives overhead
+
+Overhead scales linearly with transitions/sec. Workloads with more transitions
+per second see higher overhead:
+
+- **Low overhead** (<10%): write-heavy OLTP, long-running queries, workloads
+  where data fits in shared_buffers (buffer hits don't trigger wait events)
+- **Medium overhead** (10-20%): mixed read/write with moderate buffer miss rates
+- **High overhead** (20-30%): very high TPS with small shared_buffers relative
+  to working set, where most reads miss shared_buffers but hit OS page cache
+  (fast IO completions = rapid transitions)
+
+**Where the cost comes from:**
+
+- **~70% — hardware debug exception**: CPU enters debug exception handler on
+  every write to the watched address. This is unavoidable — it happens before
+  any BPF code runs. Context switch save/restore of debug registers adds further
+  cost.
+- **~25% — lock amplification**: the debug exception fires while a backend holds
+  LWLocks or other internal locks. The extra ~200-300 ns extends lock hold times,
+  causing cascading contention under high concurrency.
+- **~5% — BPF + userspace**: ring buffer output, query_id probe reads, and
+  userspace consumption are a negligible fraction.
 
 ### Performance tuning flags
 
 | Flag | Effect | Trade-off |
 |------|--------|-----------|
-| `--skip-query-id` | Skips 1 `bpf_probe_read_user` per event (~100-200ns) | query_event view unavailable |
-| `--lightweight` | BPF accumulates in per-CPU hash map, no ring buffer | Only time_model and system_event views work. No per-PID, per-query, histogram, or trace recording |
+| `--skip-query-id` | Skips 1 `bpf_probe_read_user` per event (~100-200 ns) | query_event view unavailable |
+| `--lightweight` | BPF accumulates in per-CPU hash map, no ring buffer | Only time_model and system_event views. No per-PID, per-query, histogram, or trace recording |
+
+These flags provide marginal improvement (1-3 percentage points) because the
+dominant cost is the hardware debug exception, not BPF processing. They are
+most useful for write-heavy OLTP where transitions/sec is moderate.
 
 **Recommendations:**
 
-- **Default (full trace)** is appropriate for most production use. ~10% overhead
-  on an 8-client pgbench write-heavy workload is a worst case — real OLTP
-  workloads with mixed reads/writes typically see less.
-- Use `--skip-query-id` if you don't need per-query wait attribution and want
-  to save ~1.5%.
+- **Default (full trace)** is appropriate for most production use. Write-heavy
+  OLTP workloads see ~6% overhead, and you get all 6 views plus trace recording.
 - Use `--lightweight` for always-on monitoring where you only need time_model
   and system_event views.
+- Use `--skip-query-id` if you don't need per-query wait attribution.
+- Monitor overhead on your workload — if baseline TPS is very high (>50K) with
+  high buffer miss rates, overhead may be significant.
 
 ### BPF optimizations
 
