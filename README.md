@@ -1128,6 +1128,33 @@ The following optimizations are applied automatically:
   writes to reduce false watchpoint fires
 - **Compact state_map** (512 entries) — better cache utilization
 
+### Future: PostgreSQL-native wait event timing
+
+The hardware watchpoint overhead is fundamentally limited by the CPU debug
+exception cost (~200-300 ns per fire). A
+[proposed PostgreSQL patch](https://github.com/DmitryNFomin/postgres/pull/1)
+adds Oracle-style internal wait event instrumentation — two VDSO
+`clock_gettime()` calls per event (~40-100 ns) — achieving near-zero overhead.
+
+**Benchmark comparison** (same environment: Hetzner cx43, 8 vCPU, PG 19devel,
+pgbench scale 100, 8 clients, 60-second runs, 5 repetitions):
+
+| Approach | TPC-B overhead | SELECT-only worst case |
+|---|:---:|:---:|
+| pg_wait_tracer (hardware watchpoint) | 6% | 29% |
+| **PG patch (`wait_event_timing = on`)** | **< 1%** | **< 1%** |
+
+The patch adds a `wait_event_timing` GUC (default: off) that accumulates
+per-backend, per-event statistics in shared memory: call count, total
+nanoseconds, max duration, and 16-bucket log2 histogram. When the patch is
+available, pg_wait_tracer can read these stats directly instead of using
+hardware watchpoints, eliminating the debug exception overhead entirely.
+
+The patch provides aggregate statistics (equivalent to Oracle's
+`V$SYSTEM_EVENT` and `V$EVENT_HISTOGRAM`). For per-event trace recording,
+histogram drill-down, and the investigation clients (`pgwt`, `pgwt-cli`),
+hardware watchpoint mode remains necessary.
+
 ## Requirements
 
 - Linux kernel >= 5.8
