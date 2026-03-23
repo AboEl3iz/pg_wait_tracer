@@ -1138,8 +1138,9 @@ adds Oracle-style internal wait event instrumentation — two VDSO
 
 The patch adds a `wait_event_timing` GUC (default: off) that accumulates
 per-backend, per-event statistics in shared memory: call count, total
-nanoseconds, max duration, and 16-bucket log2 histogram — equivalent to
-Oracle's `V$SYSTEM_EVENT`, `V$SESSION_EVENT`, and `V$EVENT_HISTOGRAM`.
+nanoseconds, max duration, 16-bucket log2 histogram, and per-(query_id, event)
+attribution — equivalent to Oracle's `V$SYSTEM_EVENT`, `V$SESSION_EVENT`,
+`V$EVENT_HISTOGRAM`, and `V$SQL` wait statistics.
 
 **3-way benchmark** (Hetzner cx43, 8 vCPU, PG 19devel built from source,
 pgbench scale 100, shared_buffers = 128 MB, 8 clients, SELECT-only — the
@@ -1147,13 +1148,14 @@ worst case at ~220K wait event transitions/sec, 60-second runs, 3 repetitions):
 
 | Configuration | Mean TPS | Overhead |
 |---|---:|:---:|
-| Unpatched PG (master, no patch code) | 118,507 | baseline |
-| Patched PG, `wait_event_timing = off` | 117,843 | -0.6% (noise) |
-| Patched PG, `wait_event_timing = on` | 116,619 | -1.6% (noise) |
+| Unpatched PG (stock master) | 119,331 | baseline |
+| Patched PG, `wait_event_timing = off` | 116,657 | -2.2% |
+| Patched PG, `wait_event_timing = on` + query attribution | 114,627 | **-3.9%** |
 | pg_wait_tracer hardware watchpoint | 76,475 | **-29%** |
 
-All three non-watchpoint configurations are within the ~1.7% run-to-run
-variance — the patch overhead is unmeasurable even on the worst-case workload.
+The patch adds ~4% overhead on the worst-case workload (220K transitions/sec)
+vs 29% for hardware watchpoints — a 7x improvement. On typical OLTP workloads
+with lower transition rates, the overhead is proportionally smaller.
 
 When the patch is available, pg_wait_tracer can read these stats directly
 instead of using hardware watchpoints, eliminating the debug exception overhead
