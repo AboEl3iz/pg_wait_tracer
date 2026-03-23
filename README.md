@@ -1136,24 +1136,29 @@ exception cost (~200-300 ns per fire). A
 adds Oracle-style internal wait event instrumentation — two VDSO
 `clock_gettime()` calls per event (~40-100 ns) — achieving near-zero overhead.
 
-**Benchmark comparison** (same environment: Hetzner cx43, 8 vCPU, PG 19devel,
-pgbench scale 100, 8 clients, 60-second runs, 5 repetitions):
-
-| Approach | TPC-B overhead | SELECT-only worst case |
-|---|:---:|:---:|
-| pg_wait_tracer (hardware watchpoint) | 6% | 29% |
-| **PG patch (`wait_event_timing = on`)** | **< 1%** | **< 1%** |
-
 The patch adds a `wait_event_timing` GUC (default: off) that accumulates
 per-backend, per-event statistics in shared memory: call count, total
-nanoseconds, max duration, and 16-bucket log2 histogram. When the patch is
-available, pg_wait_tracer can read these stats directly instead of using
-hardware watchpoints, eliminating the debug exception overhead entirely.
+nanoseconds, max duration, and 16-bucket log2 histogram — equivalent to
+Oracle's `V$SYSTEM_EVENT`, `V$SESSION_EVENT`, and `V$EVENT_HISTOGRAM`.
 
-The patch provides aggregate statistics (equivalent to Oracle's
-`V$SYSTEM_EVENT` and `V$EVENT_HISTOGRAM`). For per-event trace recording,
-histogram drill-down, and the investigation clients (`pgwt`, `pgwt-cli`),
-hardware watchpoint mode remains necessary.
+**3-way benchmark** (Hetzner cx43, 8 vCPU, PG 19devel built from source,
+pgbench scale 100, shared_buffers = 128 MB, 8 clients, SELECT-only — the
+worst case at ~220K wait event transitions/sec, 60-second runs, 3 repetitions):
+
+| Configuration | Mean TPS | Overhead |
+|---|---:|:---:|
+| Unpatched PG (master, no patch code) | 118,507 | baseline |
+| Patched PG, `wait_event_timing = off` | 117,843 | -0.6% (noise) |
+| Patched PG, `wait_event_timing = on` | 116,619 | -1.6% (noise) |
+| pg_wait_tracer hardware watchpoint | 76,475 | **-29%** |
+
+All three non-watchpoint configurations are within the ~1.7% run-to-run
+variance — the patch overhead is unmeasurable even on the worst-case workload.
+
+When the patch is available, pg_wait_tracer can read these stats directly
+instead of using hardware watchpoints, eliminating the debug exception overhead
+entirely. For per-event trace recording and the investigation clients (`pgwt`,
+`pgwt-cli`), hardware watchpoint mode remains necessary.
 
 ## Requirements
 
