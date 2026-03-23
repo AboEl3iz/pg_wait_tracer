@@ -1148,14 +1148,14 @@ worst case at ~220K wait event transitions/sec, 60-second runs, 3 repetitions):
 
 | Configuration | Mean TPS | Overhead |
 |---|---:|:---:|
-| Unpatched PG (stock master) | 119,331 | baseline |
-| Patched PG, `wait_event_timing = off` | 116,657 | -2.2% |
-| Patched PG, `wait_event_timing = on` + query attribution | 114,627 | **-3.9%** |
+| Unpatched PG (stock master) | 119,201 | baseline |
+| Patched, all features ON (timing + query + 10046 trace) | 113,852 | **-4.5%** |
 | pg_wait_tracer hardware watchpoint | 76,475 | **-29%** |
 
-The patch adds ~4% overhead on the worst-case workload (220K transitions/sec)
-vs 29% for hardware watchpoints — a 7x improvement. On typical OLTP workloads
-with lower transition rates, the overhead is proportionally smaller.
+The patch with all features enabled adds ~4.5% overhead on the worst-case
+workload (220K transitions/sec) vs 29% for hardware watchpoints — a 6x
+improvement. On typical OLTP workloads with lower transition rates, the
+overhead is proportionally smaller.
 
 When the patch is available, pg_wait_tracer can read these stats directly
 instead of using hardware watchpoints, eliminating the debug exception overhead
