@@ -1,3 +1,6 @@
+# macOS
+.DS_Store
+
 # Build artifacts
 build/
 pg_wait_tracer
@@ -10,6 +13,11 @@ include/pg_wait_tracer.skel.h
 # Test binaries
 tests/test_wait_event
 tests/test_cmdline
+tests/test_bucket
+tests/test_event_writer
+tests/test_event_reader
+tests/gen_test_traces
+tests/gen_bench_traces
 tests/__pycache__/
 
 # Go build artifacts
@@ -18,5 +26,6 @@ poc/web/go.sum
 web/pgwt
 web/go.sum
 
-# Rust build artifacts
-client/target/
+# Cross-compiled Go binaries
+pgwt-darwin-amd64
+pgwt-darwin-arm64
