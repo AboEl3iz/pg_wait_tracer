@@ -1535,7 +1535,7 @@ function startAutoRefresh(rangeSecs) {
             const end = state.toNs;
             state.viewFrom = Math.max(state.fromNs, end - rangeSecs * 1e9);
             state.viewTo = end;
-            refreshAll();
+            refresh();
         } catch (e) { /* ignore on disconnect */ }
     }, 5000);
 }
@@ -1566,7 +1566,7 @@ function initLiveMode() {
             state.viewFrom = Math.max(state.fromNs, end - 300e9);
             state.viewTo = end;
             startAutoRefresh(300);
-            refreshAll();
+            refresh();
         }
     });
 }
