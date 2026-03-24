@@ -72,6 +72,7 @@ struct pgwt_daemon {
     const char *event_filter;     /* for histogram view */
     pid_t       pid_filter;       /* for session_event detail */
     bool        verbose;
+    bool        quiet;               /* suppress view output (record only) */
     int         pg_major_version;   /* 14, 15, 16, 17, or 18 */
     int         st_query_id_offset; /* 0 = not available */
     int         st_activity_offset; /* st_activity_raw in PgBackendStatus, 0 = N/A */

@@ -75,27 +75,29 @@ static void handle_timer(struct pgwt_daemon *d)
     if (d->ring.slots)
         pgwt_ring_push(&d->ring, &d->accum);
 
-    switch (d->view) {
-    case PGWT_VIEW_TIME_MODEL:
-        pgwt_print_time_model(d);
-        break;
-    case PGWT_VIEW_SYSTEM_EVENT:
-        pgwt_print_system_event(d);
-        break;
-    case PGWT_VIEW_SESSION_EVENT:
-        pgwt_print_session_event(d);
-        break;
-    case PGWT_VIEW_HISTOGRAM:
-        pgwt_print_histogram(d);
-        break;
-    case PGWT_VIEW_QUERY_EVENT:
-        pgwt_print_query_event(d);
-        break;
-    case PGWT_VIEW_ACTIVE:
-        pgwt_print_active(d);
-        break;
+    if (!d->quiet) {
+        switch (d->view) {
+        case PGWT_VIEW_TIME_MODEL:
+            pgwt_print_time_model(d);
+            break;
+        case PGWT_VIEW_SYSTEM_EVENT:
+            pgwt_print_system_event(d);
+            break;
+        case PGWT_VIEW_SESSION_EVENT:
+            pgwt_print_session_event(d);
+            break;
+        case PGWT_VIEW_HISTOGRAM:
+            pgwt_print_histogram(d);
+            break;
+        case PGWT_VIEW_QUERY_EVENT:
+            pgwt_print_query_event(d);
+            break;
+        case PGWT_VIEW_ACTIVE:
+            pgwt_print_active(d);
+            break;
+        }
+        fflush(stdout);
     }
-    fflush(stdout);
 
     /* GC: sweep backend table every 60s for dead processes.
      * Handles PIDs that exited without triggering on_exit tracepoint
@@ -362,7 +364,8 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
     d->start_ts = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
     d->running = true;
 
-    pgwt_print_header(d);
+    if (!d->quiet)
+        pgwt_print_header(d);
     return 0;
 
 fail:

@@ -57,6 +57,7 @@ static void usage(const char *prog)
         "                             Disables query_event view\n"
         "\n"
         "Other:\n"
+        "  -q, --quiet           Suppress view output (daemon mode: record only)\n"
         "  -v, --verbose         Verbose output to stderr\n"
         "  -h, --help            Show this help\n"
         "\n"
@@ -189,6 +190,7 @@ static struct option long_opts[] = {
     {"trace-group",     required_argument, NULL, OPT_TRACE_GROUP},
     {"lightweight",     no_argument,       NULL, OPT_LIGHTWEIGHT},
     {"skip-query-id",   no_argument,       NULL, OPT_SKIP_QID},
+    {"quiet",           no_argument,       NULL, 'q'},
     {"verbose",         no_argument,       NULL, 'v'},
     {"help",            no_argument,       NULL, 'h'},
     {NULL, 0, NULL, 0},
@@ -217,7 +219,7 @@ int main(int argc, char **argv)
     const char *to_str = NULL;
     int opt;
 
-    while ((opt = getopt_long(argc, argv, "p:D:i:d:V:f:n:w:e:P:Q:S:T:R:vh", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:D:i:d:V:f:n:w:e:P:Q:S:T:R:qvh", long_opts, NULL)) != -1) {
         switch (opt) {
         case 'p': pm_pid = atoi(optarg); break;
         case 'D': pgdata = optarg; break;
@@ -245,6 +247,7 @@ int main(int argc, char **argv)
         case OPT_TRACE_GROUP: d->trace_group = optarg; break;
         case OPT_LIGHTWEIGHT: d->lightweight_mode = 1; break;
         case OPT_SKIP_QID:    d->skip_query_id = 1; break;
+        case 'q': d->quiet = true; break;
         case 'v': d->verbose = true; break;
         case 'h': usage(argv[0]); free(d); return 0;
         default:  usage(argv[0]); free(d); return 1;
