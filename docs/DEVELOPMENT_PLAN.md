@@ -318,7 +318,7 @@ current architecture. Revisit if shared cache across users becomes a need.
 
 ---
 
-## Sprint 12: Live Mode (Phase H)
+## Sprint 12: Live Mode (Phase H) ✅ COMPLETED (2026-03-24)
 
 **Goal:** Near-real-time AAS chart and drill-down from the running daemon's
 trace data, without merging daemon + server.
@@ -351,21 +351,26 @@ resolution from trace files. Historical + live data seamlessly merged.
 
 ---
 
-## Sprint 13: Tracing Analysis Phase 3 — Concurrency
+## Sprint 13: Tracing Analysis Phase 3 — Concurrency ✅ COMPLETED (2026-03-24)
 
 **Goal:** Detect thundering herds and micro-bursts.
 
-**Depends on:** Sprint 10 (transitions), Sprint 11 (daemon-served for live detection).
+**Depends on:** Sprint 10 (transitions).
 
-| # | Task | Details |
-|---|------|---------|
-| 13.1 | Peak concurrency per AAS bucket | Track max simultaneous sessions per wait state within each time bucket |
-| 13.2 | Web UI: peak concurrency markers on AAS chart | Secondary axis or annotation markers |
-| 13.3 | Burst detection algorithm | Sliding window: N sessions enter same wait within <10ms |
-| 13.4 | Web UI: burst annotations on AAS timeline | Clickable → session timeline for affected PIDs |
+| # | Task | Details | Status |
+|---|------|---------|--------|
+| 13.1 | Peak concurrency per AAS bucket | Builds sorted active intervals, counts max overlapping sessions per event per bucket | ✅ |
+| 13.2 | Web UI: peak concurrency markers | Deferred to UI polish pass — data available via `concurrency` endpoint | ⏸ |
+| 13.3 | Burst detection algorithm | Sliding window (10ms default): finds N+ sessions entering same wait simultaneously. Returns PIDs. | ✅ |
+| 13.4 | Web UI: burst annotations | Deferred to UI polish pass — data available via `concurrency` endpoint | ⏸ |
 
-**Deliverable:** "43 sessions hit buffer_mapping simultaneously at 10:04:05" —
-detected automatically, visible on the chart.
+**Details:**
+- **Algorithm:** Sorts events by start_ns, scans for time-overlapping intervals on same event_id.
+  Peak tracking per bucket: O(events × events_per_bucket). Burst detection: O(events × window_size).
+- **Parameters:** `burst_window_ns` (default 10ms), `burst_threshold` (default 4 sessions).
+- **Server endpoint:** `concurrency` returns `peaks[]` (per-bucket) + `bursts[]` (sorted by sessions desc).
+
+**Result:** Commit: `2e6483f`. Web UI integration deferred — backend API complete.
 
 ---
 
@@ -403,8 +408,8 @@ Sprint 8:  Drop Rust TUI                                ✅ ──── Simplif
 Sprint 9:  Performance optimization + benchmarks        ✅ ──── Speed
 Sprint 10: Tracing analysis Phase 2 (transitions)       ✅ ──── Differentiate
 Sprint 11: Merge daemon + server                     ⏸ ──── Deferred
-Sprint 12: Live mode (Phase H)                              ──── Real-time
-Sprint 13: Tracing analysis Phase 3 (concurrency)           ──── Advanced
+Sprint 12: Live mode (Phase H)                          ✅ ──── Real-time
+Sprint 13: Tracing analysis Phase 3 (concurrency)       ✅ ──── Advanced
 Sprint 14: Advanced analysis (Phases 4-5) + G.2             ──── Research
 ```
 
