@@ -286,6 +286,18 @@ def handle_request(msg):
             {"source": "CPU*", "target": "IO:WalSync", "value": 100, "duration_ms": 3200.0},
         ]}
 
+    if cmd == "lock_chains":
+        return {"id": req_id, "chains": [
+            {"waiter": 1001, "blocker": 1000, "lock": "Lock:transactionid", "wait_ms": 45.2, "timestamp_ns": 1711936100000000000},
+            {"waiter": 1003, "blocker": 1002, "lock": "Lock:tuple", "wait_ms": 12.8, "timestamp_ns": 1711936200000000000},
+        ]}
+
+    if cmd == "interference":
+        return {"id": req_id, "rows": [
+            {"pid_a": 1001, "pid_b": 1003, "score": 1.0, "top_event": "LWLock:BufferMapping", "overlap_ms": 234.5},
+            {"pid_a": 1002, "pid_b": 1004, "score": 0.72, "top_event": "IO:DataFileRead", "overlap_ms": 168.3},
+        ]}
+
     if cmd == "concurrency":
         nb = msg.get("num_buckets", 60)
         peaks = [{"t": 1711936000000000000 + i * 60000000000, "max": 3 + (i % 5), "event": "LWLock:BufferMapping"} for i in range(nb)]

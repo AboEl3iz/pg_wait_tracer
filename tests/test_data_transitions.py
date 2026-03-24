@@ -36,7 +36,7 @@ try:
         data = srv.query("transitions")
         links = data.get("links", [])
 
-        t.check("total transitions = 8", data.get("total") == 8)
+        t.check(data.get("total") == 8, "total transitions = 8")
 
         def find_link(src_substr, tgt_substr):
             for l in links:
@@ -45,34 +45,34 @@ try:
             return None
 
         cpu_to_read = find_link("CPU", "DataFileRead")
-        t.check("CPU→IO:DataFileRead count=2",
-                cpu_to_read is not None and cpu_to_read["value"] == 2)
+        t.check(cpu_to_read is not None and cpu_to_read["value"] == 2,
+                "CPU→IO:DataFileRead count=2")
 
         read_to_cpu = find_link("DataFileRead", "CPU")
-        t.check("IO:DataFileRead→CPU count=2",
-                read_to_cpu is not None and read_to_cpu["value"] == 2)
+        t.check(read_to_cpu is not None and read_to_cpu["value"] == 2,
+                "IO:DataFileRead→CPU count=2")
 
         cpu_to_write = find_link("CPU", "DataFileWrite")
-        t.check("CPU→IO:DataFileWrite count=1",
-                cpu_to_write is not None and cpu_to_write["value"] == 1)
+        t.check(cpu_to_write is not None and cpu_to_write["value"] == 1,
+                "CPU→IO:DataFileWrite count=1")
 
         lock_to_cpu = find_link("extend", "CPU")
-        t.check("Lock:extend→CPU count=1",
-                lock_to_cpu is not None and lock_to_cpu["value"] == 1)
+        t.check(lock_to_cpu is not None and lock_to_cpu["value"] == 1,
+                "Lock:extend→CPU count=1")
 
         # Duration: IO:DataFileRead→CPU has 2 events × 2ms each = 4ms
-        t.check("IO:DataFileRead→CPU duration=4ms",
-                read_to_cpu is not None and abs(read_to_cpu["duration_ms"] - 4.0) < 0.01)
+        t.check(read_to_cpu is not None and abs(read_to_cpu["duration_ms"] - 4.0) < 0.01,
+                "IO:DataFileRead→CPU duration=4ms")
 
         # Test fingerprints endpoint
         fp = srv.query("fingerprints")
         rows = fp.get("rows", [])
-        t.check("1 query fingerprint", len(rows) == 1)
+        t.check(len(rows) == 1, "1 query fingerprint")
         if rows:
-            t.check("query_id = 100", rows[0]["query_id"] == 100)
-            t.check("8 transitions", rows[0]["transitions"] == 8)
+            t.check(rows[0]["query_id"] == 100, "query_id = 100")
+            t.check(rows[0]["transitions"] == 8, "8 transitions")
             sig = rows[0].get("signature", "")
-            t.check("signature has IO and CPU", "IO:" in sig and "CPU:" in sig)
+            t.check("IO:" in sig and "CPU:" in sig, "signature has IO and CPU")
 finally:
     cleanup_traces(trace_dir)
 
