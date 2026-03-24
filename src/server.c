@@ -1273,6 +1273,64 @@ static void handle_fingerprints(struct pgwt_server *srv, struct pgwt_request *re
     emit_json(root);
 }
 
+static void handle_concurrency(struct pgwt_server *srv, struct pgwt_request *req)
+{
+    int count;
+    struct pgwt_trace_event *events =
+        server_load_events(srv, req->from_ns, req->to_ns, &count);
+
+    uint64_t from = req->from_ns ? req->from_ns : srv->earliest_wall_ns;
+    uint64_t to   = req->to_ns   ? req->to_ns   : srv->latest_wall_ns;
+    int num_buckets = req->num_buckets > 0 ? req->num_buckets : 60;
+
+    struct pgwt_concurrency_result res;
+    pgwt_compute_concurrency(events, count, &req->filter,
+                              from, to, num_buckets,
+                              10000000ULL,  /* 10ms burst window */
+                              4,            /* 4+ sessions = burst */
+                              &res);
+    free(events);
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddNumberToObject(root, "id", (double)req->id);
+    cjson_add_uint64(root, "bucket_ns", res.bucket_ns);
+
+    /* Peak concurrency per bucket */
+    cJSON *peaks = cJSON_AddArrayToObject(root, "peaks");
+    for (int i = 0; i < res.num_buckets; i++) {
+        cJSON *p = cJSON_CreateObject();
+        cjson_add_uint64(p, "t", from + (uint64_t)i * res.bucket_ns);
+        cJSON_AddNumberToObject(p, "max", res.peak_sessions[i]);
+        if (res.peak_event[i]) {
+            char ename[64];
+            pgwt_event_full_name(res.peak_event[i], ename, sizeof(ename));
+            cJSON_AddStringToObject(p, "event", ename);
+        }
+        cJSON_AddItemToArray(peaks, p);
+    }
+
+    /* Bursts */
+    cJSON *bursts_arr = cJSON_AddArrayToObject(root, "bursts");
+    int nb = res.num_bursts < 20 ? res.num_bursts : 20;
+    for (int i = 0; i < nb; i++) {
+        cJSON *b = cJSON_CreateObject();
+        cjson_add_uint64(b, "timestamp_ns", res.bursts[i].timestamp_ns);
+        cJSON_AddStringToObject(b, "event", res.bursts[i].event_name);
+        cJSON_AddNumberToObject(b, "sessions", res.bursts[i].num_sessions);
+
+        cJSON *pids = cJSON_AddArrayToObject(b, "pids");
+        for (int j = 0; j < res.bursts[i].num_pids; j++)
+            cJSON_AddItemToArray(pids, cJSON_CreateNumber(res.bursts[i].pids[j]));
+
+        cJSON_AddItemToArray(bursts_arr, b);
+    }
+
+    free(res.peak_sessions);
+    free(res.peak_event);
+    free(res.bursts);
+    emit_json(root);
+}
+
 static void dispatch(struct pgwt_server *srv, struct pgwt_request *req)
 {
     if (strcmp(req->cmd, "info") == 0)
@@ -1295,6 +1353,8 @@ static void dispatch(struct pgwt_server *srv, struct pgwt_request *req)
         handle_transitions(srv, req);
     else if (strcmp(req->cmd, "fingerprints") == 0)
         handle_fingerprints(srv, req);
+    else if (strcmp(req->cmd, "concurrency") == 0)
+        handle_concurrency(srv, req);
     else {
         cJSON *root = cJSON_CreateObject();
         cJSON_AddNumberToObject(root, "id", (double)req->id);

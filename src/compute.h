@@ -268,4 +268,37 @@ void pgwt_compute_fingerprints(const struct pgwt_trace_event *events, int count,
                                 const struct pgwt_filter *f,
                                 struct pgwt_fingerprint_result *out);
 
+/* ── Concurrency / Burst Detection ────────────────────────── */
+
+struct pgwt_burst {
+    uint64_t timestamp_ns;    /* when the burst started */
+    uint32_t event_id;        /* which wait event */
+    char     event_name[64];
+    int      num_sessions;    /* how many sessions entered simultaneously */
+    uint32_t pids[64];        /* affected PIDs (up to 64) */
+    int      num_pids;
+};
+
+struct pgwt_concurrency_result {
+    /* Per-bucket peak concurrency (same layout as AAS buckets) */
+    int     *peak_sessions;   /* malloc'd [num_buckets] — max simultaneous waiters */
+    uint32_t *peak_event;     /* malloc'd [num_buckets] — event with max concurrency */
+    int      num_buckets;
+    uint64_t bucket_ns;
+
+    /* Detected bursts (sorted by num_sessions descending) */
+    struct pgwt_burst *bursts;  /* malloc'd, caller frees */
+    int    num_bursts;
+};
+
+/* Detect concurrency peaks and burst events.
+ * burst_window_ns: time window for burst detection (e.g. 10ms = 10000000).
+ * burst_threshold: minimum sessions to count as burst (e.g. 4). */
+void pgwt_compute_concurrency(const struct pgwt_trace_event *events, int count,
+                               const struct pgwt_filter *f,
+                               uint64_t from_ns, uint64_t to_ns,
+                               int num_buckets,
+                               uint64_t burst_window_ns, int burst_threshold,
+                               struct pgwt_concurrency_result *out);
+
 #endif /* PGWT_COMPUTE_H */

@@ -1959,3 +1959,170 @@ void pgwt_compute_fingerprints(const struct pgwt_trace_event *events, int count,
     out->rows = rows;
     out->num_rows = nr;
 }
+
+/* ── Concurrency / Burst Detection ────────────────────────── */
+
+/*
+ * For each event, we know: PID was in old_event from (timestamp - duration)
+ * to timestamp. Two sessions overlap if their time intervals overlap on the
+ * same event. We detect bursts by sorting events by start time and using a
+ * sliding window.
+ */
+
+struct active_entry {
+    uint32_t pid;
+    uint32_t event_id;
+    uint64_t start_ns;   /* timestamp_ns - duration_ns */
+    uint64_t end_ns;      /* timestamp_ns */
+};
+
+static int cmp_active_by_start(const void *a, const void *b)
+{
+    uint64_t sa = ((const struct active_entry *)a)->start_ns;
+    uint64_t sb = ((const struct active_entry *)b)->start_ns;
+    return (sa > sb) - (sa < sb);
+}
+
+static int cmp_burst_desc(const void *a, const void *b)
+{
+    int na = ((const struct pgwt_burst *)a)->num_sessions;
+    int nb = ((const struct pgwt_burst *)b)->num_sessions;
+    return (nb > na) - (nb < na);
+}
+
+void pgwt_compute_concurrency(const struct pgwt_trace_event *events, int count,
+                               const struct pgwt_filter *f,
+                               uint64_t from_ns, uint64_t to_ns,
+                               int num_buckets,
+                               uint64_t burst_window_ns, int burst_threshold,
+                               struct pgwt_concurrency_result *out)
+{
+    memset(out, 0, sizeof(*out));
+
+    if (count == 0 || from_ns >= to_ns || num_buckets <= 0)
+        return;
+
+    uint64_t bucket_ns = (to_ns - from_ns) / num_buckets;
+    if (bucket_ns == 0) bucket_ns = 1;
+
+    out->num_buckets = num_buckets;
+    out->bucket_ns = bucket_ns;
+    out->peak_sessions = calloc(num_buckets, sizeof(int));
+    out->peak_event = calloc(num_buckets, sizeof(uint32_t));
+
+    /* Build sorted list of active intervals */
+    int cap = count < 100000 ? count : 100000;  /* limit for memory */
+    struct active_entry *active = malloc(cap * sizeof(*active));
+    int nactive = 0;
+
+    for (int i = 0; i < count && nactive < cap; i++) {
+        const struct pgwt_trace_event *ev = &events[i];
+        if (!pgwt_filter_matches(f, ev) || pgwt_is_idle_event(ev->old_event))
+            continue;
+        if (ev->old_event == 0) continue;  /* skip CPU for burst detection */
+        if (ev->timestamp_ns < from_ns || ev->timestamp_ns > to_ns)
+            continue;
+
+        active[nactive].pid = ev->pid;
+        active[nactive].event_id = ev->old_event;
+        active[nactive].start_ns = ev->timestamp_ns - ev->duration_ns;
+        active[nactive].end_ns = ev->timestamp_ns;
+        nactive++;
+    }
+
+    qsort(active, nactive, sizeof(active[0]), cmp_active_by_start);
+
+    /* Phase 1: Peak concurrency per AAS bucket.
+     * For each bucket, count max overlapping sessions on same event. */
+    for (int b = 0; b < num_buckets; b++) {
+        uint64_t bstart = from_ns + (uint64_t)b * bucket_ns;
+        uint64_t bend = bstart + bucket_ns;
+
+        /* Count sessions active in this bucket, grouped by event */
+        struct { uint32_t eid; int count; } ev_counts[256];
+        int nev = 0;
+
+        for (int i = 0; i < nactive; i++) {
+            if (active[i].start_ns >= bend) break;
+            if (active[i].end_ns <= bstart) continue;
+
+            /* This session overlaps with the bucket */
+            int found = -1;
+            for (int j = 0; j < nev; j++) {
+                if (ev_counts[j].eid == active[i].event_id) {
+                    found = j;
+                    break;
+                }
+            }
+            if (found >= 0) {
+                ev_counts[found].count++;
+            } else if (nev < 256) {
+                ev_counts[nev].eid = active[i].event_id;
+                ev_counts[nev].count = 1;
+                nev++;
+            }
+        }
+
+        /* Find peak */
+        for (int j = 0; j < nev; j++) {
+            if (ev_counts[j].count > out->peak_sessions[b]) {
+                out->peak_sessions[b] = ev_counts[j].count;
+                out->peak_event[b] = ev_counts[j].eid;
+            }
+        }
+    }
+
+    /* Phase 2: Burst detection.
+     * Sliding window: find groups of N+ sessions entering the same wait
+     * event within burst_window_ns of each other. */
+    int burst_cap = 256;
+    struct pgwt_burst *bursts = calloc(burst_cap, sizeof(*bursts));
+    int nbursts = 0;
+
+    for (int i = 0; i < nactive && nbursts < burst_cap; i++) {
+        uint32_t eid = active[i].event_id;
+        uint64_t window_end = active[i].start_ns + burst_window_ns;
+
+        /* Count sessions with same event starting within window */
+        int burst_count = 0;
+        uint32_t pids[64];
+        int npids = 0;
+
+        for (int j = i; j < nactive; j++) {
+            if (active[j].start_ns > window_end) break;
+            if (active[j].event_id == eid) {
+                burst_count++;
+                if (npids < 64) {
+                    /* Avoid duplicate PIDs */
+                    int dup = 0;
+                    for (int k = 0; k < npids; k++)
+                        if (pids[k] == active[j].pid) { dup = 1; break; }
+                    if (!dup) pids[npids++] = active[j].pid;
+                }
+            }
+        }
+
+        if (npids >= burst_threshold) {
+            struct pgwt_burst *b = &bursts[nbursts++];
+            b->timestamp_ns = active[i].start_ns;
+            b->event_id = eid;
+            b->num_sessions = npids;
+            pgwt_event_full_name(eid, b->event_name, sizeof(b->event_name));
+            b->num_pids = npids < 64 ? npids : 64;
+            memcpy(b->pids, pids, b->num_pids * sizeof(uint32_t));
+
+            /* Skip past this burst to avoid duplicates */
+            while (i + 1 < nactive &&
+                   active[i + 1].start_ns <= window_end &&
+                   active[i + 1].event_id == eid)
+                i++;
+        }
+    }
+
+    free(active);
+
+    qsort(bursts, nbursts, sizeof(bursts[0]), cmp_burst_desc);
+
+    out->bursts = bursts;
+    out->num_bursts = nbursts;
+}
