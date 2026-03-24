@@ -147,9 +147,10 @@ async function init() {
         state.fromNs = info.from_ns;
         state.toNs = info.to_ns;
         state.numCpus = info.num_cpus;
-        const ONE_HOUR_NS = 3600 * 1e9;
-        state.viewFrom = Math.max(info.from_ns, info.to_ns - ONE_HOUR_NS);
+        const FIFTEEN_MIN_NS = 900 * 1e9;
+        state.viewFrom = info.to_ns - FIFTEEN_MIN_NS;
         state.viewTo = info.to_ns;
+        state.liveRangeSecs = 900;
         setStatus(info.num_cpus + ' CPUs, ~' + fmtCount(info.num_events) + ' events', 'connected');
         updateTimeRange();
         initChart();
@@ -158,6 +159,8 @@ async function init() {
         initTimePicker();
         initLiveMode();
         await refresh();
+        /* Start in live mode (last 15 min, auto-refresh) */
+        startAutoRefresh(900);
     } catch (e) {
         setStatus('Error: ' + e.message, 'error');
     }
