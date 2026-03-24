@@ -597,7 +597,7 @@ function initTimePicker() {
                 // "Last N" — relative range from end of available data
                 state.liveRangeSecs = secs;
                 const end = state.toNs;
-                const from = Math.max(state.fromNs, end - secs * 1e9);
+                const from = end - secs * 1e9;
                 zoomTo(from, end);
                 startAutoRefresh(secs);
             }
@@ -1533,7 +1533,7 @@ function startAutoRefresh(rangeSecs) {
                 if (info.from_ns) state.fromNs = info.from_ns;
             }
             const end = state.toNs;
-            state.viewFrom = Math.max(state.fromNs, end - rangeSecs * 1e9);
+            state.viewFrom = end - rangeSecs * 1e9;
             state.viewTo = end;
             refresh();
         } catch (e) { /* ignore on disconnect */ }
@@ -1563,7 +1563,7 @@ function initLiveMode() {
             // Default: last 5 minutes from the end of available data
             state.liveRangeSecs = 300;
             const end = state.toNs || Date.now() * 1e6;
-            state.viewFrom = Math.max(state.fromNs, end - 300e9);
+            state.viewFrom = end - 300e9;
             state.viewTo = end;
             startAutoRefresh(300);
             refresh();
