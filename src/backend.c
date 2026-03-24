@@ -125,7 +125,7 @@ int pgwt_scan_existing_backends(struct pgwt_daemon *d)
         int wp_prog_fd = bpf_program__fd(d->skel->progs.on_watchpoint);
         be->wp_fd = pgwt_open_watchpoint(pid, ptr, wp_prog_fd);
         if (be->wp_fd < 0) {
-            fprintf(stderr, "WARN: cannot attach watchpoint to PID %d\n", pid);
+            /* Silently skip — process likely exited before attach */
             be->is_alive = false;
             be->pid = 0;
             continue;
@@ -208,7 +208,7 @@ int pgwt_handle_fork(struct pgwt_daemon *d, pid_t child_pid)
         if (ptr != 0) {
             return pgwt_handle_init(d, child_pid, ptr);
         }
-        fprintf(stderr, "WARN: cannot attach bootstrap to PID %d\n", child_pid);
+        /* Silently skip — process exited before bootstrap attach */
         be->is_alive = false;
         be->pid = 0;
         return -1;
@@ -246,7 +246,7 @@ int pgwt_handle_init(struct pgwt_daemon *d, pid_t pid, uint64_t addr)
     int wp_prog_fd = bpf_program__fd(d->skel->progs.on_watchpoint);
     be->wp_fd = pgwt_open_watchpoint(pid, addr, wp_prog_fd);
     if (be->wp_fd < 0) {
-        fprintf(stderr, "WARN: cannot attach real watchpoint to PID %d\n", pid);
+        /* Silently skip — process likely exited before attach */
         be->is_alive = false;
         be->pid = 0;
         return -1;

@@ -34,8 +34,11 @@ int pgwt_open_watchpoint(pid_t pid, uint64_t addr, int bpf_prog_fd)
 
     int fd = sys_perf_event_open(&attr, pid, -1, -1, PERF_FLAG_FD_CLOEXEC);
     if (fd < 0) {
-        fprintf(stderr, "perf_event_open(pid=%d, addr=0x%lx): %s\n",
-                pid, (unsigned long)addr, strerror(errno));
+        /* ESRCH = process exited before we could attach — expected for
+         * short-lived backends. Don't spam stderr with these. */
+        if (errno != ESRCH)
+            fprintf(stderr, "perf_event_open(pid=%d, addr=0x%lx): %s\n",
+                    pid, (unsigned long)addr, strerror(errno));
         return -1;
     }
 
