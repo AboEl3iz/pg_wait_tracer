@@ -591,6 +591,37 @@ def test_chart_rendering(page):
     check(height > 100, f"Chart height = {height}px (expected > 100)")
 
 
+def test_concurrency_overlay(page):
+    """15b. AAS chart includes concurrency overlay (Peak Concurrency line)."""
+    print("--- Test 15b: Concurrency Overlay ---")
+
+    page.goto(MOCK_URL)
+    page.wait_for_selector("#status.connected", timeout=10000)
+    page.wait_for_timeout(2000)
+
+    # The chart should have a "Peak Concurrency" legend entry
+    legend_text = page.evaluate("""
+        () => {
+            const c = echarts.getInstanceByDom(document.getElementById('chart-container'));
+            if (!c) return '';
+            const opt = c.getOption();
+            return (opt.legend && opt.legend[0] && opt.legend[0].data)
+                ? opt.legend[0].data.join(',') : '';
+        }
+    """)
+    check("Peak Concurrency" in legend_text,
+          f"Chart legend includes Peak Concurrency (got: {legend_text[:80]})")
+
+    # Should have more than just the stacked area series
+    num_series = page.evaluate("""
+        () => {
+            const c = echarts.getInstanceByDom(document.getElementById('chart-container'));
+            return c ? c.getOption().series.length : 0;
+        }
+    """)
+    check(num_series > 2, f"Chart has {num_series} series (expected > 2 with overlay)")
+
+
 def test_reconnection(page, mock_proc):
     """16. WebSocket reconnects after disconnect."""
     print("--- Test 16: Reconnection ---")
@@ -988,6 +1019,7 @@ def main():
             test_zoom_out(page)
             test_auto_refresh(page)
             test_chart_rendering(page)
+            test_concurrency_overlay(page)
             test_session_drill_to_timeline(page)
             test_query_drill(page)
 

@@ -772,6 +772,68 @@ function renderChart(data) {
     };
 
     chart.setOption(option, true);
+
+    // Overlay concurrency data (peak sessions + bursts)
+    fetchConcurrencyOverlay(times, bns);
+}
+
+async function fetchConcurrencyOverlay(times, bns) {
+    try {
+        const data = await send('concurrency', {
+            from: state.viewFrom,
+            to: state.viewTo,
+            num_buckets: times.length,
+            filters: state.filters,
+        });
+        if (!data || !data.peaks || !chart) return;
+
+        // Build peak concurrency line data
+        const peakData = data.peaks.map(p => p.max || 0);
+        const maxPeak = Math.max(...peakData, 1);
+
+        // Build burst markers
+        const burstMarkers = (data.bursts || []).map(b => {
+            // Find closest time bucket
+            const idx = data.peaks.findIndex(p => p.t >= b.timestamp_ns);
+            return {
+                name: `${b.event}\n${b.sessions} sessions`,
+                coord: [Math.max(0, idx), peakData[Math.max(0, idx)] || 0],
+                value: b.sessions,
+                itemStyle: { color: '#f44' },
+                symbol: 'triangle',
+                symbolSize: Math.min(8 + b.sessions, 20),
+            };
+        });
+
+        // Add secondary Y-axis + line series to existing chart
+        const opt = chart.getOption();
+        opt.yAxis.push({
+            type: 'value',
+            name: 'Peak Sessions',
+            nameTextStyle: { color: '#f8a', fontSize: 10 },
+            position: 'right',
+            min: 0,
+            max: maxPeak + 2,
+            axisLabel: { color: '#f8a', fontSize: 10 },
+            splitLine: { show: false },
+        });
+        opt.series.push({
+            name: 'Peak Concurrency',
+            type: 'line',
+            yAxisIndex: 1,
+            data: peakData,
+            lineStyle: { color: '#f8a', width: 1, type: 'dashed' },
+            itemStyle: { color: '#f8a' },
+            symbol: 'none',
+            z: 10,
+            markPoint: burstMarkers.length > 0 ? {
+                data: burstMarkers,
+                label: { show: false },
+            } : undefined,
+        });
+        opt.legend[0].data.push('Peak Concurrency');
+        chart.setOption(opt);
+    } catch (e) { /* ignore — concurrency overlay is optional */ }
 }
 
 // -- Tables -------------------------------------------------------------------

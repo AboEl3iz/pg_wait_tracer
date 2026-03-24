@@ -286,6 +286,15 @@ def handle_request(msg):
             {"source": "CPU*", "target": "IO:WalSync", "value": 100, "duration_ms": 3200.0},
         ]}
 
+    if cmd == "concurrency":
+        nb = msg.get("num_buckets", 60)
+        peaks = [{"t": 1711936000000000000 + i * 60000000000, "max": 3 + (i % 5), "event": "LWLock:BufferMapping"} for i in range(nb)]
+        bursts = [
+            {"timestamp_ns": 1711936180000000000, "event": "LWLock:BufferMapping", "sessions": 8, "pids": [1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008]},
+            {"timestamp_ns": 1711936300000000000, "event": "IO:DataFileRead", "sessions": 5, "pids": [1001, 1003, 1005, 1007, 1009]},
+        ]
+        return {"id": req_id, "peaks": peaks, "bursts": bursts, "bucket_ns": 60000000000}
+
     if cmd == "fingerprints":
         return {"id": req_id, "rows": [
             {"query_id": 123456, "transitions": 800, "signature": "IO:40%|CPU:35%|LWLock:25%",
