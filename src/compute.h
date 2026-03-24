@@ -301,4 +301,49 @@ void pgwt_compute_concurrency(const struct pgwt_trace_event *events, int count,
                                uint64_t burst_window_ns, int burst_threshold,
                                struct pgwt_concurrency_result *out);
 
+/* ── Lock Chains ──────────────────────────────────────────── */
+
+struct pgwt_lock_chain_link {
+    uint32_t waiter_pid;
+    uint32_t blocker_pid;     /* PID that was on CPU while waiter waited on Lock */
+    uint32_t lock_event;      /* Lock:transactionid, Lock:tuple, etc. */
+    char     lock_name[64];
+    uint64_t wait_ns;         /* how long the waiter waited */
+    uint64_t timestamp_ns;    /* when the wait started */
+};
+
+struct pgwt_lock_chains_result {
+    struct pgwt_lock_chain_link *links;  /* malloc'd, caller frees */
+    int    num_links;
+};
+
+/* Detect lock chains: find sessions waiting on Lock events and identify
+ * which other session was likely the blocker (on CPU during the same interval).
+ * Returns waiter→blocker links sorted by wait_ns descending. */
+void pgwt_compute_lock_chains(const struct pgwt_trace_event *events, int count,
+                               const struct pgwt_filter *f, int max_links,
+                               struct pgwt_lock_chains_result *out);
+
+/* ── Interference Scoring ────────────────────────────────── */
+
+struct pgwt_interference_row {
+    uint32_t pid_a;
+    uint32_t pid_b;
+    double   score;        /* 0-1: how much A and B contend on same events */
+    uint32_t top_event;    /* most contended event */
+    char     top_event_name[64];
+    uint64_t overlap_ns;   /* total time both were waiting on same event */
+};
+
+struct pgwt_interference_result {
+    struct pgwt_interference_row *rows;  /* malloc'd, caller frees */
+    int    num_rows;
+};
+
+/* Score cross-session interference: find PID pairs that frequently wait
+ * on the same event at the same time. High-scoring pairs are "noisy neighbors". */
+void pgwt_compute_interference(const struct pgwt_trace_event *events, int count,
+                                const struct pgwt_filter *f, int max_rows,
+                                struct pgwt_interference_result *out);
+
 #endif /* PGWT_COMPUTE_H */

@@ -2126,3 +2126,244 @@ void pgwt_compute_concurrency(const struct pgwt_trace_event *events, int count,
     out->bursts = bursts;
     out->num_bursts = nbursts;
 }
+
+/* ── Lock Chains ──────────────────────────────────────────── */
+
+/*
+ * Lock chain detection: for each Lock wait event, find another PID that
+ * was active (on CPU or in a different state) during the same time interval.
+ * The "blocker" is the PID that was most likely on CPU while the waiter
+ * was blocked on a Lock event.
+ *
+ * This is a heuristic: without pg_locks data, we can only infer blockers
+ * from temporal overlap. A PID on CPU while another waits on Lock:transactionid
+ * is likely holding the conflicting lock.
+ */
+
+static int cmp_lock_chain_desc(const void *a, const void *b)
+{
+    uint64_t wa = ((const struct pgwt_lock_chain_link *)a)->wait_ns;
+    uint64_t wb = ((const struct pgwt_lock_chain_link *)b)->wait_ns;
+    return (wb > wa) - (wb < wa);
+}
+
+void pgwt_compute_lock_chains(const struct pgwt_trace_event *events, int count,
+                               const struct pgwt_filter *f, int max_links,
+                               struct pgwt_lock_chains_result *out)
+{
+    memset(out, 0, sizeof(*out));
+
+    /* Collect Lock wait intervals */
+    int lock_cap = 4096;
+    struct active_entry *locks = malloc(lock_cap * sizeof(*locks));
+    int nlocks = 0;
+
+    /* Collect CPU intervals (potential blockers) */
+    int cpu_cap = 8192;
+    struct active_entry *cpus = malloc(cpu_cap * sizeof(*cpus));
+    int ncpus = 0;
+
+    for (int i = 0; i < count; i++) {
+        const struct pgwt_trace_event *ev = &events[i];
+        if (!pgwt_filter_matches(f, ev))
+            continue;
+
+        uint8_t cls = (ev->old_event >> 24) & 0xFF;
+
+        if (cls == 0x03 && nlocks < lock_cap) {  /* Lock class */
+            locks[nlocks].pid = ev->pid;
+            locks[nlocks].event_id = ev->old_event;
+            locks[nlocks].start_ns = ev->timestamp_ns - ev->duration_ns;
+            locks[nlocks].end_ns = ev->timestamp_ns;
+            nlocks++;
+        }
+        if (ev->old_event == 0 && ncpus < cpu_cap) {  /* CPU */
+            cpus[ncpus].pid = ev->pid;
+            cpus[ncpus].event_id = 0;
+            cpus[ncpus].start_ns = ev->timestamp_ns - ev->duration_ns;
+            cpus[ncpus].end_ns = ev->timestamp_ns;
+            ncpus++;
+        }
+    }
+
+    /* For each Lock wait, find the CPU interval from a different PID
+     * that overlaps the most. That PID is the likely blocker. */
+    int link_cap = max_links * 2;
+    struct pgwt_lock_chain_link *links = calloc(link_cap, sizeof(*links));
+    int nlinks = 0;
+
+    for (int i = 0; i < nlocks && nlinks < link_cap; i++) {
+        uint32_t best_pid = 0;
+        uint64_t best_overlap = 0;
+
+        for (int j = 0; j < ncpus; j++) {
+            if (cpus[j].pid == locks[i].pid)
+                continue;  /* skip self */
+
+            /* Compute overlap */
+            uint64_t ostart = locks[i].start_ns > cpus[j].start_ns
+                            ? locks[i].start_ns : cpus[j].start_ns;
+            uint64_t oend = locks[i].end_ns < cpus[j].end_ns
+                          ? locks[i].end_ns : cpus[j].end_ns;
+
+            if (oend > ostart) {
+                uint64_t overlap = oend - ostart;
+                if (overlap > best_overlap) {
+                    best_overlap = overlap;
+                    best_pid = cpus[j].pid;
+                }
+            }
+        }
+
+        if (best_pid != 0 && best_overlap > 0) {
+            struct pgwt_lock_chain_link *l = &links[nlinks++];
+            l->waiter_pid = locks[i].pid;
+            l->blocker_pid = best_pid;
+            l->lock_event = locks[i].event_id;
+            l->wait_ns = locks[i].end_ns - locks[i].start_ns;
+            l->timestamp_ns = locks[i].start_ns;
+            pgwt_event_full_name(locks[i].event_id, l->lock_name,
+                                 sizeof(l->lock_name));
+        }
+    }
+
+    free(locks);
+    free(cpus);
+
+    qsort(links, nlinks, sizeof(links[0]), cmp_lock_chain_desc);
+
+    int nr = nlinks < max_links ? nlinks : max_links;
+    out->links = links;
+    out->num_links = nr;
+}
+
+/* ── Interference Scoring ────────────────────────────────── */
+
+/*
+ * For each pair of PIDs, compute how much time they spent waiting on the
+ * same wait event simultaneously. High overlap = "noisy neighbors" contending
+ * on the same resource.
+ *
+ * Algorithm: for each event, build (pid, event_id, start_ns, end_ns) intervals.
+ * For each pair of intervals on the same event from different PIDs, compute overlap.
+ * Aggregate per PID pair.
+ */
+
+struct pair_accum {
+    uint32_t pid_a;
+    uint32_t pid_b;
+    uint64_t overlap_ns;
+    uint32_t top_event;
+    uint64_t top_event_ns;
+};
+
+#define PAIR_HT_SIZE 4096
+#define PAIR_HT_MASK (PAIR_HT_SIZE - 1)
+
+static int cmp_interference_desc(const void *a, const void *b)
+{
+    double sa = ((const struct pgwt_interference_row *)a)->score;
+    double sb = ((const struct pgwt_interference_row *)b)->score;
+    return (sb > sa) - (sb < sa);
+}
+
+void pgwt_compute_interference(const struct pgwt_trace_event *events, int count,
+                                const struct pgwt_filter *f, int max_rows,
+                                struct pgwt_interference_result *out)
+{
+    memset(out, 0, sizeof(*out));
+
+    /* Build active intervals (non-CPU, non-idle wait events only) */
+    int cap = count < 50000 ? count : 50000;
+    struct active_entry *active = malloc(cap * sizeof(*active));
+    int nactive = 0;
+
+    for (int i = 0; i < count && nactive < cap; i++) {
+        const struct pgwt_trace_event *ev = &events[i];
+        if (!pgwt_filter_matches(f, ev) || pgwt_is_idle_event(ev->old_event))
+            continue;
+        if (ev->old_event == 0) continue;  /* skip CPU */
+
+        active[nactive].pid = ev->pid;
+        active[nactive].event_id = ev->old_event;
+        active[nactive].start_ns = ev->timestamp_ns - ev->duration_ns;
+        active[nactive].end_ns = ev->timestamp_ns;
+        nactive++;
+    }
+
+    qsort(active, nactive, sizeof(active[0]), cmp_active_by_start);
+
+    /* Find overlapping pairs on same event */
+    struct pair_accum *ht = calloc(PAIR_HT_SIZE, sizeof(*ht));
+    int num_pairs = 0;
+    uint64_t max_overlap = 0;
+
+    for (int i = 0; i < nactive; i++) {
+        /* Look forward for overlapping intervals on same event */
+        for (int j = i + 1; j < nactive; j++) {
+            if (active[j].start_ns >= active[i].end_ns)
+                break;  /* no more overlaps possible (sorted by start) */
+
+            if (active[j].event_id != active[i].event_id)
+                continue;
+            if (active[j].pid == active[i].pid)
+                continue;
+
+            /* Compute overlap */
+            uint64_t ostart = active[j].start_ns;  /* j starts after i (sorted) */
+            uint64_t oend = active[i].end_ns < active[j].end_ns
+                          ? active[i].end_ns : active[j].end_ns;
+            if (oend <= ostart) continue;
+            uint64_t overlap = oend - ostart;
+
+            /* Normalize PID pair (smaller first) */
+            uint32_t pa = active[i].pid < active[j].pid ? active[i].pid : active[j].pid;
+            uint32_t pb = active[i].pid < active[j].pid ? active[j].pid : active[i].pid;
+
+            /* Hash lookup */
+            uint32_t h = ((pa * 0x45d9f3b) ^ (pb * 0x9e3779b9)) & PAIR_HT_MASK;
+            while (ht[h].overlap_ns > 0 &&
+                   (ht[h].pid_a != pa || ht[h].pid_b != pb))
+                h = (h + 1) & PAIR_HT_MASK;
+
+            if (ht[h].overlap_ns == 0) {
+                ht[h].pid_a = pa;
+                ht[h].pid_b = pb;
+                num_pairs++;
+            }
+            ht[h].overlap_ns += overlap;
+            if (overlap > ht[h].top_event_ns) {
+                ht[h].top_event_ns = overlap;
+                ht[h].top_event = active[i].event_id;
+            }
+            if (ht[h].overlap_ns > max_overlap)
+                max_overlap = ht[h].overlap_ns;
+        }
+    }
+
+    free(active);
+
+    /* Build result rows */
+    struct pgwt_interference_row *rows = calloc(num_pairs, sizeof(*rows));
+    int nr = 0;
+
+    for (int i = 0; i < PAIR_HT_SIZE; i++) {
+        if (ht[i].overlap_ns == 0) continue;
+        rows[nr].pid_a = ht[i].pid_a;
+        rows[nr].pid_b = ht[i].pid_b;
+        rows[nr].score = max_overlap > 0
+                       ? (double)ht[i].overlap_ns / (double)max_overlap : 0;
+        rows[nr].top_event = ht[i].top_event;
+        rows[nr].overlap_ns = ht[i].overlap_ns;
+        pgwt_event_full_name(ht[i].top_event, rows[nr].top_event_name,
+                             sizeof(rows[nr].top_event_name));
+        nr++;
+    }
+
+    free(ht);
+    qsort(rows, nr, sizeof(rows[0]), cmp_interference_desc);
+
+    int n = nr < max_rows ? nr : max_rows;
+    out->rows = rows;
+    out->num_rows = n;
+}

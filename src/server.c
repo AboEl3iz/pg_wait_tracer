@@ -1273,6 +1273,64 @@ static void handle_fingerprints(struct pgwt_server *srv, struct pgwt_request *re
     emit_json(root);
 }
 
+static void handle_lock_chains(struct pgwt_server *srv, struct pgwt_request *req)
+{
+    int count;
+    struct pgwt_trace_event *events =
+        server_load_events(srv, req->from_ns, req->to_ns, &count);
+
+    struct pgwt_lock_chains_result res;
+    pgwt_compute_lock_chains(events, count, &req->filter, 50, &res);
+    free(events);
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddNumberToObject(root, "id", (double)req->id);
+
+    cJSON *chains = cJSON_AddArrayToObject(root, "chains");
+    for (int i = 0; i < res.num_links; i++) {
+        cJSON *c = cJSON_CreateObject();
+        cJSON_AddNumberToObject(c, "waiter", res.links[i].waiter_pid);
+        cJSON_AddNumberToObject(c, "blocker", res.links[i].blocker_pid);
+        cJSON_AddStringToObject(c, "lock", res.links[i].lock_name);
+        cJSON_AddNumberToObject(c, "wait_ms",
+                                (double)res.links[i].wait_ns / 1e6);
+        cjson_add_uint64(c, "timestamp_ns", res.links[i].timestamp_ns);
+        cJSON_AddItemToArray(chains, c);
+    }
+
+    free(res.links);
+    emit_json(root);
+}
+
+static void handle_interference(struct pgwt_server *srv, struct pgwt_request *req)
+{
+    int count;
+    struct pgwt_trace_event *events =
+        server_load_events(srv, req->from_ns, req->to_ns, &count);
+
+    struct pgwt_interference_result res;
+    pgwt_compute_interference(events, count, &req->filter, 30, &res);
+    free(events);
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddNumberToObject(root, "id", (double)req->id);
+
+    cJSON *rows = cJSON_AddArrayToObject(root, "rows");
+    for (int i = 0; i < res.num_rows; i++) {
+        cJSON *r = cJSON_CreateObject();
+        cJSON_AddNumberToObject(r, "pid_a", res.rows[i].pid_a);
+        cJSON_AddNumberToObject(r, "pid_b", res.rows[i].pid_b);
+        cJSON_AddNumberToObject(r, "score", res.rows[i].score);
+        cJSON_AddStringToObject(r, "top_event", res.rows[i].top_event_name);
+        cJSON_AddNumberToObject(r, "overlap_ms",
+                                (double)res.rows[i].overlap_ns / 1e6);
+        cJSON_AddItemToArray(rows, r);
+    }
+
+    free(res.rows);
+    emit_json(root);
+}
+
 static void handle_concurrency(struct pgwt_server *srv, struct pgwt_request *req)
 {
     int count;
@@ -1355,6 +1413,10 @@ static void dispatch(struct pgwt_server *srv, struct pgwt_request *req)
         handle_fingerprints(srv, req);
     else if (strcmp(req->cmd, "concurrency") == 0)
         handle_concurrency(srv, req);
+    else if (strcmp(req->cmd, "lock_chains") == 0)
+        handle_lock_chains(srv, req);
+    else if (strcmp(req->cmd, "interference") == 0)
+        handle_interference(srv, req);
     else {
         cJSON *root = cJSON_CreateObject();
         cJSON_AddNumberToObject(root, "id", (double)req->id);
