@@ -56,9 +56,35 @@ SERVER_SRCS = $(SRC_DIR)/server.c \
 SERVER_OBJS = $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/server_%.o,$(SERVER_SRCS))
 SERVER_LDFLAGS = -lz -llz4 -lm
 
-.PHONY: all clean
+.PHONY: all clean test-asan test-valgrind bench
 
 all: $(TARGET) pgwt-server
+
+# ASan build: recompile server with address sanitizer
+test-asan:
+	$(MAKE) clean
+	$(MAKE) pgwt-server CFLAGS="$(CFLAGS) -fsanitize=address -fno-omit-frame-pointer" \
+		LDFLAGS="-fsanitize=address"
+	$(MAKE) -C tests
+	@echo "=== Running tests under ASan ==="
+	cd tests && for t in test_wait_event test_cmdline test_bucket; do ./$$t || exit 1; done
+	@echo "=== ASan: all tests passed ==="
+
+# Valgrind: run server under valgrind with synthetic data
+test-valgrind:
+	$(MAKE) -C tests
+	@echo "=== Running pgwt-server under Valgrind ==="
+	rm -rf /tmp/pgwt-valgrind-test && mkdir -p /tmp/pgwt-valgrind-test
+	tests/gen_bench_traces -o /tmp/pgwt-valgrind-test -n 10000
+	echo '{"cmd":"time_model","from_ns":0,"to_ns":999999999999999}' | \
+		valgrind --leak-check=full --error-exitcode=1 ./pgwt-server /tmp/pgwt-valgrind-test > /dev/null
+	rm -rf /tmp/pgwt-valgrind-test
+	@echo "=== Valgrind: clean ==="
+
+# Performance benchmark
+bench:
+	$(MAKE) -C tests
+	python3 tests/bench_server.py
 
 $(BUILD_DIR):
 	@mkdir -p $(BUILD_DIR)
