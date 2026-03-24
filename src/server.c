@@ -102,7 +102,10 @@ struct file_cache_entry {
     char     path[512];
     struct pgwt_trace_event *events;
     int      count;
+    int      capacity;
     int      immutable;    /* 1 = .trace.lz4 (never changes), 0 = current.trace */
+    int      last_num_blocks;  /* for incremental reads of current.trace */
+    int64_t  mono_to_wall;     /* clock offset for this file */
 };
 
 struct pgwt_server {
@@ -443,8 +446,47 @@ load_file_events(const char *path, int *out_count)
     return events;
 }
 
+/* Incrementally read new blocks from current.trace into an existing cache entry.
+ * Only reads blocks beyond ce->last_num_blocks. */
+static void cache_read_incremental(struct file_cache_entry *ce)
+{
+    struct pgwt_event_reader reader;
+    if (pgwt_reader_open(&reader, ce->path) != 0)
+        return;
+
+    /* Detect file rotation: if num_blocks < last_num_blocks, the file
+     * was replaced (rotated). Reset cache and re-read from start. */
+    if (reader.num_blocks < ce->last_num_blocks) {
+        ce->count = 0;
+        ce->last_num_blocks = 0;
+    }
+
+    ce->mono_to_wall = reader.mono_to_wall;
+
+    struct pgwt_trace_event block_buf[PGWT_BLOCK_EVENTS];
+
+    for (int b = ce->last_num_blocks; b < reader.num_blocks; b++) {
+        int n = pgwt_reader_decode_block(&reader, b, block_buf, PGWT_BLOCK_EVENTS);
+        for (int i = 0; i < n; i++) {
+            if (ce->count >= ce->capacity) {
+                ce->capacity = ce->capacity ? ce->capacity * 2 : 16384;
+                struct pgwt_trace_event *tmp =
+                    realloc(ce->events, ce->capacity * sizeof(*tmp));
+                if (!tmp) { pgwt_reader_close(&reader); return; }
+                ce->events = tmp;
+            }
+            ce->events[ce->count] = block_buf[i];
+            ce->events[ce->count].timestamp_ns =
+                pgwt_reader_mono_to_wall(&reader, block_buf[i].timestamp_ns);
+            ce->count++;
+        }
+    }
+    ce->last_num_blocks = reader.num_blocks;
+    pgwt_reader_close(&reader);
+}
+
 /* Get cached events for a file. Immutable files are read once.
- * current.trace is re-read on every call. */
+ * current.trace reads incrementally (only new blocks since last read). */
 static struct file_cache_entry *
 get_cached_file(struct pgwt_server *srv, int file_idx)
 {
@@ -456,9 +498,8 @@ get_cached_file(struct pgwt_server *srv, int file_idx)
         if (strcmp(srv->cache[i].path, path) == 0) {
             if (srv->cache[i].immutable)
                 return &srv->cache[i];  /* immutable — use cache */
-            /* current.trace — invalidate and re-read */
-            free(srv->cache[i].events);
-            srv->cache[i].events = load_file_events(path, &srv->cache[i].count);
+            /* current.trace — read only new blocks */
+            cache_read_incremental(&srv->cache[i]);
             return &srv->cache[i];
         }
     }
@@ -468,9 +509,16 @@ get_cached_file(struct pgwt_server *srv, int file_idx)
         return NULL;
 
     struct file_cache_entry *ce = &srv->cache[srv->cache_count++];
+    memset(ce, 0, sizeof(*ce));
     snprintf(ce->path, sizeof(ce->path), "%s", path);
     ce->immutable = !is_current;
-    ce->events = load_file_events(path, &ce->count);
+
+    if (ce->immutable) {
+        ce->events = load_file_events(path, &ce->count);
+    } else {
+        /* First read of current.trace — read all existing blocks */
+        cache_read_incremental(ce);
+    }
     return ce;
 }
 
