@@ -310,42 +310,44 @@ Commits: `711f590`, `7fd8f62`.
 
 ---
 
-## Sprint 11: Merge Daemon + Server
+## Sprint 11: Merge Daemon + Server — DEFERRED
 
-**Goal:** Single process for capture + serving. Enables live mode.
-
-**Depends on:** Sprint 6 (cJSON), Sprint 9 (performance work done). This is the
-biggest architectural change — all stabilization should be done first.
-
-| # | Task | Details |
-|---|------|---------|
-| 11.1 | Add Unix socket listener to daemon | Accept client connections on `/var/run/pgwt/pgwt.sock` |
-| 11.2 | Handle JSON requests in daemon event loop | Reuse `compute.c` functions. Serve from in-memory events + trace files. |
-| 11.3 | Go client: connect to Unix socket (via SSH) instead of spawning pgwt-server | `web/bridge.go`: `ssh host "socat UNIX:/var/run/pgwt/pgwt.sock -"` or direct stdin/stdout forwarding |
-| 11.4 | Keep `pgwt-server` standalone for offline replay | Compile separately, reads trace files without daemon |
-| 11.5 | Event decoded cache: decode trace blocks once, reuse across requests | LRU cache keyed by (file, block_offset) |
-| 11.6 | Tests: verify daemon-served responses match pgwt-server responses | Same synthetic data, both paths, compare output |
-
-**Deliverable:** Web client connects to running daemon. No startup delay.
-Historical + live data in same process. Foundation for live streaming.
+Deferred: the per-session SSH-spawned model (pgwt → ssh → pgwt-server) works
+well without merging. Security, ops simplicity, and resilience all favor the
+current architecture. Revisit if shared cache across users becomes a need.
 
 ---
 
 ## Sprint 12: Live Mode (Phase H)
 
-**Goal:** Real-time streaming from daemon to web UI.
+**Goal:** Near-real-time AAS chart and drill-down from the running daemon's
+trace data, without merging daemon + server.
 
-**Depends on:** Sprint 11 (daemon serves client connections).
+**Architecture:** pgwt-server reads `current.trace` (the file being written by
+the daemon) using a streaming block reader that handles missing footer. Immutable
+`.trace.lz4` files are cached per-session; only `current.trace` is re-read on
+auto-refresh. This gives 1-5 second latency with zero persistent server processes.
+
+```
+Daemon (root, BPF):                pgwt-server (no root, per-session):
+  writes current.trace ──────────→ reads current.trace (tail-follow)
+  rotates to .trace.lz4 ────────→ reads .trace.lz4 (cached, immutable)
+```
+
+**Depends on:** Sprint 9 (performance), Sprint 10 (transitions).
 
 | # | Task | Details |
 |---|------|---------|
-| 12.1 | Live AAS push: daemon sends AAS update every second | On timer tick, compute AAS for last N seconds, push to connected clients |
-| 12.2 | Web UI: live/historical toggle | Switch between live streaming and historical trace file analysis |
-| 12.3 | Active sessions view in web UI | Reads BPF state_map via daemon, shows real-time backend states |
-| 12.4 | Live event stream for session timeline | New events appear in real-time as colored bars extending right |
+| 12.1 | Streaming trace reader for `current.trace` | Read blocks sequentially without footer. Stop at EOF or incomplete block header. Detect new blocks on re-read. |
+| 12.2 | Include `current.trace` in pgwt-server file list | `server_init()` adds `current.trace` to scan. Rescan on each request (file grows). |
+| 12.3 | Per-session cache for immutable trace files | Cache computed aggregates keyed by `(filename, time_range)`. Only re-read `current.trace` on refresh. |
+| 12.4 | Web UI: auto-refresh toggle | Button to enable 5-second polling. Re-sends current view request. AAS chart appends new buckets. |
+| 12.5 | Web UI: "Live" time range | New quick range: "Live" = last 5 minutes, auto-refresh on. Updates `viewTo` to "now" on each refresh. |
+| 12.6 | Tests: verify `current.trace` reading | Write partial trace file (no footer), verify pgwt-server reads all complete blocks. |
 
-**Deliverable:** `pgwt root@server` shows real-time AAS chart + active sessions.
-Historical drill-down works seamlessly alongside live view.
+**Deliverable:** `pgwt root@server` shows near-real-time AAS chart that updates
+every 5 seconds. Drill-down into any time range works at full nanosecond
+resolution from trace files. Historical + live data seamlessly merged.
 
 ---
 
@@ -400,7 +402,7 @@ Sprint 7:  Dynamic event names                          ✅ ──── Forward
 Sprint 8:  Drop Rust TUI                                ✅ ──── Simplify
 Sprint 9:  Performance optimization + benchmarks        ✅ ──── Speed
 Sprint 10: Tracing analysis Phase 2 (transitions)       ✅ ──── Differentiate
-Sprint 11: Merge daemon + server                            ──── Architecture
+Sprint 11: Merge daemon + server                     ⏸ ──── Deferred
 Sprint 12: Live mode (Phase H)                              ──── Real-time
 Sprint 13: Tracing analysis Phase 3 (concurrency)           ──── Advanced
 Sprint 14: Advanced analysis (Phases 4-5) + G.2             ──── Research
