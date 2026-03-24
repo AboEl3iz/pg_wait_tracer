@@ -97,12 +97,20 @@ Running the full test suite requires additional packages and PostgreSQL configur
 
 ```bash
 # Rocky/RHEL/Oracle Linux 9:
-sudo dnf install -y python3 bc
+sudo dnf install -y python3 python3-pip bc
 
 # Ubuntu:
-sudo apt install -y python3 bc
+sudo apt install -y python3 python3-pip bc
 
 # pgbench is included in postgresql-contrib (already installed above)
+
+# Web UI tests (optional — skipped if not installed)
+pip3 install playwright websockets
+playwright install chromium
+
+# On Rocky/RHEL, Chromium also needs:
+sudo dnf install -y atk at-spi2-atk cups-libs libXcomposite libXdamage \
+    libXrandr libgbm pango alsa-lib nss libxkbcommon
 ```
 
 #### PostgreSQL Configuration
@@ -298,10 +306,25 @@ sudo ./pg_wait_tracer --pid $(pgrep -xo postgres) --interval 5 --duration 10 -v
 sudo tests/run_all.sh
 
 # Target a specific PG version on multi-instance hosts
-sudo tests/run_all.sh --pg-version 16
+sudo tests/run_all.sh --pg-version 18
 
 # Or specify the postmaster PID directly
 sudo tests/run_all.sh --pid 12345
+
+# Individual test layers:
+make -C tests                             # Build C tests + generators
+tests/test_wait_event                     # C unit: event ID parsing (75 checks)
+tests/test_cmdline                        # C unit: CLI parser (36 checks)
+tests/test_bucket                         # C unit: histogram buckets (25 checks)
+python3 tests/test_data_time_model.py     # Synthetic: time model math
+python3 tests/test_data_transitions.py    # Synthetic: transition matrix
+python3 tests/test_data_lock_chains.py    # Synthetic: lock chains + interference
+python3 tests/test_web_ui.py              # Playwright: 108 browser checks
+make bench                                # Performance: 10.8M events/sec
+
+# Memory safety checks:
+make test-asan                            # Rebuild with AddressSanitizer
+make test-valgrind                        # Run under Valgrind
 ```
 
 ## Troubleshooting
