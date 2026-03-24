@@ -475,6 +475,11 @@ static int server_init(struct pgwt_server *srv, const char *trace_dir)
 
     pgwt_init_event_names(18); /* Default to PG18 tables */
 
+    /* Try loading dynamic event names from sidecar file.
+     * Written by the daemon when it queries pg_wait_events. */
+    if (pgwt_load_names_json(trace_dir) == 0)
+        fprintf(stderr, "pgwt-server: loaded event names from wait_event_names.json\n");
+
     srv->num_files = pgwt_scan_trace_files(trace_dir, srv->files, 256);
     if (srv->num_files <= 0) {
         fprintf(stderr, "pgwt-server: no trace files found in %s\n", trace_dir);

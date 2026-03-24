@@ -580,6 +580,43 @@ int pgwt_discover(struct pgwt_daemon *d)
     /* Initialize version-aware event name tables */
     pgwt_init_event_names(d->pg_major_version);
 
+    /* Load dynamic event names from the running PG instance (PG17+).
+     * This overrides hardcoded tables with the actual names from this
+     * PG build, ensuring forward-compatibility with PG19+. */
+    if (d->pg_major_version >= 17) {
+        /* Extract bindir from binary path */
+        char bindir[256];
+        snprintf(bindir, sizeof(bindir), "%s", binary);
+        char *slash = strrchr(bindir, '/');
+        if (slash) *slash = '\0';
+
+        /* Read port from postmaster.pid (line 4) */
+        int pg_port = 5432;
+        {
+            char pidpath[512];
+            snprintf(pidpath, sizeof(pidpath), "%s/postmaster.pid", d->pgdata);
+            FILE *pf = fopen(pidpath, "r");
+            if (pf) {
+                char ln[128];
+                for (int i = 0; i < 4 && fgets(ln, sizeof(ln), pf); i++) {
+                    if (i == 3) pg_port = atoi(ln);
+                }
+                fclose(pf);
+            }
+        }
+
+        if (pgwt_load_event_names_from_pg(bindir, pg_port, "postgres") == 0) {
+            if (d->verbose)
+                fprintf(stderr, "INFO: loaded dynamic event names from PG%d\n",
+                        d->pg_major_version);
+            /* Write sidecar for pgwt-server to use later */
+            if (d->trace_dir)
+                pgwt_write_names_json(d->trace_dir);
+        } else if (d->verbose) {
+            fprintf(stderr, "INFO: dynamic event name query failed, using hardcoded tables\n");
+        }
+    }
+
     /* Extract basename for /proc/pid/maps matching */
     const char *base = strrchr(binary, '/');
     base = base ? base + 1 : binary;

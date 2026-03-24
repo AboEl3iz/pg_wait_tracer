@@ -5,15 +5,31 @@
  *
  * Tables here cover PG17 and PG18. For PG16 and earlier, events that don't
  * match the current table gracefully fall back to numeric display ("IO:id=N").
+ *
+ * Dynamic name resolution: pgwt_load_event_names_from_pg() queries the running
+ * PG instance's pg_wait_events view (PG17+) and builds name tables at runtime.
+ * pgwt_write_names_json() / pgwt_load_names_json() persist the mapping as a
+ * sidecar file alongside trace files, so pgwt-server can resolve names for
+ * any PG version without hardcoded tables.
  */
 #include "wait_event.h"
 #include "pg_wait_tracer.h"
+#include "cJSON.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 
 /* PG major version, set by pgwt_init_event_names() */
 static int pg_version = 18;
+
+/* Dynamic name storage — heap-allocated when loaded from PG or sidecar.
+ * Each class has an array of strdup'd names indexed by event_id. */
+#define DYN_MAX_EVENTS_PER_CLASS 512
+static char *dyn_names[16][DYN_MAX_EVENTS_PER_CLASS]; /* [class_byte][event_id] */
+static int   dyn_max[16];                              /* max event_id per class */
+static int   dyn_loaded = 0;                           /* 1 if dynamic names active */
 
 /* ── IO Events PG18 (class 0x0A, 81 events, 0-indexed, alphabetical) ── */
 static const char *io_events_pg18[] = {
@@ -480,6 +496,12 @@ const char *pgwt_event_name(uint32_t wei)
     int id  = WE_EVENT(wei);
     const char *name;
 
+    /* Try dynamic names first (loaded from PG or sidecar) */
+    if (dyn_loaded && cls < 16 && id < DYN_MAX_EVENTS_PER_CLASS &&
+        id <= dyn_max[cls] && dyn_names[cls][id])
+        return dyn_names[cls][id];
+
+    /* Fall back to hardcoded tables */
     switch (cls) {
     case PG_WAIT_IO:
         name = lookup0(io_events, io_events_max, id);
@@ -531,4 +553,213 @@ int pgwt_is_idle_event(uint32_t wei)
 {
     return WE_CLASS(wei) == PG_WAIT_ACTIVITY ||
            wei == PG_WAIT_CLIENT_READ;
+}
+
+/* ── Dynamic Name Resolution ─────────────────────────────── */
+
+/* Map class name string to class byte (high byte of wait_event_info) */
+static int class_name_to_byte(const char *name)
+{
+    if (strcmp(name, "LWLock") == 0)    return 0x01;
+    if (strcmp(name, "Lock") == 0)      return 0x03;
+    if (strcmp(name, "BufferPin") == 0 ||
+        strcmp(name, "Buffer") == 0)    return 0x04;
+    if (strcmp(name, "Activity") == 0)  return 0x05;
+    if (strcmp(name, "Client") == 0)    return 0x06;
+    if (strcmp(name, "Extension") == 0) return 0x07;
+    if (strcmp(name, "IPC") == 0)       return 0x08;
+    if (strcmp(name, "Timeout") == 0)   return 0x09;
+    if (strcmp(name, "IO") == 0)        return 0x0A;
+    if (strcmp(name, "InjectionPoint") == 0) return 0x0B;
+    return -1;
+}
+
+static void dyn_clear(void)
+{
+    for (int c = 0; c < 16; c++) {
+        for (int i = 0; i <= dyn_max[c]; i++) {
+            free(dyn_names[c][i]);
+            dyn_names[c][i] = NULL;
+        }
+        dyn_max[c] = -1;
+    }
+    dyn_loaded = 0;
+}
+
+static void dyn_add(int class_byte, int event_id, const char *name)
+{
+    if (class_byte < 0 || class_byte >= 16) return;
+    if (event_id < 0 || event_id >= DYN_MAX_EVENTS_PER_CLASS) return;
+
+    free(dyn_names[class_byte][event_id]);
+    dyn_names[class_byte][event_id] = strdup(name);
+
+    if (event_id > dyn_max[class_byte])
+        dyn_max[class_byte] = event_id;
+}
+
+int pgwt_load_event_names_from_pg(const char *pg_bindir, int pg_port,
+                                  const char *pg_user)
+{
+    char cmd[512];
+    char line[256];
+    int  count = 0;
+
+    /* pg_wait_events view exists since PG17 */
+    snprintf(cmd, sizeof(cmd),
+             "%s/psql -U %s -p %d -d postgres -tAF'|' "
+             "-c \"SELECT type, name FROM pg_wait_events ORDER BY type, name\" 2>/dev/null",
+             pg_bindir, pg_user, pg_port);
+
+    FILE *fp = popen(cmd, "r");
+    if (!fp)
+        return -1;
+
+    dyn_clear();
+
+    /* Track sequential event_id per class.
+     * pg_wait_events returns events in enum order within each class,
+     * so the nth event within a class has event_id = n. */
+    int cur_class = -1;
+    int cur_id = -1;
+
+    while (fgets(line, sizeof(line), fp)) {
+        /* Remove trailing newline */
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+        if (line[0] == '\0') continue;
+
+        /* Parse "Type|Name" */
+        char *sep = strchr(line, '|');
+        if (!sep) continue;
+        *sep = '\0';
+
+        const char *type = line;
+        const char *name = sep + 1;
+        int cb = class_name_to_byte(type);
+        if (cb < 0) continue;
+
+        if (cb != cur_class) {
+            cur_class = cb;
+            cur_id = 0;
+        } else {
+            cur_id++;
+        }
+
+        dyn_add(cb, cur_id, name);
+        count++;
+    }
+
+    int status = pclose(fp);
+    if (status != 0 || count == 0) {
+        dyn_clear();
+        return -1;
+    }
+
+    dyn_loaded = 1;
+    return 0;
+}
+
+int pgwt_write_names_json(const char *trace_dir)
+{
+    char path[512];
+    snprintf(path, sizeof(path), "%s/wait_event_names.json", trace_dir);
+
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return -1;
+
+    const char *class_names[] = {
+        NULL, "LWLock", NULL, "Lock", "BufferPin", "Activity",
+        "Client", "Extension", "IPC", "Timeout", "IO", "InjectionPoint",
+        NULL, NULL, NULL, NULL
+    };
+
+    for (int c = 0; c < 16; c++) {
+        if (dyn_max[c] < 0) continue;
+
+        const char *cname = class_names[c];
+        if (!cname) continue;
+
+        cJSON *arr = cJSON_CreateArray();
+        for (int i = 0; i <= dyn_max[c]; i++) {
+            const char *n = dyn_names[c][i];
+            cJSON_AddItemToArray(arr, cJSON_CreateString(n ? n : ""));
+        }
+        cJSON_AddItemToObject(root, cname, arr);
+    }
+
+    /* Also store pg_version for reference */
+    cJSON_AddNumberToObject(root, "pg_version", pg_version);
+
+    char *json_str = cJSON_Print(root);
+    cJSON_Delete(root);
+    if (!json_str) return -1;
+
+    FILE *fp = fopen(path, "w");
+    if (!fp) {
+        free(json_str);
+        return -1;
+    }
+    fputs(json_str, fp);
+    fputc('\n', fp);
+    fclose(fp);
+    free(json_str);
+    return 0;
+}
+
+int pgwt_load_names_json(const char *trace_dir)
+{
+    char path[512];
+    snprintf(path, sizeof(path), "%s/wait_event_names.json", trace_dir);
+
+    FILE *fp = fopen(path, "r");
+    if (!fp) return -1;
+
+    /* Read entire file */
+    fseek(fp, 0, SEEK_END);
+    long len = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+
+    if (len <= 0 || len > 1024 * 1024) {
+        fclose(fp);
+        return -1;
+    }
+
+    char *buf = malloc(len + 1);
+    if (!buf) { fclose(fp); return -1; }
+    size_t nread = fread(buf, 1, len, fp);
+    buf[nread] = '\0';
+    fclose(fp);
+
+    cJSON *root = cJSON_Parse(buf);
+    free(buf);
+    if (!root) return -1;
+
+    dyn_clear();
+
+    /* Load pg_version if present */
+    cJSON *ver = cJSON_GetObjectItem(root, "pg_version");
+    if (ver && cJSON_IsNumber(ver))
+        pg_version = (int)ver->valuedouble;
+
+    /* Iterate class arrays */
+    cJSON *item;
+    cJSON_ArrayForEach(item, root) {
+        if (!cJSON_IsArray(item)) continue;
+
+        int cb = class_name_to_byte(item->string);
+        if (cb < 0) continue;
+
+        int idx = 0;
+        cJSON *elem;
+        cJSON_ArrayForEach(elem, item) {
+            if (cJSON_IsString(elem) && elem->valuestring[0] != '\0')
+                dyn_add(cb, idx, elem->valuestring);
+            idx++;
+        }
+    }
+
+    cJSON_Delete(root);
+    dyn_loaded = 1;
+    return 0;
 }
