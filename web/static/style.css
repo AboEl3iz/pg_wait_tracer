@@ -55,6 +55,19 @@ h1 { font-size: 18px; font-weight: 600; color: #fff; }
 }
 .zoom-out-btn:hover { background: #2a2a4a; color: #ccc; }
 
+.live-btn {
+  background: none;
+  border: 1px solid #444;
+  color: #888;
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background 0.2s, color 0.2s;
+}
+.live-btn:hover { background: #2a2a4a; color: #ccc; }
+.live-btn.active { background: #1a4a1a; border-color: #4a4; color: #4f4; }
+
 .time-picker {
   position: absolute;
   top: 100%;

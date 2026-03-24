@@ -156,6 +156,7 @@ async function init() {
         initChartResize();
         initTabs();
         initTimePicker();
+        initLiveMode();
         await refresh();
     } catch (e) {
         setStatus('Error: ' + e.message, 'error');
@@ -1438,6 +1439,46 @@ function renderTimeline(container, data) {
 
     timelineChart.setOption(option, true);
 }
+
+// -- Live mode (auto-refresh) -------------------------------------------------
+
+let liveInterval = null;
+
+function initLiveMode() {
+    const btn = document.getElementById('live-btn');
+    if (!btn) return;
+
+    btn.addEventListener('click', () => {
+        if (liveInterval) {
+            // Stop live mode
+            clearInterval(liveInterval);
+            liveInterval = null;
+            btn.classList.remove('active');
+            btn.textContent = 'Live';
+        } else {
+            // Start live mode: set window to last 5 minutes, auto-refresh
+            const now = Date.now() * 1e6;  // ms → ns
+            state.viewFrom = now - 300e9;  // 5 min ago
+            state.viewTo = now;
+            btn.classList.add('active');
+            btn.textContent = 'Live ●';
+
+            // Immediate refresh
+            refreshAll();
+
+            // Poll every 5 seconds
+            liveInterval = setInterval(() => {
+                const now = Date.now() * 1e6;
+                state.viewFrom = now - 300e9;
+                state.viewTo = now;
+                refreshAll();
+            }, 5000);
+        }
+    });
+}
+
+// Call after connect
+const _origOnOpen = typeof onWsOpen === 'function' ? onWsOpen : null;
 
 // -- Transitions Sankey -------------------------------------------------------
 
