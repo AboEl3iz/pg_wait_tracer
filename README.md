@@ -8,13 +8,17 @@ requires no PostgreSQL patches, no extensions, and no restarts.
 
 Key capabilities:
 
-- **6 diagnostic views**: time_model, system_event, session_event, histogram,
-  query_event, active
+- **7 diagnostic views**: time_model, system_event, session_event, histogram,
+  query_event, active, transitions (Sankey diagram)
 - **Web investigation client** (`pgwt`): browser UI with ECharts AAS chart,
-  color-coded drill-down tables, percentage bars, summary metrics — connects
-  to DB server over SSH, runs from your laptop
+  color-coded drill-down tables, percentage bars, summary metrics, concurrency
+  peak overlay, burst detection markers — connects to DB server over SSH
+- **Live mode**: auto-refreshing AAS chart with sliding time window, per-session
+  event cache for immutable trace files
 - **Text dump** (`pgwt-server --dump`): quick CLI summary of trace files
   (time model, top events, top sessions, top queries) — no TUI needed
+- **Advanced analysis**: wait event transitions + fingerprinting, lock chain
+  detection (waiter→blocker inference), cross-session interference scoring
 - **Multi-window analysis**: compare wait profiles across time horizons
   (e.g. last 5s vs 1m vs 5m)
 - **Daemon mode**: persistent monitoring with automatic re-attach on
@@ -23,6 +27,8 @@ Key capabilities:
   rotation and configurable retention
 - **Offline replay**: analyze historical trace files without root or a
   running PostgreSQL instance
+- **Dynamic event names**: auto-discovers wait event names from PostgreSQL
+  (PG17+) via `pg_wait_events`, forward-compatible with PG19+
 
 Overhead scales with wait event transition rate: ~6% on write-heavy OLTP,
 up to ~30% on read-heavy workloads with high buffer miss rates. See
@@ -690,6 +696,39 @@ sudo ./pg_wait_tracer --view query_event --query-id 5678234567890123
 
 All three modes support `--window` with vertically stacked sections per window.
 
+## Advanced Analysis (Web Client)
+
+The web client (`pgwt`) provides additional analysis views beyond the CLI:
+
+### Transitions (Sankey Diagram)
+
+Visualizes wait event state transitions as a Sankey flow diagram. Shows which
+events commonly follow each other (e.g., CPU → IO:DataFileRead → CPU).
+
+The server also computes per-query **fingerprints** — compact signatures like
+`IO:30%|CPU:22%|LWLock:21%|Lock:13%` that characterize each query's wait profile.
+Useful for detecting query plan changes (same query_id, different fingerprint).
+
+### Concurrency Peaks + Burst Detection
+
+Overlaid on the AAS chart as a dashed "Peak Concurrency" line showing the maximum
+number of sessions simultaneously in the same wait state per time bucket.
+
+**Burst markers** (red triangles) highlight moments when 4+ sessions entered the
+same wait event within 10ms — "thundering herd" detection.
+
+### Lock Chains
+
+Infers waiter→blocker relationships from trace data. For each Lock-class wait,
+identifies which other PID was most likely holding the lock (on CPU during the
+same time interval). Available via `lock_chains` server endpoint.
+
+### Interference Scoring
+
+Scores PID pairs by how much time they spend waiting on the same event
+simultaneously. High-scoring pairs are "noisy neighbors" contending on the
+same resources. Available via `interference` server endpoint.
+
 ## Trace File Format
 
 When `--trace-dir` is specified, the daemon (or interactive mode) writes raw
@@ -894,10 +933,11 @@ sudo tests/run_all.sh --pg-version 18
 | Layer | Tests | Requires | What it proves |
 |-------|-------|----------|----------------|
 | **C unit tests** | `test_wait_event`, `test_cmdline`, `test_bucket` | `make -C tests` | Event ID parsing, CLI parser, histogram buckets |
-| **Synthetic data** | `test_data_*.py` (9 suites) | `pgwt-server` + `gen_test_traces` | Compute math is correct (0% tolerance) |
+| **Synthetic data** | `test_data_*.py` (11 suites) | `pgwt-server` + `gen_test_traces` | Compute math: time model, events, sessions, queries, filters, idle, edge cases, transitions, fingerprints, lock chains, interference (91 checks, 0% tolerance) |
 | **CLI integration** | `test_cli.sh`, `test_lifecycle.sh` | Root + PG | CLI flags, daemon lifecycle |
 | **Live correctness** | `test_accuracy.py`, `test_percentage.py`, `test_aas_accuracy.py`, etc. (14 suites) | Root + PG + pgbench | BPF → file → compute pipeline against real workloads |
-| **Web UI** | `test_web_ui.py` | Python + playwright + websockets | Browser rendering, drill-down, reconnection (67 checks) |
+| **Web UI** | `test_web_ui.py` | Python + playwright + websockets | 108 checks: tabs, tables, sorting, drill-down, breadcrumbs, Sankey transitions, concurrency overlay, auto-refresh, reconnection |
+| **Performance** | `bench_server.py` + `gen_bench_traces` | `pgwt-server` | Compute throughput: 10.8M events/sec on 10M event trace |
 
 ### Running individual layers
 
@@ -979,12 +1019,19 @@ Userspace consumes ring buffer events and accumulates them into per-view
 statistics. When `--trace-dir` is enabled, events are also written to disk
 in columnar LZ4-compressed trace files.
 
+The server (`pgwt-server`) reads trace files and computes all views using
+O(n) hash-table-based algorithms (10.8M events/sec throughput). Immutable
+`.trace.lz4` files are cached per session; `current.trace` (the file being
+written by the daemon) is read with a streaming block reader for live mode.
+
 This design means:
 - **No PostgreSQL patches or extensions required** — works with stock binaries
 - **No sampling** — every event transition is captured exactly
 - **Low overhead** — ~6% on write-heavy OLTP (see [Performance](#performance))
 - **No lock contention** — ring buffer is lock-free
 - **Historical analysis** — trace files enable offline replay of past events
+- **Live analysis** — `current.trace` readable while daemon writes it
+- **Forward-compatible** — event names discovered dynamically from PG17+
 
 ## Performance
 
