@@ -964,6 +964,7 @@ static void handle_session_timeline(struct pgwt_server *srv, struct pgwt_request
             continue;
         total_matching++;
 
+        /* Collect unique PIDs (linear scan is fine for ≤256 PIDs) */
         int found = 0;
         for (int p = 0; p < num_pids; p++) {
             if (pids[p] == ev->pid) { found = 1; break; }
@@ -1039,6 +1040,16 @@ static void handle_session_timeline(struct pgwt_server *srv, struct pgwt_request
         } \
     } while(0)
 
+    /* Build PID→index hash table for O(1) lookup in second pass */
+    int pid_idx_ht[1024];  /* hash table: slot → pids[] index, -1 = empty */
+    memset(pid_idx_ht, -1, sizeof(pid_idx_ht));
+    for (int p = 0; p < num_pids; p++) {
+        uint32_t slot = (pids[p] * 0x45d9f3b) & 1023;
+        while (pid_idx_ht[slot] >= 0)
+            slot = (slot + 1) & 1023;
+        pid_idx_ht[slot] = p;
+    }
+
     for (int i = 0; i < count; i++) {
         const struct pgwt_trace_event *ev = &events[i];
         if (!pgwt_filter_matches(&req->filter, ev))
@@ -1046,10 +1057,17 @@ static void handle_session_timeline(struct pgwt_server *srv, struct pgwt_request
         if (pgwt_is_idle_event(ev->old_event))
             continue;
 
-        /* Find PID index */
+        /* O(1) PID index lookup */
         int pidx = -1;
-        for (int p = 0; p < num_pids; p++) {
-            if (pids[p] == ev->pid) { pidx = p; break; }
+        {
+            uint32_t slot = (ev->pid * 0x45d9f3b) & 1023;
+            while (pid_idx_ht[slot] >= 0) {
+                if (pids[pid_idx_ht[slot]] == ev->pid) {
+                    pidx = pid_idx_ht[slot];
+                    break;
+                }
+                slot = (slot + 1) & 1023;
+            }
         }
         if (pidx < 0) continue;
 

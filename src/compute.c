@@ -42,6 +42,84 @@ static uint32_t compute_duration_to_bucket(uint64_t ns)
 #define compute_duration_to_bucket pgwt_duration_to_bucket
 #endif
 
+/* ── Hash helpers for O(1) event/PID/query lookups ─────────── */
+
+/* Hash a uint32 key to a table slot (power-of-2 table size) */
+static inline int hash32(uint32_t key, int mask)
+{
+    key = ((key >> 16) ^ key) * 0x45d9f3b;
+    key = ((key >> 16) ^ key) * 0x45d9f3b;
+    key = (key >> 16) ^ key;
+    return (int)(key & mask);
+}
+
+/* Hash a uint64 key to a table slot (power-of-2 table size) */
+static inline int hash64(uint64_t key, int mask)
+{
+    key = (key ^ (key >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    key = (key ^ (key >> 27)) * 0x94d049bb133111ebULL;
+    key = key ^ (key >> 31);
+    return (int)(key & mask);
+}
+
+/*
+ * Find-or-insert in an open-addressing hash table of event_accum entries.
+ * Returns the index of the existing or newly-inserted entry, or -1 if full.
+ * Table entries with event_id == 0 are considered empty (event_id 0 = CPU
+ * is handled specially by callers before reaching the hash lookup).
+ */
+struct event_ht_entry {
+    uint32_t event_id;    /* 0 = empty slot */
+    double   total_ns;
+};
+
+#define EVENT_HT_SIZE 2048  /* must be power of 2 */
+#define EVENT_HT_MASK (EVENT_HT_SIZE - 1)
+
+static inline int event_ht_find_or_insert(struct event_ht_entry *ht,
+                                          uint32_t event_id)
+{
+    int slot = hash32(event_id, EVENT_HT_MASK);
+    for (int i = 0; i < EVENT_HT_SIZE; i++) {
+        int idx = (slot + i) & EVENT_HT_MASK;
+        if (ht[idx].event_id == event_id)
+            return idx;
+        if (ht[idx].event_id == 0) {
+            ht[idx].event_id = event_id;
+            return idx;
+        }
+    }
+    return -1;  /* full (shouldn't happen with 2048 slots for ~300 events) */
+}
+
+/*
+ * Find-or-insert for per-PID wait tracking within a session_accum.
+ * Uses same open-addressing approach.
+ */
+#define WAIT_HT_SIZE 256   /* must be power of 2 */
+#define WAIT_HT_MASK (WAIT_HT_SIZE - 1)
+
+struct wait_ht_entry {
+    uint32_t event_id;    /* 0 = empty */
+    uint64_t total_ns;
+};
+
+static inline int wait_ht_find_or_insert(struct wait_ht_entry *ht,
+                                         uint32_t event_id)
+{
+    int slot = hash32(event_id, WAIT_HT_MASK);
+    for (int i = 0; i < WAIT_HT_SIZE; i++) {
+        int idx = (slot + i) & WAIT_HT_MASK;
+        if (ht[idx].event_id == event_id)
+            return idx;
+        if (ht[idx].event_id == 0) {
+            ht[idx].event_id = event_id;
+            return idx;
+        }
+    }
+    return -1;
+}
+
 /* ── Wait class mapping ───────────────────────────────────── */
 
 int pgwt_wait_class_index(uint32_t event_id)
@@ -316,10 +394,8 @@ void pgwt_compute_time_model(const struct pgwt_trace_event *events, int count,
         snprintf(classes[i].name, sizeof(classes[i].name), "%s",
                  pgwt_class_names[i]);
 
-    /* Use a flat array for per-event accum (max 4096 distinct events) */
-    #define MAX_DISTINCT_EVENTS 4096
-    struct event_accum *ev_accum = calloc(MAX_DISTINCT_EVENTS, sizeof(*ev_accum));
-    int num_ev_accum = 0;
+    /* Hash table for per-event accumulation — O(1) lookup */
+    struct event_ht_entry *ev_ht = calloc(EVENT_HT_SIZE, sizeof(*ev_ht));
 
     double db_time_ns  = 0.0;
     double idle_time_ns = 0.0;
@@ -340,24 +416,10 @@ void pgwt_compute_time_model(const struct pgwt_trace_event *events, int count,
         int cls_idx = pgwt_wait_class_index(ev->old_event);
         classes[cls_idx].total_ns += dur_ns;
 
-        /* Find or insert event in flat array */
-        const char *cls_name = pgwt_class_names[cls_idx];
-        int found = -1;
-        for (int j = 0; j < num_ev_accum; j++) {
-            if (ev_accum[j].event_id == ev->old_event) {
-                found = j;
-                break;
-            }
-        }
-        if (found >= 0) {
-            ev_accum[found].total_ns += dur_ns;
-        } else if (num_ev_accum < MAX_DISTINCT_EVENTS) {
-            snprintf(ev_accum[num_ev_accum].class_name,
-                     sizeof(ev_accum[num_ev_accum].class_name), "%s", cls_name);
-            ev_accum[num_ev_accum].event_id = ev->old_event;
-            ev_accum[num_ev_accum].total_ns = dur_ns;
-            num_ev_accum++;
-        }
+        /* O(1) hash lookup for per-event accumulation */
+        int slot = event_ht_find_or_insert(ev_ht, ev->old_event);
+        if (slot >= 0)
+            ev_ht[slot].total_ns += dur_ns;
     }
 
     double db_time_ms  = db_time_ns / 1e6;
@@ -380,7 +442,21 @@ void pgwt_compute_time_model(const struct pgwt_trace_event *events, int count,
     /* Sort classes by total descending */
     qsort(classes, PGWT_NUM_CLASSES, sizeof(classes[0]), cmp_class_desc);
 
-    /* Sort event accum for sub-event lookup */
+    /* Convert hash table to sorted array for Phase 2 sub-event lookup */
+    #define MAX_DISTINCT_EVENTS 4096
+    struct event_accum *ev_accum = calloc(MAX_DISTINCT_EVENTS, sizeof(*ev_accum));
+    int num_ev_accum = 0;
+    for (int i = 0; i < EVENT_HT_SIZE && num_ev_accum < MAX_DISTINCT_EVENTS; i++) {
+        if (ev_ht[i].event_id == 0) continue;
+        int cls_idx = pgwt_wait_class_index(ev_ht[i].event_id);
+        snprintf(ev_accum[num_ev_accum].class_name,
+                 sizeof(ev_accum[num_ev_accum].class_name), "%s",
+                 pgwt_class_names[cls_idx]);
+        ev_accum[num_ev_accum].event_id = ev_ht[i].event_id;
+        ev_accum[num_ev_accum].total_ns = ev_ht[i].total_ns;
+        num_ev_accum++;
+    }
+    free(ev_ht);
     qsort(ev_accum, num_ev_accum, sizeof(ev_accum[0]), cmp_event_desc);
 
     for (int c = 0; c < PGWT_NUM_CLASSES; c++) {
@@ -453,8 +529,7 @@ struct top_event_accum {
     uint64_t hist[HISTOGRAM_BUCKETS];
 };
 
-#define EVENT_HT_SIZE 1024
-#define EVENT_HT_MASK (EVENT_HT_SIZE - 1)
+/* Reuses EVENT_HT_SIZE/EVENT_HT_MASK defined above */
 
 /* Histogram bucket upper boundaries in microseconds */
 static const uint64_t hist_upper_us[HISTOGRAM_BUCKETS] = {
@@ -562,10 +637,8 @@ struct session_accum {
     uint32_t pid;
     uint64_t total_ns;
     uint64_t cpu_ns;
-    /* Top wait tracking: simple linear array (max 256 per PID) */
-    uint32_t wait_ids[MAX_EVENTS_PER_PID];
-    uint64_t wait_ns[MAX_EVENTS_PER_PID];
-    int      num_waits;
+    /* Per-wait hash table — O(1) lookup */
+    struct wait_ht_entry waits[WAIT_HT_SIZE];
 };
 
 #define SESSION_HT_SIZE MAX_BACKENDS
@@ -606,22 +679,10 @@ void pgwt_compute_top_sessions(const struct pgwt_trace_event *events, int count,
         if (ev->old_event == 0) {
             ht[h].cpu_ns += ev->duration_ns;
         } else {
-            /* Track per-wait totals */
-            int found = -1;
-            for (int j = 0; j < ht[h].num_waits; j++) {
-                if (ht[h].wait_ids[j] == ev->old_event) {
-                    found = j;
-                    break;
-                }
-            }
-            if (found >= 0) {
-                ht[h].wait_ns[found] += ev->duration_ns;
-            } else if (ht[h].num_waits < MAX_EVENTS_PER_PID) {
-                int n = ht[h].num_waits;
-                ht[h].wait_ids[n] = ev->old_event;
-                ht[h].wait_ns[n]  = ev->duration_ns;
-                ht[h].num_waits++;
-            }
+            /* O(1) hash lookup for per-wait totals */
+            int wslot = wait_ht_find_or_insert(ht[h].waits, ev->old_event);
+            if (wslot >= 0)
+                ht[h].waits[wslot].total_ns += ev->duration_ns;
         }
     }
 
@@ -641,13 +702,14 @@ void pgwt_compute_top_sessions(const struct pgwt_trace_event *events, int count,
         r->cpu_pct  = db > 0 ? (double)ht[i].cpu_ns / db * 100.0 : 0;
         r->wait_pct = 100.0 - r->cpu_pct;
 
-        /* Find top wait (exclude CPU=0) */
+        /* Find top wait from per-PID hash table */
         uint32_t top_id = 0;
         uint64_t top_ns = 0;
-        for (int j = 0; j < ht[i].num_waits; j++) {
-            if (ht[i].wait_ns[j] > top_ns) {
-                top_ns = ht[i].wait_ns[j];
-                top_id = ht[i].wait_ids[j];
+        for (int j = 0; j < WAIT_HT_SIZE; j++) {
+            if (ht[i].waits[j].event_id != 0 &&
+                ht[i].waits[j].total_ns > top_ns) {
+                top_ns = ht[i].waits[j].total_ns;
+                top_id = ht[i].waits[j].event_id;
             }
         }
         r->top_wait_id = top_id;
@@ -674,10 +736,8 @@ struct query_accum {
     uint64_t count;
     uint64_t total_ns;
     uint64_t class_ns[PGWT_NUM_CLASSES]; /* per-class time breakdown */
-    /* Top wait tracking */
-    uint32_t wait_ids[64];
-    uint64_t wait_ns[64];
-    int      num_waits;
+    /* Per-wait hash table — O(1) lookup */
+    struct wait_ht_entry waits[WAIT_HT_SIZE];
 };
 
 #define QUERY_HT_SIZE 2048
@@ -722,21 +782,11 @@ void pgwt_compute_top_queries(const struct pgwt_trace_event *events, int count,
         ht[h].total_ns += ev->duration_ns;
         ht[h].class_ns[pgwt_wait_class_index(ev->old_event)] += ev->duration_ns;
 
-        /* Track per-wait totals */
-        int found = -1;
-        for (int j = 0; j < ht[h].num_waits; j++) {
-            if (ht[h].wait_ids[j] == ev->old_event) {
-                found = j;
-                break;
-            }
-        }
-        if (found >= 0) {
-            ht[h].wait_ns[found] += ev->duration_ns;
-        } else if (ht[h].num_waits < 64) {
-            int n = ht[h].num_waits;
-            ht[h].wait_ids[n] = ev->old_event;
-            ht[h].wait_ns[n]  = ev->duration_ns;
-            ht[h].num_waits++;
+        /* O(1) hash lookup for per-wait totals */
+        if (ev->old_event != 0) {
+            int wslot = wait_ht_find_or_insert(ht[h].waits, ev->old_event);
+            if (wslot >= 0)
+                ht[h].waits[wslot].total_ns += ev->duration_ns;
         }
     }
 
@@ -758,15 +808,24 @@ void pgwt_compute_top_queries(const struct pgwt_trace_event *events, int count,
                      : 0;
         r->pct_db   = db_time_ms > 0 ? r->total_ms / db_time_ms * 100.0 : 0;
 
-        /* Find top wait */
+        /* Find top wait + build per-event breakdown from hash table */
         uint32_t top_id = 0;
         uint64_t top_ns = 0;
-        for (int j = 0; j < ht[i].num_waits; j++) {
-            if (ht[i].wait_ns[j] > top_ns) {
-                top_ns = ht[i].wait_ns[j];
-                top_id = ht[i].wait_ids[j];
+
+        /* Collect non-empty entries from wait hash table */
+        struct { uint32_t eid; uint64_t ns; } wlist[WAIT_HT_SIZE];
+        int nw = 0;
+        for (int j = 0; j < WAIT_HT_SIZE; j++) {
+            if (ht[i].waits[j].event_id == 0) continue;
+            if (ht[i].waits[j].total_ns > top_ns) {
+                top_ns = ht[i].waits[j].total_ns;
+                top_id = ht[i].waits[j].event_id;
             }
+            wlist[nw].eid = ht[i].waits[j].event_id;
+            wlist[nw].ns  = ht[i].waits[j].total_ns;
+            nw++;
         }
+
         r->top_wait_id = top_id;
         if (top_id == 0)
             snprintf(r->top_wait, sizeof(r->top_wait), "CPU*");
@@ -776,26 +835,23 @@ void pgwt_compute_top_queries(const struct pgwt_trace_event *events, int count,
         for (int c = 0; c < PGWT_NUM_CLASSES; c++)
             r->class_ms[c] = (double)ht[i].class_ns[c] / 1e6;
 
-        /* Per-event breakdown: sort by time desc, pick top 16 */
+        /* Per-event breakdown: pick top 16 by time desc */
         r->num_events = 0;
-        if (ht[i].num_waits > 0) {
-            /* Simple selection sort for top 16 */
-            uint8_t used[64] = {0};
-            for (int k = 0; k < 16 && k < ht[i].num_waits; k++) {
-                int best = -1;
-                uint64_t best_ns = 0;
-                for (int j = 0; j < ht[i].num_waits; j++) {
-                    if (!used[j] && ht[i].wait_ns[j] > best_ns) {
-                        best_ns = ht[i].wait_ns[j];
-                        best = j;
-                    }
-                }
-                if (best < 0) break;
-                used[best] = 1;
-                r->event_ids[k] = ht[i].wait_ids[best];
-                r->event_ms[k]  = (double)ht[i].wait_ns[best] / 1e6;
-                r->num_events++;
+        for (int k = 0; k < 16 && k < nw; k++) {
+            /* Find max remaining */
+            int best = k;
+            for (int j = k + 1; j < nw; j++) {
+                if (wlist[j].ns > wlist[best].ns)
+                    best = j;
             }
+            if (best != k) {
+                uint32_t te = wlist[k].eid; uint64_t tn = wlist[k].ns;
+                wlist[k].eid = wlist[best].eid; wlist[k].ns = wlist[best].ns;
+                wlist[best].eid = te; wlist[best].ns = tn;
+            }
+            r->event_ids[k] = wlist[k].eid;
+            r->event_ms[k]  = (double)wlist[k].ns / 1e6;
+            r->num_events++;
         }
 
         nr++;
