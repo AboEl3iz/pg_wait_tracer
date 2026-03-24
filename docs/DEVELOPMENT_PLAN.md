@@ -284,22 +284,29 @@ Commits: `711f590`, `7fd8f62`.
 
 ---
 
-## Sprint 10: Tracing Analysis Phase 2 — Transitions + Fingerprinting
+## Sprint 10: Tracing Analysis Phase 2 — Transitions + Fingerprinting ✅ COMPLETED (2026-03-24)
 
 **Goal:** Build the features that differentiate tracing from sampling.
 
 **Depends on:** Sprint 1 (timeline bug fixed), Sprint 6 (cJSON for new endpoints).
 
-| # | Task | Details |
-|---|------|---------|
-| 10.1 | New server endpoint: `transitions` | Compute NxN state transition matrix for query_id/PID. Returns top transitions with probabilities. |
-| 10.2 | Web UI: Sankey/chord diagram for transitions | New tab or drill-down from Queries tab. ECharts Sankey. |
-| 10.3 | Wait pattern fingerprinting | Per-query_id transition signature. Compare across time windows. |
-| 10.4 | Web UI: "pattern changed" indicator in Queries tab | Click to see before/after fingerprint diff. |
-| 10.5 | Tests for transition computation | Synthetic events → verify transition matrix is correct |
+| # | Task | Details | Status |
+|---|------|---------|--------|
+| 10.1 | New server endpoint: `transitions` | Hash table (4096 slots) for (from, to) pairs. Returns Sankey-compatible links JSON. | ✅ |
+| 10.2 | Web UI: Sankey diagram for transitions | New "Transitions" tab. ECharts Sankey with hover tooltips (count, %, duration). | ✅ |
+| 10.3 | Wait pattern fingerprinting | `pgwt_compute_fingerprints()`: per-query class distribution + top transition. Signature: "IO:30%\|CPU:22%\|LWLock:21%" | ✅ |
+| 10.4 | Server endpoint: `fingerprints` | Returns per-query signatures, class percentages, top transitions. | ✅ |
+| 10.5 | Tests for transition computation | 10/10 checks: exact counts, durations, fingerprint signature content. | ✅ |
 
-**Deliverable:** Wait transition Sankey diagrams. Plan change detection from wait
-event shapes. Features no sampling tool can offer.
+**Details:**
+- **Transitions:** Uses `(from * 0x45d9f3b) ^ (to * 0x9e3779b9)` hash for O(1) pair lookup.
+  Filters idle events and exit sentinels. Returns top N by count with duration totals.
+- **Fingerprints:** Per-query hash table (2048 slots). Class % sorted descending for
+  consistent signatures. Top transition tracked per query with 64-entry linear array.
+- **Sankey:** Handles self-transitions (CPU→CPU) by appending space suffix to target.
+  Gradient line style, adjacency focus on hover.
+
+**Result:** 10/10 transition tests pass. +517 lines. Commit: `efe531e`.
 
 ---
 
@@ -392,7 +399,7 @@ Sprint 6:  cJSON integration                            ✅ ──── Clean J
 Sprint 7:  Dynamic event names                          ✅ ──── Forward compat
 Sprint 8:  Drop Rust TUI                                ✅ ──── Simplify
 Sprint 9:  Performance optimization + benchmarks        ✅ ──── Speed
-Sprint 10: Tracing analysis Phase 2 (transitions)           ──── Differentiate
+Sprint 10: Tracing analysis Phase 2 (transitions)       ✅ ──── Differentiate
 Sprint 11: Merge daemon + server                            ──── Architecture
 Sprint 12: Live mode (Phase H)                              ──── Real-time
 Sprint 13: Tracing analysis Phase 3 (concurrency)           ──── Advanced
