@@ -255,24 +255,32 @@ Commit: `008f624`.
 
 ---
 
-## Sprint 9: Performance Optimization + Benchmarks
+## Sprint 9: Performance Optimization + Benchmarks ✅ COMPLETED (2026-03-24)
 
 **Goal:** Replace O(n²) hot paths with hash tables. Establish performance baselines.
 
 **Depends on:** Sprint 2 (test data generator for benchmarks).
 
-| # | Task | Details |
-|---|------|---------|
-| 9.1 | Hash tables for `pgwt_compute_time_model` event accumulation | Replace linear scan with open-addressing hash (Issue 11) |
-| 9.2 | Hash tables for session/query per-wait tracking | `compute.c:~599, ~715` (Issue 11) |
-| 9.3 | Hash lookup for session timeline PID index | `server.c` (Issue 11) |
-| 9.4 | Write `gen_bench_traces.c` | Generate 1M/10M event trace files |
-| 9.5 | Write `bench_server.py` | Measure compute throughput and server response latency |
-| 9.6 | Establish performance baselines | Save results, track across commits |
-| 9.7 | Add ASan/Valgrind targets to Makefile | `make test-asan`, `make test-valgrind` |
+| # | Task | Details | Status |
+|---|------|---------|--------|
+| 9.1 | Hash tables for `pgwt_compute_time_model` event accumulation | `event_ht_entry` hash table (2048 slots), replaces linear scan | ✅ |
+| 9.2 | Hash tables for session/query per-wait tracking | `wait_ht_entry` hash table (256 slots per PID/query), replaces linear arrays | ✅ |
+| 9.3 | Hash lookup for session timeline PID index | `pid_idx_ht` hash table (1024 slots), replaces linear search in second pass | ✅ |
+| 9.4 | Write `gen_bench_traces.c` | Generates 1M/10M events with realistic pgbench-like mix | ✅ |
+| 9.5 | Write `bench_server.py` | Measures server latency per command at varying event counts | ✅ |
+| 9.6 | Establish performance baselines | 1M events: 101ms (10M/sec), 10M events: 924ms (10.8M/sec) | ✅ |
+| 9.7 | Add ASan/Valgrind targets to Makefile | `make test-asan`, `make test-valgrind`, `make bench` | ✅ |
 
-**Deliverable:** O(n) compute for all hot paths. Performance baselines documented.
-Memory safety verified under ASan.
+**Details:**
+- **Hash helpers:** `hash32()`, `hash64()`, `event_ht_find_or_insert()`, `wait_ht_find_or_insert()` —
+  reusable open-addressing hash functions at the top of compute.c.
+- **Top events:** Already used hash table (pre-existing); removed duplicate `EVENT_HT_SIZE` definition.
+- **Session/query accum:** Replaced `wait_ids[]/wait_ns[]/num_waits` flat arrays with `wait_ht_entry waits[256]`
+  hash tables. Top-wait scan iterates 256 hash slots instead of variable-length array.
+- **Summary path:** Serves most commands in <1ms regardless of event count (pre-aggregated).
+
+**Result:** All 72 synthetic data tests pass with 0% tolerance. Compute throughput: 10.8M events/sec.
+Commits: `711f590`, `7fd8f62`.
 
 ---
 
@@ -383,7 +391,7 @@ Sprint 5:  Web UI tests (Playwright)                    ✅ ──── Stop cl
 Sprint 6:  cJSON integration                            ✅ ──── Clean JSON
 Sprint 7:  Dynamic event names                          ✅ ──── Forward compat
 Sprint 8:  Drop Rust TUI                                ✅ ──── Simplify
-Sprint 9:  Performance optimization + benchmarks            ──── Speed
+Sprint 9:  Performance optimization + benchmarks        ✅ ──── Speed
 Sprint 10: Tracing analysis Phase 2 (transitions)           ──── Differentiate
 Sprint 11: Merge daemon + server                            ──── Architecture
 Sprint 12: Live mode (Phase H)                              ──── Real-time
