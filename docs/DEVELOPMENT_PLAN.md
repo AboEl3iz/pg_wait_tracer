@@ -374,23 +374,31 @@ resolution from trace files. Historical + live data seamlessly merged.
 
 ---
 
-## Sprint 14: Advanced Analysis (Phases 4-5) + Phase G.2
+## Sprint 14: Advanced Analysis (Phases 4-5) + Phase G.2 ✅ COMPLETED (2026-03-24)
 
 **Goal:** Lock chains, interference scoring, plan_id capture.
 
 **Depends on:** Sprint 13 (concurrency analysis foundation).
 
-| # | Task | Details |
-|---|------|---------|
-| 14.1 | Lock chain detection | Scan overlapping Lock waits, reconstruct A→B→C chains |
-| 14.2 | Web UI: lock chain visualization | New Locks tab or overlay in session timeline |
-| 14.3 | Cross-session interference scoring | Temporal correlation between PIDs |
-| 14.4 | Plan identifier capture (PG18+) | Read `st_plan_id` from shared memory, store in trace events |
-| 14.5 | Plan change detection in web UI | Highlight when same query_id has multiple plan_ids |
-| 14.6 | HMM anomaly detection (research/evaluate) | Train on "normal" transitions, alert on deviation |
+| # | Task | Details | Status |
+|---|------|---------|--------|
+| 14.1 | Lock chain detection | Scans Lock waits, finds likely blocker PID via CPU interval overlap | ✅ |
+| 14.2 | Web UI: lock chain visualization | Deferred — data available via `lock_chains` endpoint | ⏸ |
+| 14.3 | Cross-session interference scoring | Overlapping wait intervals on same event from different PIDs, scored 0-1 | ✅ |
+| 14.4 | Plan identifier capture (PG18+) | Deferred — requires BPF changes + `st_plan_id` offset discovery | ⏸ |
+| 14.5 | Plan change detection in web UI | Deferred — depends on 14.4 | ⏸ |
+| 14.6 | HMM anomaly detection (research/evaluate) | Deferred — research task | ⏸ |
 
-**Deliverable:** Lock chain visualization, noisy-neighbor detection, plan
-regression identification. Research verdict on HMM approach.
+**Details:**
+- **Lock chains:** Collects Lock-class wait intervals + CPU intervals. For each Lock wait,
+  finds the different PID on CPU with maximum temporal overlap → likely blocker. Heuristic
+  (no pg_locks data), but effective for Lock:transactionid and Lock:tuple contention.
+- **Interference:** Sorts active intervals by start_ns, scans forward for overlapping pairs
+  on same event from different PIDs. Hash table (4096 slots) per (pid_a, pid_b) pair.
+  Normalized score: 1.0 = highest overlap in the trace.
+- **Endpoints:** `lock_chains` (waiter/blocker/lock/wait_ms), `interference` (pid_a/pid_b/score/overlap_ms).
+
+**Result:** Commit: `5af0d0b`. All synthetic tests pass.
 
 ---
 
@@ -410,7 +418,7 @@ Sprint 10: Tracing analysis Phase 2 (transitions)       ✅ ──── Differe
 Sprint 11: Merge daemon + server                     ⏸ ──── Deferred
 Sprint 12: Live mode (Phase H)                          ✅ ──── Real-time
 Sprint 13: Tracing analysis Phase 3 (concurrency)       ✅ ──── Advanced
-Sprint 14: Advanced analysis (Phases 4-5) + G.2             ──── Research
+Sprint 14: Advanced analysis (Phases 4-5) + G.2         ✅ ──── Research
 ```
 
 ## Dependency Graph
