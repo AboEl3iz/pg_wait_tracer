@@ -1726,3 +1726,236 @@ void pgwt_compute_heatmap_from_summaries(
     out->max_count    = ctx.max_count;
     out->total_events = ctx.total_events;
 }
+
+/* ── Transitions ──────────────────────────────────────────── */
+
+struct trans_accum {
+    uint32_t from_event;
+    uint32_t to_event;
+    uint64_t count;
+    uint64_t total_ns;
+};
+
+#define TRANS_HT_SIZE 4096
+#define TRANS_HT_MASK (TRANS_HT_SIZE - 1)
+
+static int cmp_trans_desc(const void *a, const void *b)
+{
+    uint64_t ca = ((const struct trans_accum *)a)->count;
+    uint64_t cb = ((const struct trans_accum *)b)->count;
+    return (cb > ca) - (cb < ca);
+}
+
+void pgwt_compute_transitions(const struct pgwt_trace_event *events, int count,
+                               const struct pgwt_filter *f, int max_rows,
+                               struct pgwt_transitions_result *out)
+{
+    memset(out, 0, sizeof(*out));
+
+    /* Hash table for (from, to) pairs */
+    struct trans_accum *ht = calloc(TRANS_HT_SIZE, sizeof(*ht));
+    int num_entries = 0;
+    uint64_t total = 0;
+
+    for (int i = 0; i < count; i++) {
+        const struct pgwt_trace_event *ev = &events[i];
+        if (!pgwt_filter_matches(f, ev))
+            continue;
+        if (pgwt_is_idle_event(ev->old_event) || pgwt_is_idle_event(ev->new_event))
+            continue;
+        if (ev->new_event == PGWT_EVENT_EXIT)
+            continue;
+
+        uint32_t from = ev->old_event;
+        uint32_t to   = ev->new_event;
+
+        /* Hash: combine from and to */
+        uint32_t h = ((from * 0x45d9f3b) ^ (to * 0x9e3779b9)) & TRANS_HT_MASK;
+        while (ht[h].count > 0 &&
+               (ht[h].from_event != from || ht[h].to_event != to))
+            h = (h + 1) & TRANS_HT_MASK;
+
+        if (ht[h].count == 0) {
+            ht[h].from_event = from;
+            ht[h].to_event = to;
+            num_entries++;
+        }
+        ht[h].count++;
+        ht[h].total_ns += ev->duration_ns;
+        total++;
+    }
+
+    /* Collect into flat array for sorting */
+    struct trans_accum *arr = calloc(num_entries, sizeof(*arr));
+    int n = 0;
+    for (int i = 0; i < TRANS_HT_SIZE && n < num_entries; i++) {
+        if (ht[i].count > 0)
+            arr[n++] = ht[i];
+    }
+    free(ht);
+
+    qsort(arr, n, sizeof(arr[0]), cmp_trans_desc);
+
+    /* Build result rows */
+    int nr = n < max_rows ? n : max_rows;
+    struct pgwt_transition_row *rows = calloc(nr, sizeof(*rows));
+    for (int i = 0; i < nr; i++) {
+        rows[i].from_event = arr[i].from_event;
+        rows[i].to_event   = arr[i].to_event;
+        rows[i].count      = arr[i].count;
+        rows[i].total_ns   = arr[i].total_ns;
+        pgwt_event_full_name(arr[i].from_event, rows[i].from_name,
+                             sizeof(rows[i].from_name));
+        pgwt_event_full_name(arr[i].to_event, rows[i].to_name,
+                             sizeof(rows[i].to_name));
+    }
+    free(arr);
+
+    out->rows = rows;
+    out->num_rows = nr;
+    out->total_transitions = total;
+}
+
+/* ── Fingerprints ─────────────────────────────────────────── */
+
+struct fp_accum {
+    uint64_t query_id;
+    uint64_t class_ns[PGWT_NUM_CLASSES];
+    uint64_t total_ns;
+    uint64_t total_transitions;
+    /* Top transition tracking */
+    struct trans_accum top_trans[64];
+    int num_trans;
+};
+
+#define FP_HT_SIZE 2048
+#define FP_HT_MASK (FP_HT_SIZE - 1)
+
+static int cmp_fp_desc(const void *a, const void *b)
+{
+    uint64_t ta = ((const struct pgwt_fingerprint_row *)a)->total_transitions;
+    uint64_t tb = ((const struct pgwt_fingerprint_row *)b)->total_transitions;
+    return (tb > ta) - (tb < ta);
+}
+
+void pgwt_compute_fingerprints(const struct pgwt_trace_event *events, int count,
+                                const struct pgwt_filter *f,
+                                struct pgwt_fingerprint_result *out)
+{
+    memset(out, 0, sizeof(*out));
+
+    struct fp_accum *ht = calloc(FP_HT_SIZE, sizeof(*ht));
+    int num_entries = 0;
+
+    for (int i = 0; i < count; i++) {
+        const struct pgwt_trace_event *ev = &events[i];
+        if (!pgwt_filter_matches(f, ev))
+            continue;
+        if (pgwt_is_idle_event(ev->old_event))
+            continue;
+        if (ev->query_id == 0)
+            continue;
+
+        /* Find query in hash table */
+        uint32_t h = hash64(ev->query_id, FP_HT_MASK);
+        while (ht[h].total_ns > 0 && ht[h].query_id != ev->query_id)
+            h = (h + 1) & FP_HT_MASK;
+
+        if (ht[h].total_ns == 0) {
+            ht[h].query_id = ev->query_id;
+            num_entries++;
+        }
+
+        int cls = pgwt_wait_class_index(ev->old_event);
+        ht[h].class_ns[cls] += ev->duration_ns;
+        ht[h].total_ns += ev->duration_ns;
+
+        /* Count transition if not exit */
+        if (ev->new_event != PGWT_EVENT_EXIT &&
+            !pgwt_is_idle_event(ev->new_event)) {
+            ht[h].total_transitions++;
+
+            /* Track top transition for this query */
+            uint32_t from = ev->old_event;
+            uint32_t to   = ev->new_event;
+            int found = -1;
+            for (int j = 0; j < ht[h].num_trans; j++) {
+                if (ht[h].top_trans[j].from_event == from &&
+                    ht[h].top_trans[j].to_event == to) {
+                    found = j;
+                    break;
+                }
+            }
+            if (found >= 0) {
+                ht[h].top_trans[found].count++;
+            } else if (ht[h].num_trans < 64) {
+                int n = ht[h].num_trans;
+                ht[h].top_trans[n].from_event = from;
+                ht[h].top_trans[n].to_event = to;
+                ht[h].top_trans[n].count = 1;
+                ht[h].num_trans++;
+            }
+        }
+    }
+
+    /* Build result rows */
+    struct pgwt_fingerprint_row *rows = calloc(num_entries, sizeof(*rows));
+    int nr = 0;
+
+    for (int i = 0; i < FP_HT_SIZE; i++) {
+        if (ht[i].total_ns == 0) continue;
+
+        struct pgwt_fingerprint_row *r = &rows[nr];
+        r->query_id = ht[i].query_id;
+        r->total_transitions = ht[i].total_transitions;
+
+        /* Compute class percentages */
+        for (int c = 0; c < PGWT_NUM_CLASSES; c++)
+            r->class_pct[c] = ht[i].total_ns > 0
+                ? (double)ht[i].class_ns[c] / (double)ht[i].total_ns * 100.0
+                : 0;
+
+        /* Find top transition */
+        uint64_t best_count = 0;
+        for (int j = 0; j < ht[i].num_trans; j++) {
+            if (ht[i].top_trans[j].count > best_count) {
+                best_count = ht[i].top_trans[j].count;
+                r->top_from = ht[i].top_trans[j].from_event;
+                r->top_to = ht[i].top_trans[j].to_event;
+            }
+        }
+
+        /* Build signature: "CPU:45%|IO:30%|Lock:25% → IO:DataFileRead→CPU*" */
+        char sig[128] = {0};
+        int pos = 0;
+        /* Sort classes by percentage for consistent signatures */
+        struct { int idx; double pct; } cpairs[PGWT_NUM_CLASSES];
+        for (int c = 0; c < PGWT_NUM_CLASSES; c++) {
+            cpairs[c].idx = c;
+            cpairs[c].pct = r->class_pct[c];
+        }
+        /* Simple bubble sort for 11 elements */
+        for (int a = 0; a < PGWT_NUM_CLASSES - 1; a++)
+            for (int b = a + 1; b < PGWT_NUM_CLASSES; b++)
+                if (cpairs[b].pct > cpairs[a].pct) {
+                    int ti = cpairs[a].idx; double tp = cpairs[a].pct;
+                    cpairs[a].idx = cpairs[b].idx; cpairs[a].pct = cpairs[b].pct;
+                    cpairs[b].idx = ti; cpairs[b].pct = tp;
+                }
+
+        for (int c = 0; c < PGWT_NUM_CLASSES && cpairs[c].pct >= 1.0; c++) {
+            if (pos > 0) pos += snprintf(sig + pos, sizeof(sig) - pos, "|");
+            pos += snprintf(sig + pos, sizeof(sig) - pos, "%s:%.0f%%",
+                           pgwt_class_display[cpairs[c].idx], cpairs[c].pct);
+        }
+        snprintf(r->signature, sizeof(r->signature), "%s", sig);
+
+        nr++;
+    }
+
+    free(ht);
+    qsort(rows, nr, sizeof(rows[0]), cmp_fp_desc);
+
+    out->rows = rows;
+    out->num_rows = nr;
+}

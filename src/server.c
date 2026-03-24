@@ -1114,6 +1114,81 @@ static void handle_session_timeline(struct pgwt_server *srv, struct pgwt_request
 
 /* ── Dispatch ─────────────────────────────────────────────── */
 
+static void handle_transitions(struct pgwt_server *srv, struct pgwt_request *req)
+{
+    int count;
+    struct pgwt_trace_event *events =
+        server_load_events(srv, req->from_ns, req->to_ns, &count);
+
+    int max_rows = req->num_buckets > 0 ? req->num_buckets : 50;
+    struct pgwt_transitions_result res;
+    pgwt_compute_transitions(events, count, &req->filter, max_rows, &res);
+    free(events);
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddNumberToObject(root, "id", (double)req->id);
+    cjson_add_uint64(root, "total", res.total_transitions);
+
+    /* Build Sankey-compatible nodes + links */
+    cJSON *links = cJSON_AddArrayToObject(root, "links");
+    for (int i = 0; i < res.num_rows; i++) {
+        cJSON *link = cJSON_CreateObject();
+        cJSON_AddStringToObject(link, "source", res.rows[i].from_name);
+        cJSON_AddStringToObject(link, "target", res.rows[i].to_name);
+        cJSON_AddNumberToObject(link, "value", (double)res.rows[i].count);
+        cJSON_AddNumberToObject(link, "duration_ms",
+                                (double)res.rows[i].total_ns / 1e6);
+        cJSON_AddItemToArray(links, link);
+    }
+
+    free(res.rows);
+    emit_json(root);
+}
+
+static void handle_fingerprints(struct pgwt_server *srv, struct pgwt_request *req)
+{
+    int count;
+    struct pgwt_trace_event *events =
+        server_load_events(srv, req->from_ns, req->to_ns, &count);
+
+    struct pgwt_fingerprint_result res;
+    pgwt_compute_fingerprints(events, count, &req->filter, &res);
+    free(events);
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddNumberToObject(root, "id", (double)req->id);
+
+    cJSON *rows = cJSON_AddArrayToObject(root, "rows");
+    for (int i = 0; i < res.num_rows; i++) {
+        cJSON *r = cJSON_CreateObject();
+        cjson_add_uint64(r, "query_id", res.rows[i].query_id);
+        cJSON_AddNumberToObject(r, "transitions",
+                                (double)res.rows[i].total_transitions);
+        cJSON_AddStringToObject(r, "signature", res.rows[i].signature);
+
+        /* Class distribution */
+        cJSON *pct = cJSON_CreateObject();
+        for (int c = 0; c < PGWT_NUM_CLASSES; c++) {
+            if (res.rows[i].class_pct[c] >= 0.1)
+                cJSON_AddNumberToObject(pct, pgwt_class_names[c],
+                                        res.rows[i].class_pct[c]);
+        }
+        cJSON_AddItemToObject(r, "class_pct", pct);
+
+        /* Top transition */
+        char from_name[64], to_name[64];
+        pgwt_event_full_name(res.rows[i].top_from, from_name, sizeof(from_name));
+        pgwt_event_full_name(res.rows[i].top_to, to_name, sizeof(to_name));
+        cJSON_AddStringToObject(r, "top_from", from_name);
+        cJSON_AddStringToObject(r, "top_to", to_name);
+
+        cJSON_AddItemToArray(rows, r);
+    }
+
+    free(res.rows);
+    emit_json(root);
+}
+
 static void dispatch(struct pgwt_server *srv, struct pgwt_request *req)
 {
     if (strcmp(req->cmd, "info") == 0)
@@ -1132,6 +1207,10 @@ static void dispatch(struct pgwt_server *srv, struct pgwt_request *req)
         handle_heatmap(srv, req);
     else if (strcmp(req->cmd, "session_timeline") == 0)
         handle_session_timeline(srv, req);
+    else if (strcmp(req->cmd, "transitions") == 0)
+        handle_transitions(srv, req);
+    else if (strcmp(req->cmd, "fingerprints") == 0)
+        handle_fingerprints(srv, req);
     else {
         cJSON *root = cJSON_CreateObject();
         cJSON_AddNumberToObject(root, "id", (double)req->id);

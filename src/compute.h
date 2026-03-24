@@ -224,4 +224,48 @@ void pgwt_compute_heatmap_from_summaries(
     const struct pgwt_filter *f, int num_buckets,
     struct pgwt_heatmap_result *out);
 
+/* ── Transitions ──────────────────────────────────────────── */
+
+struct pgwt_transition_row {
+    uint32_t from_event;
+    uint32_t to_event;
+    char     from_name[64];
+    char     to_name[64];
+    uint64_t count;
+    double   total_ns;       /* total time spent in from_event before this transition */
+};
+
+struct pgwt_transitions_result {
+    struct pgwt_transition_row *rows;  /* malloc'd, caller frees */
+    int    num_rows;
+    uint64_t total_transitions;
+};
+
+/* Compute top state transitions (old_event → new_event).
+ * Returns pairs sorted by count descending, limited to max_rows. */
+void pgwt_compute_transitions(const struct pgwt_trace_event *events, int count,
+                               const struct pgwt_filter *f, int max_rows,
+                               struct pgwt_transitions_result *out);
+
+/* ── Fingerprint ─────────────────────────────────────────── */
+
+struct pgwt_fingerprint_row {
+    uint64_t query_id;
+    double   class_pct[PGWT_NUM_CLASSES];  /* % of time per wait class */
+    uint64_t total_transitions;
+    uint32_t top_from;       /* most frequent transition source */
+    uint32_t top_to;         /* most frequent transition target */
+    char     signature[128]; /* compact text fingerprint */
+};
+
+struct pgwt_fingerprint_result {
+    struct pgwt_fingerprint_row *rows;  /* malloc'd, caller frees */
+    int    num_rows;
+};
+
+/* Compute per-query wait fingerprints: class distribution + top transition. */
+void pgwt_compute_fingerprints(const struct pgwt_trace_event *events, int count,
+                                const struct pgwt_filter *f,
+                                struct pgwt_fingerprint_result *out);
+
 #endif /* PGWT_COMPUTE_H */

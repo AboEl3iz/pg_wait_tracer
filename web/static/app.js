@@ -194,6 +194,10 @@ async function refreshTable() {
         await refreshTimeline();
         return;
     }
+    if (state.activeTab === 'transitions') {
+        await refreshTransitions();
+        return;
+    }
     try {
         const cmdMap = {
             overview: 'time_model',
@@ -372,6 +376,9 @@ function switchTab(tab) {
     }
     if (state.activeTab === 'timeline' && tab !== 'timeline') {
         if (timelineChart) { timelineChart.dispose(); timelineChart = null; }
+    }
+    if (state.activeTab === 'transitions' && tab !== 'transitions') {
+        if (sankeyChart) { sankeyChart.dispose(); sankeyChart = null; }
     }
     state.activeTab = tab;
     document.querySelectorAll('.tab').forEach(b => {
@@ -1430,6 +1437,80 @@ function renderTimeline(container, data) {
     };
 
     timelineChart.setOption(option, true);
+}
+
+// -- Transitions Sankey -------------------------------------------------------
+
+let sankeyChart = null;
+
+async function refreshTransitions() {
+    const container = document.getElementById('table-container');
+
+    // Create chart container if not present
+    if (!document.getElementById('sankey-container')) {
+        container.innerHTML =
+            '<div id="sankey-container" style="width:100%;height:600px;"></div>';
+    }
+
+    const data = await send('transitions', {
+        from: state.viewFrom,
+        to: state.viewTo,
+        filters: state.filters,
+        num_buckets: 30,  // top 30 transitions
+    });
+
+    if (!data || !data.links || data.links.length === 0) {
+        container.innerHTML = '<p style="color:#888;padding:20px">No transitions found</p>';
+        return;
+    }
+
+    // Build unique node list from links
+    const nodeSet = new Set();
+    data.links.forEach(l => { nodeSet.add(l.source); nodeSet.add(l.target); });
+
+    // Handle self-transitions (source === target) by appending a suffix
+    const links = data.links.map(l => ({
+        source: l.source,
+        target: l.source === l.target ? l.target + ' ' : l.target,
+        value: l.value,
+        duration_ms: l.duration_ms,
+    }));
+    links.forEach(l => { nodeSet.add(l.source); nodeSet.add(l.target); });
+
+    const nodes = Array.from(nodeSet).map(name => ({ name }));
+
+    const el = document.getElementById('sankey-container');
+    if (!sankeyChart) sankeyChart = echarts.init(el, 'dark');
+
+    sankeyChart.setOption({
+        title: {
+            text: `Wait Event Transitions (${data.total.toLocaleString()} total)`,
+            left: 'center',
+            textStyle: { color: '#ccc', fontSize: 14 },
+        },
+        tooltip: {
+            trigger: 'item',
+            formatter: p => {
+                if (p.dataType === 'edge') {
+                    const pct = (p.value / data.total * 100).toFixed(1);
+                    return `${p.data.source} → ${p.data.target}<br/>` +
+                           `Count: ${p.value.toLocaleString()} (${pct}%)<br/>` +
+                           `Duration: ${p.data.duration_ms.toFixed(1)} ms`;
+                }
+                return p.name;
+            },
+        },
+        series: [{
+            type: 'sankey',
+            layout: 'none',
+            emphasis: { focus: 'adjacency' },
+            data: nodes,
+            links: links,
+            lineStyle: { color: 'gradient', curveness: 0.5 },
+            label: { color: '#ccc', fontSize: 11 },
+            itemStyle: { borderWidth: 1 },
+        }],
+    }, true);
 }
 
 // -- Start --------------------------------------------------------------------
