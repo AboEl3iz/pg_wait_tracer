@@ -213,6 +213,7 @@ int main(int argc, char **argv)
     pid_t pm_pid = 0;
     const char *pgdata = NULL;
     bool format_set = false;
+    bool view_set = false;
     bool replay_mode = false;
     bool daemon_mode = false;
     const char *from_str = NULL;
@@ -225,7 +226,7 @@ int main(int argc, char **argv)
         case 'D': pgdata = optarg; break;
         case 'i': d->interval = atoi(optarg); break;
         case 'd': d->duration = atoi(optarg); break;
-        case 'V': d->view = parse_view(optarg); break;
+        case 'V': d->view = parse_view(optarg); view_set = true; break;
         case 'f': d->format = parse_format(optarg); format_set = true; break;
         case 'n': d->count = atoi(optarg); break;
         case 'w':
@@ -323,6 +324,10 @@ int main(int argc, char **argv)
     }
 
     d->daemon_mode = daemon_mode;
+
+    /* Daemon mode defaults to quiet unless user explicitly set --view */
+    if (daemon_mode && !view_set)
+        d->quiet = true;
 
     if (d->verbose) {
         if (d->lightweight_mode)
