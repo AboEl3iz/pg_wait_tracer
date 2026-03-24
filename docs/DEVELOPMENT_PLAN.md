@@ -207,24 +207,33 @@ as a stopgap — cJSON replaces it entirely).
 
 ---
 
-## Sprint 7: Dynamic Event Name Resolution
+## Sprint 7: Dynamic Event Name Resolution ✅ COMPLETED (2026-03-24)
 
 **Goal:** Stop hardcoding PG version-specific wait event tables. Forward-compatible
 with PG19+ without code changes.
 
 **Depends on:** Sprint 6 (cJSON makes it easy to serialize name maps to JSON).
 
-| # | Task | Details |
-|---|------|---------|
-| 7.1 | At daemon startup: run `psql -tAc "SELECT type, name FROM pg_wait_events"` | Capture all event names from the running PG instance |
-| 7.2 | Store name mapping in trace file header (or sidecar `.names.json`) | Format: `{"event_id": "Class:Name", ...}` |
-| 7.3 | `pgwt-server` reads name mapping from trace file/sidecar | Falls back to hardcoded tables if missing (backward compat) |
-| 7.4 | Web client displays names from server response (already does this) | No change needed |
-| 7.5 | Keep hardcoded tables as fallback for old trace files | `src/wait_event.c` stays but is only used when no name file exists |
-| 7.6 | Update tests to verify dynamic names | |
+| # | Task | Details | Status |
+|---|------|---------|--------|
+| 7.1 | At daemon startup: query `pg_wait_events` via psql | Discovers all event names from the running PG instance (PG17+) | ✅ |
+| 7.2 | Store name mapping as sidecar `wait_event_names.json` | JSON format: `{"IO": ["Event0", ...], "Lock": [...], ...}` — events in enum order | ✅ |
+| 7.3 | `pgwt-server` reads name mapping from sidecar | Falls back to hardcoded tables if missing (backward compat) | ✅ |
+| 7.4 | Web client displays names from server response (already does this) | No change needed | ✅ |
+| 7.5 | Keep hardcoded tables as fallback for old trace files | `src/wait_event.c` dynamic lookup → hardcoded fallback | ✅ |
+| 7.6 | Detect psql user from postmaster process owner | Reads UID from `/proc/PID/status`, resolves via `getpwuid()` | ✅ |
 
-**Deliverable:** Daemon discovers event names at startup. New trace files include
-name mapping. PG19 works out of the box.
+**Details:**
+- **Dynamic name tables:** Heap-allocated `dyn_names[16][512]` array indexed by `(class_byte, event_id)`.
+  `pgwt_event_name()` checks dynamic tables first, falls back to hardcoded.
+- **PG port detection:** Reads line 4 of `postmaster.pid` for the port number.
+- **Sidecar format:** Compact JSON with one array per class. Includes `pg_version` for reference.
+  Example: 5.5 KB for PG18 (81 IO events, 84 LWLock tranches, 57 IPC events, etc.).
+- **Multi-instance:** Each daemon reads port/user from its own postmaster, writes sidecar
+  to its own trace_dir. No conflicts between instances.
+
+**Result:** All 136 C unit tests pass. Tested on Hetzner cx43 (Rocky 9, PG18).
+Commits: `6fd90f9`, `0ffd565`.
 
 ---
 
@@ -371,7 +380,7 @@ Sprint 3:  Code hardening                                   ──── Robustn
 Sprint 4:  Live data correctness tests                      ──── Prove end-to-end
 Sprint 5:  Web UI tests (Playwright)                    ✅ ──── Stop clicking
 Sprint 6:  cJSON integration                            ✅ ──── Clean JSON
-Sprint 7:  Dynamic event names                              ──── Forward compat
+Sprint 7:  Dynamic event names                          ✅ ──── Forward compat
 Sprint 8:  Drop Rust TUI                                    ──── Simplify
 Sprint 9:  Performance optimization + benchmarks            ──── Speed
 Sprint 10: Tracing analysis Phase 2 (transitions)           ──── Differentiate
