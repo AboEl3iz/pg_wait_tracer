@@ -52,6 +52,14 @@ static void cjson_add_uint64(cJSON *obj, const char *name, uint64_t val)
     cJSON_AddRawToObject(obj, name, buf);
 }
 
+/* Add int64 as raw JSON number (preserves sign for query_id etc.) */
+static void cjson_add_int64(cJSON *obj, const char *name, int64_t val)
+{
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%lld", (long long)val);
+    cJSON_AddRawToObject(obj, name, buf);
+}
+
 /* Create a raw uint64 item for arrays */
 static cJSON *cjson_create_uint64(uint64_t val)
 {
@@ -155,9 +163,9 @@ static void parse_filters(cJSON *root, struct pgwt_filter *f)
     /* query_id sent as string to avoid JS precision loss on uint64 */
     cJSON *qid = cJSON_GetObjectItem(filters, "query_id");
     if (cJSON_IsString(qid) && qid->valuestring && qid->valuestring[0])
-        f->query_id = strtoull(qid->valuestring, NULL, 10);
+        f->query_id = (uint64_t)strtoll(qid->valuestring, NULL, 10);
     else if (cJSON_IsNumber(qid))
-        f->query_id = (uint64_t)qid->valuedouble;
+        f->query_id = (uint64_t)(int64_t)qid->valuedouble;
 }
 
 static void parse_request(const char *line, struct pgwt_request *req)
@@ -912,8 +920,8 @@ static void handle_top_queries(struct pgwt_server *srv, struct pgwt_request *req
 
         /* query_id as string to avoid JS precision loss */
         char qid_str[32];
-        snprintf(qid_str, sizeof(qid_str), "%llu",
-                 (unsigned long long)res.rows[i].query_id);
+        snprintf(qid_str, sizeof(qid_str), "%lld",
+                 (long long)res.rows[i].query_id);
         cJSON_AddStringToObject(r, "query_id", qid_str);
 
         cjson_add_uint64(r, "count", res.rows[i].count);
@@ -1245,7 +1253,7 @@ static void handle_fingerprints(struct pgwt_server *srv, struct pgwt_request *re
     cJSON *rows = cJSON_AddArrayToObject(root, "rows");
     for (int i = 0; i < res.num_rows; i++) {
         cJSON *r = cJSON_CreateObject();
-        cjson_add_uint64(r, "query_id", res.rows[i].query_id);
+        cjson_add_int64(r, "query_id", (int64_t)res.rows[i].query_id);
         cJSON_AddNumberToObject(r, "transitions",
                                 (double)res.rows[i].total_transitions);
         cJSON_AddStringToObject(r, "signature", res.rows[i].signature);
