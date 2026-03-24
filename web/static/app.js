@@ -594,11 +594,11 @@ function initTimePicker() {
                 // "All" — full range, no auto-refresh
                 zoomTo(state.fromNs, state.toNs);
             } else {
-                // "Last N" — relative range, enable auto-refresh
+                // "Last N" — relative range from end of available data
                 state.liveRangeSecs = secs;
-                const now = Date.now() * 1e6;
-                const from = Math.max(state.fromNs, now - secs * 1e9);
-                zoomTo(from, Math.min(state.toNs, now));
+                const end = state.toNs;
+                const from = Math.max(state.fromNs, end - secs * 1e9);
+                zoomTo(from, end);
                 startAutoRefresh(secs);
             }
         });
@@ -1524,12 +1524,19 @@ function startAutoRefresh(rangeSecs) {
         liveBtn.textContent = 'Live ●';
     }
 
-    autoRefreshInterval = setInterval(() => {
-        const now = Date.now() * 1e6;
-        const from = Math.max(state.fromNs, now - rangeSecs * 1e9);
-        state.viewFrom = from;
-        state.viewTo = Math.min(state.toNs, now);
-        refreshAll();
+    autoRefreshInterval = setInterval(async () => {
+        try {
+            // Re-fetch info to get updated time range (new trace data)
+            const info = await send('info', {});
+            if (info && info.to_ns) {
+                state.toNs = info.to_ns;
+                if (info.from_ns) state.fromNs = info.from_ns;
+            }
+            const end = state.toNs;
+            state.viewFrom = Math.max(state.fromNs, end - rangeSecs * 1e9);
+            state.viewTo = end;
+            refreshAll();
+        } catch (e) { /* ignore on disconnect */ }
     }, 5000);
 }
 
