@@ -237,20 +237,21 @@ Commits: `6fd90f9`, `0ffd565`.
 
 ---
 
-## Sprint 8: Drop Rust TUI Client
+## Sprint 8: Drop Rust TUI Client ✅ COMPLETED (2026-03-24)
 
 **Goal:** Remove duplicated code, halve maintenance surface.
 
 **Depends on:** Sprint 7 (before dropping, ensure pgwt-server has a text dump mode).
 
-| # | Task | Details |
-|---|------|---------|
-| 8.1 | Add `--dump` mode to `pgwt-server` | Reads trace files, prints text summary to stdout (time_model + top events + top sessions). Replaces `pgwt-cli --dump`. |
-| 8.2 | Remove `client/` directory | Delete Rust TUI client (~75K lines including target/) |
-| 8.3 | Update README, INSTALL.md, ROADMAP.md | Remove references to pgwt-cli |
+| # | Task | Details | Status |
+|---|------|---------|--------|
+| 8.1 | Add `--dump` mode to `pgwt-server` | Text summary: time model + top events + top sessions + top queries | ✅ |
+| 8.2 | Remove `client/` directory | Deleted Rust TUI client (4782 lines removed) | ✅ |
+| 8.3 | Update README, INSTALL.md, ROADMAP.md | Removed all pgwt-cli references | ✅ |
 
-**Deliverable:** Single codebase for all analysis. `pgwt-server --dump` covers
-the "quick SSH check" use case.
+**Result:** Single C codebase for all analysis. `pgwt-server --dump /path/to/traces`
+covers the "quick SSH check" use case. Net: +133/-4782 lines.
+Commit: `008f624`.
 
 ---
 
@@ -381,7 +382,7 @@ Sprint 4:  Live data correctness tests                      ──── Prove e
 Sprint 5:  Web UI tests (Playwright)                    ✅ ──── Stop clicking
 Sprint 6:  cJSON integration                            ✅ ──── Clean JSON
 Sprint 7:  Dynamic event names                          ✅ ──── Forward compat
-Sprint 8:  Drop Rust TUI                                    ──── Simplify
+Sprint 8:  Drop Rust TUI                                ✅ ──── Simplify
 Sprint 9:  Performance optimization + benchmarks            ──── Speed
 Sprint 10: Tracing analysis Phase 2 (transitions)           ──── Differentiate
 Sprint 11: Merge daemon + server                            ──── Architecture
