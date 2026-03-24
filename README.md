@@ -1134,33 +1134,91 @@ The hardware watchpoint overhead is fundamentally limited by the CPU debug
 exception cost (~200-300 ns per fire). A
 [proposed PostgreSQL patch](https://github.com/DmitryNFomin/postgres/pull/1)
 adds Oracle-style internal wait event instrumentation — two VDSO
-`clock_gettime()` calls per event (~40-100 ns) — achieving near-zero overhead.
+`clock_gettime()` calls per event (~70-100 ns total) — achieving near-zero
+measurable overhead.
 
-The patch adds a `wait_event_timing` GUC (default: off) that accumulates
-per-backend, per-event statistics in shared memory: call count, total
-nanoseconds, max duration, 16-bucket log2 histogram, and per-(query_id, event)
-attribution — equivalent to Oracle's `V$SYSTEM_EVENT`, `V$SESSION_EVENT`,
-`V$EVENT_HISTOGRAM`, and `V$SQL` wait statistics.
+#### What the patch provides
 
-**3-way benchmark** (Hetzner cx43, 8 vCPU, PG 19devel built from source,
-pgbench scale 100, shared_buffers = 128 MB, 8 clients, SELECT-only — the
-worst case at ~220K wait event transitions/sec, 60-second runs, 3 repetitions):
+Compile-time option: `./configure --enable-wait-event-timing` (or
+`meson setup -Dwait_event_timing=true`). When compiled without the flag,
+the binary is identical to stock PostgreSQL — zero overhead by construction.
 
-| Configuration | Mean TPS | Overhead |
-|---|---:|:---:|
-| Unpatched PG (stock master) | 119,201 | baseline |
-| Patched, all features ON (timing + query + 10046 trace) | 113,852 | **-4.5%** |
-| pg_wait_tracer hardware watchpoint | 76,475 | **-29%** |
+When compiled with the flag, two runtime GUCs control the features:
 
-The patch with all features enabled adds ~4.5% overhead on the worst-case
-workload (220K transitions/sec) vs 29% for hardware watchpoints — a 6x
-improvement. On typical OLTP workloads with lower transition rates, the
-overhead is proportionally smaller.
+| GUC | Scope | What it enables |
+|-----|-------|-----------------|
+| `wait_event_timing` | `PGC_SUSET` | Per-event count, total nanoseconds, max, log2 histogram, per-(query_id, event) attribution |
+| `wait_event_trace` | `PGC_USERSET` | Per-session ring buffer of individual wait events (Oracle 10046 equivalent) |
 
-When the patch is available, pg_wait_tracer can read these stats directly
-instead of using hardware watchpoints, eliminating the debug exception overhead
-entirely. For per-event trace recording and the investigation clients (`pgwt`,
-`pgwt-cli`), hardware watchpoint mode remains necessary.
+Oracle equivalents achieved:
+
+| Oracle feature | PostgreSQL function |
+|---|---|
+| `V$SYSTEM_EVENT` (per-event count/time) | `pg_stat_get_wait_event_timing()` |
+| `V$EVENT_HISTOGRAM` (latency distribution) | `pg_stat_get_wait_event_timing()` — histogram column |
+| `V$SESSION_EVENT` (per-backend breakdown) | `pg_stat_get_wait_event_timing()` — backend_id column |
+| `V$SQL` wait stats (per-query attribution) | `pg_stat_get_wait_event_timing_by_query()` |
+| 10046 trace (per-event stream) | `pg_stat_get_wait_event_trace(backend_id)` |
+
+#### Benchmark methodology
+
+All benchmarks: Hetzner cx43 (8 shared vCPU, 16 GB RAM), Rocky 9.7,
+PG 19devel built from source, pgbench scale 100, 8 clients, SELECT-only
+with `shared_buffers = 128 MB` (data in OS page cache) — worst case at
+~220K wait event transitions/sec, 60-second runs.
+
+**Test 1: Compile-time flag overhead** — stock PG vs patched (without
+`--enable-wait-event-timing`) on the same data directory, alternating A/B
+runs to eliminate warmup effects, 5 rounds:
+
+| Round | Stock TPS | Patched (no flag) TPS |
+|---|---:|---:|
+| 1 | 116,398 | 118,427 |
+| 2 | 115,850 | 116,609 |
+| 3 | 116,141 | 117,669 |
+| 4 | 117,699 | 118,136 |
+| 5 | 117,634 | 118,879 |
+
+Result: **no measurable difference.** Hot-path object code is byte-identical
+(verified via `size` and `objcopy -O binary -j .text` comparison).
+
+**Test 2: GUC overhead** — same binary (compiled WITH flag), same data
+directory, toggling GUCs between server restarts, 5 rounds:
+
+| Round | GUC off | timing ON | all ON (timing+trace) |
+|---|---:|---:|---:|
+| 1 | 114,768 | 116,058 | 115,911 |
+| 2 | 116,726 | 115,789 | 116,502 |
+| 3 | 115,972 | 115,977 | 115,170 |
+| 4 | 116,405 | 113,924 | 115,242 |
+| 5 | 115,781 | 116,556 | 114,603 |
+| **Mean** | **115,930** | **115,661** | **115,486** |
+
+Result: **< 0.5% difference** between GUC off and all features enabled.
+All three configurations are within run-to-run variance — indistinguishable.
+
+**Comparison with hardware watchpoints** (from earlier benchmarks, same
+environment):
+
+| Approach | Worst-case overhead | Per-event cost |
+|---|:---:|---|
+| PG patch (all features ON) | **< 0.5%** | ~70-100 ns (VDSO, no kernel trap) |
+| pg_wait_tracer (hardware watchpoint) | **29%** | ~200-300 ns (CPU #DB exception) |
+
+The reason the patch overhead is near-zero despite ~220K events/sec: VDSO
+`clock_gettime(CLOCK_MONOTONIC)` reads a memory-mapped kernel page without
+leaving userspace — no syscall, no context switch, no trap.  Counter updates
+hit hot L1 cache lines owned by the backend.  Hardware watchpoints, by
+contrast, trigger a CPU debug exception on every event, requiring full
+kernel entry/exit with pipeline flush and KPTI page table switch.
+
+All 243 PostgreSQL regression tests pass with the patch
+(`make check` — both with and without the compile flag).
+
+When the patch is available, pg_wait_tracer can read accumulated stats
+directly instead of using hardware watchpoints.  For the investigation
+clients (`pgwt`, `pgwt-cli`), hardware watchpoint mode remains available
+for full per-event trace recording.
 
 ## Requirements
 
