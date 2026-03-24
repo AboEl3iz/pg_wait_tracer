@@ -515,6 +515,65 @@ def test_zoom_out(page):
     check(btn is not None, "Zoom out button exists")
 
 
+def test_auto_refresh(page):
+    """14b. Quick range enables auto-refresh, custom range stops it."""
+    print("--- Test 14b: Auto-Refresh ---")
+
+    page.goto(MOCK_URL)
+    page.wait_for_selector("#status.connected", timeout=10000)
+    page.wait_for_timeout(1000)
+
+    # Live button exists
+    live_btn = page.query_selector("#live-btn")
+    check(live_btn is not None, "Live button exists")
+
+    # Initially not active
+    is_active = page.evaluate("el => el.classList.contains('active')",
+                              live_btn)
+    check(not is_active, "Live button not active initially")
+
+    # Click "5m" quick range → should activate auto-refresh
+    page.click("#time-range")
+    page.wait_for_timeout(300)
+    btn_5m = page.query_selector(".tp-quick button[data-range='300']")
+    if btn_5m:
+        btn_5m.click()
+        page.wait_for_timeout(500)
+
+        is_active = page.evaluate(
+            "el => el.classList.contains('active')",
+            page.query_selector("#live-btn"))
+        check(is_active, "Live indicator active after selecting '5m'")
+
+    # Click "All" → should stop auto-refresh
+    page.click("#time-range")
+    page.wait_for_timeout(300)
+    btn_all = page.query_selector(".tp-quick button[data-range='0']")
+    if btn_all:
+        btn_all.click()
+        page.wait_for_timeout(500)
+
+        is_active = page.evaluate(
+            "el => el.classList.contains('active')",
+            page.query_selector("#live-btn"))
+        check(not is_active, "Live indicator off after selecting 'All'")
+
+    # Click Live button → should toggle on
+    page.click("#live-btn")
+    page.wait_for_timeout(1000)
+    is_active = page.evaluate(
+        "document.getElementById('live-btn').classList.contains('active')")
+    check(is_active, "Live button toggles on")
+
+    # Click Live button again → should toggle off
+    page.click("#live-btn")
+    page.wait_for_timeout(500)
+    is_active = page.evaluate(
+        "el => el.classList.contains('active')",
+        page.query_selector("#live-btn"))
+    check(not is_active, "Live button toggles off")
+
+
 def test_chart_rendering(page):
     """15. AAS chart is rendered with canvas."""
     print("--- Test 15: Chart Rendering ---")
@@ -927,6 +986,7 @@ def main():
             test_transitions_tab(page)
             test_time_picker(page)
             test_zoom_out(page)
+            test_auto_refresh(page)
             test_chart_rendering(page)
             test_session_drill_to_timeline(page)
             test_query_drill(page)

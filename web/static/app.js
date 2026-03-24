@@ -1491,13 +1491,13 @@ function initLiveMode() {
         if (autoRefreshInterval) {
             stopAutoRefresh();
         } else {
-            // Default: last 5 minutes
+            // Default: last 5 minutes from the end of available data
             state.liveRangeSecs = 300;
-            const now = Date.now() * 1e6;
-            state.viewFrom = Math.max(state.fromNs, now - 300e9);
-            state.viewTo = Math.min(state.toNs, now);
-            refreshAll();
+            const end = state.toNs || Date.now() * 1e6;
+            state.viewFrom = Math.max(state.fromNs, end - 300e9);
+            state.viewTo = end;
             startAutoRefresh(300);
+            refreshAll();
         }
     });
 }
