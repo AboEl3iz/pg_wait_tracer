@@ -102,7 +102,7 @@ def test_tabs(page):
 
     tabs = page.query_selector_all(".tab")
     tab_names = [t.text_content() for t in tabs]
-    expected = ["Overview", "Events", "Sessions", "Queries", "Histogram", "Timeline"]
+    expected = ["Overview", "Events", "Sessions", "Queries", "Histogram", "Timeline", "Transitions"]
     check(tab_names == expected,
           f"Tabs: {tab_names}")
 
@@ -424,6 +424,26 @@ def test_timeline_tab(page):
     else:
         check(False, "No session row to drill into")
         check(False, "(skipped timeline chart)")
+
+
+def test_transitions_tab(page):
+    """12b. Transitions tab shows Sankey diagram."""
+    print("--- Test 12b: Transitions Tab ---")
+
+    page.goto(MOCK_URL)
+    page.wait_for_selector("#status.connected", timeout=10000)
+    page.click(".tab[data-tab='transitions']")
+    page.wait_for_timeout(3000)
+
+    active = page.query_selector(".tab.active")
+    check(active and active.text_content() == "Transitions",
+          "Transitions tab becomes active")
+
+    # Sankey chart should render (ECharts creates canvas)
+    container = page.query_selector("#sankey-container")
+    canvas = page.query_selector("#sankey-container canvas") if container else None
+    check(canvas is not None or (container and "No transitions" not in (container.text_content() or "")),
+          "Sankey chart rendered or transitions displayed")
 
 
 def test_time_picker(page):
@@ -904,6 +924,7 @@ def main():
             test_queries_table(page)
             test_histogram_tab(page)
             test_timeline_tab(page)
+            test_transitions_tab(page)
             test_time_picker(page)
             test_zoom_out(page)
             test_chart_rendering(page)

@@ -277,6 +277,21 @@ def handle_request(msg):
             return {"id": req_id, **_CANNED["session_timeline"]}
         return {"id": req_id, "events": [], "pids": [], "truncated": False, "total_count": 0}
 
+    if cmd == "transitions":
+        return {"id": req_id, "total": 1500, "links": [
+            {"source": "CPU*", "target": "IO:DataFileRead", "value": 500, "duration_ms": 2500.0},
+            {"source": "IO:DataFileRead", "target": "CPU*", "value": 480, "duration_ms": 1920.0},
+            {"source": "CPU*", "target": "LWLock:WALInsert", "value": 300, "duration_ms": 900.0},
+            {"source": "LWLock:WALInsert", "target": "CPU*", "value": 290, "duration_ms": 870.0},
+            {"source": "CPU*", "target": "IO:WalSync", "value": 100, "duration_ms": 3200.0},
+        ]}
+
+    if cmd == "fingerprints":
+        return {"id": req_id, "rows": [
+            {"query_id": 123456, "transitions": 800, "signature": "IO:40%|CPU:35%|LWLock:25%",
+             "class_pct": {"io": 40, "cpu": 35, "lwlock": 25}, "top_from": "CPU*", "top_to": "IO:DataFileRead"},
+        ]}
+
     return {"id": req_id, "error": f"unknown command: {cmd}"}
 
 
