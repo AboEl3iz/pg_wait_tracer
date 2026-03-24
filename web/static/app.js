@@ -457,6 +457,7 @@ function initChart() {
         const startIdx = chart.convertFromPixel({ xAxisIndex: 0 }, minX);
         const endIdx = chart.convertFromPixel({ xAxisIndex: 0 }, maxX);
         if (startIdx >= 0 && endIdx < data.length && startIdx < endIdx) {
+            stopAutoRefresh();  // Manual zoom stops auto-refresh
             zoomTo(data[startIdx], data[endIdx]);
         }
     });
@@ -578,19 +579,27 @@ function initTimePicker() {
     });
     picker.addEventListener('click', (e) => e.stopPropagation());
 
-    // Quick range buttons
+    // Quick range buttons — "last N" ranges auto-refresh
     picker.querySelectorAll('.tp-quick button').forEach(btn => {
         btn.addEventListener('click', () => {
             const secs = parseInt(btn.dataset.range);
             picker.style.display = 'none';
-            // Update active class
             picker.querySelectorAll('.tp-quick button').forEach(b => b.classList.remove('active'));
             btn.classList.add('active');
+
+            // Stop any existing auto-refresh
+            stopAutoRefresh();
+
             if (secs === 0) {
+                // "All" — full range, no auto-refresh
                 zoomTo(state.fromNs, state.toNs);
             } else {
-                const from = Math.max(state.fromNs, state.toNs - secs * 1e9);
-                zoomTo(from, state.toNs);
+                // "Last N" — relative range, enable auto-refresh
+                state.liveRangeSecs = secs;
+                const now = Date.now() * 1e6;
+                const from = Math.max(state.fromNs, now - secs * 1e9);
+                zoomTo(from, Math.min(state.toNs, now));
+                startAutoRefresh(secs);
             }
         });
     });
@@ -605,11 +614,12 @@ function initTimePicker() {
         if (fromNs >= toNs) return;
         picker.style.display = 'none';
         picker.querySelectorAll('.tp-quick button').forEach(b => b.classList.remove('active'));
+        stopAutoRefresh();  // Custom range stops auto-refresh
         zoomTo(Math.max(state.fromNs, fromNs), Math.min(state.toNs, toNs));
     });
 
     // Zoom out button
-    zoomOutBtn.addEventListener('click', () => zoomOut());
+    zoomOutBtn.addEventListener('click', () => { stopAutoRefresh(); zoomOut(); });
 }
 
 function nsToDatetimeLocal(ns) {
@@ -1440,45 +1450,57 @@ function renderTimeline(container, data) {
     timelineChart.setOption(option, true);
 }
 
-// -- Live mode (auto-refresh) -------------------------------------------------
+// -- Auto-refresh for "last N" ranges -----------------------------------------
 
-let liveInterval = null;
+let autoRefreshInterval = null;
+
+function startAutoRefresh(rangeSecs) {
+    stopAutoRefresh();
+    const liveBtn = document.getElementById('live-btn');
+    if (liveBtn) {
+        liveBtn.classList.add('active');
+        liveBtn.textContent = 'Live ●';
+    }
+
+    autoRefreshInterval = setInterval(() => {
+        const now = Date.now() * 1e6;
+        const from = Math.max(state.fromNs, now - rangeSecs * 1e9);
+        state.viewFrom = from;
+        state.viewTo = Math.min(state.toNs, now);
+        refreshAll();
+    }, 5000);
+}
+
+function stopAutoRefresh() {
+    if (autoRefreshInterval) {
+        clearInterval(autoRefreshInterval);
+        autoRefreshInterval = null;
+    }
+    const liveBtn = document.getElementById('live-btn');
+    if (liveBtn) {
+        liveBtn.classList.remove('active');
+        liveBtn.textContent = 'Live';
+    }
+}
 
 function initLiveMode() {
     const btn = document.getElementById('live-btn');
     if (!btn) return;
 
     btn.addEventListener('click', () => {
-        if (liveInterval) {
-            // Stop live mode
-            clearInterval(liveInterval);
-            liveInterval = null;
-            btn.classList.remove('active');
-            btn.textContent = 'Live';
+        if (autoRefreshInterval) {
+            stopAutoRefresh();
         } else {
-            // Start live mode: set window to last 5 minutes, auto-refresh
-            const now = Date.now() * 1e6;  // ms → ns
-            state.viewFrom = now - 300e9;  // 5 min ago
-            state.viewTo = now;
-            btn.classList.add('active');
-            btn.textContent = 'Live ●';
-
-            // Immediate refresh
+            // Default: last 5 minutes
+            state.liveRangeSecs = 300;
+            const now = Date.now() * 1e6;
+            state.viewFrom = Math.max(state.fromNs, now - 300e9);
+            state.viewTo = Math.min(state.toNs, now);
             refreshAll();
-
-            // Poll every 5 seconds
-            liveInterval = setInterval(() => {
-                const now = Date.now() * 1e6;
-                state.viewFrom = now - 300e9;
-                state.viewTo = now;
-                refreshAll();
-            }, 5000);
+            startAutoRefresh(300);
         }
     });
 }
-
-// Call after connect
-const _origOnOpen = typeof onWsOpen === 'function' ? onWsOpen : null;
 
 // -- Transitions Sankey -------------------------------------------------------
 
