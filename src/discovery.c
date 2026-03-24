@@ -9,6 +9,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <signal.h>
+#include <pwd.h>
 #include <sys/utsname.h>
 #include <libelf.h>
 #include <gelf.h>
@@ -605,7 +606,28 @@ int pgwt_discover(struct pgwt_daemon *d)
             }
         }
 
-        if (pgwt_load_event_names_from_pg(bindir, pg_port, "postgres") == 0) {
+        /* Use the owner of the postmaster process as the psql user */
+        char pg_user[64] = "postgres";
+        {
+            char statpath[64];
+            snprintf(statpath, sizeof(statpath), "/proc/%d/status", pm_pid);
+            FILE *sf = fopen(statpath, "r");
+            if (sf) {
+                char sln[256];
+                while (fgets(sln, sizeof(sln), sf)) {
+                    int uid;
+                    if (sscanf(sln, "Uid:\t%d", &uid) == 1) {
+                        struct passwd *pw = getpwuid(uid);
+                        if (pw)
+                            snprintf(pg_user, sizeof(pg_user), "%s", pw->pw_name);
+                        break;
+                    }
+                }
+                fclose(sf);
+            }
+        }
+
+        if (pgwt_load_event_names_from_pg(bindir, pg_port, pg_user) == 0) {
             if (d->verbose)
                 fprintf(stderr, "INFO: loaded dynamic event names from PG%d\n",
                         d->pg_major_version);
