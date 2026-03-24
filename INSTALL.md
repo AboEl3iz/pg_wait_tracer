@@ -172,15 +172,6 @@ sudo dnf install -y golang
 # Or download from https://go.dev/dl/
 ```
 
-### 6. Rust Toolchain (for the TUI investigation client)
-
-The interactive TUI investigation client (`pgwt-cli`) is written in Rust. Install
-the Rust toolchain if you want to build it:
-
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-source "$HOME/.cargo/env"
-```
 
 ## Build
 
@@ -286,33 +277,11 @@ To use a different group name:
 sudo ./pg_wait_tracer --daemon -T /var/lib/pgwt/traces --trace-group mygroup
 ```
 
-### TUI Investigation Client (Rust)
+### Text Dump (pgwt-server --dump)
 
 ```bash
-cd client
-cargo build --release
-```
-
-This produces `client/target/release/pgwt-cli`. The client reads trace files
-produced by the daemon (both rotated `.trace.lz4` and the live `current.trace`)
-and provides an interactive TUI with an AAS stacked bar chart for investigation.
-It does not require root or a running PostgreSQL instance.
-
-**Pixel-perfect chart rendering:** On terminals that support graphics protocols
-(iTerm2, Kitty, WezTerm, foot, Sixel-capable terminals), the AAS chart renders
-as true pixel graphics. On standard terminals, it falls back to half-block
-Unicode characters. Protocol detection is automatic.
-
-```bash
-# Quick test with synthetic data
-./client/target/release/pgwt-cli /tmp/test --generate-test
-./client/target/release/pgwt-cli /tmp/test
-
-# Analyze real traces (works while daemon is running)
-./client/target/release/pgwt-cli /var/lib/pgwt/traces
-
-# Non-interactive summary
-./client/target/release/pgwt-cli /var/lib/pgwt/traces --dump
+# Quick summary of trace files (no root needed)
+pgwt-server --dump /var/lib/pgwt/traces
 ```
 
 ## Quick Test

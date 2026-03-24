@@ -41,7 +41,8 @@ In-memory accumulation of ring buffer events into the 6 diagnostic views.
 
 ### Phase E.0: Investigation Client — Foundation (DONE)
 
-Rust TUI (`pgwt-cli`) for interactive trace file analysis.
+Investigation client for trace file analysis. (Rust TUI client removed in
+Sprint 8; replaced by `pgwt-server --dump` for CLI and `pgwt` web client.)
 
 - **Trace file reader** (Rust): reads `.trace.lz4` files (header, footer,
   block index, LZ4 decompression, columnar decode)
@@ -360,13 +361,12 @@ silently inactive. Document this clearly.
 
 ---
 
-## Legacy: Rust TUI Client
+## Legacy: Rust TUI Client (Removed)
 
-The Rust TUI client (`client/` directory, Phases E.0–E.1) remains as a
-lightweight terminal-based option for quick checks over SSH. It works
-standalone on the DB server with no daemon needed — reads trace files
-directly. The web client (Phase F) supersedes it for interactive
-investigation workflows.
+The Rust TUI client (`client/` directory, Phases E.0–E.1) was removed in
+Sprint 8. Its functionality is covered by:
+- `pgwt-server --dump` — CLI text summary (time model, top events, sessions, queries)
+- `pgwt` — web investigation client with full drill-down and AAS charts
 
 ---
 

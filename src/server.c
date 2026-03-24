@@ -1126,10 +1126,111 @@ static void dispatch(struct pgwt_server *srv, struct pgwt_request *req)
 
 /* ── Main ─────────────────────────────────────────────────── */
 
+/* ── Dump mode: text summary to stdout ──────────────────── */
+
+static void dump_summary(struct pgwt_server *srv)
+{
+    uint64_t from = srv->earliest_wall_ns;
+    uint64_t to = srv->latest_wall_ns;
+    double wall_ms = (double)(to - from) / 1e6;
+    struct pgwt_filter filt = {0};
+
+    /* Load all events */
+    int count;
+    struct pgwt_trace_event *events = server_load_events(srv, from, to, &count);
+
+    printf("════════════════════════════════════════════════════════════════════════════════\n");
+    printf("pgwt-server — Summary    Events: %d    Duration: %.1fs\n", count, wall_ms / 1000.0);
+    printf("════════════════════════════════════════════════════════════════════════════════\n");
+
+    /* Time Model */
+    struct pgwt_tm_result tm;
+    pgwt_compute_time_model(events, count, &filt, wall_ms, &tm);
+
+    printf("\n  === Time Model ===\n\n");
+    printf("  AAS: %.2f    DB Time: %.1f ms    Idle: %.1f ms\n\n",
+           tm.aas, tm.db_time_ms, tm.idle_time_ms);
+
+    for (int i = 0; i < tm.num_rows; i++) {
+        struct pgwt_tm_row *r = &tm.rows[i];
+        if (r->indent == 0)
+            printf("  %-32s %10.1f ms  %6.1f%%\n", r->name, r->time_ms, r->pct_db_time);
+        else if (r->indent == 1)
+            printf("    %-30s %10.1f ms  %6.1f%%\n", r->name, r->time_ms, r->pct_db_time);
+        else
+            printf("      %-28s %10.1f ms  %6.1f%%\n", r->name, r->time_ms, r->pct_db_time);
+    }
+    free(tm.rows);
+
+    /* Top Events */
+    struct pgwt_events_result ev;
+    pgwt_compute_top_events(events, count, &filt, wall_ms, &ev);
+
+    printf("\n  === Top Events ===\n\n");
+    printf("  %-28s %10s %12s %10s %8s\n", "Wait Event", "Waits", "Total (ms)", "Avg (us)", "% DB");
+    printf("  ─────────────────────────────────────────────────────────────────────────\n");
+
+    int n = ev.num_rows < 15 ? ev.num_rows : 15;
+    for (int i = 0; i < n; i++) {
+        struct pgwt_event_row *r = &ev.rows[i];
+        printf("  %-28s %10llu %12.1f %10.1f %7.1f%%\n",
+               r->name, (unsigned long long)r->count, r->total_ms, r->avg_us, r->pct_db);
+    }
+    free(ev.rows);
+
+    /* Top Sessions */
+    struct pgwt_sessions_result sess;
+    pgwt_compute_top_sessions(events, count, &filt, wall_ms, &sess);
+
+    printf("\n  === Top Sessions ===\n\n");
+    printf("  %7s %12s %7s %7s  %-20s\n",
+           "PID", "DB Time(ms)", "CPU%", "Wait%", "Top Wait");
+    printf("  ─────────────────────────────────────────────────────────────────────────\n");
+
+    n = sess.num_rows < 15 ? sess.num_rows : 15;
+    for (int i = 0; i < n; i++) {
+        struct pgwt_session_row *r = &sess.rows[i];
+        printf("  %7d %12.1f %6.1f%% %6.1f%%  %-20s\n",
+               r->pid, r->db_time_ms, r->cpu_pct, r->wait_pct, r->top_wait);
+    }
+    free(sess.rows);
+
+    /* Top Queries */
+    struct pgwt_queries_result qry;
+    pgwt_compute_top_queries(events, count, &filt, wall_ms, &qry);
+
+    printf("\n  === Top Queries ===\n\n");
+    printf("  %20s %10s %12s %8s  %-20s\n",
+           "query_id", "Waits", "Total (ms)", "% DB", "Top Wait");
+    printf("  ─────────────────────────────────────────────────────────────────────────\n");
+
+    n = qry.num_rows < 15 ? qry.num_rows : 15;
+    for (int i = 0; i < n; i++) {
+        struct pgwt_query_row *r = &qry.rows[i];
+        printf("  %20lld %10llu %12.1f %7.1f%%  %-20s\n",
+               (long long)r->query_id, (unsigned long long)r->count,
+               r->total_ms, r->pct_db, r->top_wait);
+    }
+    free(qry.rows);
+
+    free(events);
+    printf("\n");
+}
+
 int main(int argc, char **argv)
 {
-    if (argc < 2) {
-        fprintf(stderr, "Usage: pgwt-server <trace-dir>\n");
+    int dump_mode = 0;
+    const char *trace_dir = NULL;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--dump") == 0)
+            dump_mode = 1;
+        else if (argv[i][0] != '-')
+            trace_dir = argv[i];
+    }
+
+    if (!trace_dir) {
+        fprintf(stderr, "Usage: pgwt-server [--dump] <trace-dir>\n");
         return 1;
     }
 
@@ -1137,8 +1238,13 @@ int main(int argc, char **argv)
     setvbuf(stdout, NULL, _IOLBF, 0);
 
     struct pgwt_server srv;
-    if (server_init(&srv, argv[1]) != 0)
+    if (server_init(&srv, trace_dir) != 0)
         return 1;
+
+    if (dump_mode) {
+        dump_summary(&srv);
+        return 0;
+    }
 
     char line[8192];
     while (fgets(line, sizeof(line), stdin)) {

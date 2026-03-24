@@ -13,9 +13,8 @@ Key capabilities:
 - **Web investigation client** (`pgwt`): browser UI with ECharts AAS chart,
   color-coded drill-down tables, percentage bars, summary metrics — connects
   to DB server over SSH, runs from your laptop
-- **TUI investigation client** (`pgwt-cli`): Rust TUI with AAS stacked
-  bar chart, drill-down navigation, and pixel-perfect rendering on supported
-  terminals (iTerm2, Kitty, WezTerm, Sixel)
+- **Text dump** (`pgwt-server --dump`): quick CLI summary of trace files
+  (time model, top events, top sessions, top queries) — no TUI needed
 - **Multi-window analysis**: compare wait profiles across time horizons
   (e.g. last 5s vs 1m vs 5m)
 - **Daemon mode**: persistent monitoring with automatic re-attach on
@@ -53,8 +52,8 @@ pg_wait_tracer --replay -T /var/lib/pgwt/traces --from 1h
 # Web client: browser UI from your laptop over SSH (no root needed)
 pgwt root@db-server
 
-# Investigation client: interactive TUI with AAS chart (no root needed)
-pgwt-cli /var/lib/pgwt/traces
+# Quick summary from trace files (no root needed)
+pgwt-server --dump /var/lib/pgwt/traces
 ```
 
 ## Operating Modes
@@ -124,7 +123,7 @@ pg_wait_tracer --replay -T /var/lib/pgwt/traces --from 2h \
   BPF state_map to read current wait states).
 - `current.trace` (the file being written by the daemon) has no footer and
   cannot be read by replay. Only rotated `.trace.lz4` files are readable.
-  (The investigation client `pgwt-cli` *can* read `current.trace` — see below.)
+  Only rotated `.trace.lz4` files are readable by replay and `pgwt-server`.
 - Output format is always `text` in replay mode.
 
 ### Web Investigation Client (`pgwt`)
@@ -183,59 +182,18 @@ daemon. See [INSTALL.md](INSTALL.md) for build instructions.
 | `--trace-dir` | `/var/lib/pgsql/18/data/pg_wait_tracer/` | Trace directory on the remote host |
 | `--server-path` | `pgwt-server` | Path to `pgwt-server` binary on the remote host |
 
-### Investigation Client (`pgwt-cli`)
+### Text Dump (`pgwt-server --dump`)
 
-A separate Rust-based TUI for interactive drill-down analysis of trace files.
-Unlike the C replay mode, `pgwt-cli` provides:
-
-- **AAS (Average Active Sessions) stacked bar chart** — shows wait class
-  distribution over time with color-coded bars. Uses pixel-perfect rendering
-  on terminals that support iTerm2/Sixel/Kitty graphics protocols, with
-  half-block Unicode fallback on standard terminals.
-- **4 drill-down views**: Overview (time model), Events, Sessions, Queries
-- **Filter & pivot navigation**: Enter to drill into a class/event/session,
-  Esc to go back, `\` to clear all filters
-- **Live trace reading**: reads `current.trace` (the active file being written
-  by the daemon) by scanning blocks sequentially, in addition to rotated
-  `.trace.lz4` files
+Quick CLI summary of trace files — time model, top events, top sessions, top
+queries. No TUI, no browser, no root. Useful for SSH one-liners.
 
 ```bash
-# View trace files interactively (no root needed)
-pgwt-cli /var/lib/pgwt/traces
+# Summary of all trace files
+pgwt-server --dump /var/lib/pgwt/traces
 
-# Generate synthetic test data for demo/development
-pgwt-cli /tmp/test --generate-test
-pgwt-cli /tmp/test
-
-# Print summary to stdout (no TUI)
-pgwt-cli /var/lib/pgwt/traces --dump
+# Pipe-friendly (combine with standard tools)
+pgwt-server --dump /var/lib/pgwt/traces | grep "IO:"
 ```
-
-**Keyboard shortcuts:**
-
-| Key | Action |
-|-----|--------|
-| `Enter` | Drill down (filter to selected row, pivot to next view) |
-| `Esc` / `Backspace` | Drill back (undo last filter) |
-| `o` / `e` / `s` / `r` | Switch view: Overview / Events / Sessions / Queries |
-| `j` / `k` or arrows | Move cursor up/down |
-| `\` | Clear all filters |
-| `q` | Quit |
-
-**Wait class colors (AAS chart):**
-
-| Class | Color |
-|-------|-------|
-| CPU | Green |
-| IO | Blue |
-| Lock | Red |
-| LwLock | Pink |
-| IPC | Cyan |
-| Client | Yellow |
-| Timeout | Orange |
-| BufferPin | Teal |
-| Activity | Purple |
-| Extension | Light purple |
 
 See [INSTALL.md](INSTALL.md) for build instructions and
 [docs/ROADMAP.md](docs/ROADMAP.md) for the development roadmap.
@@ -767,7 +725,7 @@ events to disk in a columnar, LZ4-compressed format.
 ### File lifecycle
 
 - **Active file**: `current.trace` — being written, no footer. Not readable
-  by the C replay mode, but readable by `pgwt-cli` (streaming reader).
+  by the C replay mode. Only rotated `.trace.lz4` files are readable.
 - **Rotation**: Every calendar hour, the current file is finalized (footer
   written) and renamed to `YYYY-MM-DD_HH.trace.lz4`.
 - **Retention**: Files older than `--trace-retention` hours are deleted.
@@ -1217,7 +1175,7 @@ All 243 PostgreSQL regression tests pass with the patch
 
 When the patch is available, pg_wait_tracer can read accumulated stats
 directly instead of using hardware watchpoints.  For the investigation
-clients (`pgwt`, `pgwt-cli`), hardware watchpoint mode remains available
+clients (`pgwt`), hardware watchpoint mode remains available
 for full per-event trace recording.
 
 ## Requirements
