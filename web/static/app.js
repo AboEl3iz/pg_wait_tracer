@@ -1529,15 +1529,12 @@ function startAutoRefresh(rangeSecs) {
 
     autoRefreshInterval = setInterval(async () => {
         try {
-            // Re-fetch info to get updated time range (new trace data)
-            const info = await send('info', {});
-            if (info && info.to_ns) {
-                state.toNs = info.to_ns;
-                if (info.from_ns) state.fromNs = info.from_ns;
-            }
-            const end = state.toNs;
-            state.viewFrom = end - rangeSecs * 1e9;
-            state.viewTo = end;
+            // Advance the window by 5 seconds (the tick interval).
+            // Don't re-fetch info — avoids race with daemon writing current.trace.
+            const advance = 5e9; // 5 seconds in nanoseconds
+            state.toNs += advance;
+            state.viewFrom = state.toNs - rangeSecs * 1e9;
+            state.viewTo = state.toNs;
             refresh();
         } catch (e) { /* ignore on disconnect */ }
     }, 5000);
