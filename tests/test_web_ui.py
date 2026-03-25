@@ -427,7 +427,7 @@ def test_timeline_tab(page):
 
 
 def test_transitions_tab(page):
-    """12b. Transitions tab shows Sankey diagram."""
+    """12b. Transitions tab shows Sankey diagram with data."""
     print("--- Test 12b: Transitions Tab ---")
 
     page.goto(MOCK_URL)
@@ -439,11 +439,47 @@ def test_transitions_tab(page):
     check(active and active.text_content() == "Transitions",
           "Transitions tab becomes active")
 
-    # Sankey chart should render (ECharts creates canvas)
+    # Container must exist
     container = page.query_selector("#sankey-container")
-    canvas = page.query_selector("#sankey-container canvas") if container else None
-    check(canvas is not None or (container and "No transitions" not in (container.text_content() or "")),
-          "Sankey chart rendered or transitions displayed")
+    check(container is not None, "Sankey container exists")
+
+    # Must NOT show "No transitions found" or error
+    container_text = container.text_content() if container else ""
+    check("No transitions" not in container_text,
+          f"No 'No transitions' message (got: '{container_text[:60]}')")
+    check("timeout" not in container_text.lower(),
+          "No timeout error")
+
+    # Verify ECharts Sankey instance exists with actual data
+    sankey_status = page.evaluate("""
+        () => {
+            const el = document.getElementById('sankey-container');
+            if (!el) return 'no container';
+            const c = echarts.getInstanceByDom(el);
+            if (!c) return 'no echarts instance';
+            const opt = c.getOption();
+            if (!opt.series || !opt.series[0]) return 'no series';
+            if (!opt.series[0].links || opt.series[0].links.length === 0) return 'no links';
+            return 'ok:' + opt.series[0].links.length;
+        }
+    """)
+    check(sankey_status.startswith("ok"),
+          f"Sankey chart rendered with data ({sankey_status})")
+
+    # Verify specific link data from mock (CPU* → IO:DataFileRead)
+    link_count = page.evaluate("""
+        () => {
+            const el = document.getElementById('sankey-container');
+            if (!el) return 0;
+            const c = echarts.getInstanceByDom(el);
+            if (!c) return 0;
+            const opt = c.getOption();
+            return (opt.series && opt.series[0] && opt.series[0].links)
+                ? opt.series[0].links.length : 0;
+        }
+    """)
+    check(link_count >= 5,
+          f"Sankey has {link_count} links (mock sends 5)")
 
 
 def test_time_picker(page):
@@ -527,10 +563,10 @@ def test_auto_refresh(page):
     live_btn = page.query_selector("#live-btn")
     check(live_btn is not None, "Live button exists")
 
-    # Initially not active
+    # Initially active (starts in live mode with 15m auto-refresh)
     is_active = page.evaluate("el => el.classList.contains('active')",
                               live_btn)
-    check(not is_active, "Live button not active initially")
+    check(is_active, "Live button active initially (live mode default)")
 
     # Click "5m" quick range → should activate auto-refresh
     page.click("#time-range")
