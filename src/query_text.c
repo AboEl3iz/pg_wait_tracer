@@ -174,8 +174,10 @@ void pgwt_qt_check(struct pgwt_query_text_capture *qt,
         wall_ns = (uint64_t)wall.tv_sec * 1000000000ULL + wall.tv_nsec;
     }
 
-    /* Write JSONL line: {"q":<query_id>,"t":"<text>","ts":<wall_ns>} */
-    fprintf(qt->fp, "{\"q\":%llu,\"t\":", (unsigned long long)query_id);
+    /* Write JSONL line: {"q":"<query_id>","t":"<text>","ts":<wall_ns>}
+     * query_id as string to preserve full int64 precision (JSON numbers
+     * are doubles with only 53 bits). Signed — can be negative. */
+    fprintf(qt->fp, "{\"q\":\"%lld\",\"t\":", (long long)(int64_t)query_id);
     write_json_string(qt->fp, qt->read_buf, len);
     fprintf(qt->fp, ",\"ts\":%llu}\n", (unsigned long long)wall_ns);
     fflush(qt->fp);

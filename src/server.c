@@ -296,8 +296,10 @@ static void server_load_query_texts(struct pgwt_server *srv)
         cJSON *t = cJSON_GetObjectItem(root, "t");
 
         uint64_t qid = 0;
-        if (cJSON_IsNumber(q))
-            qid = (uint64_t)q->valuedouble;
+        if (cJSON_IsString(q) && q->valuestring)
+            qid = (uint64_t)strtoll(q->valuestring, NULL, 10);
+        else if (cJSON_IsNumber(q))
+            qid = (uint64_t)(int64_t)q->valuedouble;  /* legacy numeric format */
         if (qid == 0 || !cJSON_IsString(t) || !t->valuestring) {
             cJSON_Delete(root);
             continue;
