@@ -63,8 +63,25 @@ int pgwt_reader_open(struct pgwt_event_reader *r, const char *path)
             if (r->block_index &&
                 fread(r->block_index, sizeof(struct pgwt_block_index_entry),
                       nb, r->fp) == nb) {
-                r->num_blocks = (int)nb;
-                have_footer = 1;
+                /* Validate: block index timestamps must be monotonically
+                 * increasing and non-zero. Rejects garbage from files
+                 * without a real footer (e.g. current.trace being written). */
+                int valid = 1;
+                for (uint32_t k = 0; k < nb; k++) {
+                    if (r->block_index[k].timestamp_ns == 0 ||
+                        (k > 0 && r->block_index[k].timestamp_ns <
+                                   r->block_index[k-1].timestamp_ns)) {
+                        valid = 0;
+                        break;
+                    }
+                }
+                if (valid) {
+                    r->num_blocks = (int)nb;
+                    have_footer = 1;
+                } else {
+                    free(r->block_index);
+                    r->block_index = NULL;
+                }
             } else {
                 free(r->block_index);
                 r->block_index = NULL;
@@ -84,9 +101,9 @@ int pgwt_reader_open(struct pgwt_event_reader *r, const char *path)
         r->num_blocks = 0;
         struct pgwt_trace_block_header bh;
         uint64_t prev_ts = 0;
-        /* Use file header start_time as reference for timestamp validation */
-        uint64_t ref_ts = r->header.start_time_ns > 0
-                        ? r->header.start_time_ns : r->header.clock_offset_ns;
+        /* Use monotonic clock offset as reference for block timestamp validation.
+         * Block timestamps are monotonic (CLOCK_MONOTONIC), NOT wall-clock. */
+        uint64_t ref_ts = r->header.clock_offset_ns;
         while (fread(&bh, sizeof(bh), 1, r->fp) == 1 &&
                bh.compressed_size > 0 && bh.num_events > 0 &&
                /* Validate: reject partial/corrupt headers from concurrent writes */
