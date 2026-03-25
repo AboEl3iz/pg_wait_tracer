@@ -89,6 +89,7 @@ if [[ -x "$PROJECT_DIR/pgwt-server" ]] && [[ -x "$SCRIPT_DIR/gen_test_traces" ]]
     run_test "test_data_edge" python3 "$SCRIPT_DIR/test_data_edge.py"
     run_test "test_data_transitions" python3 "$SCRIPT_DIR/test_data_transitions.py"
     run_test "test_data_lock_chains" python3 "$SCRIPT_DIR/test_data_lock_chains.py"
+    run_test "test_current_trace" python3 "$SCRIPT_DIR/test_current_trace.py"
 else
     skip_test "test_data_*" "pgwt-server or gen_test_traces not built"
 fi
