@@ -2033,41 +2033,56 @@ void pgwt_compute_concurrency(const struct pgwt_trace_event *events, int count,
     qsort(active, nactive, sizeof(active[0]), cmp_active_by_start);
 
     /* Phase 1: Peak concurrency per AAS bucket.
-     * For each bucket, count max overlapping sessions on same event. */
+     * For each bucket, count DISTINCT PIDs waiting on the same event. */
     for (int b = 0; b < num_buckets; b++) {
         uint64_t bstart = from_ns + (uint64_t)b * bucket_ns;
         uint64_t bend = bstart + bucket_ns;
 
-        /* Count sessions active in this bucket, grouped by event */
-        struct { uint32_t eid; int count; } ev_counts[256];
+        /* Track distinct PIDs per event using small hash sets */
+        struct {
+            uint32_t eid;
+            uint32_t pids[128]; /* distinct PIDs for this event */
+            int npids;
+        } ev_pids[64];
         int nev = 0;
 
         for (int i = 0; i < nactive; i++) {
             if (active[i].start_ns >= bend) break;
             if (active[i].end_ns <= bstart) continue;
 
-            /* This session overlaps with the bucket */
+            /* Find or create entry for this event */
             int found = -1;
             for (int j = 0; j < nev; j++) {
-                if (ev_counts[j].eid == active[i].event_id) {
+                if (ev_pids[j].eid == active[i].event_id) {
                     found = j;
                     break;
                 }
             }
-            if (found >= 0) {
-                ev_counts[found].count++;
-            } else if (nev < 256) {
-                ev_counts[nev].eid = active[i].event_id;
-                ev_counts[nev].count = 1;
+            if (found < 0 && nev < 64) {
+                found = nev;
+                ev_pids[nev].eid = active[i].event_id;
+                ev_pids[nev].npids = 0;
                 nev++;
             }
+            if (found < 0) continue;
+
+            /* Add PID if not already present (distinct count) */
+            int dup = 0;
+            for (int k = 0; k < ev_pids[found].npids; k++) {
+                if (ev_pids[found].pids[k] == active[i].pid) {
+                    dup = 1;
+                    break;
+                }
+            }
+            if (!dup && ev_pids[found].npids < 128)
+                ev_pids[found].pids[ev_pids[found].npids++] = active[i].pid;
         }
 
-        /* Find peak */
+        /* Find peak (distinct PIDs, not event count) */
         for (int j = 0; j < nev; j++) {
-            if (ev_counts[j].count > out->peak_sessions[b]) {
-                out->peak_sessions[b] = ev_counts[j].count;
-                out->peak_event[b] = ev_counts[j].eid;
+            if (ev_pids[j].npids > out->peak_sessions[b]) {
+                out->peak_sessions[b] = ev_pids[j].npids;
+                out->peak_event[b] = ev_pids[j].eid;
             }
         }
     }
