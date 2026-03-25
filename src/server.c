@@ -679,10 +679,18 @@ static int should_use_summaries(struct pgwt_server *srv, struct pgwt_request *re
 
 static void handle_info(struct pgwt_server *srv, struct pgwt_request *req)
 {
-    /* Lightweight refresh: rescan directory, update latest_wall_ns from
-     * current.trace. earliest_wall_ns stays from server_init (stable).
-     * Only current.trace needs a file open — O(1) block header read. */
+    /* Refresh: rescan directory, reload metadata, update latest_wall_ns. */
     srv->num_files = pgwt_scan_trace_files(srv->trace_dir, srv->files, 256);
+
+    /* Reload query texts and backend metadata (daemon appends new entries
+     * as it discovers backends/queries). These files are small — fast. */
+    qt_map_clear(srv);
+    server_load_query_texts(srv);
+    free(srv->bm_map);
+    srv->bm_map = NULL;
+    srv->bm_capacity = 0;
+    srv->bm_count = 0;
+    server_load_backends(srv);
 
     /* Update latest_wall_ns from current.trace (one quick open+close) */
     for (int i = 0; i < srv->num_files; i++) {
