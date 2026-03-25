@@ -216,6 +216,26 @@ static int flush_block(struct pgwt_event_writer *w)
     w->total_events_written += w->num_events;
     w->total_bytes_written += sizeof(bh) + compressed_size;
     w->num_events = 0;
+
+    /* Flush to OS page cache so concurrent readers can see this block */
+    fflush(w->fp);
+
+    /* Write committed block count atomically (Kafka-style high watermark).
+     * Readers use this instead of scanning/guessing block count. */
+    {
+        char meta_path[512], tmp_path[512];
+        snprintf(meta_path, sizeof(meta_path), "%s/current.trace.meta",
+                 w->trace_dir);
+        snprintf(tmp_path, sizeof(tmp_path), "%s/current.trace.meta.tmp",
+                 w->trace_dir);
+        FILE *mf = fopen(tmp_path, "w");
+        if (mf) {
+            fprintf(mf, "%d\n", w->num_blocks);
+            fclose(mf);
+            rename(tmp_path, meta_path);  /* atomic on POSIX */
+        }
+    }
+
     return 0;
 }
 
@@ -331,6 +351,14 @@ int pgwt_writer_check_rotation(struct pgwt_event_writer *w)
              file_tm.tm_year + 1900, file_tm.tm_mon + 1,
              file_tm.tm_mday, file_tm.tm_hour);
     rename(w->current_path, new_path);
+
+    /* Remove meta file — the rotated .trace.lz4 has a real footer */
+    {
+        char meta_path[512];
+        snprintf(meta_path, sizeof(meta_path), "%s/current.trace.meta",
+                 w->trace_dir);
+        unlink(meta_path);
+    }
 
     /* Reset stats for next file */
     w->total_events_written = 0;

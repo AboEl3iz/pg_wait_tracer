@@ -527,6 +527,22 @@ static int flush_accum(struct pgwt_summary_writer *w)
     w->total_bytes_written += sizeof(bh) + compressed_size;
     w->accum_active = false;
 
+    /* Flush + committed block count (same pattern as event_writer) */
+    fflush(w->fp);
+    {
+        char meta_path[512], tmp_path[512];
+        snprintf(meta_path, sizeof(meta_path), "%s/current.summary.meta",
+                 w->trace_dir);
+        snprintf(tmp_path, sizeof(tmp_path), "%s/current.summary.meta.tmp",
+                 w->trace_dir);
+        FILE *mf = fopen(tmp_path, "w");
+        if (mf) {
+            fprintf(mf, "%d\n", w->num_blocks);
+            fclose(mf);
+            rename(tmp_path, meta_path);
+        }
+    }
+
     return 0;
 }
 
@@ -650,6 +666,14 @@ int pgwt_summary_check_rotation(struct pgwt_summary_writer *w)
              file_tm.tm_year + 1900, file_tm.tm_mon + 1,
              file_tm.tm_mday, file_tm.tm_hour);
     rename(w->current_path, new_path);
+
+    /* Remove meta file */
+    {
+        char meta_path[512];
+        snprintf(meta_path, sizeof(meta_path), "%s/current.summary.meta",
+                 w->trace_dir);
+        unlink(meta_path);
+    }
 
     /* Reset stats */
     w->total_records_written = 0;

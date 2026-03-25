@@ -44,33 +44,76 @@ int pgwt_summary_reader_open(struct pgwt_summary_reader *r, const char *path)
     r->mono_to_wall = (int64_t)r->header.start_time_ns
                     - (int64_t)r->header.clock_offset_ns;
 
-    /* Try reading footer: last 4 bytes = num_blocks.
-     * Falls back to sequential block scan for files still being written
-     * (e.g. current.summary which has no footer yet). */
-    int have_footer = 0;
-    uint32_t nb = 0;
+    /* Same 3-strategy approach as event_reader:
+     * 1. Meta file (committed block count from daemon)
+     * 2. Footer (completed .summary.lz4 files)
+     * 3. Sequential scan (backward compat) */
+    int have_index = 0;
 
-    if (fseek(r->fp, -4, SEEK_END) == 0 &&
-        fread(&nb, sizeof(nb), 1, r->fp) == 1 && nb > 0) {
-        long index_start = ftell(r->fp) - 4
-                         - (long)nb * (long)sizeof(struct pgwt_block_index_entry);
-        if (index_start >= (long)sizeof(struct pgwt_trace_file_header)) {
-            fseek(r->fp, index_start, SEEK_SET);
-            r->block_index = malloc(nb * sizeof(struct pgwt_block_index_entry));
-            if (r->block_index &&
-                fread(r->block_index, sizeof(struct pgwt_block_index_entry),
-                      nb, r->fp) == nb) {
-                r->num_blocks = (int)nb;
-                have_footer = 1;
-            } else {
-                free(r->block_index);
-                r->block_index = NULL;
+    /* Strategy 1: Meta file */
+    {
+        char meta_path[600];
+        snprintf(meta_path, sizeof(meta_path), "%s.meta", path);
+        FILE *mf = fopen(meta_path, "r");
+        if (mf) {
+            int committed = 0;
+            if (fscanf(mf, "%d", &committed) == 1 && committed > 0) {
+                fseek(r->fp, (long)sizeof(struct pgwt_trace_file_header),
+                      SEEK_SET);
+                r->block_index = malloc(committed *
+                                        sizeof(struct pgwt_block_index_entry));
+                if (r->block_index) {
+                    r->num_blocks = 0;
+                    struct pgwt_summary_block_header bh;
+                    while (r->num_blocks < committed &&
+                           fread(&bh, sizeof(bh), 1, r->fp) == 1 &&
+                           bh.compressed_size > 0) {
+                        long off = ftell(r->fp) - (long)sizeof(bh);
+                        r->block_index[r->num_blocks].file_offset = (uint64_t)off;
+                        r->block_index[r->num_blocks].timestamp_ns = bh.wall_ns;
+                        r->num_blocks++;
+                        if (fseek(r->fp, (long)bh.compressed_size,
+                                  SEEK_CUR) != 0)
+                            break;
+                    }
+                    if (r->num_blocks > 0)
+                        have_index = 1;
+                    else {
+                        free(r->block_index);
+                        r->block_index = NULL;
+                    }
+                }
+            }
+            fclose(mf);
+        }
+    }
+
+    /* Strategy 2: Footer */
+    if (!have_index) {
+        uint32_t nb = 0;
+        if (fseek(r->fp, -4, SEEK_END) == 0 &&
+            fread(&nb, sizeof(nb), 1, r->fp) == 1 &&
+            nb > 0 && nb < 100000) {
+            long index_start = ftell(r->fp) - 4
+                             - (long)nb * (long)sizeof(struct pgwt_block_index_entry);
+            if (index_start >= (long)sizeof(struct pgwt_trace_file_header)) {
+                fseek(r->fp, index_start, SEEK_SET);
+                r->block_index = malloc(nb * sizeof(struct pgwt_block_index_entry));
+                if (r->block_index &&
+                    fread(r->block_index, sizeof(struct pgwt_block_index_entry),
+                          nb, r->fp) == nb) {
+                    r->num_blocks = (int)nb;
+                    have_index = 1;
+                } else {
+                    free(r->block_index);
+                    r->block_index = NULL;
+                }
             }
         }
     }
 
-    /* Fallback: scan blocks sequentially from start of data */
-    if (!have_footer) {
+    /* Strategy 3: Sequential scan */
+    if (!have_index) {
         fseek(r->fp, (long)sizeof(struct pgwt_trace_file_header), SEEK_SET);
         int cap = 128;
         r->block_index = malloc(cap * sizeof(struct pgwt_block_index_entry));
@@ -93,7 +136,6 @@ int pgwt_summary_reader_open(struct pgwt_summary_reader *r, const char *path)
             r->block_index[r->num_blocks].file_offset = (uint64_t)block_start;
             r->block_index[r->num_blocks].timestamp_ns = bh.wall_ns;
             r->num_blocks++;
-            /* Skip past compressed payload */
             if (fseek(r->fp, (long)bh.compressed_size, SEEK_CUR) != 0)
                 break;
         }

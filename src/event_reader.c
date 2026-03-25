@@ -47,50 +47,89 @@ int pgwt_reader_open(struct pgwt_event_reader *r, const char *path)
     r->mono_to_wall = (int64_t)r->header.start_time_ns
                     - (int64_t)r->header.clock_offset_ns;
 
-    /* Try reading footer: last 4 bytes = num_blocks.
-     * Falls back to sequential block scan for files still being written
-     * (e.g. current.trace which has no footer yet). */
-    int have_footer = 0;
-    uint32_t nb = 0;
+    /*
+     * Determine number of blocks to read. Three strategies, tried in order:
+     *
+     * 1. Meta file (current.trace.meta) — written atomically by the daemon
+     *    after each block flush. Contains the committed block count. This
+     *    is the ONLY reliable way to read current.trace while the daemon
+     *    is writing to it. No scanning, no guessing, no race conditions.
+     *
+     * 2. Footer — for completed .trace.lz4 files. Last 4 bytes = num_blocks,
+     *    preceding bytes = block index array. Written on rotation.
+     *
+     * 3. Sequential scan — backward compat for old files without meta.
+     *    Only used when no meta file and no footer. Simple validation.
+     */
+    int have_index = 0;
 
-    if (fseek(r->fp, -4, SEEK_END) == 0 &&
-        fread(&nb, sizeof(nb), 1, r->fp) == 1 && nb > 0) {
-        long index_start = ftell(r->fp) - 4
-                         - (long)nb * (long)sizeof(struct pgwt_block_index_entry);
-        if (index_start >= (long)sizeof(struct pgwt_trace_file_header)) {
-            fseek(r->fp, index_start, SEEK_SET);
-            r->block_index = malloc(nb * sizeof(struct pgwt_block_index_entry));
-            if (r->block_index &&
-                fread(r->block_index, sizeof(struct pgwt_block_index_entry),
-                      nb, r->fp) == nb) {
-                /* Validate: block index timestamps must be monotonically
-                 * increasing and non-zero. Rejects garbage from files
-                 * without a real footer (e.g. current.trace being written). */
-                int valid = 1;
-                for (uint32_t k = 0; k < nb; k++) {
-                    if (r->block_index[k].timestamp_ns == 0 ||
-                        (k > 0 && r->block_index[k].timestamp_ns <
-                                   r->block_index[k-1].timestamp_ns)) {
-                        valid = 0;
-                        break;
+    /* Strategy 1: Meta file (Kafka-style high watermark) */
+    {
+        char meta_path[600];
+        snprintf(meta_path, sizeof(meta_path), "%s.meta", path);
+        FILE *mf = fopen(meta_path, "r");
+        if (mf) {
+            int committed = 0;
+            if (fscanf(mf, "%d", &committed) == 1 && committed > 0) {
+                /* Scan exactly 'committed' blocks sequentially */
+                fseek(r->fp, (long)sizeof(struct pgwt_trace_file_header),
+                      SEEK_SET);
+                r->block_index = malloc(committed *
+                                        sizeof(struct pgwt_block_index_entry));
+                if (r->block_index) {
+                    r->num_blocks = 0;
+                    struct pgwt_trace_block_header bh;
+                    while (r->num_blocks < committed &&
+                           fread(&bh, sizeof(bh), 1, r->fp) == 1 &&
+                           bh.compressed_size > 0 && bh.num_events > 0) {
+                        long off = ftell(r->fp) - (long)sizeof(bh);
+                        r->block_index[r->num_blocks++] =
+                            (struct pgwt_block_index_entry){
+                                .timestamp_ns = bh.first_timestamp_ns,
+                                .file_offset = (uint64_t)off,
+                            };
+                        if (fseek(r->fp, (long)bh.compressed_size,
+                                  SEEK_CUR) != 0)
+                            break;
+                    }
+                    if (r->num_blocks > 0)
+                        have_index = 1;
+                    else {
+                        free(r->block_index);
+                        r->block_index = NULL;
                     }
                 }
-                if (valid) {
+            }
+            fclose(mf);
+        }
+    }
+
+    /* Strategy 2: Footer (for completed .trace.lz4 files) */
+    if (!have_index) {
+        uint32_t nb = 0;
+        if (fseek(r->fp, -4, SEEK_END) == 0 &&
+            fread(&nb, sizeof(nb), 1, r->fp) == 1 &&
+            nb > 0 && nb < 100000) {  /* sanity: < 100K blocks */
+            long index_start = ftell(r->fp) - 4
+                             - (long)nb * (long)sizeof(struct pgwt_block_index_entry);
+            if (index_start >= (long)sizeof(struct pgwt_trace_file_header)) {
+                fseek(r->fp, index_start, SEEK_SET);
+                r->block_index = malloc(nb * sizeof(struct pgwt_block_index_entry));
+                if (r->block_index &&
+                    fread(r->block_index, sizeof(struct pgwt_block_index_entry),
+                          nb, r->fp) == nb) {
                     r->num_blocks = (int)nb;
-                    have_footer = 1;
+                    have_index = 1;
                 } else {
                     free(r->block_index);
                     r->block_index = NULL;
                 }
-            } else {
-                free(r->block_index);
-                r->block_index = NULL;
             }
         }
     }
 
-    /* Fallback: scan blocks sequentially from start of data */
-    if (!have_footer) {
+    /* Strategy 3: Sequential scan (backward compat, no meta or footer) */
+    if (!have_index) {
         fseek(r->fp, (long)sizeof(struct pgwt_trace_file_header), SEEK_SET);
         int cap = 128;
         r->block_index = malloc(cap * sizeof(struct pgwt_block_index_entry));
@@ -100,25 +139,10 @@ int pgwt_reader_open(struct pgwt_event_reader *r, const char *path)
         }
         r->num_blocks = 0;
         struct pgwt_trace_block_header bh;
-        uint64_t prev_ts = 0;
-        /* Use monotonic clock offset as reference for block timestamp validation.
-         * Block timestamps are monotonic (CLOCK_MONOTONIC), NOT wall-clock. */
-        uint64_t ref_ts = r->header.clock_offset_ns;
         while (fread(&bh, sizeof(bh), 1, r->fp) == 1 &&
                bh.compressed_size > 0 && bh.num_events > 0 &&
-               /* Validate: reject partial/corrupt headers from concurrent writes */
                bh.num_events <= PGWT_BLOCK_EVENTS &&
-               bh.compressed_size <= 10 * 1024 * 1024 && /* 10 MB max */
-               bh.uncompressed_size > 0 &&
-               bh.uncompressed_size <= bh.num_events * 64 && /* ~max bytes per event */
-               bh.first_timestamp_ns > 0 &&
-               bh.last_timestamp_ns >= bh.first_timestamp_ns &&
-               (prev_ts == 0 || bh.first_timestamp_ns >= prev_ts) &&
-               /* Timestamp within ±1 year of file start (rejects garbage values) */
-               (ref_ts == 0 ||
-                (bh.first_timestamp_ns > ref_ts - 31536000000000000ULL &&
-                 bh.first_timestamp_ns < ref_ts + 31536000000000000ULL))) {
-            prev_ts = bh.last_timestamp_ns;
+               bh.compressed_size <= 10 * 1024 * 1024) {
             if (r->num_blocks >= cap) {
                 cap *= 2;
                 struct pgwt_block_index_entry *tmp =
@@ -131,7 +155,6 @@ int pgwt_reader_open(struct pgwt_event_reader *r, const char *path)
                 .timestamp_ns = bh.first_timestamp_ns,
                 .file_offset = (uint64_t)block_offset,
             };
-            /* Skip compressed payload */
             if (fseek(r->fp, (long)bh.compressed_size, SEEK_CUR) != 0)
                 break;
         }

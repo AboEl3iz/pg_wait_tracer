@@ -6,7 +6,7 @@ CFLAGS    = -g -O2 -Wall -I../src -I../include
 BUILD     = ../build
 
 TESTS     = test_wait_event test_cmdline test_event_writer test_event_reader \
-            test_bucket gen_test_traces gen_bench_traces
+            test_bucket gen_test_traces gen_bench_traces test_concurrent_rw
 
 .PHONY: all clean
 
@@ -37,6 +37,10 @@ gen_test_traces: gen_test_traces.c $(SERVER_OBJS)
 
 gen_bench_traces: gen_bench_traces.c $(SERVER_OBJS)
 	$(CC) $(CFLAGS) -DPGWT_SERVER -o $@ $^ -llz4
+
+test_concurrent_rw: test_concurrent_rw.c $(BUILD)/event_reader.o $(BUILD)/event_writer.o \
+                    $(BUILD)/map_reader.o $(BUILD)/wait_event.o $(BUILD)/cJSON.o
+	$(CC) $(CFLAGS) -o $@ $^ -llz4 -lbpf -lelf -lz
 
 clean:
 	rm -f $(TESTS)
