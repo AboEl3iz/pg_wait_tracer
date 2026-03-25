@@ -1765,6 +1765,7 @@ async function refreshTransitions() {
     container.innerHTML =
         '<div id="transitions-chart" style="width:100%;height:500px;"></div>' +
         '<div id="transitions-detail" style="padding:10px;"></div>' +
+        '<div id="transitions-drilldown"></div>' +
         '<div id="transitions-table" style="padding:10px;"></div>';
 
     // -- Heatmap --
@@ -1849,6 +1850,31 @@ async function refreshTransitions() {
         showFromDetail(events[fromIdx], events, lookup, fromTotals, data.total);
     });
 
+    // -- State selector buttons (click to drill down) --
+    let btnHtml = '<div style="padding:10px 0;display:flex;flex-wrap:wrap;gap:6px;">' +
+        '<span style="color:#888;line-height:28px;margin-right:4px">After:</span>';
+    events.forEach(ev => {
+        const color = classColor(ev) || '#888';
+        btnHtml += `<button class="state-btn" data-event="${esc(ev)}" ` +
+            `style="background:#1e1e3a;border:1px solid ${color};color:#ccc;` +
+            `padding:3px 10px;border-radius:4px;cursor:pointer;font-size:12px;` +
+            `border-left:3px solid ${color}">${esc(ev)}</button>`;
+    });
+    btnHtml += '</div>';
+    document.getElementById('transitions-detail').innerHTML = btnHtml;
+
+    document.querySelectorAll('.state-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            document.querySelectorAll('.state-btn').forEach(b => b.style.opacity = '0.5');
+            btn.style.opacity = '1';
+            showFromDetail(btn.dataset.event, events, lookup, fromTotals, data.total);
+        });
+    });
+
+    // Show CPU drill-down by default (most common starting point)
+    const cpuEvent = events.find(e => e.startsWith('CPU'));
+    if (cpuEvent) showFromDetail(cpuEvent, events, lookup, fromTotals, data.total);
+
     // -- Top transitions table --
     const sorted = data.links.slice().sort((a, b) => b.value - a.value).slice(0, 30);
     let html = '<h3 style="color:#ccc;margin:10px 0 5px">Top Transitions</h3>' +
@@ -1880,7 +1906,7 @@ async function refreshTransitions() {
 }
 
 function showFromDetail(fromEvent, events, lookup, fromTotals, total) {
-    const detailEl = document.getElementById('transitions-detail');
+    const detailEl = document.getElementById('transitions-drilldown');
     const totalOut = fromTotals[fromEvent] || 0;
     if (totalOut === 0) {
         detailEl.innerHTML = '';
@@ -1916,7 +1942,6 @@ function showFromDetail(fromEvent, events, lookup, fromTotals, total) {
     });
     html += '</tbody></table>';
     detailEl.innerHTML = html;
-    detailEl.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }
 
 // -- Start --------------------------------------------------------------------
