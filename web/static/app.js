@@ -1587,15 +1587,22 @@ async function refreshTransitions() {
             '<div id="sankey-container" style="width:100%;height:600px;"></div>';
     }
 
-    const data = await send('transitions', {
-        from: state.viewFrom,
-        to: state.viewTo,
-        filters: state.filters,
-        num_buckets: 30,  // top 30 transitions
-    });
+    let data;
+    try {
+        data = await send('transitions', {
+            from: state.viewFrom,
+            to: state.viewTo,
+            filters: state.filters,
+            num_buckets: 30,
+        });
+    } catch (e) {
+        container.innerHTML = '<p style="color:#888;padding:20px">Transitions: ' + e.message + '</p>';
+        return;
+    }
 
     if (!data || !data.links || data.links.length === 0) {
-        container.innerHTML = '<p style="color:#888;padding:20px">No transitions found</p>';
+        container.innerHTML = '<p style="color:#888;padding:20px">No transitions found (total=' +
+            (data ? data.total : 'null') + ', from=' + state.viewFrom + ', to=' + state.viewTo + ')</p>';
         return;
     }
 
