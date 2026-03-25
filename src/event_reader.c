@@ -83,8 +83,16 @@ int pgwt_reader_open(struct pgwt_event_reader *r, const char *path)
         }
         r->num_blocks = 0;
         struct pgwt_trace_block_header bh;
+        uint64_t prev_ts = 0;
         while (fread(&bh, sizeof(bh), 1, r->fp) == 1 &&
-               bh.compressed_size > 0 && bh.num_events > 0) {
+               bh.compressed_size > 0 && bh.num_events > 0 &&
+               /* Validate: reject partial/corrupt headers from concurrent writes */
+               bh.num_events <= PGWT_BLOCK_EVENTS &&
+               bh.compressed_size <= 10 * 1024 * 1024 && /* 10 MB max */
+               bh.uncompressed_size > 0 &&
+               bh.first_timestamp_ns > 0 &&
+               (prev_ts == 0 || bh.first_timestamp_ns >= prev_ts)) {
+            prev_ts = bh.first_timestamp_ns;
             if (r->num_blocks >= cap) {
                 cap *= 2;
                 struct pgwt_block_index_entry *tmp =
