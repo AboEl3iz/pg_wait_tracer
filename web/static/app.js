@@ -170,7 +170,10 @@ async function init() {
 // -- Refresh ------------------------------------------------------------------
 
 async function refresh() {
-    await Promise.all([refreshChart(), refreshTable()]);
+    /* Sequential, not parallel. The server processes one request at a time.
+     * Parallel requests cause queueing, backlog, and timeouts. */
+    await refreshChart();
+    await refreshTable();
 }
 
 async function refreshChart() {
@@ -778,8 +781,11 @@ function renderChart(data) {
 
     chart.setOption(option, true);
 
-    // Overlay concurrency data (peak sessions + bursts)
-    fetchConcurrencyOverlay(times, bns);
+    // Concurrency overlay only on manual refresh (not auto-refresh)
+    // to avoid loading millions of raw events on every 5-second tick.
+    if (!autoRefreshInterval) {
+        fetchConcurrencyOverlay(times, bns);
+    }
 }
 
 async function fetchConcurrencyOverlay(times, bns) {
@@ -1529,29 +1535,31 @@ function startAutoRefresh(rangeSecs) {
         liveBtn.textContent = 'Live ●';
     }
 
-    autoRefreshInterval = setInterval(async () => {
-        try {
-            // Re-fetch info to get server's current time.
-            const info = await send('info', {});
-            console.log('[auto-refresh] info:', JSON.stringify(info));
-            if (info) {
-                if (info.to_ns) state.toNs = info.to_ns;
-                if (info.from_ns) state.fromNs = info.from_ns;
-                state.serverNow = info.now_ns || info.to_ns;
-                state.viewFrom = state.serverNow - rangeSecs * 1e9;
-                state.viewTo = state.serverNow;
-            }
-            console.log('[auto-refresh] viewFrom:', state.viewFrom, 'viewTo:', state.viewTo);
-            refresh();
-        } catch (e) { /* ignore on disconnect */ }
-    }, 5000);
+    /* Use a sequential loop, not setInterval. Each tick waits for the
+     * previous one to complete before scheduling the next. This prevents
+     * request pile-up that causes timeouts on the transitions tab. */
+    autoRefreshInterval = true;  /* flag, not timer ID */
+    (async function autoRefreshLoop() {
+        while (autoRefreshInterval) {
+            try {
+                const info = await send('info', {});
+                if (info) {
+                    if (info.to_ns) state.toNs = info.to_ns;
+                    if (info.from_ns) state.fromNs = info.from_ns;
+                    state.serverNow = info.now_ns || info.to_ns;
+                    state.viewFrom = state.serverNow - rangeSecs * 1e9;
+                    state.viewTo = state.serverNow;
+                }
+                await refresh();
+            } catch (e) { /* ignore on disconnect */ }
+            /* Wait 5 seconds AFTER completion before next tick */
+            await new Promise(r => setTimeout(r, 5000));
+        }
+    })();
 }
 
 function stopAutoRefresh() {
-    if (autoRefreshInterval) {
-        clearInterval(autoRefreshInterval);
-        autoRefreshInterval = null;
-    }
+    autoRefreshInterval = null;  /* stops the loop */
     const liveBtn = document.getElementById('live-btn');
     if (liveBtn) {
         liveBtn.classList.remove('active');
