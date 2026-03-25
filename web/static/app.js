@@ -208,11 +208,7 @@ async function refreshTable() {
         return;
     }
     if (state.activeTab === 'concurrency') {
-        /* Keep existing chart during auto-refresh — don't re-fetch.
-         * Only fetch when chart doesn't exist (first visit to tab). */
-        if (!concurrencyChart) {
-            await refreshConcurrency();
-        }
+        await refreshConcurrency();
         return;
     }
     try {
@@ -408,6 +404,12 @@ function switchTab(tab) {
     if (state.activeTab === 'concurrency' && tab !== 'concurrency') {
         if (concurrencyChart) { concurrencyChart.dispose(); concurrencyChart = null; }
     }
+
+    // Stop auto-refresh when switching to concurrency tab
+    if (tab === 'concurrency') {
+        stopAutoRefresh();
+    }
+
     state.activeTab = tab;
     document.querySelectorAll('.tab').forEach(b => {
         b.classList.toggle('active', b.dataset.tab === tab);
@@ -421,8 +423,12 @@ let chart = null;
 const chartEl = document.getElementById('chart-container');
 
 function initChart() {
-    chart = echarts.init(chartEl, 'dark');
-    window.addEventListener('resize', () => chart.resize());
+    chart = echarts.init(chartEl, 'dark', { group: 'pgwt' });
+    echarts.connect('pgwt');
+    window.addEventListener('resize', () => {
+        chart.resize();
+        if (concurrencyChart) concurrencyChart.resize();
+    });
 
     // -- Brush selection (Grafana-style click-drag zoom) --
     const overlay = document.createElement('div');
@@ -1488,12 +1494,15 @@ let concurrencyChart = null;
 async function refreshConcurrency() {
     const container = document.getElementById('table-container');
 
+    // Use same bucket count as main AAS chart for synchronized xAxis
+    const numBuckets = Math.min(Math.floor(chartEl.clientWidth / 4), 300);
+
     let data;
     try {
         data = await send('concurrency', {
             from: state.viewFrom,
             to: state.viewTo,
-            buckets: 120,
+            buckets: numBuckets,
             filters: state.filters,
         });
     } catch (e) {
@@ -1513,9 +1522,12 @@ async function refreshConcurrency() {
 
     // -- Peak concurrency line chart --
     const el = document.getElementById('concurrency-chart');
-    if (!concurrencyChart) concurrencyChart = echarts.init(el, 'dark');
+    if (concurrencyChart) { concurrencyChart.dispose(); concurrencyChart = null; }
+    concurrencyChart = echarts.init(el, 'dark', { group: 'pgwt' });
+    echarts.connect('pgwt');
 
     const times = data.peaks.map(p => p.t);
+    const bns = data.bucket_ns || 0;
     const peakData = data.peaks.map(p => p.max || 0);
     const peakEvents = data.peaks.map(p => p.event || '');
 
@@ -1540,23 +1552,28 @@ async function refreshConcurrency() {
         },
         tooltip: {
             trigger: 'axis',
+            axisPointer: { type: 'cross' },
+            backgroundColor: '#1e1e3a',
+            borderColor: '#333',
+            textStyle: { color: '#e0e0e0', fontSize: 12 },
             formatter: params => {
                 if (!params.length) return '';
                 const idx = params[0].dataIndex;
                 const ev = peakEvents[idx] || 'none';
-                return fmtTime(params[0].axisValue) + '<br/>' +
+                return fmtTime(params[0].axisValue, bns) + '<br/>' +
                        'Peak: <b>' + params[0].value + ' sessions</b><br/>' +
                        'Event: ' + ev;
             },
         },
-        grid: { left: 60, right: 30, top: 50, bottom: 40 },
+        grid: { left: 50, right: 20, top: 50, bottom: 40 },
         xAxis: {
             type: 'category',
             data: times,
             axisLabel: {
                 color: '#888', fontSize: 10,
-                formatter: v => fmtTime(v),
+                formatter: v => fmtTime(v, bns),
             },
+            axisLine: { lineStyle: { color: '#333' } },
         },
         yAxis: {
             type: 'value',
