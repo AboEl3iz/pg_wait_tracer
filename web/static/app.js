@@ -1745,16 +1745,19 @@ async function refreshTransitions() {
     // Keep full Type:Event format for labels
     const shortName = name => name;
 
-    // Build heatmap data: [toIdx, fromIdx, count]
+    // Build heatmap data: [toIdx, fromIdx, pct] — row-normalized (% of outgoing)
+    // This breaks symmetry: "after CPU, 40% → IO" vs "after IO, 80% → CPU"
     const heatData = [];
-    let maxCount = 0;
+    let maxPct = 0;
     for (let fi = 0; fi < events.length; fi++) {
+        const total = fromTotals[events[fi]] || 1;
         for (let ti = 0; ti < events.length; ti++) {
             const key = events[fi] + '|' + events[ti];
             const l = lookup[key];
             const count = l ? l.value : 0;
-            if (count > maxCount) maxCount = count;
-            heatData.push([ti, fi, count]);
+            const pct = count / total * 100;
+            if (pct > maxPct) maxPct = pct;
+            heatData.push([ti, fi, Math.round(pct * 10) / 10, count]);
         }
     }
 
@@ -1773,8 +1776,8 @@ async function refreshTransitions() {
 
     transitionsChart.setOption({
         title: {
-            text: `Transition Matrix (${Number(data.total).toLocaleString()} total)`,
-            subtext: 'Rows = From state, Columns = To state. Click a row to see outgoing transitions.',
+            text: `Transition Matrix — % of Outgoing (${Number(data.total).toLocaleString()} total)`,
+            subtext: 'Each row shows where that state goes next. Click a row for details.',
             left: 'center',
             textStyle: { color: '#ccc', fontSize: 14 },
             subtextStyle: { color: '#666', fontSize: 11 },
@@ -1784,15 +1787,13 @@ async function refreshTransitions() {
                 if (!p.data || p.data[2] === 0) return '';
                 const from = events[p.data[1]];
                 const to = events[p.data[0]];
-                const count = p.data[2];
-                const pct = (count / data.total * 100).toFixed(1);
-                const fromPct = fromTotals[from]
-                    ? (count / fromTotals[from] * 100).toFixed(0) : '?';
+                const pct = p.data[2];
+                const count = p.data[3];
                 const l = lookup[from + '|' + to];
                 const dur = l ? (l.duration_ms / count).toFixed(1) : '?';
                 return `<b>${from}</b> → <b>${to}</b><br/>` +
-                       `Count: ${count.toLocaleString()} (${pct}% of all)<br/>` +
-                       `${fromPct}% of outgoing from ${shortName(from)}<br/>` +
+                       `<b>${pct}%</b> of outgoing from ${shortName(from)}<br/>` +
+                       `Count: ${count.toLocaleString()}<br/>` +
                        `Avg dwell in source: ${dur} ms`;
             },
         },
@@ -1814,11 +1815,12 @@ async function refreshTransitions() {
         },
         visualMap: {
             min: 0,
-            max: maxCount || 1,
+            max: maxPct || 1,
             calculable: true,
             orient: 'horizontal',
             left: 'center',
             bottom: 0,
+            formatter: v => v.toFixed(0) + '%',
             inRange: { color: ['#1a1a2e', '#16213e', '#0f3460', '#e94560', '#ff6b6b'] },
             textStyle: { color: '#888' },
         },
@@ -1831,9 +1833,7 @@ async function refreshTransitions() {
                 color: '#ddd',
                 formatter: p => {
                     if (p.data[2] === 0) return '';
-                    return p.data[2] >= 1000
-                        ? (p.data[2] / 1000).toFixed(0) + 'K'
-                        : p.data[2].toString();
+                    return p.data[2].toFixed(0) + '%';
                 },
             },
             emphasis: {
