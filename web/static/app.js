@@ -148,8 +148,10 @@ async function init() {
         state.toNs = info.to_ns;
         state.numCpus = info.num_cpus;
         const FIFTEEN_MIN_NS = 900 * 1e9;
-        state.viewFrom = info.to_ns - FIFTEEN_MIN_NS;
-        state.viewTo = info.to_ns;
+        const serverNow = info.now_ns || info.to_ns;
+        state.serverNow = serverNow;
+        state.viewFrom = serverNow - FIFTEEN_MIN_NS;
+        state.viewTo = serverNow;
         state.liveRangeSecs = 900;
         setStatus(info.num_cpus + ' CPUs, ~' + fmtCount(info.num_events) + ' events', 'connected');
         updateTimeRange();
@@ -598,9 +600,9 @@ function initTimePicker() {
                 // "All" — full range, no auto-refresh
                 zoomTo(state.fromNs, state.toNs);
             } else {
-                // "Last N" — relative range from end of available data
+                // "Last N" — relative range from server's "now"
                 state.liveRangeSecs = secs;
-                const end = state.toNs;
+                const end = state.serverNow || state.toNs;
                 const from = end - secs * 1e9;
                 zoomTo(from, end);
                 startAutoRefresh(secs);
@@ -1530,15 +1532,17 @@ function startAutoRefresh(rangeSecs) {
 
     autoRefreshInterval = setInterval(async () => {
         try {
-            // Re-fetch info to get updated time range from server.
+            // Re-fetch info to get server's current time.
             const info = await send('info', {});
             console.log('[auto-refresh] info:', JSON.stringify(info));
-            if (info && info.to_ns) {
-                state.toNs = info.to_ns;
+            if (info) {
+                if (info.to_ns) state.toNs = info.to_ns;
                 if (info.from_ns) state.fromNs = info.from_ns;
+                const serverNow = info.now_ns || info.to_ns;
+                state.serverNow = serverNow;
+                state.viewFrom = serverNow - rangeSecs * 1e9;
+                state.viewTo = serverNow;
             }
-            state.viewFrom = state.toNs - rangeSecs * 1e9;
-            state.viewTo = state.toNs;
             console.log('[auto-refresh] viewFrom:', state.viewFrom, 'viewTo:', state.viewTo);
             refresh();
         } catch (e) { /* ignore on disconnect */ }
@@ -1565,9 +1569,9 @@ function initLiveMode() {
         if (autoRefreshInterval) {
             stopAutoRefresh();
         } else {
-            // Default: last 5 minutes from the end of available data
+            // Default: last 5 minutes from server's "now"
             state.liveRangeSecs = 300;
-            const end = state.toNs || Date.now() * 1e6;
+            const end = state.serverNow || state.toNs;
             state.viewFrom = end - 300e9;
             state.viewTo = end;
             startAutoRefresh(300);

@@ -16,6 +16,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <ctype.h>
+#include <time.h>
 
 /* ── Utility ──────────────────────────────────────────────── */
 
@@ -698,6 +699,13 @@ static void handle_info(struct pgwt_server *srv, struct pgwt_request *req)
     cjson_add_uint64(root, "to_ns", srv->latest_wall_ns);
     cJSON_AddNumberToObject(root, "num_events", (double)srv->total_events);
     cJSON_AddNumberToObject(root, "num_cpus", srv->num_cpus);
+
+    /* Server wall clock — client uses this as "now" for relative time ranges */
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    uint64_t now_ns = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+    cjson_add_uint64(root, "now_ns", now_ns);
+
     emit_json(root);
 }
 
