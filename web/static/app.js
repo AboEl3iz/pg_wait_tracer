@@ -1569,28 +1569,45 @@ async function refreshConcurrency() {
         }],
     }, true);
 
-    // -- Burst table --
-    const bursts = data.bursts || [];
-    if (bursts.length === 0) {
-        document.getElementById('burst-table').innerHTML =
-            '<p style="color:#666">No burst events detected (threshold: 4+ sessions within 10ms)</p>';
-        return;
-    }
+    // -- Peak moments table --
+    // Show the top N buckets by peak concurrency
+    const topPeaks = data.peaks
+        .filter(p => p.max > 1)
+        .sort((a, b) => b.max - a.max)
+        .slice(0, 10);
 
-    let html = '<h3 style="color:#ccc;margin:10px 0 5px">Burst Events</h3>' +
+    let html = '<h3 style="color:#ccc;margin:10px 0 5px">Top Peak Moments</h3>' +
         '<table class="data-table"><thead><tr>' +
-        '<th>Time</th><th>Wait Event</th><th>Sessions</th><th>PIDs</th>' +
+        '<th>Time</th><th>Wait Event</th><th>Simultaneous Sessions</th>' +
         '</tr></thead><tbody>';
 
-    bursts.forEach(b => {
-        const time = fmtTime(b.timestamp_ns);
-        const pids = (b.pids || []).slice(0, 8).join(', ') +
-                     (b.pids && b.pids.length > 8 ? '...' : '');
-        html += `<tr><td>${time}</td><td>${b.event}</td>` +
-                `<td><b>${b.sessions}</b></td><td>${pids}</td></tr>`;
+    topPeaks.forEach(p => {
+        html += `<tr><td>${fmtTime(p.t)}</td><td>${p.event || 'CPU*'}</td>` +
+                `<td><b>${p.max}</b></td></tr>`;
     });
-
     html += '</tbody></table>';
+
+    // -- Burst table --
+    const bursts = data.bursts || [];
+    if (bursts.length > 0) {
+        html += '<h3 style="color:#ccc;margin:15px 0 5px">Burst Events ' +
+                '<span style="color:#666;font-size:12px">(4+ sessions within 10ms)</span></h3>' +
+                '<table class="data-table"><thead><tr>' +
+                '<th>Time</th><th>Wait Event</th><th>Sessions</th><th>PIDs</th>' +
+                '</tr></thead><tbody>';
+
+        bursts.forEach(b => {
+            const time = fmtTime(b.timestamp_ns);
+            const pids = (b.pids || []).slice(0, 8).join(', ') +
+                         (b.pids && b.pids.length > 8 ? '...' : '');
+            html += `<tr><td>${time}</td><td>${b.event}</td>` +
+                    `<td><b>${b.sessions}</b></td><td>${pids}</td></tr>`;
+        });
+        html += '</tbody></table>';
+    } else {
+        html += '<p style="color:#666;margin-top:15px">No burst events detected</p>';
+    }
+
     document.getElementById('burst-table').innerHTML = html;
 }
 
