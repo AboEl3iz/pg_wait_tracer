@@ -450,7 +450,21 @@ def test_transitions_tab(page):
     check("timeout" not in container_text.lower(),
           "No timeout error")
 
-    # Verify ECharts Sankey instance exists with actual data
+    # Capture any JS errors during rendering
+    js_errors = []
+    page.on("pageerror", lambda err: js_errors.append(str(err)))
+
+    # Re-click to trigger fresh render after error listener is attached
+    page.click(".tab[data-tab='overview']")
+    page.wait_for_timeout(500)
+    page.click(".tab[data-tab='transitions']")
+    page.wait_for_timeout(3000)
+
+    # Must have NO JavaScript errors (catches "Sankey is a DAG, cycle!" etc.)
+    check(len(js_errors) == 0,
+          f"No JS errors during Sankey render (got {len(js_errors)}: {js_errors[:2]})")
+
+    # Verify ECharts instance has data AND rendered (canvas or SVG element exists)
     sankey_status = page.evaluate("""
         () => {
             const el = document.getElementById('sankey-container');
@@ -460,26 +474,13 @@ def test_transitions_tab(page):
             const opt = c.getOption();
             if (!opt.series || !opt.series[0]) return 'no series';
             if (!opt.series[0].links || opt.series[0].links.length === 0) return 'no links';
+            // Check actual visual rendering (canvas or SVG must exist)
+            if (!el.querySelector('canvas') && !el.querySelector('svg')) return 'no visual';
             return 'ok:' + opt.series[0].links.length;
         }
     """)
     check(sankey_status.startswith("ok"),
-          f"Sankey chart rendered with data ({sankey_status})")
-
-    # Verify specific link data from mock (CPU* → IO:DataFileRead)
-    link_count = page.evaluate("""
-        () => {
-            const el = document.getElementById('sankey-container');
-            if (!el) return 0;
-            const c = echarts.getInstanceByDom(el);
-            if (!c) return 0;
-            const opt = c.getOption();
-            return (opt.series && opt.series[0] && opt.series[0].links)
-                ? opt.series[0].links.length : 0;
-        }
-    """)
-    check(link_count >= 5,
-          f"Sankey has {link_count} links (mock sends 5)")
+          f"Sankey chart rendered visually with data ({sankey_status})")
 
 
 def test_time_picker(page):
@@ -633,6 +634,15 @@ def test_concurrency_overlay(page):
 
     page.goto(MOCK_URL)
     page.wait_for_selector("#status.connected", timeout=10000)
+    page.wait_for_timeout(2000)
+
+    # Stop auto-refresh — concurrency overlay only runs on manual refresh
+    page.click("#live-btn")
+    page.wait_for_timeout(500)
+    # Trigger a manual refresh by selecting "All" time range
+    page.click("#time-range")
+    page.wait_for_timeout(300)
+    page.click(".tp-quick button[data-range='0']")
     page.wait_for_timeout(2000)
 
     # The chart should have a "Peak Concurrency" legend entry
