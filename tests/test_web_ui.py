@@ -427,7 +427,7 @@ def test_timeline_tab(page):
 
 
 def test_transitions_tab(page):
-    """12b. Transitions tab shows Sankey diagram with data."""
+    """12b. Transitions tab shows heatmap matrix and table with data."""
     print("--- Test 12b: Transitions Tab ---")
 
     page.goto(MOCK_URL)
@@ -439,12 +439,13 @@ def test_transitions_tab(page):
     check(active and active.text_content() == "Transitions",
           "Transitions tab becomes active")
 
-    # Container must exist
-    container = page.query_selector("#sankey-container")
-    check(container is not None, "Sankey container exists")
+    # Heatmap container must exist
+    container = page.query_selector("#transitions-chart")
+    check(container is not None, "Transitions heatmap container exists")
 
     # Must NOT show "No transitions found" or error
-    container_text = container.text_content() if container else ""
+    table_container = page.query_selector("#table-container")
+    container_text = table_container.text_content() if table_container else ""
     check("No transitions" not in container_text,
           f"No 'No transitions' message (got: '{container_text[:60]}')")
     check("timeout" not in container_text.lower(),
@@ -460,27 +461,33 @@ def test_transitions_tab(page):
     page.click(".tab[data-tab='transitions']")
     page.wait_for_timeout(3000)
 
-    # Must have NO JavaScript errors (catches "Sankey is a DAG, cycle!" etc.)
+    # Must have NO JavaScript errors
     check(len(js_errors) == 0,
-          f"No JS errors during Sankey render (got {len(js_errors)}: {js_errors[:2]})")
+          f"No JS errors during transitions render (got {len(js_errors)}: {js_errors[:2]})")
 
-    # Verify ECharts instance has data AND rendered (canvas or SVG element exists)
-    sankey_status = page.evaluate("""
+    # Verify ECharts heatmap has data and rendered
+    chart_status = page.evaluate("""
         () => {
-            const el = document.getElementById('sankey-container');
+            const el = document.getElementById('transitions-chart');
             if (!el) return 'no container';
             const c = echarts.getInstanceByDom(el);
             if (!c) return 'no echarts instance';
             const opt = c.getOption();
             if (!opt.series || !opt.series[0]) return 'no series';
-            if (!opt.series[0].links || opt.series[0].links.length === 0) return 'no links';
-            // Check actual visual rendering (canvas or SVG must exist)
+            const data = opt.series[0].data;
+            if (!data || data.length === 0) return 'no data';
             if (!el.querySelector('canvas') && !el.querySelector('svg')) return 'no visual';
-            return 'ok:' + opt.series[0].links.length;
+            return 'ok:' + data.length;
         }
     """)
-    check(sankey_status.startswith("ok"),
-          f"Sankey chart rendered visually with data ({sankey_status})")
+    check(chart_status.startswith("ok"),
+          f"Transitions heatmap rendered with data ({chart_status})")
+
+    # Top transitions table must exist
+    table = page.query_selector("#transitions-table table")
+    check(table is not None, "Top transitions table exists")
+    rows = page.query_selector_all("#transitions-table tbody tr")
+    check(len(rows) > 0, f"Top transitions table has rows ({len(rows)})")
 
 
 def test_time_picker(page):
