@@ -97,15 +97,14 @@ struct bm_entry {
 
 /* ── Server state ─────────────────────────────────────────── */
 
-/* Per-file event cache — avoids re-reading immutable .trace.lz4 files */
+/* Per-file event cache — for immutable .trace.lz4 files only */
 struct file_cache_entry {
     char     path[512];
     struct pgwt_trace_event *events;
     int      count;
-    int      capacity;
-    int      immutable;    /* 1 = .trace.lz4 (never changes), 0 = current.trace */
-    int      last_num_blocks;  /* for incremental reads of current.trace */
-    int64_t  mono_to_wall;     /* clock offset for this file */
+    int      immutable;
+    uint64_t first_wall_ns;  /* earliest event timestamp (for range skip) */
+    uint64_t last_wall_ns;   /* latest event timestamp */
 };
 
 struct pgwt_server {
@@ -401,7 +400,7 @@ static void server_load_backends(struct pgwt_server *srv)
                 srv->bm_count);
 }
 
-/* ── Event caching ────────────────────────────────────────── */
+/* ── Event caching + on-demand loading ────────────────────── */
 
 /* Check if a file is the current (mutable) trace */
 static int is_current_trace(const char *path)
@@ -411,68 +410,50 @@ static int is_current_trace(const char *path)
     return strcmp(base, "current.trace") == 0;
 }
 
-/* Load all events from a single file, converting to wall-clock timestamps.
- * Returns malloc'd array. Caller frees. */
-static struct pgwt_trace_event *
-load_file_events(const char *path, int *out_count)
+/* Get cached events for an immutable file. Reads once, caches forever.
+ * Returns NULL for current.trace (handled separately). */
+static struct file_cache_entry *
+get_cached_immutable(struct pgwt_server *srv, const char *path)
 {
-    *out_count = 0;
-    struct pgwt_event_reader reader;
-    if (pgwt_reader_open(&reader, path) != 0)
+    /* Look for existing entry */
+    for (int i = 0; i < srv->cache_count; i++) {
+        if (strcmp(srv->cache[i].path, path) == 0)
+            return &srv->cache[i];
+    }
+
+    /* New entry — read entire file once */
+    if (srv->cache_count >= 256)
         return NULL;
 
+    struct file_cache_entry *ce = &srv->cache[srv->cache_count++];
+    memset(ce, 0, sizeof(*ce));
+    snprintf(ce->path, sizeof(ce->path), "%s", path);
+    ce->immutable = 1;
+    ce->count = 0;
+
+    struct pgwt_event_reader reader;
+    if (pgwt_reader_open(&reader, path) != 0)
+        return ce;
+
     int cap = 16384;
-    struct pgwt_trace_event *events = malloc(cap * sizeof(*events));
-    int total = 0;
+    ce->events = malloc(cap * sizeof(*ce->events));
     struct pgwt_trace_event block_buf[PGWT_BLOCK_EVENTS];
+
+    /* Store time range for this file */
+    if (reader.num_blocks > 0) {
+        ce->first_wall_ns = pgwt_reader_mono_to_wall(&reader,
+            reader.block_index[0].timestamp_ns);
+        ce->last_wall_ns = pgwt_reader_mono_to_wall(&reader,
+            reader.block_index[reader.num_blocks - 1].timestamp_ns);
+    }
 
     for (int b = 0; b < reader.num_blocks; b++) {
         int n = pgwt_reader_decode_block(&reader, b, block_buf, PGWT_BLOCK_EVENTS);
         for (int i = 0; i < n; i++) {
-            if (total >= cap) {
+            if (ce->count >= cap) {
                 cap *= 2;
-                struct pgwt_trace_event *tmp = realloc(events, cap * sizeof(*tmp));
+                struct pgwt_trace_event *tmp = realloc(ce->events, cap * sizeof(*tmp));
                 if (!tmp) break;
-                events = tmp;
-            }
-            events[total] = block_buf[i];
-            events[total].timestamp_ns =
-                pgwt_reader_mono_to_wall(&reader, block_buf[i].timestamp_ns);
-            total++;
-        }
-    }
-    pgwt_reader_close(&reader);
-    *out_count = total;
-    return events;
-}
-
-/* Incrementally read new blocks from current.trace into an existing cache entry.
- * Only reads blocks beyond ce->last_num_blocks. */
-static void cache_read_incremental(struct file_cache_entry *ce)
-{
-    struct pgwt_event_reader reader;
-    if (pgwt_reader_open(&reader, ce->path) != 0)
-        return;
-
-    /* Detect file rotation: if num_blocks < last_num_blocks, the file
-     * was replaced (rotated). Reset cache and re-read from start. */
-    if (reader.num_blocks < ce->last_num_blocks) {
-        ce->count = 0;
-        ce->last_num_blocks = 0;
-    }
-
-    ce->mono_to_wall = reader.mono_to_wall;
-
-    struct pgwt_trace_event block_buf[PGWT_BLOCK_EVENTS];
-
-    for (int b = ce->last_num_blocks; b < reader.num_blocks; b++) {
-        int n = pgwt_reader_decode_block(&reader, b, block_buf, PGWT_BLOCK_EVENTS);
-        for (int i = 0; i < n; i++) {
-            if (ce->count >= ce->capacity) {
-                ce->capacity = ce->capacity ? ce->capacity * 2 : 16384;
-                struct pgwt_trace_event *tmp =
-                    realloc(ce->events, ce->capacity * sizeof(*tmp));
-                if (!tmp) { pgwt_reader_close(&reader); return; }
                 ce->events = tmp;
             }
             ce->events[ce->count] = block_buf[i];
@@ -481,70 +462,78 @@ static void cache_read_incremental(struct file_cache_entry *ce)
             ce->count++;
         }
     }
-    ce->last_num_blocks = reader.num_blocks;
     pgwt_reader_close(&reader);
-}
-
-/* Get cached events for a file. Immutable files are read once.
- * current.trace reads incrementally (only new blocks since last read). */
-static struct file_cache_entry *
-get_cached_file(struct pgwt_server *srv, int file_idx)
-{
-    const char *path = srv->files[file_idx].path;
-    int is_current = is_current_trace(path);
-
-    /* Look for existing cache entry */
-    for (int i = 0; i < srv->cache_count; i++) {
-        if (strcmp(srv->cache[i].path, path) == 0) {
-            if (srv->cache[i].immutable)
-                return &srv->cache[i];  /* immutable — use cache */
-            /* current.trace — read only new blocks */
-            cache_read_incremental(&srv->cache[i]);
-            return &srv->cache[i];
-        }
-    }
-
-    /* New entry */
-    if (srv->cache_count >= 256)
-        return NULL;
-
-    struct file_cache_entry *ce = &srv->cache[srv->cache_count++];
-    memset(ce, 0, sizeof(*ce));
-    snprintf(ce->path, sizeof(ce->path), "%s", path);
-    ce->immutable = !is_current;
-
-    if (ce->immutable) {
-        ce->events = load_file_events(path, &ce->count);
-    } else {
-        /* First read of current.trace — read all existing blocks */
-        cache_read_incremental(ce);
-    }
     return ce;
 }
 
-/* Rescan trace_dir for new files (current.trace may have appeared/grown,
- * new .trace.lz4 files from rotation). */
-static void server_rescan_files(struct pgwt_server *srv)
+/* Read events from current.trace for a time range — on demand, no caching.
+ * Opens file, seeks to the right blocks via block index, decodes only
+ * the blocks that overlap [from_wall_ns, to_wall_ns].
+ * Appends to events array at *total, growing if needed. */
+static void load_current_trace_range(const char *path,
+                                      uint64_t from_wall_ns, uint64_t to_wall_ns,
+                                      struct pgwt_trace_event **events,
+                                      int *total, int *cap)
 {
-    int old_count = srv->num_files;
-    srv->num_files = pgwt_scan_trace_files(srv->trace_dir, srv->files, 256);
-    if (srv->num_files > old_count) {
-        /* Update time range */
-        for (int i = 0; i < srv->num_files; i++) {
-            if (srv->files[i].start_wall_ns > 0) {
-                if (srv->files[i].start_wall_ns < srv->earliest_wall_ns)
-                    srv->earliest_wall_ns = srv->files[i].start_wall_ns;
+    struct pgwt_event_reader reader;
+    if (pgwt_reader_open(&reader, path) != 0)
+        return;
+
+    uint64_t from_mono = pgwt_reader_wall_to_mono(&reader, from_wall_ns);
+    uint64_t to_mono   = pgwt_reader_wall_to_mono(&reader, to_wall_ns);
+
+    int first_block = pgwt_reader_find_block(&reader, from_mono);
+    struct pgwt_trace_event block_buf[PGWT_BLOCK_EVENTS];
+
+    for (int b = first_block; b < reader.num_blocks; b++) {
+        if (reader.block_index[b].timestamp_ns > to_mono)
+            break;
+
+        int n = pgwt_reader_decode_block(&reader, b, block_buf, PGWT_BLOCK_EVENTS);
+        for (int i = 0; i < n; i++) {
+            uint64_t ts_mono = block_buf[i].timestamp_ns;
+            if (ts_mono < from_mono) continue;
+            if (ts_mono > to_mono) break;
+
+            if (*total >= *cap) {
+                *cap *= 2;
+                struct pgwt_trace_event *tmp = realloc(*events, *cap * sizeof(**events));
+                if (!tmp) { pgwt_reader_close(&reader); return; }
+                *events = tmp;
             }
+
+            (*events)[*total] = block_buf[i];
+            (*events)[*total].timestamp_ns =
+                pgwt_reader_mono_to_wall(&reader, ts_mono);
+            (*total)++;
         }
     }
+    pgwt_reader_close(&reader);
+}
+
+/* Get latest wall-clock timestamp from current.trace — quick, O(1).
+ * Opens file, reads last block header, converts, closes. */
+static uint64_t get_current_trace_latest(const char *path)
+{
+    struct pgwt_event_reader reader;
+    if (pgwt_reader_open(&reader, path) != 0)
+        return 0;
+
+    uint64_t latest = 0;
+    if (reader.num_blocks > 0)
+        latest = pgwt_reader_mono_to_wall(&reader,
+            reader.block_index[reader.num_blocks - 1].timestamp_ns);
+
+    pgwt_reader_close(&reader);
+    return latest;
 }
 
 /* ── Event loading ────────────────────────────────────────── */
 
 /*
- * Load all events in [from_wall_ns, to_wall_ns] from trace files.
- * If from/to are 0, use full range. Timestamps in returned events
- * are wall-clock nanoseconds. Uses per-file cache.
+ * Load events in [from_wall_ns, to_wall_ns] from trace files.
+ * Immutable .trace.lz4: from cache (read once per session).
+ * current.trace: on-demand block reads (no caching, no memory growth).
  * Returns malloc'd array. Caller must free(). Sets *out_count.
  */
 static struct pgwt_trace_event *
@@ -554,47 +543,51 @@ server_load_events(struct pgwt_server *srv,
 {
     *out_count = 0;
 
-    /* Rescan for new/updated files */
-    server_rescan_files(srv);
+    /* Quick rescan for new files (directory listing only, no file opens) */
+    srv->num_files = pgwt_scan_trace_files(srv->trace_dir, srv->files, 256);
 
     if (from_wall_ns == 0)
         from_wall_ns = srv->earliest_wall_ns;
     if (to_wall_ns == 0)
         to_wall_ns = srv->latest_wall_ns;
 
-    /* Collect events from cached files, filtering by time range */
     int cap = 65536;
     struct pgwt_trace_event *events = malloc(cap * sizeof(*events));
     if (!events) return NULL;
     int total = 0;
 
     for (int fi = 0; fi < srv->num_files; fi++) {
-        struct file_cache_entry *ce = get_cached_file(srv, fi);
-        if (!ce || !ce->events)
-            continue;
+        const char *path = srv->files[fi].path;
 
-        /* Filter cached events by wall-clock time range */
-        for (int i = 0; i < ce->count; i++) {
-            uint64_t ts = ce->events[i].timestamp_ns;
-            if (ts < from_wall_ns)
+        if (is_current_trace(path)) {
+            /* On-demand: read only blocks in [from, to] */
+            load_current_trace_range(path, from_wall_ns, to_wall_ns,
+                                     &events, &total, &cap);
+        } else {
+            /* Immutable: use cache */
+            struct file_cache_entry *ce = get_cached_immutable(srv, path);
+            if (!ce || !ce->events) continue;
+
+            /* Skip file entirely if its time range doesn't overlap */
+            if (ce->last_wall_ns > 0 && ce->first_wall_ns > to_wall_ns)
                 continue;
-            if (ts > to_wall_ns)
-                break;  /* events are sorted by time */
+            if (ce->last_wall_ns > 0 && ce->last_wall_ns < from_wall_ns)
+                continue;
 
-            /* Grow buffer if needed */
-            if (total >= cap) {
-                cap *= 2;
-                struct pgwt_trace_event *tmp = realloc(events,
-                    cap * sizeof(*events));
-                if (!tmp) {
-                    *out_count = total;
-                    return events;
+            /* Filter cached events by time range */
+            for (int i = 0; i < ce->count; i++) {
+                uint64_t ts = ce->events[i].timestamp_ns;
+                if (ts < from_wall_ns) continue;
+                if (ts > to_wall_ns) break;
+
+                if (total >= cap) {
+                    cap *= 2;
+                    struct pgwt_trace_event *tmp = realloc(events, cap * sizeof(*tmp));
+                    if (!tmp) { *out_count = total; return events; }
+                    events = tmp;
                 }
-                events = tmp;
+                events[total++] = ce->events[i];
             }
-
-            events[total] = ce->events[i];
-            total++;
         }
     }
 
@@ -685,39 +678,18 @@ static int should_use_summaries(struct pgwt_server *srv, struct pgwt_request *re
 
 static void handle_info(struct pgwt_server *srv, struct pgwt_request *req)
 {
-    /* Re-scan for new files */
+    /* Lightweight refresh: rescan directory, update latest_wall_ns from
+     * current.trace. earliest_wall_ns stays from server_init (stable).
+     * Only current.trace needs a file open — O(1) block header read. */
     srv->num_files = pgwt_scan_trace_files(srv->trace_dir, srv->files, 256);
 
-    /* Re-load query texts and backend metadata */
-    qt_map_clear(srv);
-    server_load_query_texts(srv);
-    free(srv->bm_map);
-    srv->bm_map = NULL;
-    srv->bm_capacity = 0;
-    srv->bm_count = 0;
-    server_load_backends(srv);
-
-    /* Re-compute time range */
-    srv->earliest_wall_ns = 0;
-    srv->latest_wall_ns   = 0;
-    srv->total_events     = 0;
-
+    /* Update latest_wall_ns from current.trace (one quick open+close) */
     for (int i = 0; i < srv->num_files; i++) {
-        struct pgwt_event_reader reader;
-        if (pgwt_reader_open(&reader, srv->files[i].path) != 0)
-            continue;
-        if (reader.num_blocks > 0) {
-            uint64_t first_wall = pgwt_reader_mono_to_wall(&reader,
-                reader.block_index[0].timestamp_ns);
-            uint64_t last_wall = pgwt_reader_mono_to_wall(&reader,
-                reader.block_index[reader.num_blocks - 1].timestamp_ns);
-            if (srv->earliest_wall_ns == 0 || first_wall < srv->earliest_wall_ns)
-                srv->earliest_wall_ns = first_wall;
-            if (last_wall > srv->latest_wall_ns)
-                srv->latest_wall_ns = last_wall;
-            srv->total_events += reader.num_blocks * PGWT_BLOCK_EVENTS;
+        if (is_current_trace(srv->files[i].path)) {
+            uint64_t t = get_current_trace_latest(srv->files[i].path);
+            if (t > srv->latest_wall_ns)
+                srv->latest_wall_ns = t;
         }
-        pgwt_reader_close(&reader);
     }
 
     cJSON *root = cJSON_CreateObject();
