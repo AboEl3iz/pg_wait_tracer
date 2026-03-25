@@ -405,8 +405,8 @@ function switchTab(tab) {
         if (concurrencyChart) { concurrencyChart.dispose(); concurrencyChart = null; }
     }
 
-    // Stop auto-refresh when switching to concurrency tab
-    if (tab === 'concurrency') {
+    // Stop auto-refresh when switching to analysis tabs
+    if (tab === 'concurrency' || tab === 'transitions') {
         stopAutoRefresh();
     }
 
@@ -1905,26 +1905,95 @@ async function refreshTransitions() {
     });
 }
 
+// Chain state: array of { event, pct } representing the path being explored
+let transitionChain = [];
+let _transEvents, _transLookup, _transFromTotals, _transTotal;
+
 function showFromDetail(fromEvent, events, lookup, fromTotals, total) {
+    // Save references for chain navigation
+    _transEvents = events;
+    _transLookup = lookup;
+    _transFromTotals = fromTotals;
+    _transTotal = total;
+
+    // Start a new chain from this event
+    transitionChain = [{ event: fromEvent, pct: 100 }];
+    renderChain();
+}
+
+function extendChain(toEvent) {
+    // Compute probability of this step
+    const last = transitionChain[transitionChain.length - 1];
+    const l = _transLookup[last.event + '|' + toEvent];
+    const totalOut = _transFromTotals[last.event] || 1;
+    const stepPct = l ? (l.value / totalOut * 100) : 0;
+    // Chain probability = product of all step percentages
+    const chainPct = last.pct * stepPct / 100;
+    transitionChain.push({ event: toEvent, pct: chainPct });
+    renderChain();
+}
+
+function truncateChain(idx) {
+    transitionChain = transitionChain.slice(0, idx + 1);
+    renderChain();
+}
+
+function renderChain() {
     const detailEl = document.getElementById('transitions-drilldown');
-    const totalOut = fromTotals[fromEvent] || 0;
+    if (!transitionChain.length) { detailEl.innerHTML = ''; return; }
+
+    const last = transitionChain[transitionChain.length - 1];
+    const fromEvent = last.event;
+    const totalOut = _transFromTotals[fromEvent] || 0;
+
+    // -- Chain breadcrumb --
+    let html = '<div style="padding:8px 0;display:flex;align-items:center;flex-wrap:wrap;gap:4px">' +
+        '<span style="color:#888;margin-right:4px">Chain:</span>';
+    transitionChain.forEach((step, i) => {
+        if (i > 0) {
+            const pct = (() => {
+                const prev = transitionChain[i - 1];
+                const l = _transLookup[prev.event + '|' + step.event];
+                const t = _transFromTotals[prev.event] || 1;
+                return l ? (l.value / t * 100).toFixed(0) : '?';
+            })();
+            html += `<span style="color:#666;font-size:18px;margin:0 2px">\u2192</span>` +
+                `<span style="color:#666;font-size:10px">${pct}%</span>` +
+                `<span style="color:#666;font-size:18px;margin:0 2px">\u2192</span>`;
+        }
+        const color = classColor(step.event) || '#888';
+        const isLast = i === transitionChain.length - 1;
+        html += `<span class="chain-step" data-idx="${i}" style="` +
+            `background:${isLast ? '#2a2a4a' : '#1a1a2e'};border:1px solid ${color};` +
+            `border-left:3px solid ${color};color:#ccc;padding:2px 8px;border-radius:4px;` +
+            `cursor:pointer;font-size:12px;${isLast ? 'font-weight:bold' : ''}">${esc(step.event)}</span>`;
+    });
+    if (transitionChain.length > 1) {
+        const chainProb = last.pct;
+        html += `<span style="color:#888;margin-left:8px;font-size:11px">` +
+            `(chain: ${chainProb < 1 ? chainProb.toFixed(1) : chainProb.toFixed(0)}%)</span>`;
+    }
+    html += '</div>';
+
+    // -- Outgoing table for the last state in the chain --
     if (totalOut === 0) {
-        detailEl.innerHTML = '';
+        html += '<p style="color:#666">No outgoing transitions from this state</p>';
+        detailEl.innerHTML = html;
         return;
     }
 
-    // Gather all outgoing transitions for this source
-    const outgoing = events
+    const outgoing = _transEvents
         .map(to => {
-            const l = lookup[fromEvent + '|' + to];
+            const l = _transLookup[fromEvent + '|' + to];
             return l ? { to, count: l.value, duration_ms: l.duration_ms } : null;
         })
         .filter(Boolean)
         .sort((a, b) => b.count - a.count);
 
-    let html = `<h3 style="color:#ccc;margin:10px 0 5px">` +
+    html += `<h3 style="color:#ccc;margin:5px 0">` +
         `${dot(fromEvent)} After <b>${esc(fromEvent)}</b> ` +
-        `<span style="color:#666">(${totalOut.toLocaleString()} outgoing)</span></h3>` +
+        `<span style="color:#666">(${totalOut.toLocaleString()} outgoing) ` +
+        `\u2014 click a row to extend chain</span></h3>` +
         '<table class="data-table"><thead><tr>' +
         '<th>Next State</th><th>Count</th><th>% of Outgoing</th><th>Distribution</th><th>Avg Dwell (ms)</th>' +
         '</tr></thead><tbody>';
@@ -1933,7 +2002,7 @@ function showFromDetail(fromEvent, events, lookup, fromTotals, total) {
         const avg = (o.duration_ms / o.count).toFixed(1);
         const barW = Math.min(pct, 100);
         const color = classColor(o.to) || '#4fc3f7';
-        html += `<tr>` +
+        html += `<tr class="chain-next" data-to="${esc(o.to)}" style="cursor:pointer">` +
             `<td>${dot(o.to)} ${esc(o.to)}</td>` +
             `<td>${o.count.toLocaleString()}</td>` +
             `<td>${pct.toFixed(1)}%</td>` +
@@ -1942,6 +2011,14 @@ function showFromDetail(fromEvent, events, lookup, fromTotals, total) {
     });
     html += '</tbody></table>';
     detailEl.innerHTML = html;
+
+    // Wire up chain navigation
+    detailEl.querySelectorAll('.chain-next').forEach(row => {
+        row.addEventListener('click', () => extendChain(row.dataset.to));
+    });
+    detailEl.querySelectorAll('.chain-step').forEach(step => {
+        step.addEventListener('click', () => truncateChain(+step.dataset.idx));
+    });
 }
 
 // -- Start --------------------------------------------------------------------
