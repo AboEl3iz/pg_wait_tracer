@@ -208,7 +208,11 @@ async function refreshTable() {
         return;
     }
     if (state.activeTab === 'concurrency') {
-        await refreshConcurrency();
+        /* Keep existing chart during auto-refresh — don't re-fetch.
+         * Only fetch when chart doesn't exist (first visit to tab). */
+        if (!concurrencyChart) {
+            await refreshConcurrency();
+        }
         return;
     }
     try {
