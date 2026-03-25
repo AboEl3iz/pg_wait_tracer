@@ -1600,13 +1600,17 @@ async function refreshTransitions() {
             num_buckets: 30,
         });
     } catch (e) {
-        container.innerHTML = '<p style="color:#888;padding:20px">Transitions: ' + e.message + '</p>';
+        container.innerHTML = '<p style="color:#888;padding:20px">Transitions error: ' + e.message + '</p>';
+        console.error('[transitions] error:', e);
         return;
     }
 
+    console.log('[transitions] response:', data ? 'total=' + data.total + ' links=' + (data.links ? data.links.length : 'null') : 'null');
+
     if (!data || !data.links || data.links.length === 0) {
         container.innerHTML = '<p style="color:#888;padding:20px">No transitions found (total=' +
-            (data ? data.total : 'null') + ', from=' + state.viewFrom + ', to=' + state.viewTo + ')</p>';
+            (data ? data.total : 'null') + ', links=' + (data && data.links ? data.links.length : 'none') +
+            ', from=' + state.viewFrom + ', to=' + state.viewTo + ')</p>';
         return;
     }
 
