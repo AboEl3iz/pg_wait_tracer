@@ -281,6 +281,14 @@ function fmtTime(ns, bucketNs) {
     return hms + '.' + frac.toFixed(6).slice(2);                                // us
 }
 
+function fmtTimeMs(ms) {
+    if (!ms) return '--';
+    const d = new Date(ms);
+    const hms = d.toUTCString().slice(17, 25);
+    const frac = ms % 1000;
+    return hms + '.' + String(frac).padStart(3, '0');
+}
+
 function fmtDuration(ns) {
     const s = ns / 1e9;
     if (s < 60) return s.toFixed(0) + 's';
@@ -1582,7 +1590,7 @@ async function refreshConcurrency() {
         '</tr></thead><tbody>';
 
     topPeaks.forEach(p => {
-        html += `<tr><td>${fmtTime(p.t)}</td><td>${p.event || 'CPU*'}</td>` +
+        html += `<tr><td>${fmtTimeMs(p.t_ms)}</td><td>${p.event || 'CPU*'}</td>` +
                 `<td><b>${p.max}</b></td></tr>`;
     });
     html += '</tbody></table>';
@@ -1597,7 +1605,7 @@ async function refreshConcurrency() {
                 '</tr></thead><tbody>';
 
         bursts.forEach(b => {
-            const time = fmtTime(b.timestamp_ns);
+            const time = fmtTimeMs(b.timestamp_ms);
             const pids = (b.pids || []).slice(0, 8).join(', ') +
                          (b.pids && b.pids.length > 8 ? '...' : '');
             html += `<tr><td>${time}</td><td>${b.event}</td>` +
