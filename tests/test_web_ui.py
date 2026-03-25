@@ -102,7 +102,7 @@ def test_tabs(page):
 
     tabs = page.query_selector_all(".tab")
     tab_names = [t.text_content() for t in tabs]
-    expected = ["Overview", "Events", "Sessions", "Queries", "Histogram", "Timeline", "Transitions"]
+    expected = ["Overview", "Events", "Sessions", "Queries", "Histogram", "Timeline", "Transitions", "Concurrency"]
     check(tab_names == expected,
           f"Tabs: {tab_names}")
 
@@ -628,44 +628,43 @@ def test_chart_rendering(page):
     check(height > 100, f"Chart height = {height}px (expected > 100)")
 
 
-def test_concurrency_overlay(page):
-    """15b. AAS chart includes concurrency overlay (Peak Concurrency line)."""
-    print("--- Test 15b: Concurrency Overlay ---")
+def test_concurrency_tab(page):
+    """15b. Concurrency tab shows peak chart and burst table."""
+    print("--- Test 15b: Concurrency Tab ---")
 
     page.goto(MOCK_URL)
     page.wait_for_selector("#status.connected", timeout=10000)
-    page.wait_for_timeout(2000)
 
-    # Stop auto-refresh — concurrency overlay only runs on manual refresh
+    # Stop auto-refresh so concurrency loads fully
     page.click("#live-btn")
     page.wait_for_timeout(500)
-    # Trigger a manual refresh by selecting "All" time range
-    page.click("#time-range")
-    page.wait_for_timeout(300)
-    page.click(".tp-quick button[data-range='0']")
-    page.wait_for_timeout(2000)
 
-    # The chart should have a "Peak Concurrency" legend entry
-    legend_text = page.evaluate("""
+    page.click(".tab[data-tab='concurrency']")
+    page.wait_for_timeout(3000)
+
+    active = page.query_selector(".tab.active")
+    check(active and active.text_content() == "Concurrency",
+          "Concurrency tab active")
+
+    # Peak chart should render
+    chart_el = page.query_selector("#concurrency-chart")
+    check(chart_el is not None, "Peak concurrency chart container exists")
+
+    has_chart = page.evaluate("""
         () => {
-            const c = echarts.getInstanceByDom(document.getElementById('chart-container'));
-            if (!c) return '';
-            const opt = c.getOption();
-            return (opt.legend && opt.legend[0] && opt.legend[0].data)
-                ? opt.legend[0].data.join(',') : '';
+            const el = document.getElementById('concurrency-chart');
+            return el && echarts.getInstanceByDom(el) != null;
         }
     """)
-    check("Peak Concurrency" in legend_text,
-          f"Chart legend includes Peak Concurrency (got: {legend_text[:80]})")
+    check(has_chart, "Peak concurrency ECharts instance rendered")
 
-    # Should have more than just the stacked area series
-    num_series = page.evaluate("""
-        () => {
-            const c = echarts.getInstanceByDom(document.getElementById('chart-container'));
-            return c ? c.getOption().series.length : 0;
-        }
-    """)
-    check(num_series > 2, f"Chart has {num_series} series (expected > 2 with overlay)")
+    # Burst table should exist
+    burst_el = page.query_selector("#burst-table")
+    check(burst_el is not None, "Burst table container exists")
+
+    burst_text = burst_el.text_content() if burst_el else ""
+    check("Burst Events" in burst_text or "No burst" in burst_text,
+          "Burst section has content")
 
 
 def test_reconnection(page, mock_proc):
@@ -1065,7 +1064,7 @@ def main():
             test_zoom_out(page)
             test_auto_refresh(page)
             test_chart_rendering(page)
-            test_concurrency_overlay(page)
+            test_concurrency_tab(page)
             test_session_drill_to_timeline(page)
             test_query_drill(page)
 

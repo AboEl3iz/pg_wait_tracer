@@ -207,6 +207,10 @@ async function refreshTable() {
         await refreshTransitions();
         return;
     }
+    if (state.activeTab === 'concurrency') {
+        await refreshConcurrency();
+        return;
+    }
     try {
         const cmdMap = {
             overview: 'time_model',
@@ -388,6 +392,9 @@ function switchTab(tab) {
     }
     if (state.activeTab === 'transitions' && tab !== 'transitions') {
         if (sankeyChart) { sankeyChart.dispose(); sankeyChart = null; }
+    }
+    if (state.activeTab === 'concurrency' && tab !== 'concurrency') {
+        if (concurrencyChart) { concurrencyChart.dispose(); concurrencyChart = null; }
     }
     state.activeTab = tab;
     document.querySelectorAll('.tab').forEach(b => {
@@ -781,71 +788,10 @@ function renderChart(data) {
 
     chart.setOption(option, true);
 
-    // Concurrency overlay only on manual refresh (not auto-refresh)
-    // to avoid loading millions of raw events on every 5-second tick.
-    if (!autoRefreshInterval) {
-        fetchConcurrencyOverlay(times, bns);
-    }
+    // Concurrency moved to dedicated tab (not overlay)
 }
 
-async function fetchConcurrencyOverlay(times, bns) {
-    try {
-        const data = await send('concurrency', {
-            from: state.viewFrom,
-            to: state.viewTo,
-            num_buckets: times.length,
-            filters: state.filters,
-        });
-        if (!data || !data.peaks || !chart) return;
-
-        // Build peak concurrency line data
-        const peakData = data.peaks.map(p => p.max || 0);
-        const maxPeak = Math.max(...peakData, 1);
-
-        // Build burst markers
-        const burstMarkers = (data.bursts || []).map(b => {
-            // Find closest time bucket
-            const idx = data.peaks.findIndex(p => p.t >= b.timestamp_ns);
-            return {
-                name: `${b.event}\n${b.sessions} sessions`,
-                coord: [Math.max(0, idx), peakData[Math.max(0, idx)] || 0],
-                value: b.sessions,
-                itemStyle: { color: '#f44' },
-                symbol: 'triangle',
-                symbolSize: Math.min(8 + b.sessions, 20),
-            };
-        });
-
-        // Add secondary Y-axis + line series to existing chart
-        const opt = chart.getOption();
-        opt.yAxis.push({
-            type: 'value',
-            name: 'Peak Sessions',
-            nameTextStyle: { color: '#f8a', fontSize: 10 },
-            position: 'right',
-            min: 0,
-            max: maxPeak + 2,
-            axisLabel: { color: '#f8a', fontSize: 10 },
-            splitLine: { show: false },
-        });
-        opt.series.push({
-            name: 'Peak Concurrency',
-            type: 'line',
-            yAxisIndex: 1,
-            data: peakData,
-            lineStyle: { color: '#f8a', width: 1, type: 'dashed' },
-            itemStyle: { color: '#f8a' },
-            symbol: 'none',
-            z: 10,
-            markPoint: burstMarkers.length > 0 ? {
-                data: burstMarkers,
-                label: { show: false },
-            } : undefined,
-        });
-        opt.legend[0].data.push('Peak Concurrency');
-        chart.setOption(opt);
-    } catch (e) { /* ignore — concurrency overlay is optional */ }
-}
+// Concurrency overlay removed — moved to dedicated Concurrency tab
 
 // -- Tables -------------------------------------------------------------------
 
@@ -1521,6 +1467,127 @@ function renderTimeline(container, data) {
     };
 
     timelineChart.setOption(option, true);
+}
+
+// -- Concurrency tab ----------------------------------------------------------
+
+let concurrencyChart = null;
+
+async function refreshConcurrency() {
+    const container = document.getElementById('table-container');
+
+    let data;
+    try {
+        data = await send('concurrency', {
+            from: state.viewFrom,
+            to: state.viewTo,
+            buckets: 120,
+            filters: state.filters,
+        });
+    } catch (e) {
+        container.innerHTML = '<p style="color:#888;padding:20px">Concurrency: ' + e.message + '</p>';
+        return;
+    }
+
+    if (!data || !data.peaks || data.peaks.length === 0) {
+        container.innerHTML = '<p style="color:#888;padding:20px">No concurrency data</p>';
+        return;
+    }
+
+    // Build HTML: chart + burst table
+    container.innerHTML =
+        '<div id="concurrency-chart" style="width:100%;height:350px;"></div>' +
+        '<div id="burst-table" style="padding:10px;"></div>';
+
+    // -- Peak concurrency line chart --
+    const el = document.getElementById('concurrency-chart');
+    if (!concurrencyChart) concurrencyChart = echarts.init(el, 'dark');
+
+    const times = data.peaks.map(p => p.t);
+    const peakData = data.peaks.map(p => p.max || 0);
+    const peakEvents = data.peaks.map(p => p.event || '');
+
+    // Burst markers on the line
+    const burstPoints = (data.bursts || []).map(b => {
+        const idx = data.peaks.findIndex(p => p.t >= b.timestamp_ns);
+        return {
+            coord: [Math.max(0, idx), peakData[Math.max(0, idx)] || b.sessions],
+            value: b.sessions,
+            symbol: 'triangle',
+            symbolSize: Math.min(10 + b.sessions * 2, 30),
+            itemStyle: { color: '#f44' },
+            label: { show: true, formatter: b.sessions + '', color: '#fff', fontSize: 10 },
+        };
+    });
+
+    concurrencyChart.setOption({
+        title: {
+            text: 'Peak Concurrent Sessions per Wait Event',
+            left: 'center',
+            textStyle: { color: '#ccc', fontSize: 14 },
+        },
+        tooltip: {
+            trigger: 'axis',
+            formatter: params => {
+                if (!params.length) return '';
+                const idx = params[0].dataIndex;
+                const ev = peakEvents[idx] || 'none';
+                return fmtTime(params[0].axisValue) + '<br/>' +
+                       'Peak: <b>' + params[0].value + ' sessions</b><br/>' +
+                       'Event: ' + ev;
+            },
+        },
+        grid: { left: 60, right: 30, top: 50, bottom: 40 },
+        xAxis: {
+            type: 'category',
+            data: times,
+            axisLabel: {
+                color: '#888', fontSize: 10,
+                formatter: v => fmtTime(v),
+            },
+        },
+        yAxis: {
+            type: 'value',
+            name: 'Simultaneous Sessions',
+            nameTextStyle: { color: '#888', fontSize: 11 },
+            min: 0,
+            axisLabel: { color: '#888' },
+            splitLine: { lineStyle: { color: '#2a2a4a' } },
+        },
+        series: [{
+            type: 'line',
+            data: peakData,
+            areaStyle: { color: 'rgba(248,170,170,0.15)' },
+            lineStyle: { color: '#f8a', width: 2 },
+            itemStyle: { color: '#f8a' },
+            symbol: 'none',
+            markPoint: burstPoints.length > 0 ? { data: burstPoints } : undefined,
+        }],
+    }, true);
+
+    // -- Burst table --
+    const bursts = data.bursts || [];
+    if (bursts.length === 0) {
+        document.getElementById('burst-table').innerHTML =
+            '<p style="color:#666">No burst events detected (threshold: 4+ sessions within 10ms)</p>';
+        return;
+    }
+
+    let html = '<h3 style="color:#ccc;margin:10px 0 5px">Burst Events</h3>' +
+        '<table class="data-table"><thead><tr>' +
+        '<th>Time</th><th>Wait Event</th><th>Sessions</th><th>PIDs</th>' +
+        '</tr></thead><tbody>';
+
+    bursts.forEach(b => {
+        const time = fmtTime(b.timestamp_ns);
+        const pids = (b.pids || []).slice(0, 8).join(', ') +
+                     (b.pids && b.pids.length > 8 ? '...' : '');
+        html += `<tr><td>${time}</td><td>${b.event}</td>` +
+                `<td><b>${b.sessions}</b></td><td>${pids}</td></tr>`;
+    });
+
+    html += '</tbody></table>';
+    document.getElementById('burst-table').innerHTML = html;
 }
 
 // -- Auto-refresh for "last N" ranges -----------------------------------------
