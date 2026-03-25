@@ -185,6 +185,7 @@ async function refreshChart() {
             params.detail = 'events';
         }
         const data = await send('aas', params);
+        console.log('[aas] from:', params.from, 'to:', params.to, 'buckets:', data?.buckets?.length, 'max_aas:', data?.max_aas);
         renderChart(data);
     } catch (e) { /* ignore on disconnect */ }
 }
@@ -1530,15 +1531,15 @@ function startAutoRefresh(rangeSecs) {
     autoRefreshInterval = setInterval(async () => {
         try {
             // Re-fetch info to get updated time range from server.
-            // The server reads the last block header of current.trace
-            // (validated against corrupt/partial writes).
             const info = await send('info', {});
+            console.log('[auto-refresh] info:', JSON.stringify(info));
             if (info && info.to_ns) {
                 state.toNs = info.to_ns;
                 if (info.from_ns) state.fromNs = info.from_ns;
             }
             state.viewFrom = state.toNs - rangeSecs * 1e9;
             state.viewTo = state.toNs;
+            console.log('[auto-refresh] viewFrom:', state.viewFrom, 'viewTo:', state.viewTo);
             refresh();
         } catch (e) { /* ignore on disconnect */ }
     }, 5000);
