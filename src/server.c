@@ -1260,9 +1260,17 @@ static void handle_transitions(struct pgwt_server *srv, struct pgwt_request *req
     struct pgwt_trace_event *events =
         server_load_events(srv, req->from_ns, req->to_ns, &count);
 
+    /* Cap events for transitions to avoid O(n) on millions of events.
+     * Use only the most recent events if too many. */
+    int offset = 0;
+    if (count > 500000) {
+        offset = count - 500000;
+        count = 500000;
+    }
+
     int max_rows = req->num_buckets > 0 ? req->num_buckets : 50;
     struct pgwt_transitions_result res;
-    pgwt_compute_transitions(events, count, &req->filter, max_rows, &res);
+    pgwt_compute_transitions(events + offset, count, &req->filter, max_rows, &res);
     free(events);
 
     cJSON *root = cJSON_CreateObject();
