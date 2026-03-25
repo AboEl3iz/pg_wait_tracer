@@ -1742,11 +1742,8 @@ async function refreshTransitions() {
         .sort((a, b) => involvement[b] - involvement[a])
         .slice(0, 15);  // Cap at 15 for readability
 
-    // Short label: "LWLock:LockManager" → "LockManager", "CPU*" stays
-    const shortName = name => {
-        const colon = name.indexOf(':');
-        return colon > 0 ? name.substring(colon + 1) : name;
-    };
+    // Keep full Type:Event format for labels
+    const shortName = name => name;
 
     // Build heatmap data: [toIdx, fromIdx, count]
     const heatData = [];
@@ -1799,7 +1796,7 @@ async function refreshTransitions() {
                        `Avg dwell in source: ${dur} ms`;
             },
         },
-        grid: { left: 160, right: 40, top: 80, bottom: 120 },
+        grid: { left: 200, right: 40, top: 80, bottom: 160 },
         xAxis: {
             type: 'category',
             data: shortLabels,
