@@ -150,8 +150,12 @@ async function init() {
         const FIFTEEN_MIN_NS = 900 * 1e9;
         const serverNow = info.now_ns || info.to_ns;
         state.serverNow = serverNow;
-        state.viewFrom = serverNow - FIFTEEN_MIN_NS;
-        state.viewTo = serverNow;
+        /* Use serverNow if data is recent (within 2x the window).
+         * Otherwise anchor to latest data so the chart isn't empty. */
+        const anchor = (serverNow - info.to_ns < 2 * FIFTEEN_MIN_NS)
+            ? serverNow : info.to_ns;
+        state.viewFrom = anchor - FIFTEEN_MIN_NS;
+        state.viewTo = anchor;
         state.liveRangeSecs = 900;
         setStatus(info.num_cpus + ' CPUs, ~' + fmtCount(info.num_events) + ' events', 'connected');
         updateTimeRange();
@@ -600,10 +604,13 @@ function initTimePicker() {
                 // "All" — full range, no auto-refresh
                 zoomTo(state.fromNs, state.toNs);
             } else {
-                // "Last N" — relative range from server's "now"
+                // "Last N" — use real time if data is fresh, else latest data
                 state.liveRangeSecs = secs;
-                const end = state.serverNow || state.toNs;
-                const from = end - secs * 1e9;
+                const windowNs = secs * 1e9;
+                const srvNow = state.serverNow || state.toNs;
+                const end = (srvNow - state.toNs < 2 * windowNs)
+                    ? srvNow : state.toNs;
+                const from = end - windowNs;
                 zoomTo(from, end);
                 startAutoRefresh(secs);
             }
@@ -1540,8 +1547,12 @@ function startAutoRefresh(rangeSecs) {
                 if (info.from_ns) state.fromNs = info.from_ns;
                 const serverNow = info.now_ns || info.to_ns;
                 state.serverNow = serverNow;
-                state.viewFrom = serverNow - rangeSecs * 1e9;
-                state.viewTo = serverNow;
+                /* Use real time if data is fresh, otherwise anchor to latest data */
+                const windowNs = rangeSecs * 1e9;
+                const anchor = (serverNow - state.toNs < 2 * windowNs)
+                    ? serverNow : state.toNs;
+                state.viewFrom = anchor - windowNs;
+                state.viewTo = anchor;
             }
             console.log('[auto-refresh] viewFrom:', state.viewFrom, 'viewTo:', state.viewTo);
             refresh();
@@ -1569,9 +1580,11 @@ function initLiveMode() {
         if (autoRefreshInterval) {
             stopAutoRefresh();
         } else {
-            // Default: last 5 minutes from server's "now"
+            // Default: last 5 minutes, anchored to data if stale
             state.liveRangeSecs = 300;
-            const end = state.serverNow || state.toNs;
+            const srvNow = state.serverNow || state.toNs;
+            const end = (srvNow - state.toNs < 600e9)
+                ? srvNow : state.toNs;
             state.viewFrom = end - 300e9;
             state.viewTo = end;
             startAutoRefresh(300);
