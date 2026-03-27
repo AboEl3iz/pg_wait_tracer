@@ -996,7 +996,14 @@ function renderApexChart(data) {
             type: 'solid',
             opacity: 0.85,
         },
-        legend: { show: false },  // custom legend below
+        legend: {
+            show: true,
+            position: 'bottom',
+            horizontalAlign: 'center',
+            fontSize: '11px',
+            labels: { colors: '#888' },
+            markers: { size: 8 },
+        },
         grid: {
             borderColor: '#2a2a4a',
             padding: { left: 10, right: 10 },
@@ -1010,102 +1017,6 @@ function renderApexChart(data) {
         apexChart = new ApexCharts(apexEl, options);
         apexChart.render();
     }
-
-    // -- Custom legend with hover-isolate and click-solo/exclude --
-    const names = seriesList.map(s => s.name);
-    const colors = colorList;
-    let legendEl = document.getElementById('apex-legend');
-    if (!legendEl) {
-        legendEl = document.createElement('div');
-        legendEl.id = 'apex-legend';
-        legendEl.style.cssText = 'display:flex;flex-wrap:wrap;gap:6px;justify-content:center;padding:8px 0;';
-        apexEl.appendChild(legendEl);
-    }
-
-    // Track which series are hidden
-    if (!state.apexHidden) state.apexHidden = new Set();
-
-    legendEl.innerHTML = names.map((name, i) => {
-        const hidden = state.apexHidden.has(i);
-        return `<span class="apex-legend-item" data-idx="${i}" style="` +
-            `display:inline-flex;align-items:center;gap:4px;cursor:pointer;padding:2px 8px;` +
-            `border-radius:4px;font-size:11px;color:${hidden ? '#555' : '#ccc'};` +
-            `opacity:${hidden ? '0.4' : '1'};transition:opacity 0.15s">` +
-            `<span style="width:10px;height:10px;border-radius:2px;background:${colors[i]}"></span>` +
-            `${esc(name)}</span>`;
-    }).join('');
-
-    // Hover: isolate (dim all others)
-    legendEl.querySelectorAll('.apex-legend-item').forEach(item => {
-        const idx = +item.dataset.idx;
-
-        item.addEventListener('mouseenter', () => {
-            if (!apexChart) return;
-            // Dim all series except hovered
-            names.forEach((_, i) => {
-                apexChart.updateSeries(
-                    apexChart.w.config.series.map((s, si) => ({
-                        ...s,
-                    })),
-                    false
-                );
-            });
-            // Use ApexCharts internal — set opacity on SVG paths
-            const paths = apexEl.querySelectorAll('.apexcharts-series');
-            paths.forEach((p, i) => {
-                p.style.opacity = i === idx ? '1' : '0.1';
-            });
-        });
-
-        item.addEventListener('mouseleave', () => {
-            // Restore all visible series
-            const paths = apexEl.querySelectorAll('.apexcharts-series');
-            paths.forEach((p, i) => {
-                p.style.opacity = state.apexHidden.has(i) ? '0' : '1';
-            });
-        });
-
-        item.addEventListener('click', (e) => {
-            if (!apexChart) return;
-            if (e.metaKey || e.ctrlKey) {
-                // Cmd/Ctrl+click: toggle this one off/on
-                if (state.apexHidden.has(idx)) {
-                    state.apexHidden.delete(idx);
-                    apexChart.showSeries(names[idx]);
-                } else {
-                    state.apexHidden.add(idx);
-                    apexChart.hideSeries(names[idx]);
-                }
-            } else {
-                // Normal click: solo — show only this, hide all others
-                const allHiddenExceptThis = names.every((_, i) =>
-                    i === idx ? !state.apexHidden.has(i) : state.apexHidden.has(i));
-
-                if (allHiddenExceptThis) {
-                    // Already solo — restore all
-                    state.apexHidden.clear();
-                    names.forEach(n => apexChart.showSeries(n));
-                } else {
-                    // Solo this one
-                    state.apexHidden.clear();
-                    names.forEach((n, i) => {
-                        if (i === idx) {
-                            apexChart.showSeries(n);
-                        } else {
-                            state.apexHidden.add(i);
-                            apexChart.hideSeries(n);
-                        }
-                    });
-                }
-            }
-            // Update legend visual
-            legendEl.querySelectorAll('.apex-legend-item').forEach(el => {
-                const i = +el.dataset.idx;
-                el.style.opacity = state.apexHidden.has(i) ? '0.4' : '1';
-                el.style.color = state.apexHidden.has(i) ? '#555' : '#ccc';
-            });
-        });
-    });
 }
 
 // -- Tables -------------------------------------------------------------------
