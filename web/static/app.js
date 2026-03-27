@@ -2093,14 +2093,11 @@ async function refreshTransitions() {
             },
             series: [{
                 type: 'graph',
-                layout: 'force',
+                layout: 'circular',
                 roam: true,
                 draggable: true,
-                force: {
-                    repulsion: 300,
-                    gravity: 0.1,
-                    edgeLength: [80, 200],
-                    layoutAnimation: true,
+                circular: {
+                    rotateLabel: true,
                 },
                 data: ecNodes,
                 links: ecLinks,
