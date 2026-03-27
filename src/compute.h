@@ -346,4 +346,44 @@ void pgwt_compute_interference(const struct pgwt_trace_event *events, int count,
                                 const struct pgwt_filter *f, int max_rows,
                                 struct pgwt_interference_result *out);
 
+/* ── Variants (per-query execution flow patterns) ─────────── */
+
+/* A step in a compressed flow pattern */
+struct pgwt_variant_step {
+    uint32_t event_id;
+    char     name[64];
+    int      is_loop;          /* 1 if this step starts a loop */
+    int      loop_len;         /* number of events in the loop body */
+};
+
+#define PGWT_MAX_VARIANT_STEPS 32
+
+struct pgwt_variant {
+    struct pgwt_variant_step steps[PGWT_MAX_VARIANT_STEPS];
+    int      num_steps;
+    uint64_t hash;             /* hash of compressed pattern */
+    int      exec_count;       /* number of executions matching this pattern */
+    int      num_query_ids;    /* distinct query_ids */
+    uint64_t total_ns;         /* total wall time across all executions */
+    uint64_t avg_ns;           /* average execution time */
+    uint64_t p95_ns;           /* p95 execution time */
+    double   avg_loop_n;       /* average loop iteration count */
+    uint64_t top_query_id;     /* most frequent query_id */
+    /* Per-step timing (avg duration per step across executions) */
+    uint64_t step_avg_ns[PGWT_MAX_VARIANT_STEPS];
+};
+
+struct pgwt_variants_result {
+    struct pgwt_variant *variants;  /* malloc'd, caller frees */
+    int    num_variants;
+    int    total_executions;        /* total EXEC_START/END pairs found */
+};
+
+/* Extract per-query execution flow variants from trace events.
+ * Uses EXEC_START/END markers as case boundaries.
+ * Loop-compresses patterns, groups identical ones, ranks by total time. */
+void pgwt_compute_variants(const struct pgwt_trace_event *events, int count,
+                            const struct pgwt_filter *f, int max_variants,
+                            struct pgwt_variants_result *out);
+
 #endif /* PGWT_COMPUTE_H */

@@ -1493,6 +1493,71 @@ static void handle_concurrency(struct pgwt_server *srv, struct pgwt_request *req
     emit_json(root);
 }
 
+static void handle_variants(struct pgwt_server *srv, struct pgwt_request *req)
+{
+    int count;
+    struct pgwt_trace_event *events =
+        server_load_events(srv, req->from_ns, req->to_ns, &count);
+
+    int max_v = req->num_buckets > 0 ? req->num_buckets : 20;
+    struct pgwt_variants_result res;
+    pgwt_compute_variants(events, count, &req->filter, max_v, &res);
+    free(events);
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddNumberToObject(root, "id", (double)req->id);
+    cJSON_AddNumberToObject(root, "total_executions", res.total_executions);
+    cJSON_AddNumberToObject(root, "num_variants", res.num_variants);
+
+    cJSON *variants = cJSON_AddArrayToObject(root, "variants");
+    for (int i = 0; i < res.num_variants; i++) {
+        struct pgwt_variant *v = &res.variants[i];
+        cJSON *vj = cJSON_CreateObject();
+        cJSON_AddNumberToObject(vj, "exec_count", v->exec_count);
+        cJSON_AddNumberToObject(vj, "num_queries", v->num_query_ids);
+        cJSON_AddNumberToObject(vj, "total_ms", (double)v->total_ns / 1e6);
+        cJSON_AddNumberToObject(vj, "avg_ms", (double)v->avg_ns / 1e6);
+        cJSON_AddNumberToObject(vj, "p95_ms", (double)v->p95_ns / 1e6);
+        cJSON_AddNumberToObject(vj, "avg_loop_n", v->avg_loop_n);
+        cjson_add_int64(vj, "top_query_id", (int64_t)v->top_query_id);
+
+        /* Steps */
+        cJSON *steps = cJSON_AddArrayToObject(vj, "steps");
+        for (int s = 0; s < v->num_steps; s++) {
+            cJSON *sj = cJSON_CreateObject();
+            cJSON_AddStringToObject(sj, "name", v->steps[s].name);
+            cJSON_AddNumberToObject(sj, "avg_ms", (double)v->step_avg_ns[s] / 1e6);
+            if (v->steps[s].is_loop) {
+                cJSON_AddNumberToObject(sj, "loop", v->steps[s].loop_len);
+            }
+            /* Extract class for coloring */
+            const char *colon = strchr(v->steps[s].name, ':');
+            if (colon) {
+                char cls[32];
+                int len = colon - v->steps[s].name;
+                if (len > 31) len = 31;
+                memcpy(cls, v->steps[s].name, len);
+                cls[len] = '\0';
+                cJSON_AddStringToObject(sj, "class", cls);
+            } else {
+                cJSON_AddStringToObject(sj, "class", "cpu");
+            }
+            cJSON_AddItemToArray(steps, sj);
+        }
+
+        /* Query text if available */
+        if (v->top_query_id) {
+            const char *qt = qt_map_lookup(srv, v->top_query_id);
+            if (qt) cJSON_AddStringToObject(vj, "query_text", qt);
+        }
+
+        cJSON_AddItemToArray(variants, vj);
+    }
+
+    free(res.variants);
+    emit_json(root);
+}
+
 static void dispatch(struct pgwt_server *srv, struct pgwt_request *req)
 {
     if (strcmp(req->cmd, "info") == 0)
@@ -1519,6 +1584,8 @@ static void dispatch(struct pgwt_server *srv, struct pgwt_request *req)
         handle_concurrency(srv, req);
     else if (strcmp(req->cmd, "lock_chains") == 0)
         handle_lock_chains(srv, req);
+    else if (strcmp(req->cmd, "variants") == 0)
+        handle_variants(srv, req);
     else if (strcmp(req->cmd, "interference") == 0)
         handle_interference(srv, req);
     else {
