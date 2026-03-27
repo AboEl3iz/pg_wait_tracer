@@ -64,6 +64,16 @@ struct pgwt_trace_event {
 
 #define PGWT_EVENT_EXIT  0xFFFFFFFFU  /* sentinel new_event for process exit */
 
+/* Query lifecycle markers — emitted as trace events with these sentinels.
+ * old_event = marker type, new_event = marker type, duration_ns = 0.
+ * Inserted into the per-PID stream between wait events. */
+#define PGWT_MARKER_EXEC_START   0xFFFFFFF0U  /* query execution start (PortalRun entry) */
+#define PGWT_MARKER_EXEC_END     0xFFFFFFF1U  /* query execution end (PortalRun return) */
+#define PGWT_MARKER_PLAN_START   0xFFFFFFF2U  /* query planning start (pg_plan_query entry) */
+#define PGWT_MARKER_PLAN_END     0xFFFFFFF3U  /* query planning end (pg_plan_query return) */
+
+#define PGWT_IS_MARKER(e) ((e) >= 0xFFFFFFF0U && (e) <= 0xFFFFFFF3U)
+
 /* ── Wait Event Class IDs ─────────────────────────────────── */
 #define PG_WAIT_LWLOCK      0x01
 #define PG_WAIT_LOCK        0x03

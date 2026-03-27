@@ -87,6 +87,7 @@ struct pgwt_daemon {
     uint32_t    skip_query_id;          /* 1 = skip query_id reads in BPF */
     enum pgwt_exit_reason exit_reason;   /* why the event loop exited */
     char        pgdata[512];             /* stored for restart detection */
+    char        pg_binary[256];          /* path to postgres binary (for USDT probes) */
 
     /* Trace file recording */
     const char *trace_dir;                  /* NULL = disabled */

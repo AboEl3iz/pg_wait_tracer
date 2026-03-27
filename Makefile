@@ -15,7 +15,8 @@ TARGET     = pg_wait_tracer
 ARCH       := $(shell uname -m | sed 's/x86_64/x86/' | sed 's/aarch64/arm64/')
 
 BPF_CFLAGS = -g -O2 -target bpf -D__TARGET_ARCH_$(ARCH) \
-             -I$(INC_DIR) -I$(SRC_DIR)
+             -I$(INC_DIR) -I$(SRC_DIR) \
+             -I/usr/include/$(shell uname -m)-linux-gnu
 
 CFLAGS     = -g -O2 -Wall -Wextra -Wno-unused-parameter \
              -I$(INC_DIR) -I$(SRC_DIR)

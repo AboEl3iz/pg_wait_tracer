@@ -17,6 +17,7 @@
 #include "pg_wait_tracer.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
+#include <bpf/usdt.bpf.h>
 
 /* ringbuf submit flags (may not be in all header versions) */
 #ifndef BPF_RB_NO_WAKEUP
@@ -294,6 +295,64 @@ int on_exit(struct trace_event_raw_sched_process_template *ctx)
         ev->timestamp = now;
         bpf_ringbuf_submit(ev, 0);
     }
+    return 0;
+}
+
+/* ── Programs 5-8: USDT query lifecycle probes ────────────── */
+/* Emit marker events into the same ringbuf as wait events.
+ * Uses bpf_ktime_get_ns() — same clock as on_watchpoint.
+ * Only active in full trace mode (checked at emit time). */
+
+static __always_inline void emit_marker(u32 marker)
+{
+    if (lightweight_mode)
+        return;
+
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    u64 now = bpf_ktime_get_ns();
+
+    /* Read current query_id from backend status */
+    struct pgwt_pid_state *st = bpf_map_lookup_elem(&state_map, &pid);
+    u64 qid = 0;
+    if (st && !skip_query_id)
+        qid = read_query_id_cached(st->be_entry_ptr);
+
+    struct pgwt_trace_event evt = {
+        .timestamp_ns = now,
+        .pid = pid,
+        .old_event = marker,
+        .new_event = marker,
+        .duration_ns = 0,
+        .query_id = qid,
+    };
+    bpf_ringbuf_output(&event_ringbuf, &evt, sizeof(evt), BPF_RB_NO_WAKEUP);
+}
+
+SEC("usdt")
+int BPF_USDT(on_exec_start)
+{
+    emit_marker(PGWT_MARKER_EXEC_START);
+    return 0;
+}
+
+SEC("usdt")
+int BPF_USDT(on_exec_done)
+{
+    emit_marker(PGWT_MARKER_EXEC_END);
+    return 0;
+}
+
+SEC("usdt")
+int BPF_USDT(on_plan_start)
+{
+    emit_marker(PGWT_MARKER_PLAN_START);
+    return 0;
+}
+
+SEC("usdt")
+int BPF_USDT(on_plan_done)
+{
+    emit_marker(PGWT_MARKER_PLAN_END);
     return 0;
 }
 

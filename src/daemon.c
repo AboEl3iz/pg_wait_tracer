@@ -199,6 +199,32 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
         goto fail;
     }
 
+    /* Attach USDT query lifecycle probes (only in full trace mode) */
+    if (!d->lightweight_mode && d->pg_binary[0]) {
+        /* pid=-1: attach to all processes running this binary (all backends) */
+        d->skel->links.on_exec_start =
+            bpf_program__attach_usdt(d->skel->progs.on_exec_start,
+                                     -1, d->pg_binary,
+                                     "postgresql", "query__execute__start", NULL);
+        d->skel->links.on_exec_done =
+            bpf_program__attach_usdt(d->skel->progs.on_exec_done,
+                                     -1, d->pg_binary,
+                                     "postgresql", "query__execute__done", NULL);
+        d->skel->links.on_plan_start =
+            bpf_program__attach_usdt(d->skel->progs.on_plan_start,
+                                     -1, d->pg_binary,
+                                     "postgresql", "query__plan__start", NULL);
+        d->skel->links.on_plan_done =
+            bpf_program__attach_usdt(d->skel->progs.on_plan_done,
+                                     -1, d->pg_binary,
+                                     "postgresql", "query__plan__done", NULL);
+
+        if (d->skel->links.on_exec_start && d->skel->links.on_exec_done)
+            fprintf(stderr, "INFO: attached USDT query lifecycle probes\n");
+        else
+            fprintf(stderr, "WARN: could not attach USDT probes (query lifecycle tracking disabled)\n");
+    }
+
     /* Set up lifecycle ring buffer consumer */
     int rb_map_fd = bpf_map__fd(d->skel->maps.lifecycle_rb);
     d->rb = ring_buffer__new(rb_map_fd, handle_lifecycle_event, d, NULL);

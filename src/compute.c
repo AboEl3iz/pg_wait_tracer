@@ -1765,6 +1765,8 @@ void pgwt_compute_transitions(const struct pgwt_trace_event *events, int count,
             continue;
         if (ev->new_event == PGWT_EVENT_EXIT)
             continue;
+        if (PGWT_IS_MARKER(ev->old_event) || PGWT_IS_MARKER(ev->new_event))
+            continue;
 
         uint32_t from = ev->old_event;
         uint32_t to   = ev->new_event;

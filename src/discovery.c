@@ -566,6 +566,7 @@ int pgwt_discover(struct pgwt_daemon *d)
         fprintf(stderr, "FATAL: cannot resolve postgres binary for PID %d\n", pm_pid);
         return -1;
     }
+    snprintf(d->pg_binary, sizeof(d->pg_binary), "%s", binary);
     if (d->verbose)
         fprintf(stderr, "INFO: postgres binary: %s\n", binary);
 
