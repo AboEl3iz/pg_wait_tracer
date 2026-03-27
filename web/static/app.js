@@ -66,6 +66,9 @@ const state = {
     // Reconnect
     reconnectDelay: 2000,
     reconnectTimer: null,
+
+    // ApexCharts comparison mode
+    useApexChart: false,
 };
 
 // -- WebSocket ----------------------------------------------------------------
@@ -189,8 +192,11 @@ async function refreshChart() {
             params.detail = 'events';
         }
         const data = await send('aas', params);
-        console.log('[aas] from:', params.from, 'to:', params.to, 'buckets:', data?.buckets?.length, 'max_aas:', data?.max_aas);
-        renderChart(data);
+        if (state.useApexChart) {
+            renderApexChart(data);
+        } else {
+            renderChart(data);
+        }
     } catch (e) { /* ignore on disconnect */ }
 }
 
@@ -410,10 +416,27 @@ function switchTab(tab) {
         stopAutoRefresh();
     }
 
-    state.activeTab = tab;
+    // Toggle chart containers for ApexCharts vs ECharts
+    const ecContainer = document.getElementById('chart-container');
+    const apexContainer = document.getElementById('apex-chart-container');
+    if (tab === 'overview-new') {
+        state.useApexChart = true;
+        ecContainer.style.display = 'none';
+        apexContainer.style.display = 'block';
+    } else if (state.useApexChart) {
+        state.useApexChart = false;
+        ecContainer.style.display = 'block';
+        apexContainer.style.display = 'none';
+        if (apexChart) { apexChart.destroy(); apexChart = null; }
+    }
+
+    // overview-new uses the same table as overview
+    const displayTab = tab === 'overview-new' ? 'overview' : tab;
+    state.activeTab = displayTab;
     document.querySelectorAll('.tab').forEach(b => {
         b.classList.toggle('active', b.dataset.tab === tab);
     });
+    refreshChart();
     refreshTable();
 }
 
@@ -810,6 +833,172 @@ function renderChart(data) {
 }
 
 // Concurrency overlay removed — moved to dedicated Concurrency tab
+
+// -- ApexCharts AAS (comparison) ----------------------------------------------
+
+let apexChart = null;
+const apexEl = document.getElementById('apex-chart-container');
+
+function renderApexChart(data) {
+    if (!data || !data.buckets || data.buckets.length === 0) return;
+
+    const isEventBreakdown = data.breakdown === 'events' && data.series;
+
+    // Build series: each is { name, data: [[timestampMs, value], ...] }
+    let seriesList, colorList;
+
+    if (isEventBreakdown) {
+        seriesList = data.series.map((s, idx) => ({
+            name: s.name,
+            data: data.buckets.map(b => [b.t / 1e6, +(b.aas[idx] || 0).toFixed(4)]),
+        }));
+        colorList = data.series.map((_, idx) => EVENT_PALETTE[idx % EVENT_PALETTE.length]);
+    } else {
+        seriesList = WAIT_CLASSES.map(wc => ({
+            name: wc.label,
+            data: data.buckets.map(b => [b.t / 1e6, +(b[wc.key] || 0).toFixed(4)]),
+        }));
+        colorList = WAIT_CLASSES.map(c => c.color);
+    }
+
+    const yMax = Math.max(
+        data.max_aas * 1.2,
+        state.numCpus > 0 ? state.numCpus * 1.5 : 0,
+        1
+    );
+
+    const options = {
+        chart: {
+            type: 'area',
+            height: 300,
+            stacked: true,
+            animations: { enabled: false },
+            toolbar: { show: false },
+            zoom: {
+                enabled: true,
+                type: 'x',
+                autoScaleYaxis: false,
+            },
+            events: {
+                zoomed: function(ctx, { xaxis }) {
+                    if (xaxis.min && xaxis.max) {
+                        stopAutoRefresh();
+                        state.viewFrom = xaxis.min * 1e6;
+                        state.viewTo = xaxis.max * 1e6;
+                        updateTimeRange();
+                        refresh();
+                    }
+                },
+            },
+            background: 'transparent',
+        },
+        theme: { mode: 'dark' },
+        colors: colorList,
+        series: seriesList,
+        xaxis: {
+            type: 'datetime',
+            labels: {
+                datetimeUTC: true,
+                style: { colors: '#888', fontSize: '10px' },
+            },
+            axisBorder: { color: '#333' },
+            axisTicks: { color: '#333' },
+            crosshairs: {
+                show: true,
+                stroke: { color: '#666', width: 1, dashArray: 3 },
+            },
+        },
+        yaxis: {
+            min: 0,
+            max: yMax,
+            title: {
+                text: 'Active Sessions',
+                style: { color: '#888', fontSize: '11px' },
+            },
+            labels: {
+                formatter: v => v.toFixed(1),
+                style: { colors: '#888', fontSize: '10px' },
+            },
+        },
+        annotations: {
+            yaxis: state.numCpus > 0 ? [{
+                y: state.numCpus,
+                borderColor: '#E53935',
+                strokeDashArray: 4,
+                label: {
+                    text: state.numCpus + ' CPUs',
+                    position: 'right',
+                    textAnchor: 'end',
+                    borderColor: 'transparent',
+                    style: {
+                        background: '#E53935',
+                        color: '#fff',
+                        fontSize: '11px',
+                        padding: { left: 5, right: 5, top: 2, bottom: 2 },
+                    },
+                },
+            }] : [],
+        },
+        tooltip: {
+            shared: true,
+            theme: 'dark',
+            custom: function({ series, dataPointIndex, w }) {
+                const ts = w.globals.seriesX[0][dataPointIndex];
+                const t = fmtTime(ts * 1e6);
+                let total = 0;
+                let items = [];
+                for (let i = series.length - 1; i >= 0; i--) {
+                    const val = series[i][dataPointIndex] || 0;
+                    if (val > 0.001) {
+                        items.push({
+                            name: w.globals.seriesNames[i],
+                            value: val,
+                            color: w.globals.colors[i],
+                        });
+                        total += val;
+                    }
+                }
+                let html = '<div style="padding:8px;background:#1e1e3a;border:1px solid #333;border-radius:4px">' +
+                    '<b>' + t + '</b><br>Total AAS: <b>' + total.toFixed(2) + '</b><br>';
+                items.forEach(it => {
+                    const pct = total > 0 ? (it.value / total * 100).toFixed(0) : '0';
+                    html += '<span style="color:' + it.color + '">\u25cf</span> ' +
+                        it.name + ': <b>' + it.value.toFixed(2) + '</b> (' + pct + '%)<br>';
+                });
+                html += '</div>';
+                return html;
+            },
+        },
+        stroke: {
+            curve: 'straight',
+            width: 1,
+        },
+        fill: {
+            type: 'solid',
+            opacity: 0.85,
+        },
+        legend: {
+            show: true,
+            position: 'bottom',
+            horizontalAlign: 'center',
+            fontSize: '11px',
+            labels: { colors: '#888' },
+            markers: { size: 8 },
+        },
+        grid: {
+            borderColor: '#2a2a4a',
+            padding: { left: 10, right: 10 },
+        },
+        dataLabels: { enabled: false },
+    };
+
+    if (apexChart) {
+        apexChart.updateOptions(options, true, false, false);
+    } else {
+        apexChart = new ApexCharts(apexEl, options);
+        apexChart.render();
+    }
+}
 
 // -- Tables -------------------------------------------------------------------
 
