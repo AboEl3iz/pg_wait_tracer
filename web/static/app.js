@@ -996,16 +996,7 @@ function renderApexChart(data) {
             type: 'solid',
             opacity: 0.85,
         },
-        legend: {
-            show: true,
-            position: 'bottom',
-            horizontalAlign: 'center',
-            fontSize: '11px',
-            labels: { colors: '#888' },
-            markers: { size: 8 },
-            onItemClick: { toggleDataSeries: false },  // we handle clicks ourselves
-            onItemHover: { highlightDataSeries: false }, // we handle hover ourselves
-        },
+        legend: { show: false },
         grid: {
             borderColor: '#2a2a4a',
             padding: { left: 10, right: 10 },
@@ -1020,83 +1011,89 @@ function renderApexChart(data) {
         apexChart.render();
     }
 
-    // -- Grafana-style legend: hover=isolate, click=solo, cmd+click=exclude --
-    if (!state.apexHidden) state.apexHidden = new Set();
+    // -- Custom HTML legend: hover=show only, click=select, cmd+click=multiselect --
     const names = seriesList.map(s => s.name);
+    if (!state.apexSelected) state.apexSelected = new Set(names.map((_, i) => i));
 
-    // Wait for ApexCharts to render legend DOM, then attach handlers
-    setTimeout(() => {
-        const legendItems = apexEl.querySelectorAll('.apexcharts-legend-series');
-        if (!legendItems.length) return;
+    let legendEl = document.getElementById('apex-legend');
+    if (!legendEl) {
+        legendEl = document.createElement('div');
+        legendEl.id = 'apex-legend';
+        legendEl.style.cssText = 'display:flex;flex-wrap:wrap;gap:4px;justify-content:center;padding:8px 20px;';
+        apexEl.parentNode.insertBefore(legendEl, apexEl.nextSibling);
+    }
 
-        legendItems.forEach((item, idx) => {
-            // Hover: dim all other series in the SVG
-            item.addEventListener('mouseenter', () => {
-                const groups = apexEl.querySelectorAll('.apexcharts-series');
-                groups.forEach((g, i) => {
-                    g.style.transition = 'opacity 0.15s';
-                    g.style.opacity = (i === idx) ? '1' : '0.08';
-                });
-            });
+    function updateLegendUI() {
+        legendEl.querySelectorAll('.apex-leg').forEach(el => {
+            const i = +el.dataset.idx;
+            const sel = state.apexSelected.has(i);
+            el.style.opacity = sel ? '1' : '0.3';
+            el.style.borderColor = sel ? colorList[i] : '#444';
+        });
+    }
 
-            item.addEventListener('mouseleave', () => {
-                const groups = apexEl.querySelectorAll('.apexcharts-series');
-                groups.forEach((g, i) => {
-                    g.style.transition = 'opacity 0.15s';
-                    g.style.opacity = state.apexHidden.has(i) ? '0' : '1';
-                });
-            });
+    function applySelection() {
+        names.forEach((n, i) => {
+            if (state.apexSelected.has(i)) apexChart.showSeries(n);
+            else apexChart.hideSeries(n);
+        });
+        updateLegendUI();
+    }
 
-            item.addEventListener('click', (e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                if (!apexChart) return;
+    legendEl.innerHTML = names.map((name, i) => {
+        return `<span class="apex-leg" data-idx="${i}" style="` +
+            `display:inline-flex;align-items:center;gap:4px;cursor:pointer;padding:3px 10px;` +
+            `border-radius:4px;font-size:11px;color:#ccc;background:#1a1a2e;` +
+            `border:1px solid ${colorList[i]};border-left:3px solid ${colorList[i]};` +
+            `transition:opacity 0.15s;user-select:none">` +
+            `<span style="width:8px;height:8px;border-radius:2px;background:${colorList[i]}"></span>` +
+            `${esc(name)}</span>`;
+    }).join('');
 
-                if (e.metaKey || e.ctrlKey) {
-                    // Cmd/Ctrl+click: show all EXCEPT this one
-                    if (state.apexHidden.has(idx) && state.apexHidden.size === 1) {
-                        // Was excluded, restore all
-                        state.apexHidden.clear();
-                        names.forEach(n => apexChart.showSeries(n));
-                    } else {
-                        // Exclude this one, show all others
-                        state.apexHidden.clear();
-                        state.apexHidden.add(idx);
-                        names.forEach((n, i) => {
-                            if (i === idx) apexChart.hideSeries(n);
-                            else apexChart.showSeries(n);
-                        });
-                    }
-                } else {
-                    // Normal click: solo this series
-                    const isSolo = names.every((_, i) =>
-                        i === idx ? !state.apexHidden.has(i) : state.apexHidden.has(i));
+    legendEl.querySelectorAll('.apex-leg').forEach(item => {
+        const idx = +item.dataset.idx;
 
-                    if (isSolo) {
-                        // Already solo — restore all
-                        state.apexHidden.clear();
-                        names.forEach(n => apexChart.showSeries(n));
-                    } else {
-                        // Solo: show only this
-                        state.apexHidden.clear();
-                        names.forEach((n, i) => {
-                            if (i === idx) {
-                                apexChart.showSeries(n);
-                            } else {
-                                state.apexHidden.add(i);
-                                apexChart.hideSeries(n);
-                            }
-                        });
-                    }
-                }
-
-                // Update legend item opacity
-                legendItems.forEach((el, i) => {
-                    el.style.opacity = state.apexHidden.has(i) ? '0.3' : '1';
-                });
+        // Hover: show ONLY this series on the graph (temporary)
+        item.addEventListener('mouseenter', () => {
+            const groups = apexEl.querySelectorAll('.apexcharts-series');
+            groups.forEach((g, i) => {
+                g.style.transition = 'opacity 0.12s';
+                g.style.opacity = (i === idx) ? '1' : '0';
             });
         });
-    }, 100);
+
+        // Mouse leave: restore to current selection state
+        item.addEventListener('mouseleave', () => {
+            const groups = apexEl.querySelectorAll('.apexcharts-series');
+            groups.forEach((g, i) => {
+                g.style.transition = 'opacity 0.12s';
+                g.style.opacity = state.apexSelected.has(i) ? '1' : '0';
+            });
+        });
+
+        // Click: select only this. Cmd+Click: toggle (multiselect)
+        item.addEventListener('click', (e) => {
+            if (e.metaKey || e.ctrlKey) {
+                // Multiselect: toggle this one
+                if (state.apexSelected.has(idx)) {
+                    if (state.apexSelected.size > 1) state.apexSelected.delete(idx);
+                } else {
+                    state.apexSelected.add(idx);
+                }
+            } else {
+                // Single select: show only this
+                if (state.apexSelected.size === 1 && state.apexSelected.has(idx)) {
+                    // Already solo — restore all
+                    state.apexSelected = new Set(names.map((_, i) => i));
+                } else {
+                    state.apexSelected = new Set([idx]);
+                }
+            }
+            applySelection();
+        });
+    });
+
+    applySelection();
 }
 
 // -- Tables -------------------------------------------------------------------
