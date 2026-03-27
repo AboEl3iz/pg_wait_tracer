@@ -184,7 +184,7 @@ async function refreshChart() {
         const params = {
             from: state.viewFrom,
             to: state.viewTo,
-            buckets: Math.min(Math.floor(chartEl.clientWidth / 4), 300),
+            buckets: Math.min(Math.floor((state.useApexChart ? apexEl : chartEl).clientWidth / 4), 300),
             filters: state.filters,
         };
         // Request per-event breakdown when drilled into a class (but not a specific event)
@@ -900,6 +900,25 @@ function renderApexChart(data) {
             labels: {
                 datetimeUTC: true,
                 style: { colors: '#888', fontSize: '10px' },
+                datetimeFormatter: {
+                    year: 'yyyy',
+                    month: "MMM 'yy",
+                    day: 'dd MMM',
+                    hour: 'HH:mm',
+                    minute: 'HH:mm:ss',
+                    second: 'HH:mm:ss',
+                },
+                formatter: function(val) {
+                    const d = new Date(val);
+                    const hms = d.toUTCString().slice(17, 25);
+                    const rangeMs = (state.viewTo - state.viewFrom) / 1e6;
+                    if (rangeMs < 60000) {
+                        // Under 1 min range — show ms
+                        const ms = d.getUTCMilliseconds();
+                        return hms + '.' + String(ms).padStart(3, '0');
+                    }
+                    return hms;
+                },
             },
             axisBorder: { color: '#333' },
             axisTicks: { color: '#333' },
