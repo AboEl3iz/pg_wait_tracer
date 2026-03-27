@@ -1253,7 +1253,6 @@ static void handle_transitions(struct pgwt_server *srv, struct pgwt_request *req
     int max_rows = req->num_buckets > 0 ? req->num_buckets : 50;
     struct pgwt_transitions_result res;
     pgwt_compute_transitions(events, count, &req->filter, max_rows, &res);
-    free(events);
 
     cJSON *root = cJSON_CreateObject();
     cJSON_AddNumberToObject(root, "id", (double)req->id);
@@ -1325,6 +1324,7 @@ static void handle_transitions(struct pgwt_server *srv, struct pgwt_request *req
         cJSON_AddItemToArray(links, link);
     }
 
+    free(events);
     free(res.rows);
     emit_json(root);
 }
