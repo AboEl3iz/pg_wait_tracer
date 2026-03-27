@@ -2036,7 +2036,8 @@ async function refreshTransitions() {
             const ms = info.total_ms || 0;
             const cls = (info.class || 'unknown').toLowerCase();
             const color = classColor(name) || classColor(cls) || '#888';
-            const size = Math.max(20, Math.min(80, 20 + (ms / maxNodeMs) * 60));
+            const logScale = ms > 0 ? Math.log10(ms + 1) / Math.log10(maxNodeMs + 1) : 0;
+            const size = Math.max(15, Math.min(90, 15 + logScale * 75));
             const timeStr = ms >= 1000 ? (ms/1000).toFixed(1) + 's' : ms.toFixed(0) + 'ms';
             return {
                 name: name,
