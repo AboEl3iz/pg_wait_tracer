@@ -1045,24 +1045,34 @@ function renderApexChart(data) {
         });
     }
 
-    function apexSetHoverOpacity(highlightIdx) {
-        // Use fill opacity array to dim/highlight — ApexCharts API only
-        const opacities = seriesNames.map((_, i) =>
-            i === highlightIdx ? 0.85 : 0.05);
-        apexChart.updateOptions({ fill: { opacity: opacities } }, false, false, false);
+    let hoverActive = false;
+
+    function apexShowOnly(idx) {
+        // Hide/show via API — properly removes from stack
+        seriesNames.forEach((n, i) => {
+            if (i === idx) apexChart.showSeries(n);
+            else apexChart.hideSeries(n);
+        });
     }
 
-    function apexRestoreOpacity() {
-        const opacities = seriesNames.map((_, i) =>
-            state.apexSelected.has(i) ? 0.85 : 0);
-        apexChart.updateOptions({ fill: { opacity: opacities } }, false, false, false);
+    function apexRestoreSelection() {
+        seriesNames.forEach((n, i) => {
+            if (state.apexSelected.has(i)) apexChart.showSeries(n);
+            else apexChart.hideSeries(n);
+        });
     }
 
     legDiv.querySelectorAll('.aleg').forEach(el => {
         const idx = +el.dataset.i;
 
-        el.addEventListener('mouseenter', () => apexSetHoverOpacity(idx));
-        el.addEventListener('mouseleave', () => apexRestoreOpacity());
+        el.addEventListener('mouseenter', () => {
+            hoverActive = true;
+            apexShowOnly(idx);
+        });
+        el.addEventListener('mouseleave', () => {
+            hoverActive = false;
+            apexRestoreSelection();
+        });
 
         el.addEventListener('click', (e) => {
             if (e.metaKey || e.ctrlKey) {
