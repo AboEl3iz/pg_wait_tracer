@@ -2135,6 +2135,102 @@ async function refreshTransitions() {
         sliderVal.textContent = v + '%';
         renderDFG(v);
     });
+
+    // -- Fetch and render variants below the DFG --
+    try {
+        const vdata = await send('variants', {
+            from: state.viewFrom,
+            to: state.viewTo,
+            filters: state.filters,
+            num_buckets: 20,
+        });
+        if (vdata && vdata.variants && vdata.variants.length > 0) {
+            renderVariants(vdata, container);
+        }
+    } catch (e) { /* ignore */ }
+}
+
+function renderVariants(vdata, container) {
+    const totalMs = vdata.variants.reduce((s, v) => s + v.total_ms, 0);
+
+    let html = '<div style="padding:10px 20px">' +
+        `<h3 style="color:#ccc;margin:10px 0 5px">Execution Flow Patterns ` +
+        `<span style="color:#666;font-size:12px">(${vdata.total_executions.toLocaleString()} executions → ` +
+        `${vdata.num_variants} patterns)</span></h3>`;
+
+    vdata.variants.forEach((v, idx) => {
+        const pctTime = totalMs > 0 ? (v.total_ms / totalMs * 100) : 0;
+        const avgStr = v.avg_ms >= 1000 ? (v.avg_ms / 1000).toFixed(1) + 's' :
+                       v.avg_ms >= 1 ? v.avg_ms.toFixed(1) + 'ms' :
+                       (v.avg_ms * 1000).toFixed(0) + 'μs';
+        const p95Str = v.p95_ms >= 1000 ? (v.p95_ms / 1000).toFixed(1) + 's' :
+                       v.p95_ms >= 1 ? v.p95_ms.toFixed(1) + 'ms' :
+                       (v.p95_ms * 1000).toFixed(0) + 'μs';
+        const totalStr = v.total_ms >= 1000 ? (v.total_ms / 1000).toFixed(1) + 's' :
+                         v.total_ms.toFixed(0) + 'ms';
+
+        // Flow bar: colored blocks proportional to step avg time
+        const stepTotalMs = v.steps.reduce((s, st) => s + (st.avg_ms || 0), 0) || 1;
+        let flowHtml = '<div style="display:flex;height:28px;border-radius:4px;overflow:hidden;' +
+            'background:#1a1a2e;border:1px solid #2a2a4a;margin:4px 0">';
+        v.steps.forEach(st => {
+            const w = Math.max(2, (st.avg_ms / stepTotalMs) * 100);
+            const color = classColor(st.name) || classColor(st.class) || '#888';
+            const label = st.name.indexOf(':') > 0 ? st.name.substring(st.name.indexOf(':') + 1) : st.name;
+            const durStr = st.avg_ms >= 1 ? st.avg_ms.toFixed(1) + 'ms' :
+                           st.avg_ms >= 0.001 ? (st.avg_ms * 1000).toFixed(0) + 'μs' : '';
+            const loopMark = st.loop ? ' ×N' : '';
+            flowHtml += `<div style="width:${w.toFixed(1)}%;background:${color};opacity:0.8;` +
+                `display:flex;align-items:center;justify-content:center;overflow:hidden;` +
+                `font-size:9px;color:#fff;white-space:nowrap;padding:0 3px;min-width:2px" ` +
+                `title="${st.name} ${durStr}${loopMark}">` +
+                `${w > 8 ? label + (loopMark ? loopMark : '') : ''}` +
+                `${w > 15 ? ' ' + durStr : ''}</div>`;
+        });
+        flowHtml += '</div>';
+
+        // Step detail text
+        let stepsText = v.steps.map(st => {
+            const label = st.name.indexOf(':') > 0 ? st.name.substring(st.name.indexOf(':') + 1) : st.name;
+            const dur = st.avg_ms >= 1 ? st.avg_ms.toFixed(1) + 'ms' :
+                        (st.avg_ms * 1000).toFixed(0) + 'μs';
+            if (st.loop) return `[${label}(${dur})…]×N`;
+            return `${label}(${dur})`;
+        }).join(' → ');
+
+        // Query text preview
+        let queryHtml = '';
+        if (v.query_text) {
+            const preview = v.query_text.length > 100 ? v.query_text.substring(0, 100) + '...' : v.query_text;
+            queryHtml = `<div style="color:#666;font-size:10px;font-family:monospace;margin-top:2px;` +
+                `white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${esc(v.query_text)}">${esc(preview)}</div>`;
+        }
+
+        html += `<div style="background:#1e1e3a;border:1px solid #2a2a4a;border-radius:6px;padding:10px;margin:6px 0">` +
+            `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">` +
+                `<span style="color:#ccc;font-size:13px;font-weight:500">#${idx + 1}</span>` +
+                `<span style="color:#888;font-size:11px">` +
+                    `<b style="color:#4fc3f7">${pctTime.toFixed(1)}%</b> of time` +
+                    ` · ${v.exec_count.toLocaleString()} exec` +
+                    ` · ${v.num_queries} queries` +
+                    ` · avg ${avgStr}` +
+                    ` · p95 ${p95Str}` +
+                    ` · total ${totalStr}` +
+                    (v.avg_loop_n > 1.5 ? ` · ~${v.avg_loop_n.toFixed(0)}× loop` : '') +
+                `</span>` +
+            `</div>` +
+            flowHtml +
+            `<div style="color:#888;font-size:10px;margin-top:2px">${stepsText}</div>` +
+            queryHtml +
+        `</div>`;
+    });
+
+    html += '</div>';
+
+    // Append to container (after DFG)
+    const variantDiv = document.createElement('div');
+    variantDiv.innerHTML = html;
+    container.appendChild(variantDiv);
 }
 
 // -- Start --------------------------------------------------------------------
