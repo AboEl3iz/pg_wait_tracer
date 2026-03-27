@@ -2047,7 +2047,9 @@ async function refreshTransitions() {
                     position: 'bottom',
                     fontSize: 10,
                     color: '#ccc',
-                    formatter: name.indexOf(':') > 0 ? name.substring(name.indexOf(':') + 1) : name,
+                    formatter: (name.indexOf(':') > 0 ? name.substring(name.indexOf(':') + 1) : name) +
+                        '\n' + timeStr,
+                    lineHeight: 14,
                 },
                 tooltip: {
                     formatter: `<b>${name}</b><br/>Total time: ${timeStr}`,
