@@ -1259,36 +1259,52 @@ static void handle_transitions(struct pgwt_server *srv, struct pgwt_request *req
     cJSON_AddNumberToObject(root, "id", (double)req->id);
     cjson_add_uint64(root, "total", res.total_transitions);
 
-    /* Compute per-node total time from transition data.
-     * For each event, sum duration_ms from all outgoing edges. */
-    struct { char name[64]; double total_ms; } node_acc[256];
+    /* Compute per-node total time directly from ALL events (not truncated rows).
+     * Each event's old_event spent duration_ns — sum by event. */
+    struct { uint32_t event_id; char name[64]; double total_ms; } node_acc[256];
     int num_nodes = 0;
-    for (int i = 0; i < res.num_rows; i++) {
-        /* Add source node time */
+    for (int i = 0; i < count; i++) {
+        const struct pgwt_trace_event *ev = &events[i];
+        if (pgwt_is_idle_event(ev->old_event) || PGWT_IS_MARKER(ev->old_event))
+            continue;
+        if (ev->old_event == 0) continue;  /* skip CPU=0 with no time */
+        /* Find or insert */
         int found = -1;
         for (int j = 0; j < num_nodes; j++) {
-            if (strcmp(node_acc[j].name, res.rows[i].from_name) == 0) {
+            if (node_acc[j].event_id == ev->old_event) {
                 found = j; break;
             }
         }
         if (found >= 0) {
-            node_acc[found].total_ms += res.rows[i].total_ns / 1e6;
+            node_acc[found].total_ms += ev->duration_ns / 1e6;
         } else if (num_nodes < 256) {
-            snprintf(node_acc[num_nodes].name, 64, "%s", res.rows[i].from_name);
-            node_acc[num_nodes].total_ms = res.rows[i].total_ns / 1e6;
+            node_acc[num_nodes].event_id = ev->old_event;
+            pgwt_event_full_name(ev->old_event, node_acc[num_nodes].name,
+                                 sizeof(node_acc[num_nodes].name));
+            node_acc[num_nodes].total_ms = ev->duration_ns / 1e6;
             num_nodes++;
         }
-        /* Ensure target node exists (may have zero outgoing time in our data) */
-        found = -1;
-        for (int j = 0; j < num_nodes; j++) {
-            if (strcmp(node_acc[j].name, res.rows[i].to_name) == 0) {
-                found = j; break;
+    }
+    /* Also ensure CPU* node exists with its total time */
+    {
+        double cpu_ms = 0;
+        for (int i = 0; i < count; i++) {
+            if (events[i].old_event == 0 && events[i].duration_ns > 0)
+                cpu_ms += events[i].duration_ns / 1e6;
+        }
+        if (cpu_ms > 0) {
+            int found = -1;
+            for (int j = 0; j < num_nodes; j++) {
+                if (node_acc[j].event_id == 0) { found = j; break; }
             }
-        }
-        if (found < 0 && num_nodes < 256) {
-            snprintf(node_acc[num_nodes].name, 64, "%s", res.rows[i].to_name);
-            node_acc[num_nodes].total_ms = 0;
-            num_nodes++;
+            if (found >= 0) {
+                node_acc[found].total_ms = cpu_ms;
+            } else if (num_nodes < 256) {
+                node_acc[num_nodes].event_id = 0;
+                snprintf(node_acc[num_nodes].name, 64, "CPU*");
+                node_acc[num_nodes].total_ms = cpu_ms;
+                num_nodes++;
+            }
         }
     }
 
