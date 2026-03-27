@@ -1267,7 +1267,61 @@ static void handle_transitions(struct pgwt_server *srv, struct pgwt_request *req
     cJSON_AddNumberToObject(root, "id", (double)req->id);
     cjson_add_uint64(root, "total", res.total_transitions);
 
-    /* Build Sankey-compatible nodes + links */
+    /* Compute per-node total time from transition data.
+     * For each event, sum duration_ms from all outgoing edges. */
+    struct { char name[64]; double total_ms; } node_acc[256];
+    int num_nodes = 0;
+    for (int i = 0; i < res.num_rows; i++) {
+        /* Add source node time */
+        int found = -1;
+        for (int j = 0; j < num_nodes; j++) {
+            if (strcmp(node_acc[j].name, res.rows[i].from_name) == 0) {
+                found = j; break;
+            }
+        }
+        if (found >= 0) {
+            node_acc[found].total_ms += res.rows[i].total_ns / 1e6;
+        } else if (num_nodes < 256) {
+            snprintf(node_acc[num_nodes].name, 64, "%s", res.rows[i].from_name);
+            node_acc[num_nodes].total_ms = res.rows[i].total_ns / 1e6;
+            num_nodes++;
+        }
+        /* Ensure target node exists (may have zero outgoing time in our data) */
+        found = -1;
+        for (int j = 0; j < num_nodes; j++) {
+            if (strcmp(node_acc[j].name, res.rows[i].to_name) == 0) {
+                found = j; break;
+            }
+        }
+        if (found < 0 && num_nodes < 256) {
+            snprintf(node_acc[num_nodes].name, 64, "%s", res.rows[i].to_name);
+            node_acc[num_nodes].total_ms = 0;
+            num_nodes++;
+        }
+    }
+
+    /* Nodes array */
+    cJSON *nodes = cJSON_AddArrayToObject(root, "nodes");
+    for (int i = 0; i < num_nodes; i++) {
+        cJSON *node = cJSON_CreateObject();
+        cJSON_AddStringToObject(node, "name", node_acc[i].name);
+        cJSON_AddNumberToObject(node, "total_ms", node_acc[i].total_ms);
+        /* Extract wait class for coloring */
+        const char *colon = strchr(node_acc[i].name, ':');
+        if (colon) {
+            char cls[32];
+            int len = colon - node_acc[i].name;
+            if (len > 31) len = 31;
+            memcpy(cls, node_acc[i].name, len);
+            cls[len] = '\0';
+            cJSON_AddStringToObject(node, "class", cls);
+        } else {
+            cJSON_AddStringToObject(node, "class", "cpu");
+        }
+        cJSON_AddItemToArray(nodes, node);
+    }
+
+    /* Links array */
     cJSON *links = cJSON_AddArrayToObject(root, "links");
     for (int i = 0; i < res.num_rows; i++) {
         cJSON *link = cJSON_CreateObject();

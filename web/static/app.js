@@ -405,7 +405,7 @@ function switchTab(tab) {
         if (timelineChart) { timelineChart.dispose(); timelineChart = null; }
     }
     if (state.activeTab === 'transitions' && tab !== 'transitions') {
-        if (transitionsChart) { transitionsChart.dispose(); transitionsChart = null; }
+        transitionsChart = null;  // DFG is raw SVG, no dispose needed
     }
     if (state.activeTab === 'concurrency' && tab !== 'concurrency') {
         if (concurrencyChart) { concurrencyChart.dispose(); concurrencyChart = null; }
@@ -1974,7 +1974,7 @@ function initLiveMode() {
     });
 }
 
-// -- Transitions Matrix -------------------------------------------------------
+// -- Transitions DFG (Directly-Follows Graph) ---------------------------------
 
 let transitionsChart = null;
 
@@ -1987,7 +1987,7 @@ async function refreshTransitions() {
             from: state.viewFrom,
             to: state.viewTo,
             filters: state.filters,
-            num_buckets: 200,  // Get enough pairs to build a complete matrix
+            num_buckets: 200,
         });
     } catch (e) {
         container.innerHTML = '<p style="color:#888;padding:20px">Transitions error: ' + e.message + '</p>';
@@ -1999,300 +1999,226 @@ async function refreshTransitions() {
         return;
     }
 
-    // Build transition lookup: { "from|to": { count, duration_ms } }
-    const lookup = {};
-    const fromTotals = {};  // total outgoing transitions per source
-    data.links.forEach(l => {
-        lookup[l.source + '|' + l.target] = l;
-        fromTotals[l.source] = (fromTotals[l.source] || 0) + l.value;
-    });
-
-    // Collect unique event names, sorted by total involvement (from + to)
-    const involvement = {};
-    data.links.forEach(l => {
-        involvement[l.source] = (involvement[l.source] || 0) + l.value;
-        involvement[l.target] = (involvement[l.target] || 0) + l.value;
-    });
-    const events = Object.keys(involvement)
-        .sort((a, b) => involvement[b] - involvement[a])
-        .slice(0, 15);  // Cap at 15 for readability
-
-    // Keep full Type:Event format for labels
-    const shortName = name => name;
-
-    // Build heatmap data: [toIdx, fromIdx, pct] — row-normalized (% of outgoing)
-    // This breaks symmetry: "after CPU, 40% → IO" vs "after IO, 80% → CPU"
-    const heatData = [];
-    let maxPct = 0;
-    for (let fi = 0; fi < events.length; fi++) {
-        const total = fromTotals[events[fi]] || 1;
-        for (let ti = 0; ti < events.length; ti++) {
-            const key = events[fi] + '|' + events[ti];
-            const l = lookup[key];
-            const count = l ? l.value : 0;
-            const pct = count / total * 100;
-            if (pct > maxPct) maxPct = pct;
-            heatData.push([ti, fi, Math.round(pct * 10) / 10, count]);
-        }
-    }
+    const maxEdgeCount = Math.max(...data.links.map(l => l.value));
+    const nodeMap = {};
+    (data.nodes || []).forEach(n => { nodeMap[n.name] = n; });
 
     // Build HTML layout
     container.innerHTML =
-        '<div id="transitions-chart" style="width:100%;height:500px;"></div>' +
-        '<div id="transitions-detail" style="padding:10px;"></div>' +
-        '<div id="transitions-drilldown"></div>' +
-        '<div id="transitions-table" style="padding:10px;"></div>';
+        '<div style="padding:10px 20px;display:flex;align-items:center;gap:12px">' +
+            '<span style="color:#888;font-size:12px">Simplify:</span>' +
+            '<input type="range" id="dfg-slider" min="0" max="100" value="30" ' +
+                'style="width:200px;accent-color:#4fc3f7">' +
+            '<span id="dfg-slider-val" style="color:#888;font-size:12px">30%</span>' +
+            '<span style="color:#666;font-size:11px;margin-left:8px">' +
+                `${Number(data.total).toLocaleString()} transitions</span>` +
+        '</div>' +
+        '<div id="dfg-container" style="width:100%;height:550px;overflow:hidden;position:relative;background:#1a1a2e"></div>' +
+        '<div id="dfg-tooltip" style="display:none;position:fixed;background:#1e1e3a;border:1px solid #3a3a5a;' +
+            'border-radius:6px;padding:8px 12px;font-size:12px;color:#ccc;z-index:200;pointer-events:none;' +
+            'box-shadow:0 4px 12px rgba(0,0,0,0.5)"></div>';
 
-    // -- Heatmap --
-    const el = document.getElementById('transitions-chart');
-    if (transitionsChart) { transitionsChart.dispose(); transitionsChart = null; }
-    transitionsChart = echarts.init(el, 'dark');
+    function renderDFG(threshold) {
+        // Filter edges by threshold (% of max count)
+        const minCount = maxEdgeCount * threshold / 100;
+        const visibleLinks = data.links.filter(l => l.value >= minCount);
 
-    const shortLabels = events.map(shortName);
+        // Collect visible nodes
+        const visibleNodes = new Set();
+        visibleLinks.forEach(l => { visibleNodes.add(l.source); visibleNodes.add(l.target); });
 
-    transitionsChart.setOption({
-        title: {
-            text: `Transition Matrix — % of Outgoing (${Number(data.total).toLocaleString()} total)`,
-            subtext: 'Each row shows where that state goes next. Click a row for details.',
-            left: 'center',
-            textStyle: { color: '#ccc', fontSize: 14 },
-            subtextStyle: { color: '#666', fontSize: 11 },
-        },
-        tooltip: {
-            formatter: p => {
-                if (!p.data || p.data[2] === 0) return '';
-                const from = events[p.data[1]];
-                const to = events[p.data[0]];
-                const pct = p.data[2];
-                const count = p.data[3];
-                const l = lookup[from + '|' + to];
-                const dur = l ? (l.duration_ms / count).toFixed(1) : '?';
-                return `<b>${from}</b> → <b>${to}</b><br/>` +
-                       `<b>${pct}%</b> of outgoing from ${shortName(from)}<br/>` +
-                       `Count: ${count.toLocaleString()}<br/>` +
-                       `Avg dwell in source: ${dur} ms`;
-            },
-        },
-        grid: { left: 200, right: 40, top: 80, bottom: 160 },
-        xAxis: {
-            type: 'category',
-            data: shortLabels,
-            position: 'bottom',
-            axisLabel: { color: '#aaa', fontSize: 10, rotate: 45 },
-            axisLine: { lineStyle: { color: '#333' } },
-            splitArea: { show: true, areaStyle: { color: ['rgba(255,255,255,0.02)', 'rgba(0,0,0,0)'] } },
-        },
-        yAxis: {
-            type: 'category',
-            data: shortLabels,
-            axisLabel: { color: '#aaa', fontSize: 10 },
-            axisLine: { lineStyle: { color: '#333' } },
-            splitArea: { show: true, areaStyle: { color: ['rgba(255,255,255,0.02)', 'rgba(0,0,0,0)'] } },
-        },
-        visualMap: {
-            min: 0,
-            max: maxPct || 1,
-            calculable: true,
-            orient: 'horizontal',
-            left: 'center',
-            bottom: 0,
-            formatter: v => v.toFixed(0) + '%',
-            inRange: { color: ['#1a1a2e', '#16213e', '#0f3460', '#e94560', '#ff6b6b'] },
-            textStyle: { color: '#888' },
-        },
-        series: [{
-            type: 'heatmap',
-            data: heatData.filter(d => d[2] > 0),
-            label: {
-                show: true,
-                fontSize: 9,
-                color: '#ddd',
-                formatter: p => {
-                    if (p.data[2] === 0) return '';
-                    return p.data[2].toFixed(0) + '%';
-                },
-            },
-            emphasis: {
-                itemStyle: { shadowBlur: 10, shadowColor: 'rgba(0,0,0,0.5)' },
-            },
-        }],
-    }, true);
-
-    // Click on heatmap cell → show detail for that "from" state
-    transitionsChart.on('click', p => {
-        if (!p.data) return;
-        const fromIdx = p.data[1];
-        showFromDetail(events[fromIdx], events, lookup, fromTotals, data.total);
-    });
-
-    // -- State selector buttons (click to drill down) --
-    let btnHtml = '<div style="padding:10px 0;display:flex;flex-wrap:wrap;gap:6px;">' +
-        '<span style="color:#888;line-height:28px;margin-right:4px">After:</span>';
-    events.forEach(ev => {
-        const color = classColor(ev) || '#888';
-        btnHtml += `<button class="state-btn" data-event="${esc(ev)}" ` +
-            `style="background:#1e1e3a;border:1px solid ${color};color:#ccc;` +
-            `padding:3px 10px;border-radius:4px;cursor:pointer;font-size:12px;` +
-            `border-left:3px solid ${color}">${esc(ev)}</button>`;
-    });
-    btnHtml += '</div>';
-    document.getElementById('transitions-detail').innerHTML = btnHtml;
-
-    document.querySelectorAll('.state-btn').forEach(btn => {
-        btn.addEventListener('click', () => {
-            document.querySelectorAll('.state-btn').forEach(b => b.style.opacity = '0.5');
-            btn.style.opacity = '1';
-            showFromDetail(btn.dataset.event, events, lookup, fromTotals, data.total);
-        });
-    });
-
-    // Show CPU drill-down by default (most common starting point)
-    const cpuEvent = events.find(e => e.startsWith('CPU'));
-    if (cpuEvent) showFromDetail(cpuEvent, events, lookup, fromTotals, data.total);
-
-    // -- Top transitions table --
-    const sorted = data.links.slice().sort((a, b) => b.value - a.value).slice(0, 30);
-    let html = '<h3 style="color:#ccc;margin:10px 0 5px">Top Transitions</h3>' +
-        '<table class="data-table"><thead><tr>' +
-        '<th>#</th><th>From</th><th>To</th><th>Count</th><th>% Total</th><th>Avg Dwell (ms)</th>' +
-        '</tr></thead><tbody>';
-    sorted.forEach((l, i) => {
-        const pct = (l.value / data.total * 100).toFixed(1);
-        const avg = (l.duration_ms / l.value).toFixed(1);
-        const fromColor = classColor(l.source) || '#888';
-        const toColor = classColor(l.target) || '#888';
-        html += `<tr style="cursor:pointer" data-from="${esc(l.source)}">` +
-            `<td>${i + 1}</td>` +
-            `<td>${dot(l.source)} ${esc(l.source)}</td>` +
-            `<td>${dot(l.target)} ${esc(l.target)}</td>` +
-            `<td>${l.value.toLocaleString()}</td>` +
-            `<td>${pct}%</td>` +
-            `<td>${avg}</td></tr>`;
-    });
-    html += '</tbody></table>';
-    document.getElementById('transitions-table').innerHTML = html;
-
-    // Click table row → show detail for that "from" state
-    document.querySelectorAll('#transitions-table tr[data-from]').forEach(row => {
-        row.addEventListener('click', () => {
-            showFromDetail(row.dataset.from, events, lookup, fromTotals, data.total);
-        });
-    });
-}
-
-// Chain state: array of { event, pct } representing the path being explored
-let transitionChain = [];
-let _transEvents, _transLookup, _transFromTotals, _transTotal;
-
-function showFromDetail(fromEvent, events, lookup, fromTotals, total) {
-    // Save references for chain navigation
-    _transEvents = events;
-    _transLookup = lookup;
-    _transFromTotals = fromTotals;
-    _transTotal = total;
-
-    // Start a new chain from this event
-    transitionChain = [{ event: fromEvent, pct: 100 }];
-    renderChain();
-}
-
-function extendChain(toEvent) {
-    // Compute probability of this step
-    const last = transitionChain[transitionChain.length - 1];
-    const l = _transLookup[last.event + '|' + toEvent];
-    const totalOut = _transFromTotals[last.event] || 1;
-    const stepPct = l ? (l.value / totalOut * 100) : 0;
-    // Chain probability = product of all step percentages
-    const chainPct = last.pct * stepPct / 100;
-    transitionChain.push({ event: toEvent, pct: chainPct });
-    renderChain();
-}
-
-function truncateChain(idx) {
-    transitionChain = transitionChain.slice(0, idx + 1);
-    renderChain();
-}
-
-function renderChain() {
-    const detailEl = document.getElementById('transitions-drilldown');
-    if (!transitionChain.length) { detailEl.innerHTML = ''; return; }
-
-    const last = transitionChain[transitionChain.length - 1];
-    const fromEvent = last.event;
-    const totalOut = _transFromTotals[fromEvent] || 0;
-
-    // -- Chain breadcrumb --
-    let html = '<div style="padding:8px 0;display:flex;align-items:center;flex-wrap:wrap;gap:4px">' +
-        '<span style="color:#888;margin-right:4px">Chain:</span>';
-    transitionChain.forEach((step, i) => {
-        if (i > 0) {
-            const pct = (() => {
-                const prev = transitionChain[i - 1];
-                const l = _transLookup[prev.event + '|' + step.event];
-                const t = _transFromTotals[prev.event] || 1;
-                return l ? (l.value / t * 100).toFixed(0) : '?';
-            })();
-            html += `<span style="color:#666;font-size:18px;margin:0 2px">\u2192</span>` +
-                `<span style="color:#666;font-size:10px">${pct}%</span>` +
-                `<span style="color:#666;font-size:18px;margin:0 2px">\u2192</span>`;
+        if (visibleNodes.size === 0) {
+            document.getElementById('dfg-container').innerHTML =
+                '<p style="color:#666;padding:40px;text-align:center">No transitions above threshold</p>';
+            return;
         }
-        const color = classColor(step.event) || '#888';
-        const isLast = i === transitionChain.length - 1;
-        html += `<span class="chain-step" data-idx="${i}" style="` +
-            `background:${isLast ? '#2a2a4a' : '#1a1a2e'};border:1px solid ${color};` +
-            `border-left:3px solid ${color};color:#ccc;padding:2px 8px;border-radius:4px;` +
-            `cursor:pointer;font-size:12px;${isLast ? 'font-weight:bold' : ''}">${esc(step.event)}</span>`;
-    });
-    if (transitionChain.length > 1) {
-        const chainProb = last.pct;
-        html += `<span style="color:#888;margin-left:8px;font-size:11px">` +
-            `(chain: ${chainProb < 1 ? chainProb.toFixed(1) : chainProb.toFixed(0)}%)</span>`;
+
+        // Build dagre graph
+        const g = new dagre.graphlib.Graph();
+        g.setGraph({ rankdir: 'LR', nodesep: 40, ranksep: 80, marginx: 40, marginy: 30 });
+        g.setDefaultEdgeLabel(() => ({}));
+
+        // Find max node time for sizing
+        const maxNodeMs = Math.max(...[...visibleNodes].map(n => (nodeMap[n]?.total_ms || 1)));
+
+        visibleNodes.forEach(name => {
+            const nd = nodeMap[name] || {};
+            const ms = nd.total_ms || 0;
+            const w = Math.max(80, Math.min(180, 80 + (ms / maxNodeMs) * 100));
+            const h = 36;
+            g.setNode(name, { width: w, height: h, label: name });
+        });
+
+        visibleLinks.forEach(l => {
+            if (visibleNodes.has(l.source) && visibleNodes.has(l.target)) {
+                g.setEdge(l.source, l.target, {
+                    value: l.value,
+                    duration_ms: l.duration_ms,
+                    weight: l.value,
+                });
+            }
+        });
+
+        dagre.layout(g);
+
+        // Render as SVG
+        const graph = g.graph();
+        const svgW = Math.max(graph.width + 80, 600);
+        const svgH = Math.max(graph.height + 60, 400);
+        const containerEl = document.getElementById('dfg-container');
+        const cW = containerEl.clientWidth;
+        const cH = containerEl.clientHeight;
+        const scale = Math.min(cW / svgW, cH / svgH, 1.2);
+        const tx = (cW - svgW * scale) / 2;
+        const ty = (cH - svgH * scale) / 2;
+
+        let svg = `<svg width="${cW}" height="${cH}" style="font-family:sans-serif">`;
+        svg += `<g transform="translate(${tx},${ty}) scale(${scale})">`;
+
+        // Draw edges
+        const maxLinkVal = Math.max(...visibleLinks.map(l => l.value));
+        visibleLinks.forEach(l => {
+            const srcNode = g.node(l.source);
+            const tgtNode = g.node(l.target);
+            if (!srcNode || !tgtNode) return;
+
+            const thickness = Math.max(1, Math.min(8, (l.value / maxLinkVal) * 8));
+            const opacity = 0.3 + (l.value / maxLinkVal) * 0.5;
+
+            const sx = srcNode.x + srcNode.width / 2;
+            const sy = srcNode.y;
+            const ex = tgtNode.x - tgtNode.width / 2;
+            const ey = tgtNode.y;
+
+            // Self-loop
+            if (l.source === l.target) {
+                const cx = srcNode.x;
+                const cy = srcNode.y - srcNode.height / 2 - 20;
+                svg += `<path d="M${sx - 15},${srcNode.y - srcNode.height/2} ` +
+                    `C${sx - 15},${cy - 15} ${sx + 15},${cy - 15} ${sx + 15},${srcNode.y - srcNode.height/2}" ` +
+                    `fill="none" stroke="#888" stroke-width="${thickness}" opacity="${opacity}" ` +
+                    `marker-end="url(#arrow)" class="dfg-edge" ` +
+                    `data-source="${esc(l.source)}" data-target="${esc(l.target)}" ` +
+                    `data-value="${l.value}" data-dur="${l.duration_ms}"/>`;
+                return;
+            }
+
+            // Back-edge (target is left of source)
+            if (tgtNode.x <= srcNode.x) {
+                const midY = Math.min(srcNode.y, tgtNode.y) - 60 - thickness * 3;
+                svg += `<path d="M${sx},${srcNode.y - srcNode.height/2} ` +
+                    `C${sx},${midY} ${tgtNode.x},${midY} ${tgtNode.x},${tgtNode.y - tgtNode.height/2}" ` +
+                    `fill="none" stroke="#888" stroke-width="${thickness}" opacity="${opacity}" ` +
+                    `stroke-dasharray="4,3" marker-end="url(#arrow)" class="dfg-edge" ` +
+                    `data-source="${esc(l.source)}" data-target="${esc(l.target)}" ` +
+                    `data-value="${l.value}" data-dur="${l.duration_ms}"/>`;
+                return;
+            }
+
+            // Forward edge — cubic bezier
+            const dx = ex - sx;
+            svg += `<path d="M${sx},${sy} C${sx + dx*0.4},${sy} ${ex - dx*0.4},${ey} ${ex},${ey}" ` +
+                `fill="none" stroke="#888" stroke-width="${thickness}" opacity="${opacity}" ` +
+                `marker-end="url(#arrow)" class="dfg-edge" ` +
+                `data-source="${esc(l.source)}" data-target="${esc(l.target)}" ` +
+                `data-value="${l.value}" data-dur="${l.duration_ms}"/>`;
+        });
+
+        // Arrow marker
+        svg += '<defs><marker id="arrow" viewBox="0 0 10 6" refX="10" refY="3" ' +
+            'markerWidth="8" markerHeight="6" orient="auto-start-reverse">' +
+            '<path d="M0,0 L10,3 L0,6 z" fill="#888"/></marker></defs>';
+
+        // Draw nodes
+        visibleNodes.forEach(name => {
+            const nd = g.node(name);
+            if (!nd) return;
+            const info = nodeMap[name] || {};
+            const cls = (info.class || 'unknown').toLowerCase();
+            const color = classColor(name) || classColor(cls) || '#888';
+            const ms = info.total_ms || 0;
+            const w = nd.width;
+            const h = nd.height;
+            const x = nd.x - w / 2;
+            const y = nd.y - h / 2;
+
+            svg += `<rect x="${x}" y="${y}" width="${w}" height="${h}" rx="6" ` +
+                `fill="#1e1e3a" stroke="${color}" stroke-width="2" class="dfg-node" data-name="${esc(name)}"/>`;
+            // Label
+            const label = name.length > 20 ? name.substring(name.indexOf(':') + 1) : name;
+            svg += `<text x="${nd.x}" y="${nd.y - 2}" text-anchor="middle" ` +
+                `fill="#ccc" font-size="11" font-weight="500">${esc(label)}</text>`;
+            // Time sublabel
+            if (ms > 0) {
+                const timeStr = ms >= 1000 ? (ms/1000).toFixed(1) + 's' : ms.toFixed(0) + 'ms';
+                svg += `<text x="${nd.x}" y="${nd.y + 13}" text-anchor="middle" ` +
+                    `fill="#888" font-size="9">${timeStr}</text>`;
+            }
+        });
+
+        svg += '</g></svg>';
+        containerEl.innerHTML = svg;
+
+        // Tooltip on edge hover
+        const tooltip = document.getElementById('dfg-tooltip');
+        containerEl.querySelectorAll('.dfg-edge').forEach(edge => {
+            edge.style.cursor = 'pointer';
+            edge.addEventListener('mouseenter', (e) => {
+                const src = edge.dataset.source;
+                const tgt = edge.dataset.target;
+                const val = +edge.dataset.value;
+                const dur = +edge.dataset.dur;
+                const pct = (val / data.total * 100).toFixed(1);
+                const avg = val > 0 ? (dur / val).toFixed(1) : '?';
+                tooltip.innerHTML = `<b>${src}</b> → <b>${tgt}</b><br>` +
+                    `Count: ${val.toLocaleString()} (${pct}%)<br>` +
+                    `Avg dwell: ${avg} ms`;
+                tooltip.style.display = 'block';
+                edge.setAttribute('stroke', '#4fc3f7');
+            });
+            edge.addEventListener('mousemove', (e) => {
+                tooltip.style.left = (e.clientX + 12) + 'px';
+                tooltip.style.top = (e.clientY - 10) + 'px';
+            });
+            edge.addEventListener('mouseleave', () => {
+                tooltip.style.display = 'none';
+                edge.setAttribute('stroke', '#888');
+            });
+        });
+
+        // Tooltip on node hover
+        containerEl.querySelectorAll('.dfg-node').forEach(node => {
+            node.style.cursor = 'pointer';
+            node.addEventListener('mouseenter', (e) => {
+                const name = node.dataset.name;
+                const info = nodeMap[name] || {};
+                const ms = info.total_ms || 0;
+                const timeStr = ms >= 1000 ? (ms/1000).toFixed(1) + 's' : ms.toFixed(0) + 'ms';
+                tooltip.innerHTML = `<b>${name}</b><br>Total time: ${timeStr}`;
+                tooltip.style.display = 'block';
+                node.setAttribute('stroke-width', '3');
+            });
+            node.addEventListener('mousemove', (e) => {
+                tooltip.style.left = (e.clientX + 12) + 'px';
+                tooltip.style.top = (e.clientY - 10) + 'px';
+            });
+            node.addEventListener('mouseleave', () => {
+                tooltip.style.display = 'none';
+                node.setAttribute('stroke-width', '2');
+            });
+        });
     }
-    html += '</div>';
 
-    // -- Outgoing table for the last state in the chain --
-    if (totalOut === 0) {
-        html += '<p style="color:#666">No outgoing transitions from this state</p>';
-        detailEl.innerHTML = html;
-        return;
-    }
+    // Initial render
+    renderDFG(30);
 
-    const outgoing = _transEvents
-        .map(to => {
-            const l = _transLookup[fromEvent + '|' + to];
-            return l ? { to, count: l.value, duration_ms: l.duration_ms } : null;
-        })
-        .filter(Boolean)
-        .sort((a, b) => b.count - a.count);
-
-    html += `<h3 style="color:#ccc;margin:5px 0">` +
-        `${dot(fromEvent)} After <b>${esc(fromEvent)}</b> ` +
-        `<span style="color:#666">(${totalOut.toLocaleString()} outgoing) ` +
-        `\u2014 click a row to extend chain</span></h3>` +
-        '<table class="data-table"><thead><tr>' +
-        '<th>Next State</th><th>Count</th><th>% of Outgoing</th><th>Distribution</th><th>Avg Dwell (ms)</th>' +
-        '</tr></thead><tbody>';
-    outgoing.forEach(o => {
-        const pct = (o.count / totalOut * 100);
-        const avg = (o.duration_ms / o.count).toFixed(1);
-        const barW = Math.min(pct, 100);
-        const color = classColor(o.to) || '#4fc3f7';
-        html += `<tr class="chain-next" data-to="${esc(o.to)}" style="cursor:pointer">` +
-            `<td>${dot(o.to)} ${esc(o.to)}</td>` +
-            `<td>${o.count.toLocaleString()}</td>` +
-            `<td>${pct.toFixed(1)}%</td>` +
-            `<td><div class="pct-bar"><div class="pct-fill" style="width:${barW.toFixed(1)}%;background:${color}"></div></div></td>` +
-            `<td>${avg}</td></tr>`;
-    });
-    html += '</tbody></table>';
-    detailEl.innerHTML = html;
-
-    // Wire up chain navigation
-    detailEl.querySelectorAll('.chain-next').forEach(row => {
-        row.addEventListener('click', () => extendChain(row.dataset.to));
-    });
-    detailEl.querySelectorAll('.chain-step').forEach(step => {
-        step.addEventListener('click', () => truncateChain(+step.dataset.idx));
+    // Slider interaction
+    const slider = document.getElementById('dfg-slider');
+    const sliderVal = document.getElementById('dfg-slider-val');
+    slider.addEventListener('input', () => {
+        const v = +slider.value;
+        sliderVal.textContent = v + '%';
+        renderDFG(v);
     });
 }
 
