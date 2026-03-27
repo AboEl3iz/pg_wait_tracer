@@ -200,7 +200,7 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
     }
 
     /* Attach USDT query lifecycle probes (only in full trace mode) */
-    if (!d->lightweight_mode && d->pg_binary[0]) {
+    if (!d->lightweight_mode && !d->skip_usdt && d->pg_binary[0]) {
         /* pid=-1: attach to all processes running this binary (all backends) */
         d->skel->links.on_exec_start =
             bpf_program__attach_usdt(d->skel->progs.on_exec_start,

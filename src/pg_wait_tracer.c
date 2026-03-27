@@ -167,6 +167,7 @@ static enum pgwt_format parse_format(const char *s)
 #define OPT_TRACE_GROUP  260
 #define OPT_LIGHTWEIGHT  261
 #define OPT_SKIP_QID     262
+#define OPT_SKIP_USDT    263
 
 static struct option long_opts[] = {
     {"pid",        required_argument, NULL, 'p'},
@@ -190,6 +191,7 @@ static struct option long_opts[] = {
     {"trace-group",     required_argument, NULL, OPT_TRACE_GROUP},
     {"lightweight",     no_argument,       NULL, OPT_LIGHTWEIGHT},
     {"skip-query-id",   no_argument,       NULL, OPT_SKIP_QID},
+    {"skip-usdt",       no_argument,       NULL, OPT_SKIP_USDT},
     {"quiet",           no_argument,       NULL, 'q'},
     {"verbose",         no_argument,       NULL, 'v'},
     {"help",            no_argument,       NULL, 'h'},
@@ -248,6 +250,7 @@ int main(int argc, char **argv)
         case OPT_TRACE_GROUP: d->trace_group = optarg; break;
         case OPT_LIGHTWEIGHT: d->lightweight_mode = 1; break;
         case OPT_SKIP_QID:    d->skip_query_id = 1; break;
+        case OPT_SKIP_USDT:   d->skip_usdt = 1; break;
         case 'q': d->quiet = true; break;
         case 'v': d->verbose = true; break;
         case 'h': usage(argv[0]); free(d); return 0;
