@@ -2198,12 +2198,18 @@ function renderVariants(vdata, container) {
             return `${label}(${dur})`;
         }).join(' → ');
 
-        // Query text preview
+        // Query ID + text preview
         let queryHtml = '';
-        if (v.query_text) {
-            const preview = v.query_text.length > 100 ? v.query_text.substring(0, 100) + '...' : v.query_text;
+        if (v.top_query_id) {
+            const qid = v.top_query_id;
+            const preview = v.query_text
+                ? (v.query_text.length > 100 ? v.query_text.substring(0, 100) + '...' : v.query_text)
+                : '';
             queryHtml = `<div style="color:#666;font-size:10px;font-family:monospace;margin-top:2px;` +
-                `white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${esc(v.query_text)}">${esc(preview)}</div>`;
+                `white-space:nowrap;overflow:hidden;text-overflow:ellipsis" ` +
+                `title="${esc(v.query_text || '')}">` +
+                `<span style="color:#888">${qid}</span>` +
+                `${preview ? ' ' + esc(preview) : ''}</div>`;
         }
 
         html += `<div style="background:#1e1e3a;border:1px solid #2a2a4a;border-radius:6px;padding:10px;margin:6px 0">` +
