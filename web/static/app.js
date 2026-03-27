@@ -996,14 +996,7 @@ function renderApexChart(data) {
             type: 'solid',
             opacity: 0.85,
         },
-        legend: {
-            show: true,
-            position: 'bottom',
-            horizontalAlign: 'center',
-            fontSize: '11px',
-            labels: { colors: '#888' },
-            markers: { size: 8 },
-        },
+        legend: { show: false },
         grid: {
             borderColor: '#2a2a4a',
             padding: { left: 10, right: 10 },
@@ -1017,6 +1010,81 @@ function renderApexChart(data) {
         apexChart = new ApexCharts(apexEl, options);
         apexChart.render();
     }
+
+    // -- HTML legend (completely isolated from ECharts) --
+    // Uses ONLY apexChart.showSeries/hideSeries/updateOptions — zero DOM queries
+    const seriesNames = seriesList.map(s => s.name);
+    const seriesColors = colorList;
+    if (!state.apexSelected) state.apexSelected = new Set(seriesNames.map((_, i) => i));
+
+    let legDiv = document.getElementById('apex-custom-legend');
+    if (!legDiv) {
+        legDiv = document.createElement('div');
+        legDiv.id = 'apex-custom-legend';
+        legDiv.style.cssText = 'display:flex;flex-wrap:wrap;gap:4px;justify-content:center;padding:8px 20px;background:#1e1e3a;';
+        // Insert after apex-chart-container, NOT inside it
+        apexEl.parentNode.insertBefore(legDiv, apexEl.nextSibling);
+    }
+
+    legDiv.innerHTML = seriesNames.map((name, i) =>
+        `<span class="aleg" data-i="${i}" style="display:inline-flex;align-items:center;gap:4px;` +
+        `cursor:pointer;padding:3px 10px;border-radius:4px;font-size:11px;color:#ccc;` +
+        `border:1px solid ${seriesColors[i]};border-left:3px solid ${seriesColors[i]};` +
+        `user-select:none;transition:opacity 0.1s">` +
+        `<span style="width:8px;height:8px;border-radius:2px;background:${seriesColors[i]}"></span>` +
+        `${esc(name)}</span>`
+    ).join('');
+
+    function apexApplySelection() {
+        seriesNames.forEach((n, i) => {
+            if (state.apexSelected.has(i)) apexChart.showSeries(n);
+            else apexChart.hideSeries(n);
+        });
+        legDiv.querySelectorAll('.aleg').forEach(el => {
+            el.style.opacity = state.apexSelected.has(+el.dataset.i) ? '1' : '0.3';
+        });
+    }
+
+    function apexSetHoverOpacity(highlightIdx) {
+        // Use fill opacity array to dim/highlight — ApexCharts API only
+        const opacities = seriesNames.map((_, i) =>
+            i === highlightIdx ? 0.85 : 0.05);
+        apexChart.updateOptions({ fill: { opacity: opacities } }, false, false, false);
+    }
+
+    function apexRestoreOpacity() {
+        const opacities = seriesNames.map((_, i) =>
+            state.apexSelected.has(i) ? 0.85 : 0);
+        apexChart.updateOptions({ fill: { opacity: opacities } }, false, false, false);
+    }
+
+    legDiv.querySelectorAll('.aleg').forEach(el => {
+        const idx = +el.dataset.i;
+
+        el.addEventListener('mouseenter', () => apexSetHoverOpacity(idx));
+        el.addEventListener('mouseleave', () => apexRestoreOpacity());
+
+        el.addEventListener('click', (e) => {
+            if (e.metaKey || e.ctrlKey) {
+                // Cmd+Click: multiselect toggle
+                if (state.apexSelected.has(idx)) {
+                    if (state.apexSelected.size > 1) state.apexSelected.delete(idx);
+                } else {
+                    state.apexSelected.add(idx);
+                }
+            } else {
+                // Click: solo (or restore all if already solo)
+                if (state.apexSelected.size === 1 && state.apexSelected.has(idx)) {
+                    state.apexSelected = new Set(seriesNames.map((_, i) => i));
+                } else {
+                    state.apexSelected = new Set([idx]);
+                }
+            }
+            apexApplySelection();
+        });
+    });
+
+    apexApplySelection();
 }
 
 // -- Tables -------------------------------------------------------------------
