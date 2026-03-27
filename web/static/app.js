@@ -2007,23 +2007,17 @@ async function refreshTransitions() {
     container.innerHTML =
         '<div style="padding:10px 20px;display:flex;align-items:center;gap:12px">' +
             '<span style="color:#888;font-size:12px">Simplify:</span>' +
-            '<input type="range" id="dfg-slider" min="0" max="100" value="30" ' +
+            '<input type="range" id="dfg-slider" min="0" max="100" value="20" ' +
                 'style="width:200px;accent-color:#4fc3f7">' +
-            '<span id="dfg-slider-val" style="color:#888;font-size:12px">30%</span>' +
+            '<span id="dfg-slider-val" style="color:#888;font-size:12px">20%</span>' +
             '<span style="color:#666;font-size:11px;margin-left:8px">' +
                 `${Number(data.total).toLocaleString()} transitions</span>` +
         '</div>' +
-        '<div id="dfg-container" style="width:100%;height:550px;overflow:hidden;position:relative;background:#1a1a2e"></div>' +
-        '<div id="dfg-tooltip" style="display:none;position:fixed;background:#1e1e3a;border:1px solid #3a3a5a;' +
-            'border-radius:6px;padding:8px 12px;font-size:12px;color:#ccc;z-index:200;pointer-events:none;' +
-            'box-shadow:0 4px 12px rgba(0,0,0,0.5)"></div>';
+        '<div id="dfg-container" style="width:100%;height:550px;background:#1a1a2e"></div>';
 
     function renderDFG(threshold) {
-        // Filter edges by threshold (% of max count)
         const minCount = maxEdgeCount * threshold / 100;
         const visibleLinks = data.links.filter(l => l.value >= minCount);
-
-        // Collect visible nodes
         const visibleNodes = new Set();
         visibleLinks.forEach(l => { visibleNodes.add(l.source); visibleNodes.add(l.target); });
 
@@ -2033,186 +2027,94 @@ async function refreshTransitions() {
             return;
         }
 
-        // Build dagre graph
-        const g = new dagre.graphlib.Graph();
-        g.setGraph({ rankdir: 'LR', nodesep: 40, ranksep: 80, marginx: 40, marginy: 30 });
-        g.setDefaultEdgeLabel(() => ({}));
-
-        // Find max node time for sizing
         const maxNodeMs = Math.max(...[...visibleNodes].map(n => (nodeMap[n]?.total_ms || 1)));
-
-        visibleNodes.forEach(name => {
-            const nd = nodeMap[name] || {};
-            const ms = nd.total_ms || 0;
-            const w = Math.max(80, Math.min(180, 80 + (ms / maxNodeMs) * 100));
-            const h = 36;
-            g.setNode(name, { width: w, height: h, label: name });
-        });
-
-        visibleLinks.forEach(l => {
-            if (visibleNodes.has(l.source) && visibleNodes.has(l.target)) {
-                g.setEdge(l.source, l.target, {
-                    value: l.value,
-                    duration_ms: l.duration_ms,
-                    weight: l.value,
-                });
-            }
-        });
-
-        dagre.layout(g);
-
-        // Render as SVG
-        const graph = g.graph();
-        const svgW = Math.max(graph.width + 80, 600);
-        const svgH = Math.max(graph.height + 60, 400);
-        const containerEl = document.getElementById('dfg-container');
-        const cW = containerEl.clientWidth;
-        const cH = containerEl.clientHeight;
-        const scale = Math.min(cW / svgW, cH / svgH, 1.2);
-        const tx = (cW - svgW * scale) / 2;
-        const ty = (cH - svgH * scale) / 2;
-
-        let svg = `<svg width="${cW}" height="${cH}" style="font-family:sans-serif">`;
-        svg += `<g transform="translate(${tx},${ty}) scale(${scale})">`;
-
-        // Draw edges
         const maxLinkVal = Math.max(...visibleLinks.map(l => l.value));
-        visibleLinks.forEach(l => {
-            const srcNode = g.node(l.source);
-            const tgtNode = g.node(l.target);
-            if (!srcNode || !tgtNode) return;
 
-            const thickness = Math.max(1, Math.min(8, (l.value / maxLinkVal) * 8));
-            const opacity = 0.3 + (l.value / maxLinkVal) * 0.5;
-
-            const sx = srcNode.x + srcNode.width / 2;
-            const sy = srcNode.y;
-            const ex = tgtNode.x - tgtNode.width / 2;
-            const ey = tgtNode.y;
-
-            // Self-loop
-            if (l.source === l.target) {
-                const cx = srcNode.x;
-                const cy = srcNode.y - srcNode.height / 2 - 20;
-                svg += `<path d="M${sx - 15},${srcNode.y - srcNode.height/2} ` +
-                    `C${sx - 15},${cy - 15} ${sx + 15},${cy - 15} ${sx + 15},${srcNode.y - srcNode.height/2}" ` +
-                    `fill="none" stroke="#888" stroke-width="${thickness}" opacity="${opacity}" ` +
-                    `marker-end="url(#arrow)" class="dfg-edge" ` +
-                    `data-source="${esc(l.source)}" data-target="${esc(l.target)}" ` +
-                    `data-value="${l.value}" data-dur="${l.duration_ms}"/>`;
-                return;
-            }
-
-            // Back-edge (target is left of source)
-            if (tgtNode.x <= srcNode.x) {
-                const midY = Math.min(srcNode.y, tgtNode.y) - 60 - thickness * 3;
-                svg += `<path d="M${sx},${srcNode.y - srcNode.height/2} ` +
-                    `C${sx},${midY} ${tgtNode.x},${midY} ${tgtNode.x},${tgtNode.y - tgtNode.height/2}" ` +
-                    `fill="none" stroke="#888" stroke-width="${thickness}" opacity="${opacity}" ` +
-                    `stroke-dasharray="4,3" marker-end="url(#arrow)" class="dfg-edge" ` +
-                    `data-source="${esc(l.source)}" data-target="${esc(l.target)}" ` +
-                    `data-value="${l.value}" data-dur="${l.duration_ms}"/>`;
-                return;
-            }
-
-            // Forward edge — cubic bezier
-            const dx = ex - sx;
-            svg += `<path d="M${sx},${sy} C${sx + dx*0.4},${sy} ${ex - dx*0.4},${ey} ${ex},${ey}" ` +
-                `fill="none" stroke="#888" stroke-width="${thickness}" opacity="${opacity}" ` +
-                `marker-end="url(#arrow)" class="dfg-edge" ` +
-                `data-source="${esc(l.source)}" data-target="${esc(l.target)}" ` +
-                `data-value="${l.value}" data-dur="${l.duration_ms}"/>`;
-        });
-
-        // Arrow marker
-        svg += '<defs><marker id="arrow" viewBox="0 0 10 6" refX="10" refY="3" ' +
-            'markerWidth="8" markerHeight="6" orient="auto-start-reverse">' +
-            '<path d="M0,0 L10,3 L0,6 z" fill="#888"/></marker></defs>';
-
-        // Draw nodes
-        visibleNodes.forEach(name => {
-            const nd = g.node(name);
-            if (!nd) return;
+        // Build ECharts graph data
+        const ecNodes = [...visibleNodes].map(name => {
             const info = nodeMap[name] || {};
+            const ms = info.total_ms || 0;
             const cls = (info.class || 'unknown').toLowerCase();
             const color = classColor(name) || classColor(cls) || '#888';
-            const ms = info.total_ms || 0;
-            const w = nd.width;
-            const h = nd.height;
-            const x = nd.x - w / 2;
-            const y = nd.y - h / 2;
-
-            svg += `<rect x="${x}" y="${y}" width="${w}" height="${h}" rx="6" ` +
-                `fill="#1e1e3a" stroke="${color}" stroke-width="2" class="dfg-node" data-name="${esc(name)}"/>`;
-            // Label
-            const label = name.length > 20 ? name.substring(name.indexOf(':') + 1) : name;
-            svg += `<text x="${nd.x}" y="${nd.y - 2}" text-anchor="middle" ` +
-                `fill="#ccc" font-size="11" font-weight="500">${esc(label)}</text>`;
-            // Time sublabel
-            if (ms > 0) {
-                const timeStr = ms >= 1000 ? (ms/1000).toFixed(1) + 's' : ms.toFixed(0) + 'ms';
-                svg += `<text x="${nd.x}" y="${nd.y + 13}" text-anchor="middle" ` +
-                    `fill="#888" font-size="9">${timeStr}</text>`;
-            }
+            const size = Math.max(20, Math.min(80, 20 + (ms / maxNodeMs) * 60));
+            const timeStr = ms >= 1000 ? (ms/1000).toFixed(1) + 's' : ms.toFixed(0) + 'ms';
+            return {
+                name: name,
+                symbolSize: size,
+                itemStyle: { color: color, borderColor: color, borderWidth: 2 },
+                label: {
+                    show: true,
+                    position: 'bottom',
+                    fontSize: 10,
+                    color: '#ccc',
+                    formatter: name.indexOf(':') > 0 ? name.substring(name.indexOf(':') + 1) : name,
+                },
+                tooltip: {
+                    formatter: `<b>${name}</b><br/>Total time: ${timeStr}`,
+                },
+                value: ms,
+            };
         });
 
-        svg += '</g></svg>';
-        containerEl.innerHTML = svg;
-
-        // Tooltip on edge hover
-        const tooltip = document.getElementById('dfg-tooltip');
-        containerEl.querySelectorAll('.dfg-edge').forEach(edge => {
-            edge.style.cursor = 'pointer';
-            edge.addEventListener('mouseenter', (e) => {
-                const src = edge.dataset.source;
-                const tgt = edge.dataset.target;
-                const val = +edge.dataset.value;
-                const dur = +edge.dataset.dur;
-                const pct = (val / data.total * 100).toFixed(1);
-                const avg = val > 0 ? (dur / val).toFixed(1) : '?';
-                tooltip.innerHTML = `<b>${src}</b> → <b>${tgt}</b><br>` +
-                    `Count: ${val.toLocaleString()} (${pct}%)<br>` +
-                    `Avg dwell: ${avg} ms`;
-                tooltip.style.display = 'block';
-                edge.setAttribute('stroke', '#4fc3f7');
-            });
-            edge.addEventListener('mousemove', (e) => {
-                tooltip.style.left = (e.clientX + 12) + 'px';
-                tooltip.style.top = (e.clientY - 10) + 'px';
-            });
-            edge.addEventListener('mouseleave', () => {
-                tooltip.style.display = 'none';
-                edge.setAttribute('stroke', '#888');
-            });
+        const ecLinks = visibleLinks.map(l => {
+            const w = Math.max(1, Math.min(10, (l.value / maxLinkVal) * 10));
+            const pct = (l.value / data.total * 100).toFixed(1);
+            const avg = l.value > 0 ? (l.duration_ms / l.value).toFixed(1) : '?';
+            return {
+                source: l.source,
+                target: l.target,
+                lineStyle: {
+                    width: w,
+                    color: '#555',
+                    curveness: l.source === l.target ? 0.8 : 0.3,
+                    opacity: 0.4 + (l.value / maxLinkVal) * 0.5,
+                },
+                tooltip: {
+                    formatter: `<b>${l.source}</b> → <b>${l.target}</b><br/>` +
+                        `Count: ${l.value.toLocaleString()} (${pct}%)<br/>` +
+                        `Avg dwell: ${avg} ms`,
+                },
+                value: l.value,
+            };
         });
 
-        // Tooltip on node hover
-        containerEl.querySelectorAll('.dfg-node').forEach(node => {
-            node.style.cursor = 'pointer';
-            node.addEventListener('mouseenter', (e) => {
-                const name = node.dataset.name;
-                const info = nodeMap[name] || {};
-                const ms = info.total_ms || 0;
-                const timeStr = ms >= 1000 ? (ms/1000).toFixed(1) + 's' : ms.toFixed(0) + 'ms';
-                tooltip.innerHTML = `<b>${name}</b><br>Total time: ${timeStr}`;
-                tooltip.style.display = 'block';
-                node.setAttribute('stroke-width', '3');
-            });
-            node.addEventListener('mousemove', (e) => {
-                tooltip.style.left = (e.clientX + 12) + 'px';
-                tooltip.style.top = (e.clientY - 10) + 'px';
-            });
-            node.addEventListener('mouseleave', () => {
-                tooltip.style.display = 'none';
-                node.setAttribute('stroke-width', '2');
-            });
-        });
+        const el = document.getElementById('dfg-container');
+        if (transitionsChart) transitionsChart.dispose();
+        transitionsChart = echarts.init(el, 'dark');
+
+        transitionsChart.setOption({
+            backgroundColor: 'transparent',
+            tooltip: {
+                backgroundColor: '#1e1e3a',
+                borderColor: '#333',
+                textStyle: { color: '#e0e0e0', fontSize: 12 },
+            },
+            series: [{
+                type: 'graph',
+                layout: 'force',
+                roam: true,
+                draggable: true,
+                force: {
+                    repulsion: 300,
+                    gravity: 0.1,
+                    edgeLength: [80, 200],
+                    layoutAnimation: true,
+                },
+                data: ecNodes,
+                links: ecLinks,
+                edgeSymbol: ['none', 'arrow'],
+                edgeSymbolSize: [0, 8],
+                emphasis: {
+                    focus: 'adjacency',
+                    lineStyle: { width: 4, opacity: 1 },
+                },
+                lineStyle: { curveness: 0.3 },
+            }],
+        }, true);
     }
 
-    // Initial render
-    renderDFG(30);
+    renderDFG(20);
 
-    // Slider interaction
     const slider = document.getElementById('dfg-slider');
     const sliderVal = document.getElementById('dfg-slider-val');
     slider.addEventListener('input', () => {
