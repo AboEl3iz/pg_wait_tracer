@@ -844,19 +844,21 @@ function renderApexChart(data) {
 
     const isEventBreakdown = data.breakdown === 'events' && data.series;
 
-    // Build series: each is { name, data: [[timestampMs, value], ...] }
+    // Build series with raw values (categories, not datetime — preserves ns precision)
     let seriesList, colorList;
+    const bns = data.bucket_ns || 0;
+    const categories = data.buckets.map(b => b.t);  // raw ns timestamps
 
     if (isEventBreakdown) {
         seriesList = data.series.map((s, idx) => ({
             name: s.name,
-            data: data.buckets.map(b => [b.t / 1e6, +(b.aas[idx] || 0).toFixed(4)]),
+            data: data.buckets.map(b => +(b.aas[idx] || 0).toFixed(4)),
         }));
         colorList = data.series.map((_, idx) => EVENT_PALETTE[idx % EVENT_PALETTE.length]);
     } else {
         seriesList = WAIT_CLASSES.map(wc => ({
             name: wc.label,
-            data: data.buckets.map(b => [b.t / 1e6, +(b[wc.key] || 0).toFixed(4)]),
+            data: data.buckets.map(b => +(b[wc.key] || 0).toFixed(4)),
         }));
         colorList = WAIT_CLASSES.map(c => c.color);
     }
@@ -881,10 +883,13 @@ function renderApexChart(data) {
             },
             events: {
                 zoomed: function(ctx, { xaxis }) {
-                    if (xaxis.min && xaxis.max) {
+                    if (xaxis.min != null && xaxis.max != null) {
                         stopAutoRefresh();
-                        state.viewFrom = xaxis.min * 1e6;
-                        state.viewTo = xaxis.max * 1e6;
+                        // xaxis.min/max are category indices
+                        const fromIdx = Math.max(0, Math.floor(xaxis.min));
+                        const toIdx = Math.min(categories.length - 1, Math.ceil(xaxis.max));
+                        state.viewFrom = categories[fromIdx];
+                        state.viewTo = categories[toIdx];
                         updateTimeRange();
                         refresh();
                     }
@@ -896,30 +901,15 @@ function renderApexChart(data) {
         colors: colorList,
         series: seriesList,
         xaxis: {
-            type: 'datetime',
+            type: 'category',
+            categories: categories,
             labels: {
-                datetimeUTC: true,
                 style: { colors: '#888', fontSize: '10px' },
-                datetimeFormatter: {
-                    year: 'yyyy',
-                    month: "MMM 'yy",
-                    day: 'dd MMM',
-                    hour: 'HH:mm',
-                    minute: 'HH:mm:ss',
-                    second: 'HH:mm:ss',
-                },
-                formatter: function(val) {
-                    const d = new Date(val);
-                    const hms = d.toUTCString().slice(17, 25);
-                    const rangeMs = (state.viewTo - state.viewFrom) / 1e6;
-                    if (rangeMs < 60000) {
-                        // Under 1 min range — show ms
-                        const ms = d.getUTCMilliseconds();
-                        return hms + '.' + String(ms).padStart(3, '0');
-                    }
-                    return hms;
-                },
+                formatter: function(val) { return fmtTime(val, bns); },
+                rotate: 0,
+                hideOverlappingLabels: true,
             },
+            tickAmount: 10,
             axisBorder: { color: '#333' },
             axisTicks: { color: '#333' },
             crosshairs: {
@@ -962,8 +952,7 @@ function renderApexChart(data) {
             shared: true,
             theme: 'dark',
             custom: function({ series, dataPointIndex, w }) {
-                const ts = w.globals.seriesX[0][dataPointIndex];
-                const t = fmtTime(ts * 1e6);
+                const t = fmtTime(categories[dataPointIndex], bns);
                 let total = 0;
                 let items = [];
                 for (let i = series.length - 1; i >= 0; i--) {
