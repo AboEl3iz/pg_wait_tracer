@@ -2030,16 +2030,34 @@ async function refreshTransitions() {
         const maxNodeMs = Math.max(...[...visibleNodes].map(n => (nodeMap[n]?.total_ms || 1)));
         const maxLinkVal = Math.max(...visibleLinks.map(l => l.value));
 
-        // Build ECharts graph data
-        const ecNodes = [...visibleNodes].map(name => {
-            const info = nodeMap[name] || {};
-            const ms = info.total_ms || 0;
+        // Build ECharts graph data — grid layout filling the container
+        const sortedNodes = [...visibleNodes]
+            .map(name => ({ name, ms: (nodeMap[name]?.total_ms || 0) }))
+            .sort((a, b) => b.ms - a.ms);
+
+        const n = sortedNodes.length;
+        const cols = Math.ceil(Math.sqrt(n * 1.8));  // wider than tall
+        const rows = Math.ceil(n / cols);
+        const el = document.getElementById('dfg-container');
+        const cW = el.clientWidth || 800;
+        const cH = el.clientHeight || 550;
+        const padX = 80, padY = 60;
+        const cellW = (cW - padX * 2) / Math.max(cols - 1, 1);
+        const cellH = (cH - padY * 2) / Math.max(rows - 1, 1);
+
+        const ecNodes = sortedNodes.map((nd, i) => {
+            const info = nodeMap[nd.name] || {};
+            const ms = nd.ms;
             const cls = (info.class || 'unknown').toLowerCase();
-            const color = classColor(name) || classColor(cls) || '#888';
+            const color = classColor(nd.name) || classColor(cls) || '#888';
             const size = Math.max(15, Math.min(120, 15 + Math.sqrt(ms / maxNodeMs) * 105));
             const timeStr = ms >= 1000 ? (ms/1000).toFixed(1) + 's' : ms.toFixed(0) + 'ms';
+            const col = i % cols;
+            const row = Math.floor(i / cols);
             return {
-                name: name,
+                name: nd.name,
+                x: padX + col * cellW,
+                y: padY + row * cellH,
                 symbolSize: size,
                 itemStyle: { color: color, borderColor: color, borderWidth: 2 },
                 label: {
@@ -2047,12 +2065,12 @@ async function refreshTransitions() {
                     position: 'bottom',
                     fontSize: 10,
                     color: '#ccc',
-                    formatter: (name.indexOf(':') > 0 ? name.substring(name.indexOf(':') + 1) : name) +
+                    formatter: (nd.name.indexOf(':') > 0 ? nd.name.substring(nd.name.indexOf(':') + 1) : nd.name) +
                         '\n' + timeStr,
                     lineHeight: 14,
                 },
                 tooltip: {
-                    formatter: `<b>${name}</b><br/>Total time: ${timeStr}`,
+                    formatter: `<b>${nd.name}</b><br/>Total time: ${timeStr}`,
                 },
                 value: ms,
             };
@@ -2080,7 +2098,6 @@ async function refreshTransitions() {
             };
         });
 
-        const el = document.getElementById('dfg-container');
         if (transitionsChart) transitionsChart.dispose();
         transitionsChart = echarts.init(el, 'dark');
 
@@ -2093,12 +2110,9 @@ async function refreshTransitions() {
             },
             series: [{
                 type: 'graph',
-                layout: 'circular',
+                layout: 'none',
                 roam: true,
                 draggable: true,
-                circular: {
-                    rotateLabel: true,
-                },
                 data: ecNodes,
                 links: ecLinks,
                 edgeSymbol: ['none', 'arrow'],
