@@ -1259,68 +1259,51 @@ static void handle_transitions(struct pgwt_server *srv, struct pgwt_request *req
     cJSON_AddNumberToObject(root, "id", (double)req->id);
     cjson_add_uint64(root, "total", res.total_transitions);
 
-    /* Compute per-node total time directly from ALL events (not truncated rows).
-     * Each event's old_event spent duration_ns — sum by event. */
-    struct { uint32_t event_id; char name[64]; double total_ms; } node_acc[256];
+    /* Compute per-node total time directly from ALL events.
+     * Use a simple hash table keyed by event_id for O(1) lookup. */
+    #define NODE_HT_SIZE 1024
+    #define NODE_HT_MASK (NODE_HT_SIZE - 1)
+    struct { uint32_t event_id; int used; char name[64]; double total_ms; }
+        *node_ht = calloc(NODE_HT_SIZE, sizeof(*node_ht));
     int num_nodes = 0;
+
     for (int i = 0; i < count; i++) {
         const struct pgwt_trace_event *ev = &events[i];
-        if (pgwt_is_idle_event(ev->old_event) || PGWT_IS_MARKER(ev->old_event))
+        uint32_t eid = ev->old_event;
+        if (pgwt_is_idle_event(eid) || PGWT_IS_MARKER(eid))
             continue;
-        if (ev->old_event == 0) continue;  /* skip CPU=0 with no time */
-        /* Find or insert */
-        int found = -1;
-        for (int j = 0; j < num_nodes; j++) {
-            if (node_acc[j].event_id == ev->old_event) {
-                found = j; break;
-            }
-        }
-        if (found >= 0) {
-            node_acc[found].total_ms += ev->duration_ns / 1e6;
-        } else if (num_nodes < 256) {
-            node_acc[num_nodes].event_id = ev->old_event;
-            pgwt_event_full_name(ev->old_event, node_acc[num_nodes].name,
-                                 sizeof(node_acc[num_nodes].name));
-            node_acc[num_nodes].total_ms = ev->duration_ns / 1e6;
+        double ms = ev->duration_ns / 1e6;
+        uint32_t h = (eid * 0x9e3779b9) & NODE_HT_MASK;
+        while (node_ht[h].used && node_ht[h].event_id != eid)
+            h = (h + 1) & NODE_HT_MASK;
+        if (node_ht[h].used) {
+            node_ht[h].total_ms += ms;
+        } else {
+            node_ht[h].used = 1;
+            node_ht[h].event_id = eid;
+            node_ht[h].total_ms = ms;
+            if (eid == 0)
+                snprintf(node_ht[h].name, 64, "CPU*");
+            else
+                pgwt_event_full_name(eid, node_ht[h].name, sizeof(node_ht[h].name));
             num_nodes++;
-        }
-    }
-    /* Also ensure CPU* node exists with its total time */
-    {
-        double cpu_ms = 0;
-        for (int i = 0; i < count; i++) {
-            if (events[i].old_event == 0 && events[i].duration_ns > 0)
-                cpu_ms += events[i].duration_ns / 1e6;
-        }
-        if (cpu_ms > 0) {
-            int found = -1;
-            for (int j = 0; j < num_nodes; j++) {
-                if (node_acc[j].event_id == 0) { found = j; break; }
-            }
-            if (found >= 0) {
-                node_acc[found].total_ms = cpu_ms;
-            } else if (num_nodes < 256) {
-                node_acc[num_nodes].event_id = 0;
-                snprintf(node_acc[num_nodes].name, 64, "CPU*");
-                node_acc[num_nodes].total_ms = cpu_ms;
-                num_nodes++;
-            }
         }
     }
 
     /* Nodes array */
     cJSON *nodes = cJSON_AddArrayToObject(root, "nodes");
-    for (int i = 0; i < num_nodes; i++) {
+    for (int i = 0; i < NODE_HT_SIZE; i++) {
+        if (!node_ht[i].used) continue;
         cJSON *node = cJSON_CreateObject();
-        cJSON_AddStringToObject(node, "name", node_acc[i].name);
-        cJSON_AddNumberToObject(node, "total_ms", node_acc[i].total_ms);
+        cJSON_AddStringToObject(node, "name", node_ht[i].name);
+        cJSON_AddNumberToObject(node, "total_ms", node_ht[i].total_ms);
         /* Extract wait class for coloring */
-        const char *colon = strchr(node_acc[i].name, ':');
+        const char *colon = strchr(node_ht[i].name, ':');
         if (colon) {
             char cls[32];
-            int len = colon - node_acc[i].name;
+            int len = colon - node_ht[i].name;
             if (len > 31) len = 31;
-            memcpy(cls, node_acc[i].name, len);
+            memcpy(cls, node_ht[i].name, len);
             cls[len] = '\0';
             cJSON_AddStringToObject(node, "class", cls);
         } else {
@@ -1328,6 +1311,7 @@ static void handle_transitions(struct pgwt_server *srv, struct pgwt_request *req
         }
         cJSON_AddItemToArray(nodes, node);
     }
+    free(node_ht);
 
     /* Links array */
     cJSON *links = cJSON_AddArrayToObject(root, "links");
