@@ -366,6 +366,7 @@ int main(int argc, char **argv)
         free(d);
         return 1;
     }
+    /* pg_binary_saved is set by pgwt_discover via strdup (heap-allocated) */
 
     /* ── Daemon mode: supervision loop ─────────────────────── */
     if (daemon_mode) {
@@ -407,6 +408,7 @@ int main(int argc, char **argv)
                 d->postmaster_pid = 0;
 
                 if (pgwt_discover(d) == 0) {
+                    /* pg_binary_saved updated inside pgwt_discover */
                     fprintf(stderr, "pg_wait_tracer: PostgreSQL restarted (PID %d), "
                             "re-attaching\n", d->postmaster_pid);
                     found = true;

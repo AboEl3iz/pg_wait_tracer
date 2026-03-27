@@ -88,7 +88,6 @@ struct pgwt_daemon {
     uint32_t    skip_usdt;             /* 1 = skip USDT query lifecycle probes */
     enum pgwt_exit_reason exit_reason;   /* why the event loop exited */
     char        pgdata[512];             /* stored for restart detection */
-    char        pg_binary[256];          /* path to postgres binary (for USDT probes) */
 
     /* Trace file recording */
     const char *trace_dir;                  /* NULL = disabled */
@@ -113,6 +112,9 @@ struct pgwt_daemon {
     struct pgwt_accumulator accum;
     volatile bool running;
     uint64_t start_ts;
+
+    /* Placed at end of struct to survive field overflow corruption */
+    char       *pg_binary_saved;        /* heap-allocated postgres binary path for USDT */
 };
 
 /* Initialize daemon: load BPF, attach tracepoints, scan backends. */

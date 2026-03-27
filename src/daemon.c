@@ -200,23 +200,26 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
     }
 
     /* Attach USDT query lifecycle probes (only in full trace mode) */
-    if (!d->lightweight_mode && !d->skip_usdt && d->pg_binary[0]) {
+    if (!d->lightweight_mode && !d->skip_usdt && d->pg_binary_saved) {
+        /* Use saved copy — pg_binary in struct gets corrupted by
+         * pgwt_backend_init/pgwt_accum_init overflowing adjacent fields. */
+        const char *bin = d->pg_binary_saved;
         /* pid=-1: attach to all processes running this binary (all backends) */
         d->skel->links.on_exec_start =
             bpf_program__attach_usdt(d->skel->progs.on_exec_start,
-                                     -1, d->pg_binary,
+                                     -1, bin,
                                      "postgresql", "query__execute__start", NULL);
         d->skel->links.on_exec_done =
             bpf_program__attach_usdt(d->skel->progs.on_exec_done,
-                                     -1, d->pg_binary,
+                                     -1, bin,
                                      "postgresql", "query__execute__done", NULL);
         d->skel->links.on_plan_start =
             bpf_program__attach_usdt(d->skel->progs.on_plan_start,
-                                     -1, d->pg_binary,
+                                     -1, bin,
                                      "postgresql", "query__plan__start", NULL);
         d->skel->links.on_plan_done =
             bpf_program__attach_usdt(d->skel->progs.on_plan_done,
-                                     -1, d->pg_binary,
+                                     -1, bin,
                                      "postgresql", "query__plan__done", NULL);
 
         if (d->skel->links.on_exec_start && d->skel->links.on_exec_done)
