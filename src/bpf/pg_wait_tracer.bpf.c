@@ -163,14 +163,9 @@ int on_watchpoint(struct bpf_perf_event_data *ctx)
             accum_add(st->last_event, duration);
         } else {
             /* Full trace: emit to ringbuf.
-             * Use bpf_ringbuf_output (1 helper call) instead of
-             * reserve+submit (2 calls). BPF_RB_NO_WAKEUP avoids
-             * per-event eventfd_signal — daemon polls at 10ms. */
-            if (!skip_query_id) {
-                u64 cur_query_id = read_query_id_cached(st->be_entry_ptr);
-                st->last_query_id = cur_query_id;
-            }
-
+             * query_id comes from state_map cache, set by EXEC_START
+             * marker (not read from shared memory here — avoids race
+             * where st_query_id and st_activity are out of sync). */
             struct pgwt_trace_event evt = {
                 .timestamp_ns = now,
                 .pid = pid,
@@ -311,11 +306,25 @@ static __always_inline void emit_marker(u32 marker)
     u32 pid = bpf_get_current_pid_tgid() >> 32;
     u64 now = bpf_ktime_get_ns();
 
-    /* Read current query_id from backend status */
     struct pgwt_pid_state *st = bpf_map_lookup_elem(&state_map, &pid);
     u64 qid = 0;
-    if (st && !skip_query_id)
-        qid = read_query_id_cached(st->be_entry_ptr);
+
+    if (st) {
+        if (marker == PGWT_MARKER_EXEC_START && !skip_query_id) {
+            /* Read query_id at execution start — guaranteed correct
+             * (set by pgstat_report_query_id during parse, before execute).
+             * Cache in state_map so all subsequent wait events use it. */
+            qid = read_query_id_cached(st->be_entry_ptr);
+            st->last_query_id = qid;
+        } else if (marker == PGWT_MARKER_EXEC_END) {
+            /* Use the cached query_id, then clear for inter-statement gap */
+            qid = st->last_query_id;
+            st->last_query_id = 0;
+        } else {
+            /* PLAN markers: use whatever is cached */
+            qid = st->last_query_id;
+        }
+    }
 
     struct pgwt_trace_event evt = {
         .timestamp_ns = now,

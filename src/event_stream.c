@@ -24,7 +24,7 @@ int pgwt_handle_trace_event(void *ctx, void *data, size_t data_sz)
 
     (void)data_sz;
 
-    /* Write to trace file if recording is enabled */
+    /* Write to trace file if recording is enabled (including markers) */
     if (d->event_writer)
         pgwt_writer_push_event(d->event_writer, evt);
 
@@ -34,6 +34,18 @@ int pgwt_handle_trace_event(void *ctx, void *data, size_t data_sz)
 
     uint32_t we = evt->old_event;
     uint64_t dur = evt->duration_ns;
+
+    /* Capture query text on EXEC_START — query_id is guaranteed correct
+     * at this point (set by pgstat_report_query_id during parse, before
+     * PortalRun fires the USDT probe). */
+    if (we == PGWT_MARKER_EXEC_START && evt->query_id != 0) {
+        if (d->query_text_capture)
+            pgwt_qt_check(d->query_text_capture, evt->pid, evt->query_id, 0);
+    }
+
+    /* Skip accumulation for marker events (duration=0, not real waits) */
+    if (PGWT_IS_MARKER(we))
+        return 0;
 
     /* Per-PID accumulation */
     struct pgwt_pid_accum *pa = pgwt_get_or_create_pid(acc, evt->pid);
@@ -83,10 +95,6 @@ int pgwt_handle_trace_event(void *ctx, void *data, size_t data_sz)
             if (dur < qe->min_ns) qe->min_ns = dur;
             if (dur > qe->max_ns) qe->max_ns = dur;
         }
-
-        /* Capture query text (only on first occurrence of each query_id) */
-        if (d->query_text_capture)
-            pgwt_qt_check(d->query_text_capture, evt->pid, evt->query_id, 0);
     }
 
     return 0;
