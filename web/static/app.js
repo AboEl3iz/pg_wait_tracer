@@ -1047,11 +1047,12 @@ function positionTooltip(tip, e) {
 
 function drillDown(filterKey, filterValue, label) {
     state.breadcrumbs.push({
-        label: label,
+        label: state.currentFilterLabel || '',
         filters: { ...state.filters },
         tab: state.activeTab,
     });
     state.filters[filterKey] = filterValue;
+    state.currentFilterLabel = label;
 
     // Auto-pivot: update tab state without triggering a separate refresh
     const pivotMap = { class: 'events', event_id: 'queries', pid: 'timeline', query_id: 'events' };
@@ -1070,6 +1071,7 @@ function drillDown(filterKey, filterValue, label) {
 function drillUp(index) {
     const crumb = state.breadcrumbs[index];
     state.filters = { ...crumb.filters };
+    state.currentFilterLabel = crumb.label;
     state.breadcrumbs = state.breadcrumbs.slice(0, index);
     // Set tab state without triggering a separate refreshTable
     const tab = crumb.tab;
@@ -1084,6 +1086,7 @@ function drillUp(index) {
 function clearFilters() {
     state.filters = {};
     state.breadcrumbs = [];
+    state.currentFilterLabel = null;
     updateBreadcrumb();
     // Set tab state without triggering a separate refreshTable
     state.activeTab = 'overview';
@@ -1107,14 +1110,11 @@ function updateBreadcrumb() {
             dot(crumb.label) + esc(crumb.label) + '</span>';
     });
 
-    // Current filter
-    const filterParts = [];
-    for (const [k, v] of Object.entries(state.filters)) {
-        filterParts.push(k + '=' + v);
-    }
-    if (filterParts.length > 0) {
+    // Current filter — show label if available, otherwise raw keys
+    if (Object.keys(state.filters).length > 0) {
         if (state.breadcrumbs.length > 0) html += '<span class="crumb-sep">\u203a</span>';
-        html += '<span style="color:#4fc3f7">' + esc(filterParts.join(', ')) + '</span>';
+        const label = state.currentFilterLabel || Object.entries(state.filters).map(([k,v]) => k + '=' + v).join(', ');
+        html += '<span style="color:#4fc3f7">' + dot(label) + esc(label) + '</span>';
         html += ' <span class="crumb-clear" title="Clear all filters">\u2715</span>';
     }
 
