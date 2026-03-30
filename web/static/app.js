@@ -775,21 +775,31 @@ function renderApexChart(data) {
 
         el.addEventListener('click', (e) => {
             if (e.metaKey || e.ctrlKey) {
-                // Cmd+Click: multiselect toggle
-                if (state.apexSelected.has(idx)) {
-                    if (state.apexSelected.size > 1) state.apexSelected.delete(idx);
+                // Cmd+Click: solo/multiselect (visual only, no drill)
+                if (e.shiftKey) {
+                    // Cmd+Shift: multiselect toggle
+                    if (state.apexSelected.has(idx)) {
+                        if (state.apexSelected.size > 1) state.apexSelected.delete(idx);
+                    } else {
+                        state.apexSelected.add(idx);
+                    }
                 } else {
-                    state.apexSelected.add(idx);
+                    // Cmd: solo (or restore all)
+                    if (state.apexSelected.size === 1 && state.apexSelected.has(idx)) {
+                        state.apexSelected = new Set(seriesNames.map((_, i) => i));
+                    } else {
+                        state.apexSelected = new Set([idx]);
+                    }
                 }
+                apexApplySelection();
             } else {
-                // Click: solo (or restore all if already solo)
-                if (state.apexSelected.size === 1 && state.apexSelected.has(idx)) {
-                    state.apexSelected = new Set(seriesNames.map((_, i) => i));
-                } else {
-                    state.apexSelected = new Set([idx]);
+                // Click: drill down into this wait class
+                const name = seriesNames[idx];
+                const wc = WAIT_CLASSES.find(c => c.label === name);
+                if (wc) {
+                    drillDown('class', wc.key, wc.label);
                 }
             }
-            apexApplySelection();
         });
     });
 
