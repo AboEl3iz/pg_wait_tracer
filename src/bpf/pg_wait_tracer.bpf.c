@@ -322,14 +322,12 @@ static __always_inline void emit_marker(u32 marker)
     u64 qid = 0;
 
     if (st) {
-        if (marker == PGWT_MARKER_EXEC_END) {
-            /* Use the cached query_id, then clear for inter-statement gap */
-            qid = st->last_query_id;
-            st->last_query_id = 0;
-        } else {
-            /* EXEC_START, PLAN markers: use query_id set by on_report_query_id uprobe */
-            qid = st->last_query_id;
-        }
+        /* All markers use the current query_id from the uprobe.
+         * Don't clear on EXEC_END — events after EXEC_END (like WALSync
+         * during COMMIT) are still part of that query's execution.
+         * The uprobe on pgstat_report_query_id overwrites last_query_id
+         * when the next statement starts. */
+        qid = st->last_query_id;
     }
 
     struct pgwt_trace_event evt = {
