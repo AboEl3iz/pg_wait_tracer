@@ -453,68 +453,38 @@ function initChart() {
         if (concurrencyChart) concurrencyChart.resize();
     });
 
-    // -- Brush selection (Grafana-style click-drag zoom) --
-    const overlay = document.createElement('div');
-    overlay.className = 'brush-overlay';
-    chartEl.appendChild(overlay);
-
-    let brushStart = null;
-
-    chartEl.addEventListener('mousedown', (e) => {
-        if (e.button !== 0 || !chart) return;
-        // Only start brush inside the chart grid area
-        const rect = chartEl.getBoundingClientRect();
-        const x = e.clientX - rect.left;
-        const gridRect = chart.getModel().getComponent('grid').coordinateSystem.getRect();
-        if (x < gridRect.x || x > gridRect.x + gridRect.width) return;
-        const y = e.clientY - rect.top;
-        if (y < gridRect.y || y > gridRect.y + gridRect.height) return;
-
-        brushStart = { x: x, gridLeft: gridRect.x, gridWidth: gridRect.width };
-        overlay.style.left = x + 'px';
-        overlay.style.width = '0px';
-        overlay.style.top = gridRect.y + 'px';
-        overlay.style.height = gridRect.height + 'px';
-        overlay.style.display = 'block';
-        e.preventDefault();
+    // -- Brush zoom: ECharts built-in brush for smooth selection --
+    chart.on('brushEnd', function(params) {
+        // Not used — we handle brushSelected instead
     });
-
-    document.addEventListener('mousemove', (e) => {
-        if (!brushStart) return;
-        const rect = chartEl.getBoundingClientRect();
-        let x = e.clientX - rect.left;
-        x = Math.max(brushStart.gridLeft, Math.min(x, brushStart.gridLeft + brushStart.gridWidth));
-        const left = Math.min(brushStart.x, x);
-        const width = Math.abs(x - brushStart.x);
-        overlay.style.left = left + 'px';
-        overlay.style.width = width + 'px';
-    });
-
-    document.addEventListener('mouseup', (e) => {
-        if (!brushStart) return;
-        overlay.style.display = 'none';
-        const rect = chartEl.getBoundingClientRect();
-        let endX = e.clientX - rect.left;
-        endX = Math.max(brushStart.gridLeft, Math.min(endX, brushStart.gridLeft + brushStart.gridWidth));
-        const minX = Math.min(brushStart.x, endX);
-        const maxX = Math.max(brushStart.x, endX);
-        brushStart = null;
-
-        // Small drag (< 5px) = click → drill down into class/event
-        if (maxX - minX < 5) {
-            handleChartClick(minX, e.clientY - rect.top);
-            return;
-        }
-
-        // Convert pixel to data index
+    chart.on('brushSelected', function(params) {
+        if (!params.batch || !params.batch[0]) return;
+        const selected = params.batch[0].selected;
+        if (!selected || !selected[0] || !selected[0].dataIndex || selected[0].dataIndex.length < 2) return;
+        const indices = selected[0].dataIndex;
         const opt = chart.getOption();
         if (!opt.xAxis || !opt.xAxis[0] || !opt.xAxis[0].data) return;
-        const data = opt.xAxis[0].data;
-        const startIdx = chart.convertFromPixel({ xAxisIndex: 0 }, minX);
-        const endIdx = chart.convertFromPixel({ xAxisIndex: 0 }, maxX);
-        if (startIdx >= 0 && endIdx < data.length && startIdx < endIdx) {
-            stopAutoRefresh();  // Manual zoom stops auto-refresh
-            zoomTo(data[startIdx], data[endIdx]);
+        const xData = opt.xAxis[0].data;
+        const startIdx = indices[0];
+        const endIdx = indices[indices.length - 1];
+        if (startIdx >= 0 && endIdx < xData.length && startIdx < endIdx) {
+            stopAutoRefresh();
+            zoomTo(xData[startIdx], xData[endIdx]);
+            // Clear brush selection after zoom
+            chart.dispatchAction({ type: 'brush', areas: [] });
+        }
+    });
+
+    // Click on chart area → drill down into class/event
+    chart.on('click', function(params) {
+        if (params.componentType === 'series' && params.seriesType === 'line') {
+            if (state.chartEventSeries) {
+                const evSeries = state.chartEventSeries.find(s => s.name === params.seriesName);
+                if (evSeries) drillDown('event_id', evSeries.event_id, params.seriesName);
+            } else {
+                const wc = WAIT_CLASSES.find(c => c.label === params.seriesName);
+                if (wc) drillDown('class', wc.key, wc.label);
+            }
         }
     });
 
@@ -524,58 +494,6 @@ function initChart() {
         zoomOut();
     });
 
-}
-
-// Handle a click on the chart at pixel (px, py) — find the topmost series
-function handleChartClick(px, py) {
-    if (!chart) return;
-    const opt = chart.getOption();
-    if (!opt.xAxis || !opt.xAxis[0] || !opt.xAxis[0].data) return;
-    const xData = opt.xAxis[0].data;
-
-    // Get grid rect for pixel → data conversion
-    const grid = chart.getModel().getComponent('grid');
-    if (!grid || !grid.coordinateSystem) return;
-    const gridRect = grid.coordinateSystem.getRect();
-
-    // X: pixel → data index
-    const xRatio = (px - gridRect.x) / gridRect.width;
-    const dataIdx = Math.round(xRatio * (xData.length - 1));
-    if (dataIdx < 0 || dataIdx >= xData.length) return;
-
-    // Y: pixel → AAS value (y-axis is inverted: top=max, bottom=0)
-    const yRatio = 1 - (py - gridRect.y) / gridRect.height;
-    const yMax = opt.yAxis[0].max || 1;
-    const yVal = yRatio * yMax;
-    if (yVal < 0) return;
-
-    // Walk stacked series bottom-to-top: find which series the click lands in
-    const seriesList = opt.series.filter(s => s.stack === 'aas');
-    let cumulative = 0;
-    let clickedSeries = null;
-    for (const s of seriesList) {
-        const val = s.data[dataIdx] || 0;
-        cumulative += val;
-        if (yVal <= cumulative) {
-            clickedSeries = s;
-            break;
-        }
-    }
-    if (!clickedSeries) return;
-
-    if (state.chartEventSeries) {
-        // Event-breakdown mode: click event → drill to event_id
-        const evSeries = state.chartEventSeries.find(s => s.name === clickedSeries.name);
-        if (evSeries) {
-            drillDown('event_id', evSeries.event_id, clickedSeries.name);
-        }
-    } else {
-        // Class mode: click class → drill to class
-        const wc = WAIT_CLASSES.find(c => c.label === clickedSeries.name);
-        if (wc) {
-            drillDown('class', wc.key, wc.label);
-        }
-    }
 }
 
 // -- Chart resize handle --------------------------------------------------
@@ -752,6 +670,7 @@ function renderChart(data) {
 
     const option = {
         backgroundColor: 'transparent',
+        animation: false,
         tooltip: {
             trigger: 'axis',
             axisPointer: { type: 'cross' },
@@ -789,9 +708,27 @@ function renderChart(data) {
         grid: {
             left: 50, right: 20, top: 30, bottom: 40,
         },
-        dataZoom: [
-            { type: 'inside', xAxisIndex: 0, zoomOnMouseWheel: false, moveOnMouseWheel: false },
-        ],
+        brush: {
+            toolbox: ['lineX'],
+            xAxisIndex: 0,
+            brushStyle: {
+                color: 'rgba(79, 195, 247, 0.15)',
+                borderColor: 'rgba(79, 195, 247, 0.4)',
+                borderWidth: 1,
+            },
+            throttleType: 'debounce',
+            throttleDelay: 300,
+        },
+        toolbox: {
+            show: true,
+            right: 20,
+            top: 5,
+            feature: {
+                brush: { title: { lineX: 'Zoom' } },
+            },
+            iconStyle: { borderColor: '#666' },
+            emphasis: { iconStyle: { borderColor: '#4fc3f7' } },
+        },
         xAxis: {
             type: 'category',
             data: times,

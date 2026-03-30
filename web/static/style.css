@@ -137,18 +137,7 @@ h1 { font-size: 18px; font-weight: 600; color: #fff; }
 }
 .tp-apply:hover { background: #1a6296; }
 
-/* Brush overlay */
-.brush-overlay {
-  position: absolute;
-  top: 0;
-  height: 100%;
-  background: rgba(79, 195, 247, 0.15);
-  border-left: 1px solid rgba(79, 195, 247, 0.4);
-  border-right: 1px solid rgba(79, 195, 247, 0.4);
-  pointer-events: none;
-  display: none;
-  z-index: 10;
-}
+/* Brush overlay removed — using ECharts built-in brush component */
 
 /* Chart */
 #chart-container {
