@@ -3,6 +3,7 @@
  * Captures the actual running SQL (not normalized) when a new query_id
  * appears in the event stream. Writes to query_texts.jsonl sidecar file. */
 #include "query_text.h"
+#include "pg_wait_tracer.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -187,6 +188,35 @@ void pgwt_qt_check(struct pgwt_query_text_capture *qt,
                 (unsigned long long)query_id,
                 qt->read_buf,
                 len > 60 ? "..." : "");
+}
+
+void pgwt_qt_store(struct pgwt_query_text_capture *qt,
+                   uint64_t query_id, const char *text, pid_t pid)
+{
+    if (!qt->enabled || !qt->fp || query_id == 0 || !text || !text[0])
+        return;
+
+    /* Check if already seen */
+    if (seen_check_or_insert(qt, query_id))
+        return;
+
+    int len = (int)strnlen(text, PGWT_QUERY_TEXT_LEN - 1);
+
+    /* Get wall-clock timestamp */
+    struct timespec wall;
+    clock_gettime(CLOCK_REALTIME, &wall);
+    uint64_t wall_ns = (uint64_t)wall.tv_sec * 1000000000ULL + wall.tv_nsec;
+
+    /* Write JSONL line */
+    fprintf(qt->fp, "{\"q\":\"%lld\",\"t\":", (long long)(int64_t)query_id);
+    write_json_string(qt->fp, text, len);
+    fprintf(qt->fp, ",\"ts\":%llu}\n", (unsigned long long)wall_ns);
+    fflush(qt->fp);
+
+    if (qt->verbose)
+        fprintf(stderr, "INFO: captured query text for query_id %llu: %.60s%s\n",
+                (unsigned long long)query_id,
+                text, len > 60 ? "..." : "");
 }
 
 void pgwt_qt_close(struct pgwt_query_text_capture *qt)

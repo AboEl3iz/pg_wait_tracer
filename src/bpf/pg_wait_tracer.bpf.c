@@ -31,6 +31,7 @@ volatile const u64 my_be_entry_addr = 0;  /* address of MyBEEntry global */
 volatile const u32 st_query_id_offset = 0; /* offsetof(PgBackendStatus, st_query_id) */
 volatile const u32 lightweight_mode = 0;   /* 0=full trace, 1=lightweight (no ringbuf) */
 volatile const u32 skip_query_id = 0;      /* 1=skip query_id reads (saves 1 probe_read) */
+volatile const u64 debug_query_string_addr = 0; /* VA of debug_query_string global */
 
 /* ── Maps ─────────────────────────────────────────────────── */
 
@@ -56,6 +57,17 @@ struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
     __uint(max_entries, 64 * 1024 * 1024);  /* 64MB */
 } event_ringbuf SEC(".maps");
+
+/* Dedup map for query text capture: tracks which query_ids we've already
+ * captured text for. Key = query_id (u64), Value = 1. Only used by
+ * on_report_query_id uprobe. Small map — typical workloads have <1000
+ * unique queries. */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 4096);
+    __type(key, u64);
+    __type(value, u8);
+} seen_query_ids SEC(".maps");
 
 /* Accumulator map for lightweight mode: per-event duration totals.
  * Key = wait_event_info (u32), Value = {total_ns, count}.
@@ -361,8 +373,8 @@ int BPF_USDT(on_plan_done)
 
 /* ── Program 9: uprobe on pgstat_report_query_id ─────────── */
 /* Captures query_id directly from the function argument,
- * bypassing shared memory. Only stores non-zero values —
- * EXEC_END marker handles the clear. */
+ * bypassing shared memory. Also captures query text from
+ * debug_query_string on first occurrence of each query_id. */
 
 SEC("uprobe")
 int on_report_query_id(struct pt_regs *ctx)
@@ -375,6 +387,37 @@ int on_report_query_id(struct pt_regs *ctx)
     struct pgwt_pid_state *st = bpf_map_lookup_elem(&state_map, &pid);
     if (st)
         st->last_query_id = query_id;
+
+    /* Capture query text on first occurrence of this query_id.
+     * Reads debug_query_string (global in postgres, always set before
+     * pgstat_report_query_id is called). Emits via lifecycle_rb
+     * (not event_ringbuf — text events are metadata, not trace data). */
+    if (lightweight_mode || skip_query_id || !debug_query_string_addr)
+        return 0;
+
+    if (bpf_map_lookup_elem(&seen_query_ids, &query_id))
+        return 0;  /* already captured text for this query_id */
+
+    /* Read the debug_query_string pointer, then the string */
+    u64 str_ptr = 0;
+    bpf_probe_read_user(&str_ptr, sizeof(str_ptr),
+                         (void *)debug_query_string_addr);
+    if (!str_ptr)
+        return 0;
+
+    struct pgwt_query_text_event *evt;
+    evt = bpf_ringbuf_reserve(&lifecycle_rb, sizeof(*evt), 0);
+    if (evt) {
+        evt->type = PGWT_LIFECYCLE_QUERY_TEXT;
+        evt->pid = pid;
+        evt->query_id = query_id;
+        bpf_probe_read_user_str(evt->text, sizeof(evt->text), (void *)str_ptr);
+        bpf_ringbuf_submit(evt, 0);
+    }
+
+    /* Mark as seen */
+    u8 one = 1;
+    bpf_map_update_elem(&seen_query_ids, &query_id, &one, BPF_ANY);
 
     return 0;
 }

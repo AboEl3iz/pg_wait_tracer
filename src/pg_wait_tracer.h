@@ -42,6 +42,7 @@ enum pgwt_lifecycle_type {
     PGWT_LIFECYCLE_FORK = 1,
     PGWT_LIFECYCLE_INIT = 2,
     PGWT_LIFECYCLE_EXIT = 3,
+    PGWT_LIFECYCLE_QUERY_TEXT = 4,
 };
 
 struct pgwt_lifecycle_event {
@@ -74,6 +75,16 @@ struct pgwt_trace_event {
 #define PGWT_MARKER_PLAN_END     0xFFFFFFF3U  /* query planning end (pg_plan_query return) */
 
 #define PGWT_IS_MARKER(e) ((e) >= 0xFFFFFFF0U && (e) <= 0xFFFFFFF3U)
+
+/* ── Query Text Event (lifecycle ringbuf) ─────────────────── */
+#define PGWT_QUERY_TEXT_LEN 256
+
+struct pgwt_query_text_event {
+    u32 type;       /* PGWT_LIFECYCLE_QUERY_TEXT */
+    u32 pid;
+    u64 query_id;
+    char text[PGWT_QUERY_TEXT_LEN];
+};
 
 /* ── Wait Event Class IDs ─────────────────────────────────── */
 #define PG_WAIT_LWLOCK      0x01

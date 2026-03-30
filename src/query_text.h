@@ -51,6 +51,11 @@ int pgwt_qt_init(struct pgwt_query_text_capture *qt,
 void pgwt_qt_check(struct pgwt_query_text_capture *qt,
                    pid_t pid, uint64_t query_id, uint64_t wall_ns);
 
+/* Store query text directly (captured by BPF from debug_query_string).
+ * No /proc/pid/mem read needed — text is already available. */
+void pgwt_qt_store(struct pgwt_query_text_capture *qt,
+                   uint64_t query_id, const char *text, pid_t pid);
+
 /* Close the JSONL file. */
 void pgwt_qt_close(struct pgwt_query_text_capture *qt);
 

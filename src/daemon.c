@@ -41,6 +41,15 @@ static int handle_lifecycle_event(void *ctx, void *data, size_t data_sz)
     case PGWT_LIFECYCLE_EXIT:
         pgwt_handle_exit(d, ev->pid);
         break;
+    case PGWT_LIFECYCLE_QUERY_TEXT: {
+        /* Query text captured by BPF from debug_query_string */
+        struct pgwt_query_text_event *qte = data;
+        if (d->query_text_capture && qte->query_id != 0) {
+            pgwt_qt_store(d->query_text_capture, qte->query_id,
+                          qte->text, qte->pid);
+        }
+        break;
+    }
     }
     return 0;
 }
@@ -175,6 +184,16 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
     d->skel->rodata->st_query_id_offset = d->st_query_id_offset;
     d->skel->rodata->lightweight_mode = d->lightweight_mode;
     d->skel->rodata->skip_query_id = d->skip_query_id;
+
+    /* Resolve debug_query_string address for BPF query text capture */
+    if (d->pg_binary_saved) {
+        uint64_t dqs_addr = pgwt_find_symbol_offset(d->pg_binary_saved,
+                                                     "debug_query_string");
+        d->skel->rodata->debug_query_string_addr = dqs_addr;
+        if (d->verbose && dqs_addr)
+            fprintf(stderr, "INFO: debug_query_string at 0x%lx\n",
+                    (unsigned long)dqs_addr);
+    }
 
     /* Load BPF programs (runs verifier) */
     err = pg_wait_tracer_bpf__load(d->skel);
