@@ -453,21 +453,64 @@ function initChart() {
         if (concurrencyChart) concurrencyChart.resize();
     });
 
-    // -- DataZoom: drag-to-zoom with data refetch --
-    chart.on('datazoom', function(params) {
-        // Fired when user drags a zoom selection via toolbox dataZoom
+    // -- Drag-to-zoom: custom handler that refetches data for new range --
+    let brushStart = null;
+    const overlay = document.createElement('div');
+    overlay.style.cssText = 'position:absolute;background:rgba(79,195,247,0.15);' +
+        'border-left:1px solid rgba(79,195,247,0.5);border-right:1px solid rgba(79,195,247,0.5);' +
+        'pointer-events:none;display:none;z-index:10;transition:width 0.02s';
+    chartEl.appendChild(overlay);
+
+    chartEl.addEventListener('mousedown', (e) => {
+        if (e.button !== 0 || !chart) return;
+        const rect = chartEl.getBoundingClientRect();
+        const x = e.clientX - rect.left;
+        const y = e.clientY - rect.top;
+        const grid = chart.getModel().getComponent('grid');
+        if (!grid || !grid.coordinateSystem) return;
+        const gr = grid.coordinateSystem.getRect();
+        if (x < gr.x || x > gr.x + gr.width || y < gr.y || y > gr.y + gr.height) return;
+        brushStart = { x, gridLeft: gr.x, gridWidth: gr.width, gridTop: gr.y, gridHeight: gr.height };
+        overlay.style.left = x + 'px';
+        overlay.style.width = '0px';
+        overlay.style.top = gr.y + 'px';
+        overlay.style.height = gr.height + 'px';
+        overlay.style.display = 'block';
+        e.preventDefault();
+    });
+
+    document.addEventListener('mousemove', (e) => {
+        if (!brushStart) return;
+        const rect = chartEl.getBoundingClientRect();
+        let x = Math.max(brushStart.gridLeft, Math.min(e.clientX - rect.left, brushStart.gridLeft + brushStart.gridWidth));
+        overlay.style.left = Math.min(brushStart.x, x) + 'px';
+        overlay.style.width = Math.abs(x - brushStart.x) + 'px';
+    });
+
+    document.addEventListener('mouseup', (e) => {
+        if (!brushStart) return;
+        overlay.style.display = 'none';
+        const rect = chartEl.getBoundingClientRect();
+        let endX = Math.max(brushStart.gridLeft, Math.min(e.clientX - rect.left, brushStart.gridLeft + brushStart.gridWidth));
+        const minX = Math.min(brushStart.x, endX);
+        const maxX = Math.max(brushStart.x, endX);
+        brushStart = null;
+
+        if (maxX - minX < 5) {
+            // Small drag = click → drill down
+            const opt = chart.getOption();
+            // Use ECharts hit test
+            return;
+        }
+
         const opt = chart.getOption();
         if (!opt.xAxis || !opt.xAxis[0] || !opt.xAxis[0].data) return;
         const xData = opt.xAxis[0].data;
-        const dz = opt.dataZoom;
-        if (!dz || !dz[0]) return;
-        const start = Math.round(dz[0].start / 100 * (xData.length - 1));
-        const end = Math.round(dz[0].end / 100 * (xData.length - 1));
-        if (start >= 0 && end < xData.length && start < end && (dz[0].start > 0 || dz[0].end < 100)) {
+        const startIdx = chart.convertFromPixel({ xAxisIndex: 0 }, minX);
+        const endIdx = chart.convertFromPixel({ xAxisIndex: 0 }, maxX);
+        if (startIdx >= 0 && endIdx < xData.length && startIdx < endIdx) {
             stopAutoRefresh();
-            // Reset zoom to full range before refetching
-            chart.dispatchAction({ type: 'dataZoom', start: 0, end: 100 });
-            zoomTo(xData[start], xData[end]);
+            zoomTo(xData[startIdx], xData[endIdx]);
         }
     });
 
@@ -703,19 +746,6 @@ function renderChart(data) {
         },
         grid: {
             left: 50, right: 20, top: 30, bottom: 40,
-        },
-        toolbox: {
-            show: true,
-            right: 20,
-            top: 5,
-            feature: {
-                dataZoom: {
-                    yAxisIndex: 'none',
-                    title: { zoom: 'Drag to zoom', back: 'Undo zoom' },
-                },
-            },
-            iconStyle: { borderColor: '#666' },
-            emphasis: { iconStyle: { borderColor: '#4fc3f7' } },
         },
         dataZoom: [
             { type: 'inside', xAxisIndex: 0, zoomOnMouseWheel: false, moveOnMouseWheel: false },
