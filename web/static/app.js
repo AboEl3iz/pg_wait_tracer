@@ -153,7 +153,7 @@ async function init() {
         state.viewFrom = state.serverNow - FIFTEEN_MIN_NS;
         state.viewTo = state.serverNow;
         state.liveRangeSecs = 900;
-        setStatus(info.num_cpus + ' CPUs, ~' + fmtCount(info.num_events) + ' events', 'connected');
+        setStatus(info.num_cpus + ' CPUs', 'connected');
         updateTimeRange();
         initChart();
         initChartResize();
@@ -191,6 +191,12 @@ async function refreshChart() {
         }
         const data = await send('aas', params);
         renderApexChart(data);
+        // Update status with current window info
+        if (data && data.buckets) {
+            const dur = fmtDuration(state.viewTo - state.viewFrom);
+            const maxAas = data.max_aas ? data.max_aas.toFixed(1) : '0';
+            setStatus(state.numCpus + ' CPUs · ' + dur + ' window · peak ' + maxAas + ' AAS', 'connected');
+        }
     } catch (e) { /* ignore on disconnect */ }
 }
 
