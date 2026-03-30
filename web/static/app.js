@@ -67,8 +67,6 @@ const state = {
     reconnectDelay: 2000,
     reconnectTimer: null,
 
-    // ApexCharts comparison mode
-    useApexChart: false,
 };
 
 // -- WebSocket ----------------------------------------------------------------
@@ -184,7 +182,7 @@ async function refreshChart() {
         const params = {
             from: state.viewFrom,
             to: state.viewTo,
-            buckets: Math.min(Math.floor((state.useApexChart ? apexEl : chartEl).clientWidth / 4), 300),
+            buckets: Math.min(Math.floor(apexEl.clientWidth / 4), 300),
             filters: state.filters,
         };
         // Request per-event breakdown when drilled into a class (but not a specific event)
@@ -192,11 +190,7 @@ async function refreshChart() {
             params.detail = 'events';
         }
         const data = await send('aas', params);
-        if (state.useApexChart) {
-            renderApexChart(data);
-        } else {
-            renderChart(data);
-        }
+        renderApexChart(data);
     } catch (e) { /* ignore on disconnect */ }
 }
 
@@ -416,23 +410,7 @@ function switchTab(tab) {
         stopAutoRefresh();
     }
 
-    // Toggle chart containers for ApexCharts vs ECharts
-    const ecContainer = document.getElementById('chart-container');
-    const apexContainer = document.getElementById('apex-chart-container');
-    if (tab === 'overview-new') {
-        state.useApexChart = true;
-        ecContainer.style.display = 'none';
-        apexContainer.style.display = 'block';
-    } else if (state.useApexChart) {
-        state.useApexChart = false;
-        ecContainer.style.display = 'block';
-        apexContainer.style.display = 'none';
-        if (apexChart) { apexChart.destroy(); apexChart = null; }
-    }
-
-    // overview-new uses the same table as overview
-    const displayTab = tab === 'overview-new' ? 'overview' : tab;
-    state.activeTab = displayTab;
+    state.activeTab = tab;
     document.querySelectorAll('.tab').forEach(b => {
         b.classList.toggle('active', b.dataset.tab === tab);
     });
@@ -440,99 +418,16 @@ function switchTab(tab) {
     refreshTable();
 }
 
-// -- Chart (ECharts) ----------------------------------------------------------
+// -- Chart container ----------------------------------------------------------
 
-let chart = null;
-const chartEl = document.getElementById('chart-container');
+const chartEl = document.getElementById('chart-container');  // hidden, kept for legacy refs
 
 function initChart() {
-    chart = echarts.init(chartEl, 'dark', { group: 'pgwt' });
-    echarts.connect('pgwt');
+    /* AAS chart is now ApexCharts (rendered in apex-chart-container).
+     * ECharts is still used for heatmap, timeline, concurrency, transitions. */
     window.addEventListener('resize', () => {
-        chart.resize();
         if (concurrencyChart) concurrencyChart.resize();
     });
-
-    // -- Drag-to-zoom: custom handler that refetches data for new range --
-    let brushStart = null;
-    const overlay = document.createElement('div');
-    overlay.style.cssText = 'position:absolute;background:rgba(79,195,247,0.15);' +
-        'border-left:1px solid rgba(79,195,247,0.5);border-right:1px solid rgba(79,195,247,0.5);' +
-        'pointer-events:none;display:none;z-index:10;transition:width 0.02s';
-    chartEl.appendChild(overlay);
-
-    chartEl.addEventListener('mousedown', (e) => {
-        if (e.button !== 0 || !chart) return;
-        const rect = chartEl.getBoundingClientRect();
-        const x = e.clientX - rect.left;
-        const y = e.clientY - rect.top;
-        const grid = chart.getModel().getComponent('grid');
-        if (!grid || !grid.coordinateSystem) return;
-        const gr = grid.coordinateSystem.getRect();
-        if (x < gr.x || x > gr.x + gr.width || y < gr.y || y > gr.y + gr.height) return;
-        brushStart = { x, gridLeft: gr.x, gridWidth: gr.width, gridTop: gr.y, gridHeight: gr.height };
-        overlay.style.left = x + 'px';
-        overlay.style.width = '0px';
-        overlay.style.top = gr.y + 'px';
-        overlay.style.height = gr.height + 'px';
-        overlay.style.display = 'block';
-        e.preventDefault();
-    });
-
-    document.addEventListener('mousemove', (e) => {
-        if (!brushStart) return;
-        const rect = chartEl.getBoundingClientRect();
-        let x = Math.max(brushStart.gridLeft, Math.min(e.clientX - rect.left, brushStart.gridLeft + brushStart.gridWidth));
-        overlay.style.left = Math.min(brushStart.x, x) + 'px';
-        overlay.style.width = Math.abs(x - brushStart.x) + 'px';
-    });
-
-    document.addEventListener('mouseup', (e) => {
-        if (!brushStart) return;
-        overlay.style.display = 'none';
-        const rect = chartEl.getBoundingClientRect();
-        let endX = Math.max(brushStart.gridLeft, Math.min(e.clientX - rect.left, brushStart.gridLeft + brushStart.gridWidth));
-        const minX = Math.min(brushStart.x, endX);
-        const maxX = Math.max(brushStart.x, endX);
-        brushStart = null;
-
-        if (maxX - minX < 5) {
-            // Small drag = click → drill down
-            const opt = chart.getOption();
-            // Use ECharts hit test
-            return;
-        }
-
-        const opt = chart.getOption();
-        if (!opt.xAxis || !opt.xAxis[0] || !opt.xAxis[0].data) return;
-        const xData = opt.xAxis[0].data;
-        const startIdx = chart.convertFromPixel({ xAxisIndex: 0 }, minX);
-        const endIdx = chart.convertFromPixel({ xAxisIndex: 0 }, maxX);
-        if (startIdx >= 0 && endIdx < xData.length && startIdx < endIdx) {
-            stopAutoRefresh();
-            zoomTo(xData[startIdx], xData[endIdx]);
-        }
-    });
-
-    // Click on chart area → drill down into class/event
-    chart.on('click', function(params) {
-        if (params.componentType === 'series' && params.seriesType === 'line') {
-            if (state.chartEventSeries) {
-                const evSeries = state.chartEventSeries.find(s => s.name === params.seriesName);
-                if (evSeries) drillDown('event_id', evSeries.event_id, params.seriesName);
-            } else {
-                const wc = WAIT_CLASSES.find(c => c.label === params.seriesName);
-                if (wc) drillDown('class', wc.key, wc.label);
-            }
-        }
-    });
-
-    // Double-click to zoom out
-    chartEl.addEventListener('dblclick', (e) => {
-        e.preventDefault();
-        zoomOut();
-    });
-
 }
 
 // -- Chart resize handle --------------------------------------------------
@@ -544,7 +439,7 @@ function initChartResize() {
     handle.addEventListener('mousedown', (e) => {
         e.preventDefault();
         startY = e.clientY;
-        startH = chartEl.offsetHeight;
+        startH = apexEl.offsetHeight;
         document.addEventListener('mousemove', onDrag);
         document.addEventListener('mouseup', onUp);
         document.body.style.cursor = 'ns-resize';
@@ -553,8 +448,8 @@ function initChartResize() {
 
     function onDrag(e) {
         const h = Math.max(120, startH + e.clientY - startY);
-        chartEl.style.height = h + 'px';
-        if (chart) chart.resize();
+        apexEl.style.height = h + 'px';
+        if (apexChart) apexChart.updateOptions({ chart: { height: h } }, false, false, false);
     }
 
     function onUp() {
@@ -643,156 +538,7 @@ function nsToDatetimeLocal(ns) {
         'T' + pad(d.getUTCHours()) + ':' + pad(d.getUTCMinutes()) + ':' + pad(d.getUTCSeconds());
 }
 
-function renderChart(data) {
-    if (!chart || !data.buckets || data.buckets.length === 0) return;
-
-    const bns = data.bucket_ns || 0;
-    const times = data.buckets.map(b => b.t);
-    const isEventBreakdown = data.breakdown === 'events' && data.series;
-
-    // Store event series info for click handler
-    state.chartEventSeries = isEventBreakdown ? data.series : null;
-
-    let series;
-    let legendData;
-
-    if (isEventBreakdown) {
-        // Per-event breakdown mode: dynamic series from server
-        series = data.series.map((s, idx) => ({
-            name: s.name,
-            type: 'line',
-            stack: 'aas',
-            areaStyle: { opacity: 0.85 },
-            lineStyle: { width: 0 },
-            emphasis: { focus: 'series' },
-            symbol: 'none',
-            color: EVENT_PALETTE[idx % EVENT_PALETTE.length],
-            data: data.buckets.map(b => +(b.aas[idx] || 0).toFixed(4)),
-        }));
-        legendData = data.series.map(s => s.name);
-    } else {
-        // Class breakdown mode (default)
-        series = WAIT_CLASSES.map(wc => ({
-            name: wc.label,
-            type: 'line',
-            stack: 'aas',
-            areaStyle: { opacity: 0.85 },
-            lineStyle: { width: 0 },
-            emphasis: { focus: 'series' },
-            symbol: 'none',
-            color: wc.color,
-            data: data.buckets.map(b => +(b[wc.key] || 0).toFixed(4)),
-        }));
-        legendData = WAIT_CLASSES.map(c => c.label);
-    }
-
-    // CPU reference line
-    const markData = [];
-    if (state.numCpus > 0) {
-        markData.push({
-            yAxis: state.numCpus,
-            label: {
-                formatter: state.numCpus + ' CPUs',
-                position: 'insideEndTop',
-                color: '#fff',
-                fontSize: 11,
-            },
-            lineStyle: { color: '#E53935', type: 'dashed', width: 2 },
-        });
-    }
-
-    const yMax = Math.max(
-        data.max_aas * 1.2,
-        state.numCpus > 0 ? state.numCpus * 1.5 : 0,
-        1
-    );
-
-    const option = {
-        backgroundColor: 'transparent',
-        animation: false,
-        tooltip: {
-            trigger: 'axis',
-            axisPointer: { type: 'cross' },
-            backgroundColor: '#1e1e3a',
-            borderColor: '#333',
-            textStyle: { color: '#e0e0e0', fontSize: 12 },
-            formatter: function(params) {
-                if (!params.length) return '';
-                let t = fmtTime(params[0].axisValue, bns);
-                let total = 0;
-                let items = [];
-                for (let i = params.length - 1; i >= 0; i--) {
-                    const p = params[i];
-                    if (p.value > 0.001) {
-                        items.push({ name: p.seriesName, value: p.value, color: p.color });
-                        total += p.value;
-                    }
-                }
-                let lines = items.map(function(it) {
-                    const pct = total > 0 ? (it.value / total * 100).toFixed(0) : '0';
-                    return '<span style="color:' + it.color + '">\u25cf</span> ' +
-                        it.name + ': <b>' + it.value.toFixed(2) + '</b> (' + pct + '%)';
-                });
-                return '<b>' + t + '</b><br>Total AAS: <b>' +
-                    total.toFixed(2) + '</b><br>' + lines.join('<br>');
-            },
-        },
-        legend: {
-            data: legendData,
-            bottom: 0,
-            textStyle: { color: '#888', fontSize: 11 },
-            itemWidth: 12,
-            itemHeight: 8,
-        },
-        grid: {
-            left: 50, right: 20, top: 30, bottom: 40,
-        },
-        dataZoom: [
-            { type: 'inside', xAxisIndex: 0, zoomOnMouseWheel: false, moveOnMouseWheel: false },
-        ],
-        xAxis: {
-            type: 'category',
-            data: times,
-            axisLabel: {
-                color: '#888',
-                fontSize: 10,
-                formatter: function(v) { return fmtTime(v, bns); },
-            },
-            axisLine: { lineStyle: { color: '#333' } },
-        },
-        yAxis: {
-            type: 'value',
-            name: 'Active Sessions',
-            nameTextStyle: { color: '#888', fontSize: 11 },
-            min: 0,
-            max: yMax,
-            axisLabel: { color: '#888', fontSize: 10 },
-            splitLine: { lineStyle: { color: '#2a2a4a' } },
-        },
-        series: [
-            ...series,
-            // CPU markLine as a dummy series
-            {
-                name: '_cpu_line',
-                type: 'line',
-                data: [],
-                markLine: {
-                    silent: true,
-                    symbol: 'none',
-                    data: markData,
-                },
-            },
-        ],
-    };
-
-    chart.setOption(option, true);
-
-    // Concurrency moved to dedicated tab (not overlay)
-}
-
-// Concurrency overlay removed — moved to dedicated Concurrency tab
-
-// -- ApexCharts AAS (comparison) ----------------------------------------------
+// -- ApexCharts AAS (main chart) ----------------------------------------------
 
 let apexChart = null;
 const apexEl = document.getElementById('apex-chart-container');
