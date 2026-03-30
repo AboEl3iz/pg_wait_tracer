@@ -200,12 +200,26 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
         goto fail;
     }
 
-    /* Attach USDT query lifecycle probes (only in full trace mode) */
+    /* Attach query lifecycle probes (only in full trace mode) */
     if (!d->lightweight_mode && !d->skip_usdt && d->pg_binary_saved) {
-        /* Use saved copy — pg_binary in struct gets corrupted by
-         * pgwt_backend_init/pgwt_accum_init overflowing adjacent fields. */
         const char *bin = d->pg_binary_saved;
-        /* pid=-1: attach to all processes running this binary (all backends) */
+
+        /* Uprobe on pgstat_report_query_id FIRST — must be active before
+         * USDT probes fire, so EXEC_START always has a correct query_id.
+         * Captures query_id from function argument, bypassing shared memory. */
+        uint64_t qid_func_va = pgwt_find_symbol_offset(bin, "pgstat_report_query_id");
+        uint64_t qid_func_off = qid_func_va > 0x400000 ? qid_func_va - 0x400000 : qid_func_va;
+        if (qid_func_off) {
+            LIBBPF_OPTS(bpf_uprobe_opts, uprobe_opts, .retprobe = false);
+            d->skel->links.on_report_query_id =
+                bpf_program__attach_uprobe_opts(d->skel->progs.on_report_query_id,
+                                                -1, bin, qid_func_off, &uprobe_opts);
+            if (d->verbose)
+                fprintf(stderr, "INFO: pgstat_report_query_id at offset 0x%lx\n",
+                        (unsigned long)qid_func_off);
+        }
+
+        /* USDT probes AFTER uprobe — query_id is already cached when these fire */
         d->skel->links.on_exec_start =
             bpf_program__attach_usdt(d->skel->progs.on_exec_start,
                                      -1, bin,
@@ -222,24 +236,6 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
             bpf_program__attach_usdt(d->skel->progs.on_plan_done,
                                      -1, bin,
                                      "postgresql", "query__plan__done", NULL);
-
-        /* Uprobe on pgstat_report_query_id — captures query_id from
-         * function argument, bypassing unreliable shared memory reads.
-         * Must resolve offset ourselves (function not in .dynsym). */
-        /* pgwt_find_symbol_offset returns st_value (virtual address).
-         * For non-PIE ELF, uprobe offset = st_value - base_vaddr.
-         * Base vaddr for postgres is typically 0x400000 (first LOAD segment). */
-        uint64_t qid_func_va = pgwt_find_symbol_offset(bin, "pgstat_report_query_id");
-        uint64_t qid_func_off = qid_func_va > 0x400000 ? qid_func_va - 0x400000 : qid_func_va;
-        if (qid_func_off) {
-            LIBBPF_OPTS(bpf_uprobe_opts, uprobe_opts, .retprobe = false);
-            d->skel->links.on_report_query_id =
-                bpf_program__attach_uprobe_opts(d->skel->progs.on_report_query_id,
-                                                -1, bin, qid_func_off, &uprobe_opts);
-            if (d->verbose)
-                fprintf(stderr, "INFO: pgstat_report_query_id at offset 0x%lx\n",
-                        (unsigned long)qid_func_off);
-        }
 
         if (d->skel->links.on_exec_start && d->skel->links.on_exec_done
             && d->skel->links.on_report_query_id)
