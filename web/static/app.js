@@ -453,25 +453,21 @@ function initChart() {
         if (concurrencyChart) concurrencyChart.resize();
     });
 
-    // -- Brush zoom: ECharts built-in brush for smooth selection --
-    chart.on('brushEnd', function(params) {
-        // Not used — we handle brushSelected instead
-    });
-    chart.on('brushSelected', function(params) {
-        if (!params.batch || !params.batch[0]) return;
-        const selected = params.batch[0].selected;
-        if (!selected || !selected[0] || !selected[0].dataIndex || selected[0].dataIndex.length < 2) return;
-        const indices = selected[0].dataIndex;
+    // -- DataZoom: drag-to-zoom with data refetch --
+    chart.on('datazoom', function(params) {
+        // Fired when user drags a zoom selection via toolbox dataZoom
         const opt = chart.getOption();
         if (!opt.xAxis || !opt.xAxis[0] || !opt.xAxis[0].data) return;
         const xData = opt.xAxis[0].data;
-        const startIdx = indices[0];
-        const endIdx = indices[indices.length - 1];
-        if (startIdx >= 0 && endIdx < xData.length && startIdx < endIdx) {
+        const dz = opt.dataZoom;
+        if (!dz || !dz[0]) return;
+        const start = Math.round(dz[0].start / 100 * (xData.length - 1));
+        const end = Math.round(dz[0].end / 100 * (xData.length - 1));
+        if (start >= 0 && end < xData.length && start < end && (dz[0].start > 0 || dz[0].end < 100)) {
             stopAutoRefresh();
-            zoomTo(xData[startIdx], xData[endIdx]);
-            // Clear brush selection after zoom
-            chart.dispatchAction({ type: 'brush', areas: [] });
+            // Reset zoom to full range before refetching
+            chart.dispatchAction({ type: 'dataZoom', start: 0, end: 100 });
+            zoomTo(xData[start], xData[end]);
         }
     });
 
@@ -708,27 +704,22 @@ function renderChart(data) {
         grid: {
             left: 50, right: 20, top: 30, bottom: 40,
         },
-        brush: {
-            toolbox: ['lineX'],
-            xAxisIndex: 0,
-            brushStyle: {
-                color: 'rgba(79, 195, 247, 0.15)',
-                borderColor: 'rgba(79, 195, 247, 0.4)',
-                borderWidth: 1,
-            },
-            throttleType: 'debounce',
-            throttleDelay: 300,
-        },
         toolbox: {
             show: true,
             right: 20,
             top: 5,
             feature: {
-                brush: { title: { lineX: 'Zoom' } },
+                dataZoom: {
+                    yAxisIndex: 'none',
+                    title: { zoom: 'Drag to zoom', back: 'Undo zoom' },
+                },
             },
             iconStyle: { borderColor: '#666' },
             emphasis: { iconStyle: { borderColor: '#4fc3f7' } },
         },
+        dataZoom: [
+            { type: 'inside', xAxisIndex: 0, zoomOnMouseWheel: false, moveOnMouseWheel: false },
+        ],
         xAxis: {
             type: 'category',
             data: times,
