@@ -29,8 +29,9 @@ typedef uint64_t u64;
 /* Per-PID state in state_map */
 struct pgwt_pid_state {
     u32 last_event;     /* previous wait_event_info value (0 = on CPU) */
+    u32 _pad;           /* alignment */
     u64 last_ts;        /* ktime_ns of last transition */
-    u64 last_query_id;  /* query_id active during last_event */
+    u64 last_query_id;  /* query_id set by on_report_query_id uprobe */
     u64 be_entry_ptr;   /* cached PgBackendStatus* (avoids 1 probe_read per event) */
     u64 wait_event_addr; /* direct PGPROC->wait_event_info address (saves 1 probe_read) */
 };

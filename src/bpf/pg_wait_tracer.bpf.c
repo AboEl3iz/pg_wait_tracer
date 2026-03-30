@@ -310,18 +310,12 @@ static __always_inline void emit_marker(u32 marker)
     u64 qid = 0;
 
     if (st) {
-        if (marker == PGWT_MARKER_EXEC_START && !skip_query_id) {
-            /* Read query_id at execution start — guaranteed correct
-             * (set by pgstat_report_query_id during parse, before execute).
-             * Cache in state_map so all subsequent wait events use it. */
-            qid = read_query_id_cached(st->be_entry_ptr);
-            st->last_query_id = qid;
-        } else if (marker == PGWT_MARKER_EXEC_END) {
+        if (marker == PGWT_MARKER_EXEC_END) {
             /* Use the cached query_id, then clear for inter-statement gap */
             qid = st->last_query_id;
             st->last_query_id = 0;
         } else {
-            /* PLAN markers: use whatever is cached */
+            /* EXEC_START, PLAN markers: use query_id set by on_report_query_id uprobe */
             qid = st->last_query_id;
         }
     }
@@ -362,6 +356,26 @@ SEC("usdt")
 int BPF_USDT(on_plan_done)
 {
     emit_marker(PGWT_MARKER_PLAN_END);
+    return 0;
+}
+
+/* ── Program 9: uprobe on pgstat_report_query_id ─────────── */
+/* Captures query_id directly from the function argument,
+ * bypassing shared memory. Only stores non-zero values —
+ * EXEC_END marker handles the clear. */
+
+SEC("uprobe")
+int on_report_query_id(struct pt_regs *ctx)
+{
+    u64 query_id = PT_REGS_PARM1(ctx);
+    if (query_id == 0)
+        return 0;
+
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    struct pgwt_pid_state *st = bpf_map_lookup_elem(&state_map, &pid);
+    if (st)
+        st->last_query_id = query_id;
+
     return 0;
 }
 

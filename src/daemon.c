@@ -1,6 +1,7 @@
 /* daemon.c — Main event loop: epoll on ring buffer, timer, signals */
 #include "daemon.h"
 #include "backend.h"
+#include "discovery.h"
 #include "event_stream.h"
 #include "event_writer.h"
 #include "map_reader.h"
@@ -222,10 +223,29 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
                                      -1, bin,
                                      "postgresql", "query__plan__done", NULL);
 
-        if (d->skel->links.on_exec_start && d->skel->links.on_exec_done)
-            fprintf(stderr, "INFO: attached USDT query lifecycle probes\n");
+        /* Uprobe on pgstat_report_query_id — captures query_id from
+         * function argument, bypassing unreliable shared memory reads.
+         * Must resolve offset ourselves (function not in .dynsym). */
+        /* pgwt_find_symbol_offset returns st_value (virtual address).
+         * For non-PIE ELF, uprobe offset = st_value - base_vaddr.
+         * Base vaddr for postgres is typically 0x400000 (first LOAD segment). */
+        uint64_t qid_func_va = pgwt_find_symbol_offset(bin, "pgstat_report_query_id");
+        uint64_t qid_func_off = qid_func_va > 0x400000 ? qid_func_va - 0x400000 : qid_func_va;
+        if (qid_func_off) {
+            LIBBPF_OPTS(bpf_uprobe_opts, uprobe_opts, .retprobe = false);
+            d->skel->links.on_report_query_id =
+                bpf_program__attach_uprobe_opts(d->skel->progs.on_report_query_id,
+                                                -1, bin, qid_func_off, &uprobe_opts);
+            if (d->verbose)
+                fprintf(stderr, "INFO: pgstat_report_query_id at offset 0x%lx\n",
+                        (unsigned long)qid_func_off);
+        }
+
+        if (d->skel->links.on_exec_start && d->skel->links.on_exec_done
+            && d->skel->links.on_report_query_id)
+            fprintf(stderr, "INFO: attached USDT + query_id uprobe\n");
         else
-            fprintf(stderr, "WARN: could not attach USDT probes (query lifecycle tracking disabled)\n");
+            fprintf(stderr, "WARN: could not attach query probes (lifecycle tracking disabled)\n");
     }
 
     /* Set up lifecycle ring buffer consumer */
