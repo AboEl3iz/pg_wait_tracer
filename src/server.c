@@ -936,20 +936,22 @@ static void handle_top_queries(struct pgwt_server *srv, struct pgwt_request *req
     int has_event_filter = (req->filter.class_name[0] != '\0' ||
                             req->filter.event_id != 0);
 
+    /* Load events once — used for both top_queries and lifecycle stats */
+    int ecount = 0;
+    struct pgwt_trace_event *all_events = NULL;
     struct pgwt_queries_result res;
 
     if (!has_event_filter && should_use_summaries(srv, req)) {
         pgwt_compute_top_queries_from_summaries(srv->trace_dir, from, to,
                                                  &req->filter, wall_ms, &res);
+        /* Still need events for lifecycle stats */
+        all_events = server_load_events(srv, req->from_ns, req->to_ns, &ecount);
     } else {
-        int count;
-        struct pgwt_trace_event *events =
-            server_load_events(srv, req->from_ns, req->to_ns, &count);
-        pgwt_compute_top_queries(events, count, &req->filter, wall_ms, &res);
-        free(events);
+        all_events = server_load_events(srv, req->from_ns, req->to_ns, &ecount);
+        pgwt_compute_top_queries(all_events, ecount, &req->filter, wall_ms, &res);
     }
 
-    /* Compute per-query exec/plan stats from markers */
+    /* Compute per-query exec/plan stats from markers (same events, no second load) */
     struct qid_lifecycle {
         uint64_t query_id;
         int used;
@@ -963,17 +965,13 @@ static void handle_top_queries(struct pgwt_server *srv, struct pgwt_request *req
     #define QLC_HT_MASK (QLC_HT_SIZE - 1)
     struct qid_lifecycle *qlc = calloc(QLC_HT_SIZE, sizeof(*qlc));
 
-    if (qlc) {
-        int ecount;
-        struct pgwt_trace_event *evts =
-            server_load_events(srv, req->from_ns, req->to_ns, &ecount);
-
+    if (qlc && all_events) {
         struct { uint32_t pid; uint64_t exec_start_ns, plan_start_ns; uint64_t qid; }
             pid_st[512];
         int npids = 0;
 
         for (int i = 0; i < ecount; i++) {
-            const struct pgwt_trace_event *ev = &evts[i];
+            const struct pgwt_trace_event *ev = &all_events[i];
             uint32_t m = ev->old_event;
             if (!PGWT_IS_MARKER(m)) continue;
 
@@ -1033,7 +1031,7 @@ static void handle_top_queries(struct pgwt_server *srv, struct pgwt_request *req
                 }
             }
         }
-        free(evts);
+        /* events freed below with all_events */
     }
 
     /* Helper: compute percentile from sorted array */
@@ -1149,6 +1147,7 @@ static void handle_top_queries(struct pgwt_server *srv, struct pgwt_request *req
         }
         free(qlc);
     }
+    free(all_events);
     free(res.rows);
 }
 
