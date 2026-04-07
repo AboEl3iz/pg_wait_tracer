@@ -644,3 +644,121 @@ What-if parameter sensitivity.
 | When behavior changed | Distribution shift, Little's Law | Conformance score | Structural vs performance change |
 | What to do | Capacity prediction | Path optimization | Targeted: which knob fixes which path |
 | How much it matters | Quantified (W increase, rho) | Identified (which variant) | "Variant B is 10x slower AND affects 15% of traffic" |
+
+---
+
+## 10. Prior art and related work
+
+Nobody combines complete event capture + queueing theory + process mining for
+database wait events. People do pieces of it in different domains.
+
+### 10.1 Database vendors and practitioners
+
+**Oracle ecosystem** — closest analog:
+
+- **Cary Millsap / Method R** — applied M/M/m queueing models to Oracle 10046
+  trace data for response time decomposition. Book: *Optimizing Oracle
+  Performance* (O'Reilly, 2003). Key shared insight: Oracle "waits" are syscall
+  durations (sojourn time), not queueing delays.
+- **Craig Shallahamer / OraPub** — applied Operations Research QT to Oracle v$
+  views for capacity forecasting. Book: *Forecasting Oracle Performance*.
+- **Tanel Poder** — deep wait chain analysis (ash_wait_chains.sql),
+  conceptually similar to PM causal discovery, but empirical/forensic.
+- Oracle ASH samples at 1Hz — loses transition sequences that make PM possible.
+
+**SQL Server** — `sys.dm_os_wait_stats` explicitly decomposes `signal_wait_time`
+(run-queue queueing) from resource wait time. Implicit QT baked into
+architecture, but aggregate counters only.
+
+**Baron Schwartz / VividCortex** (now SolarWinds DPM) — the only commercial DB
+monitoring tool that publicly uses queueing theory as a design principle.
+Applied Little's Law and Neil Gunther's USL to database metrics. Free ebook:
+*Essential Guide to Queueing Theory*.
+
+**PostgreSQL ecosystem** — pg_wait_sampling (Postgres Professional) samples at
+100Hz. pganalyze, PoWA — dashboards over sampled/aggregate data. No
+mathematical modeling.
+
+**Cloud providers** (RDS Performance Insights, Azure Intelligent Insights,
+Google Cloud SQL) — ML-based anomaly detection against baselines. None apply
+QT or PM. Data granularity (1s samples) too coarse.
+
+### 10.2 Academic research
+
+**Queueing models for databases:**
+
+- **Rasha Osman** (QuePED, 2011) — modeled database tables as FCFS service
+  centers in a queueing network. Validated on TPC-C, ~10% prediction error.
+- **Colombo & Ardagna** (2012) — survey of database performance evaluation
+  models using QT, including Queueing Petri Nets (QPNs — formal fusion of
+  QT + Petri nets).
+- **DBSeer** (Barzan Mozafari, U Michigan) — statistical regression for DB
+  performance prediction.
+
+**Process mining applied to system traces — a gap in the literature:**
+
+- Almost all PM work targets business processes (hospitals, call centers).
+- Nobody has applied PM algorithms (alpha miner, inductive miner, conformance
+  checking) to database wait event traces.
+- One 2021 paper addresses the challenge that system logs lack "case IDs" —
+  exactly what EXEC_START/END markers solve.
+- A 2025 paper applies Petri nets to microservice request traces for anomaly
+  detection.
+
+**Queue Mining — the direct QT + PM intersection:**
+
+- **Arik Senderovich et al.** (Technion, CAiSE 2014) — foundational paper
+  establishing "queue mining." Uses QT as mathematical basis within PM
+  framework to predict delays. Applied to hospitals and call centers at
+  second-to-minute resolution.
+- This is the closest existing work. The math transfers directly; the data
+  characteristics (nanosecond DB traces vs minute-scale business processes)
+  are fundamentally different.
+
+### 10.3 Adjacent fields
+
+- **Brendan Gregg / USE Method** — explicitly connects systems performance to
+  QT. Models disk as M/M/1 to predict response time vs utilization. BPF
+  tracing for systems observability.
+- **Mor Harchol-Balter** (CMU) — textbook *Performance Modeling and Design of
+  Computer Systems: Queueing Theory in Action* (Cambridge, 2013).
+- **Neil Gunther / USL** — `C(N) = N / (1 + a(N-1) + bN(N-1))`. Contention
+  (a) and coherency (b) parameters. Directly applicable to
+  throughput-vs-connections curve.
+- **Semiconductor wafer fabs** — most mature QT application for complex
+  multi-step processes. MVA widely used. Structurally similar to backends
+  cycling through wait states (re-entrant flows). Math transfers, timescales
+  don't (minutes vs nanoseconds).
+- **Distributed tracing (OpenTelemetry/Jaeger/Zipkin)** — collect spans forming
+  DAGs. A 2025 paper derives semi-Markov models from distributed traces for
+  latency prediction. Community is mostly visualization, not mathematical
+  modeling.
+
+### 10.4 Landscape comparison
+
+| Capability | Oracle 10046 | Oracle ASH | pg_wait_sampling | VividCortex | pg_wait_tracer |
+|---|---|---|---|---|---|
+| Resolution | us | 1s sample | 10ms sample | 1s | **ns** |
+| Capture | Per-session | Sample | Sample | Sample | **Every transition** |
+| Transitions | No | No | No | No | **Yes** |
+| Cross-session | No | Yes | Yes | Yes | **Yes** |
+| QT applied | Millsap (ext) | No | No | Yes (Little's, USL) | **Planned** |
+| PM applicable | Theoretically | No (no sequence) | No (no sequence) | No | **Yes** |
+
+The combination of complete capture + nanosecond resolution + transition
+sequences + cross-session coverage is unprecedented. It is the only dataset
+in the database world where classical PM algorithms and per-event QT analysis
+are both applicable.
+
+### 10.5 Key people and references
+
+| Who | Relevance |
+|---|---|
+| Arik Senderovich (York U) | Queue Mining — QT inside PM framework. Closest existing work. |
+| Cary Millsap (Method R) | Applied QT to Oracle traces. Same philosophical lineage. |
+| Baron Schwartz | Applied QT+USL to DB monitoring commercially. |
+| Brendan Gregg | USE Method, BPF tracing, systems QT reasoning. |
+| Mor Harchol-Balter (CMU) | QT for computer systems (textbook). |
+| Wil van der Aalst (RWTH Aachen) | Father of process mining. |
+| Neil Gunther | USL — the throughput curve model. |
+| Rasha Osman | Queueing Petri Nets for database contention. |
