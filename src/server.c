@@ -1493,25 +1493,12 @@ static void handle_concurrency(struct pgwt_server *srv, struct pgwt_request *req
     emit_json(root);
 }
 
-static void handle_variants(struct pgwt_server *srv, struct pgwt_request *req)
+static cJSON *serialize_variants(struct pgwt_server *srv,
+                                  struct pgwt_variants_result *res)
 {
-    int count;
-    struct pgwt_trace_event *events =
-        server_load_events(srv, req->from_ns, req->to_ns, &count);
-
-    int max_v = req->num_buckets > 0 ? req->num_buckets : 20;
-    struct pgwt_variants_result res;
-    pgwt_compute_variants(events, count, &req->filter, max_v, &res);
-    free(events);
-
-    cJSON *root = cJSON_CreateObject();
-    cJSON_AddNumberToObject(root, "id", (double)req->id);
-    cJSON_AddNumberToObject(root, "total_executions", res.total_executions);
-    cJSON_AddNumberToObject(root, "num_variants", res.num_variants);
-
-    cJSON *variants = cJSON_AddArrayToObject(root, "variants");
-    for (int i = 0; i < res.num_variants; i++) {
-        struct pgwt_variant *v = &res.variants[i];
+    cJSON *arr = cJSON_CreateArray();
+    for (int i = 0; i < res->num_variants; i++) {
+        struct pgwt_variant *v = &res->variants[i];
         cJSON *vj = cJSON_CreateObject();
         cJSON_AddNumberToObject(vj, "exec_count", v->exec_count);
         cJSON_AddNumberToObject(vj, "num_queries", v->num_query_ids);
@@ -1521,16 +1508,13 @@ static void handle_variants(struct pgwt_server *srv, struct pgwt_request *req)
         cJSON_AddNumberToObject(vj, "avg_loop_n", v->avg_loop_n);
         cjson_add_int64(vj, "top_query_id", (int64_t)v->top_query_id);
 
-        /* Steps */
         cJSON *steps = cJSON_AddArrayToObject(vj, "steps");
         for (int s = 0; s < v->num_steps; s++) {
             cJSON *sj = cJSON_CreateObject();
             cJSON_AddStringToObject(sj, "name", v->steps[s].name);
             cJSON_AddNumberToObject(sj, "avg_ms", (double)v->step_avg_ns[s] / 1e6);
-            if (v->steps[s].is_loop) {
+            if (v->steps[s].is_loop)
                 cJSON_AddNumberToObject(sj, "loop", v->steps[s].loop_len);
-            }
-            /* Extract class for coloring */
             const char *colon = strchr(v->steps[s].name, ':');
             if (colon) {
                 char cls[32];
@@ -1545,16 +1529,53 @@ static void handle_variants(struct pgwt_server *srv, struct pgwt_request *req)
             cJSON_AddItemToArray(steps, sj);
         }
 
-        /* Query text if available */
         if (v->top_query_id) {
             const char *qt = qt_map_lookup(srv, v->top_query_id);
             if (qt) cJSON_AddStringToObject(vj, "query_text", qt);
         }
 
-        cJSON_AddItemToArray(variants, vj);
+        cJSON_AddItemToArray(arr, vj);
     }
+    return arr;
+}
 
-    free(res.variants);
+static void handle_variants(struct pgwt_server *srv, struct pgwt_request *req)
+{
+    int count;
+    struct pgwt_trace_event *events =
+        server_load_events(srv, req->from_ns, req->to_ns, &count);
+
+    int max_v = req->num_buckets > 0 ? req->num_buckets : 20;
+
+    /* Extract execution variants */
+    struct pgwt_variants_result exec_res;
+    pgwt_compute_variants(events, count, &req->filter, max_v,
+                           PGWT_PHASE_EXEC, &exec_res);
+
+    /* Extract planning variants */
+    struct pgwt_variants_result plan_res;
+    pgwt_compute_variants(events, count, &req->filter, max_v,
+                           PGWT_PHASE_PLAN, &plan_res);
+
+    free(events);
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddNumberToObject(root, "id", (double)req->id);
+
+    /* Execution */
+    cJSON *exec_obj = cJSON_AddObjectToObject(root, "exec");
+    cJSON_AddNumberToObject(exec_obj, "total", exec_res.total_executions);
+    cJSON_AddNumberToObject(exec_obj, "num_variants", exec_res.num_variants);
+    cJSON_AddItemToObject(exec_obj, "variants", serialize_variants(srv, &exec_res));
+
+    /* Planning */
+    cJSON *plan_obj = cJSON_AddObjectToObject(root, "plan");
+    cJSON_AddNumberToObject(plan_obj, "total", plan_res.total_executions);
+    cJSON_AddNumberToObject(plan_obj, "num_variants", plan_res.num_variants);
+    cJSON_AddItemToObject(plan_obj, "variants", serialize_variants(srv, &plan_res));
+
+    free(exec_res.variants);
+    free(plan_res.variants);
     emit_json(root);
 }
 

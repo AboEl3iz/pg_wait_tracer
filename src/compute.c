@@ -2527,18 +2527,24 @@ static void variant_accum_add_qid(struct variant_accum *va, uint64_t qid)
 
 void pgwt_compute_variants(const struct pgwt_trace_event *events, int count,
                             const struct pgwt_filter *f, int max_variants,
+                            enum pgwt_variant_phase phase,
                             struct pgwt_variants_result *out)
 {
     memset(out, 0, sizeof(*out));
 
+    /* Select boundary markers based on phase */
+    const uint32_t marker_start = (phase == PGWT_PHASE_PLAN)
+        ? PGWT_MARKER_PLAN_START : PGWT_MARKER_EXEC_START;
+    const uint32_t marker_end = (phase == PGWT_PHASE_PLAN)
+        ? PGWT_MARKER_PLAN_END : PGWT_MARKER_EXEC_END;
+
     struct variant_accum *ht = calloc(VARIANT_HT_SIZE, sizeof(*ht));
     if (!ht) return;
 
-    /* Phase 1: scan events, extract executions per PID */
-    /* Track per-PID state: are we inside an EXEC_START..EXEC_END? */
+    /* Phase 1: scan events, extract sequences per PID */
     struct pid_exec_state {
         uint32_t pid;
-        int      active;    /* 1 = inside EXEC_START..END */
+        int      active;    /* 1 = inside start..end markers */
         struct raw_exec exec;
     };
     #define MAX_PIDS 512
@@ -2562,15 +2568,15 @@ void pgwt_compute_variants(const struct pgwt_trace_event *events, int count,
 
         struct pid_exec_state *ps = &pids[pidx];
 
-        if (ev->old_event == PGWT_MARKER_EXEC_START) {
-            /* Start a new execution */
+        if (ev->old_event == marker_start) {
+            /* Start a new phase */
             memset(&ps->exec, 0, sizeof(ps->exec));
             ps->active = 1;
             ps->exec.query_id = ev->query_id;
             continue;
         }
 
-        if (ev->old_event == PGWT_MARKER_EXEC_END && ps->active) {
+        if (ev->old_event == marker_end && ps->active) {
             /* End of execution — process it */
             ps->active = 0;
             total_execs++;

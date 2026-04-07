@@ -1854,18 +1854,25 @@ async function refreshTransitions() {
             filters: state.filters,
             num_buckets: 20,
         });
-        if (vdata && vdata.variants && vdata.variants.length > 0) {
-            renderVariants(vdata, container);
+        if (vdata) {
+            const variantDiv = document.createElement('div');
+            if (vdata.exec && vdata.exec.variants && vdata.exec.variants.length > 0) {
+                renderVariantSection(vdata.exec, 'Execution', variantDiv);
+            }
+            if (vdata.plan && vdata.plan.variants && vdata.plan.variants.length > 0) {
+                renderVariantSection(vdata.plan, 'Planning', variantDiv);
+            }
+            if (variantDiv.innerHTML) container.appendChild(variantDiv);
         }
     } catch (e) { /* ignore */ }
 }
 
-function renderVariants(vdata, container) {
+function renderVariantSection(vdata, title, container) {
     const totalMs = vdata.variants.reduce((s, v) => s + v.total_ms, 0);
 
     let html = '<div style="padding:10px 20px">' +
-        `<h3 style="color:#ccc;margin:10px 0 5px">Execution Flow Patterns ` +
-        `<span style="color:#666;font-size:12px">(${vdata.total_executions.toLocaleString()} executions → ` +
+        `<h3 style="color:#ccc;margin:10px 0 5px">${title} Flow Patterns ` +
+        `<span style="color:#666;font-size:12px">(${vdata.total.toLocaleString()} instances → ` +
         `${vdata.num_variants} patterns)</span></h3>`;
 
     vdata.variants.forEach((v, idx) => {
@@ -1943,10 +1950,9 @@ function renderVariants(vdata, container) {
 
     html += '</div>';
 
-    // Append to container (after DFG)
-    const variantDiv = document.createElement('div');
-    variantDiv.innerHTML = html;
-    container.appendChild(variantDiv);
+    const section = document.createElement('div');
+    section.innerHTML = html;
+    container.appendChild(section);
 }
 
 // -- Start --------------------------------------------------------------------

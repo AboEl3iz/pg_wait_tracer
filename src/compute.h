@@ -379,11 +379,18 @@ struct pgwt_variants_result {
     int    total_executions;        /* total EXEC_START/END pairs found */
 };
 
-/* Extract per-query execution flow variants from trace events.
- * Uses EXEC_START/END markers as case boundaries.
+/* Phase selectors for variant extraction */
+enum pgwt_variant_phase {
+    PGWT_PHASE_EXEC = 0,   /* EXEC_START → EXEC_END */
+    PGWT_PHASE_PLAN = 1,   /* PLAN_START → PLAN_END */
+};
+
+/* Extract per-query flow variants from trace events.
+ * phase selects which markers to use as case boundaries.
  * Loop-compresses patterns, groups identical ones, ranks by total time. */
 void pgwt_compute_variants(const struct pgwt_trace_event *events, int count,
                             const struct pgwt_filter *f, int max_variants,
+                            enum pgwt_variant_phase phase,
                             struct pgwt_variants_result *out);
 
 #endif /* PGWT_COMPUTE_H */
