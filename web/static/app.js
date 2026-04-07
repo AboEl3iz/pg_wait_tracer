@@ -600,14 +600,21 @@ function renderApexChart(data) {
             },
             events: {
                 zoomed: function(ctx, { xaxis }) {
+                    if (state._apexZooming) return;
                     if (xaxis.min != null && xaxis.max != null) {
+                        state._apexZooming = true;
                         stopAutoRefresh();
-                        // xaxis values are in milliseconds, convert to ns
-                        state.viewFrom = xaxis.min * 1e6;
-                        state.viewTo = xaxis.max * 1e6;
-                        updateTimeRange();
-                        refresh();
+                        const fromNs = xaxis.min * 1e6;
+                        const toNs = xaxis.max * 1e6;
+                        if (toNs > fromNs) {
+                            zoomTo(fromNs, toNs);
+                        }
+                        setTimeout(() => { state._apexZooming = false; }, 500);
                     }
+                },
+                beforeResetZoom: function() {
+                    // Prevent ApexCharts reset — we handle zoom via zoomTo/zoomOut
+                    return false;
                 },
             },
             background: 'transparent',
