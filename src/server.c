@@ -415,8 +415,26 @@ static int is_current_trace(const char *path)
 
 /* Get cached events for an immutable file. Reads once, caches forever.
  * Returns NULL for current.trace (handled separately). */
-/* Max total cached events across all files (~500MB at 36 bytes/event) */
-#define CACHE_MAX_EVENTS (14 * 1024 * 1024)
+/* Max total cached events — 25% of system RAM, capped at 2GB.
+ * Computed once at startup. */
+#include <unistd.h>
+static int cache_max_events(void)
+{
+    static int cached = 0;
+    if (cached) return cached;
+    long pages = sysconf(_SC_PHYS_PAGES);
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (pages <= 0 || page_size <= 0) {
+        cached = 14 * 1024 * 1024;  /* fallback ~500MB */
+        return cached;
+    }
+    uint64_t ram = (uint64_t)pages * page_size;
+    uint64_t budget = ram / 4;  /* 25% of RAM */
+    if (budget > 2ULL * 1024 * 1024 * 1024) budget = 2ULL * 1024 * 1024 * 1024;  /* cap 2GB */
+    cached = (int)(budget / sizeof(struct pgwt_trace_event));
+    return cached;
+}
+#define CACHE_MAX_EVENTS cache_max_events()
 
 static void cache_evict_oldest(struct pgwt_server *srv)
 {

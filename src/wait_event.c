@@ -551,8 +551,12 @@ void pgwt_event_full_name(uint32_t wei, char *buf, size_t bufsz)
 
 int pgwt_is_idle_event(uint32_t wei)
 {
-    return WE_CLASS(wei) == PG_WAIT_ACTIVITY ||
-           wei == PG_WAIT_CLIENT_READ;
+    /* Only Activity-class events are idle (AutoVacuumMain, idle, etc.).
+     * Client:ClientRead is NOT idle — it's a real wait event showing
+     * time spent waiting for the client to send the next command.
+     * Filtering it caused inconsistent behavior between zoom levels
+     * and empty Client class breakdown. */
+    return WE_CLASS(wei) == PG_WAIT_ACTIVITY;
 }
 
 /* ── Dynamic Name Resolution ─────────────────────────────── */
