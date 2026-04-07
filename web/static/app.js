@@ -561,21 +561,21 @@ function renderApexChart(data) {
 
     const isEventBreakdown = data.breakdown === 'events' && data.series;
 
-    // Build series with raw values (categories, not datetime — preserves ns precision)
+    // Build series as [x, y] pairs with x in milliseconds (fits JS doubles)
     let seriesList, colorList;
     const bns = data.bucket_ns || 0;
-    const categories = data.buckets.map(b => b.t);  // raw ns timestamps
+    const categories = data.buckets.map(b => b.t);  // raw ns timestamps (for reference)
 
     if (isEventBreakdown) {
         seriesList = data.series.map((s, idx) => ({
             name: s.name,
-            data: data.buckets.map(b => +(b.aas[idx] || 0).toFixed(4)),
+            data: data.buckets.map(b => [b.t / 1e6, +(b.aas[idx] || 0).toFixed(4)]),
         }));
         colorList = data.series.map((_, idx) => EVENT_PALETTE[idx % EVENT_PALETTE.length]);
     } else {
         seriesList = WAIT_CLASSES.map(wc => ({
             name: wc.label,
-            data: data.buckets.map(b => +(b[wc.key] || 0).toFixed(4)),
+            data: data.buckets.map(b => [b.t / 1e6, +(b[wc.key] || 0).toFixed(4)]),
         }));
         colorList = WAIT_CLASSES.map(c => c.color);
     }
@@ -602,11 +602,9 @@ function renderApexChart(data) {
                 zoomed: function(ctx, { xaxis }) {
                     if (xaxis.min != null && xaxis.max != null) {
                         stopAutoRefresh();
-                        // xaxis.min/max are category indices
-                        const fromIdx = Math.max(0, Math.floor(xaxis.min));
-                        const toIdx = Math.min(categories.length - 1, Math.ceil(xaxis.max));
-                        state.viewFrom = categories[fromIdx];
-                        state.viewTo = categories[toIdx];
+                        // xaxis values are in milliseconds, convert to ns
+                        state.viewFrom = xaxis.min * 1e6;
+                        state.viewTo = xaxis.max * 1e6;
                         updateTimeRange();
                         refresh();
                     }
@@ -618,11 +616,10 @@ function renderApexChart(data) {
         colors: colorList,
         series: seriesList,
         xaxis: {
-            type: 'category',
-            categories: categories,
+            type: 'numeric',
             labels: {
                 style: { colors: '#888', fontSize: '10px' },
-                formatter: function(val) { return fmtTime(val, bns); },
+                formatter: function(val) { return fmtTime(val * 1e6, bns); },
                 rotate: 0,
                 hideOverlappingLabels: true,
             },
@@ -669,7 +666,8 @@ function renderApexChart(data) {
             shared: true,
             theme: 'dark',
             custom: function({ series, dataPointIndex, w }) {
-                const t = fmtTime(categories[dataPointIndex], bns);
+                const xMs = w.globals.seriesX[0][dataPointIndex];
+                const t = fmtTime(xMs * 1e6, bns);
                 let total = 0;
                 let items = [];
                 for (let i = series.length - 1; i >= 0; i--) {
