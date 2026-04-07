@@ -447,74 +447,6 @@ function initChart() {
     window.addEventListener('resize', () => {
         if (concurrencyChart) concurrencyChart.resize();
     });
-
-    // -- Custom drag-to-zoom on ApexCharts --
-    // Overlay is added by ensureZoomOverlay() after chart first renders.
-    let zoomDrag = null;
-    let zoomOverlay = null;
-
-    function ensureZoomOverlay() {
-        if (zoomOverlay && zoomOverlay.parentNode) return;
-        zoomOverlay = document.createElement('div');
-        zoomOverlay.style.cssText = 'position:absolute;background:rgba(79,195,247,0.2);' +
-            'border-left:2px solid rgba(79,195,247,0.6);border-right:2px solid rgba(79,195,247,0.6);' +
-            'pointer-events:none;display:none;z-index:10;top:0;bottom:0';
-        apexEl.style.position = 'relative';
-        apexEl.appendChild(zoomOverlay);
-    }
-    // Expose so renderApexChart can call it after render
-    state._ensureZoomOverlay = ensureZoomOverlay;
-
-    apexEl.addEventListener('mousedown', (e) => {
-        if (e.button !== 0) return;
-        ensureZoomOverlay();
-        const rect = apexEl.getBoundingClientRect();
-        zoomDrag = { x: e.clientX - rect.left, rect };
-        zoomOverlay.style.left = zoomDrag.x + 'px';
-        zoomOverlay.style.width = '0px';
-        zoomOverlay.style.display = 'block';
-        e.preventDefault();
-    });
-
-    document.addEventListener('mousemove', (e) => {
-        if (!zoomDrag) return;
-        const x = e.clientX - zoomDrag.rect.left;
-        zoomOverlay.style.left = Math.min(zoomDrag.x, x) + 'px';
-        zoomOverlay.style.width = Math.abs(x - zoomDrag.x) + 'px';
-    });
-
-    document.addEventListener('mouseup', (e) => {
-        if (!zoomDrag) return;
-        zoomOverlay.style.display = 'none';
-        const rect = zoomDrag.rect;
-        const endX = e.clientX - rect.left;
-        const minX = Math.min(zoomDrag.x, endX);
-        const maxX = Math.max(zoomDrag.x, endX);
-        zoomDrag = null;
-
-        if (maxX - minX < 10) return;
-
-        // Map pixel range to time range using stored xmin/xmax (in ms)
-        const xmin = state.apexXmin || 0;
-        const xmax = state.apexXmax || 0;
-        if (!xmin || !xmax || xmax <= xmin) return;
-
-        // Chart area is roughly apexEl minus padding
-        const plotLeft = 55, plotRight = rect.width - 15;
-        const plotW = plotRight - plotLeft;
-        if (plotW <= 0) return;
-
-        const fromPct = Math.max(0, (minX - plotLeft) / plotW);
-        const toPct = Math.min(1, (maxX - plotLeft) / plotW);
-        const fromMs = xmin + fromPct * (xmax - xmin);
-        const toMs = xmin + toPct * (xmax - xmin);
-
-        if (toMs > fromMs) {
-            stopAutoRefresh();
-            zoomTo(fromMs * 1e6, toMs * 1e6);
-        }
-    });
-
     // Double-click to zoom out
     apexEl.addEventListener('dblclick', (e) => {
         e.preventDefault();
@@ -671,15 +603,36 @@ function renderApexChart(data) {
         1
     );
 
+    const xMin = state.apexXmin;
+    const xMax = state.apexXmax;
+
     const options = {
         chart: {
             type: 'area',
             height: 300,
             stacked: true,
             animations: { enabled: false },
-            toolbar: { show: false },
-            zoom: { enabled: false },
-            selection: { enabled: false },
+            toolbar: {
+                show: true,
+                tools: {
+                    download: false, selection: false, zoom: true,
+                    zoomin: false, zoomout: false, pan: false, reset: false,
+                },
+                autoSelected: 'zoom',
+            },
+            zoom: { enabled: true, type: 'x', autoScaleYaxis: false },
+            events: {
+                beforeZoom: function(ctx, { xaxis }) {
+                    // Cancel native zoom, fetch new data instead
+                    const fromNs = Math.round(xaxis.min) * 1e6;
+                    const toNs = Math.round(xaxis.max) * 1e6;
+                    if (toNs > fromNs) {
+                        stopAutoRefresh();
+                        zoomTo(fromNs, toNs);
+                    }
+                    return { xaxis: { min: undefined, max: undefined } };
+                },
+            },
             background: 'transparent',
         },
         theme: { mode: 'dark' },
@@ -687,6 +640,8 @@ function renderApexChart(data) {
         series: seriesList,
         xaxis: {
             type: 'numeric',
+            min: xMin,
+            max: xMax,
             labels: {
                 style: { colors: '#888', fontSize: '10px' },
                 formatter: function(val) { return fmtTime(val * 1e6, bns); },
@@ -789,8 +744,6 @@ function renderApexChart(data) {
         apexChart = new ApexCharts(apexEl, options);
         apexChart.render();
     }
-    // Re-add zoom overlay (chart render may have removed it)
-    if (state._ensureZoomOverlay) state._ensureZoomOverlay();
 
     // -- HTML legend (completely isolated from ECharts) --
     // Uses ONLY apexChart.showSeries/hideSeries/updateOptions — zero DOM queries
