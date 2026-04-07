@@ -369,13 +369,20 @@ function pctBar(pct, color) {
 function stackedBar(classes, total) {
     if (!classes || !total || total <= 0) return '';
     let html = '<div class="stacked-bar">';
+    let shownPct = 0;
     for (let i = 0; i < WAIT_CLASSES.length && i < classes.length; i++) {
         const pct = classes[i] / total * 100;
         if (pct < 0.5) continue;
+        shownPct += pct;
         html += '<div class="bar-seg" style="width:' + pct.toFixed(1) +
                 '%;background:' + WAIT_CLASSES[i].color + '" title="' +
                 WAIT_CLASSES[i].label + ': ' + fmtMs(classes[i]) +
                 ' (' + pct.toFixed(1) + '%)"></div>';
+    }
+    if (shownPct < 99.5) {
+        const otherPct = 100 - shownPct;
+        html += '<div class="bar-seg" style="width:' + otherPct.toFixed(1) +
+                '%;background:#444" title="Other: ' + otherPct.toFixed(1) + '%"></div>';
     }
     html += '</div>';
     return html;
@@ -384,14 +391,24 @@ function stackedBar(classes, total) {
 function eventStackedBar(events, total) {
     if (!events || !events.length || !total || total <= 0) return '';
     let html = '<div class="stacked-bar">';
+    let shownPct = 0;
     for (let i = 0; i < events.length; i++) {
         const pct = events[i].ms / total * 100;
         if (pct < 0.3) continue;
-        const color = EVENT_PALETTE[i % EVENT_PALETTE.length];
+        shownPct += pct;
+        // Use wait class color (extract class from "Class:Event" name)
+        const color = classColor(events[i].name) || EVENT_PALETTE[i % EVENT_PALETTE.length];
         html += '<div class="bar-seg" style="width:' + pct.toFixed(1) +
                 '%;background:' + color + '" title="' +
                 esc(events[i].name) + ': ' + fmtMs(events[i].ms) +
                 ' (' + pct.toFixed(1) + '%)"></div>';
+    }
+    // Show remaining as "other" with tooltip
+    if (shownPct < 99.5) {
+        const otherPct = 100 - shownPct;
+        html += '<div class="bar-seg" style="width:' + otherPct.toFixed(1) +
+                '%;background:#444" title="Other small events: ' +
+                otherPct.toFixed(1) + '%"></div>';
     }
     html += '</div>';
     return html;
