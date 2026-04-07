@@ -882,6 +882,25 @@ const TABLE_CONFIGS = {
             { key: 'classes', label: 'Wait Profile', format: (r) =>
                 r.events ? eventStackedBar(r.events, r.total_ms)
                          : stackedBar(r.classes, r.total_ms) },
+            { key: 'exec_count', label: 'Execs', cls: 'num', format: (r) =>
+                r.exec_count != null ? fmtCount(r.exec_count) : '—' },
+            { key: 'plan_count', label: 'Plans', cls: 'num', format: (r) =>
+                r.plan_count != null ? fmtCount(r.plan_count) : '—' },
+            { key: 'plan_ratio', label: 'Plan%', cls: 'num', format: (r) =>
+                (r.exec_count > 0 && r.plan_count != null)
+                    ? (r.plan_count / r.exec_count * 100).toFixed(0) + '%' : '—' },
+            { key: 'avg_exec_ms', label: 'Avg Exec', cls: 'num', format: (r) =>
+                r.avg_exec_ms != null ? fmtMs(r.avg_exec_ms) : '—' },
+            { key: 'p95_exec_ms', label: 'p95 Exec', cls: 'num', format: (r) =>
+                r.p95_exec_ms != null ? fmtMs(r.p95_exec_ms) : '—' },
+            { key: 'p99_exec_ms', label: 'p99 Exec', cls: 'num', format: (r) =>
+                r.p99_exec_ms != null ? fmtMs(r.p99_exec_ms) : '—' },
+            { key: 'avg_plan_ms', label: 'Avg Plan', cls: 'num', format: (r) =>
+                r.avg_plan_ms != null ? fmtMs(r.avg_plan_ms) : '—' },
+            { key: 'p95_plan_ms', label: 'p95 Plan', cls: 'num', format: (r) =>
+                r.p95_plan_ms != null ? fmtMs(r.p95_plan_ms) : '—' },
+            { key: 'p99_plan_ms', label: 'p99 Plan', cls: 'num', format: (r) =>
+                r.p99_plan_ms != null ? fmtMs(r.p99_plan_ms) : '—' },
             { key: 'count', label: 'Waits', cls: 'num', format: (r) => fmtCount(r.count) },
             { key: 'avg_us', label: 'Avg Wait', cls: 'num', format: (r) => fmtUs(r.avg_us) },
         ],

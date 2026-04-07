@@ -949,6 +949,95 @@ static void handle_top_queries(struct pgwt_server *srv, struct pgwt_request *req
         free(events);
     }
 
+    /* Compute per-query exec/plan stats from markers */
+    struct qid_lifecycle {
+        uint64_t query_id;
+        int used;
+        int exec_count, plan_count;
+        double exec_total_ms, plan_total_ms;
+        double *exec_times, *plan_times;
+        int exec_cap, plan_cap;
+    };
+    #define QLC_HT_SIZE 1024
+    #define QLC_HT_MASK (QLC_HT_SIZE - 1)
+    struct qid_lifecycle *qlc = calloc(QLC_HT_SIZE, sizeof(*qlc));
+
+    if (qlc) {
+        int ecount;
+        struct pgwt_trace_event *evts =
+            server_load_events(srv, req->from_ns, req->to_ns, &ecount);
+
+        struct { uint32_t pid; uint64_t exec_start_ns, plan_start_ns; uint64_t qid; }
+            pid_st[512];
+        int npids = 0;
+
+        for (int i = 0; i < ecount; i++) {
+            const struct pgwt_trace_event *ev = &evts[i];
+            uint32_t m = ev->old_event;
+            if (!PGWT_IS_MARKER(m)) continue;
+
+            int pi = -1;
+            for (int j = 0; j < npids; j++)
+                if (pid_st[j].pid == ev->pid) { pi = j; break; }
+            if (pi < 0 && npids < 512) {
+                pi = npids++;
+                memset(&pid_st[pi], 0, sizeof(pid_st[0]));
+                pid_st[pi].pid = ev->pid;
+            }
+            if (pi < 0) continue;
+
+            if (m == PGWT_MARKER_EXEC_START) {
+                pid_st[pi].exec_start_ns = ev->timestamp_ns;
+                pid_st[pi].qid = ev->query_id;
+            } else if (m == PGWT_MARKER_EXEC_END && pid_st[pi].exec_start_ns) {
+                double ms = (ev->timestamp_ns - pid_st[pi].exec_start_ns) / 1e6;
+                uint64_t qid = pid_st[pi].qid;
+                pid_st[pi].exec_start_ns = 0;
+                if (qid == 0) continue;
+                uint32_t h = (uint32_t)((qid * 0x9e3779b9ULL) & QLC_HT_MASK);
+                while (qlc[h].used && qlc[h].query_id != qid) h = (h + 1) & QLC_HT_MASK;
+                if (!qlc[h].used) { qlc[h].used = 1; qlc[h].query_id = qid; }
+                qlc[h].exec_count++;
+                qlc[h].exec_total_ms += ms;
+                if (qlc[h].exec_count <= 10000) {
+                    if (qlc[h].exec_count > qlc[h].exec_cap) {
+                        int nc = qlc[h].exec_cap ? qlc[h].exec_cap * 2 : 64;
+                        double *t = realloc(qlc[h].exec_times, nc * sizeof(double));
+                        if (t) { qlc[h].exec_times = t; qlc[h].exec_cap = nc; }
+                    }
+                    if (qlc[h].exec_times && qlc[h].exec_count <= qlc[h].exec_cap)
+                        qlc[h].exec_times[qlc[h].exec_count - 1] = ms;
+                }
+            } else if (m == PGWT_MARKER_PLAN_START) {
+                pid_st[pi].plan_start_ns = ev->timestamp_ns;
+                pid_st[pi].qid = ev->query_id;
+            } else if (m == PGWT_MARKER_PLAN_END && pid_st[pi].plan_start_ns) {
+                double ms = (ev->timestamp_ns - pid_st[pi].plan_start_ns) / 1e6;
+                uint64_t qid = pid_st[pi].qid;
+                pid_st[pi].plan_start_ns = 0;
+                if (qid == 0) continue;
+                uint32_t h = (uint32_t)((qid * 0x9e3779b9ULL) & QLC_HT_MASK);
+                while (qlc[h].used && qlc[h].query_id != qid) h = (h + 1) & QLC_HT_MASK;
+                if (!qlc[h].used) { qlc[h].used = 1; qlc[h].query_id = qid; }
+                qlc[h].plan_count++;
+                qlc[h].plan_total_ms += ms;
+                if (qlc[h].plan_count <= 10000) {
+                    if (qlc[h].plan_count > qlc[h].plan_cap) {
+                        int nc = qlc[h].plan_cap ? qlc[h].plan_cap * 2 : 64;
+                        double *t = realloc(qlc[h].plan_times, nc * sizeof(double));
+                        if (t) { qlc[h].plan_times = t; qlc[h].plan_cap = nc; }
+                    }
+                    if (qlc[h].plan_times && qlc[h].plan_count <= qlc[h].plan_cap)
+                        qlc[h].plan_times[qlc[h].plan_count - 1] = ms;
+                }
+            }
+        }
+        free(evts);
+    }
+
+    /* Helper: compute percentile from sorted array */
+    #define PERCENTILE(arr, n, pct) ((n) > 0 ? (arr)[(int)((n) * (pct))] : 0)
+
     cJSON *root = cJSON_CreateObject();
     cJSON_AddNumberToObject(root, "id", (double)req->id);
 
@@ -998,12 +1087,63 @@ static void handle_top_queries(struct pgwt_server *srv, struct pgwt_request *req
             }
         }
 
+        /* Exec/plan lifecycle stats from markers */
+        if (qlc) {
+            uint64_t qid = res.rows[i].query_id;
+            uint32_t h = (uint32_t)((qid * 0x9e3779b9ULL) & QLC_HT_MASK);
+            while (qlc[h].used && qlc[h].query_id != qid) h = (h + 1) & QLC_HT_MASK;
+            if (qlc[h].used && qlc[h].query_id == qid) {
+                struct qid_lifecycle *lc = &qlc[h];
+                cJSON_AddNumberToObject(r, "exec_count", lc->exec_count);
+                cJSON_AddNumberToObject(r, "plan_count", lc->plan_count);
+                if (lc->exec_count > 0) {
+                    cJSON_AddNumberToObject(r, "avg_exec_ms",
+                        lc->exec_total_ms / lc->exec_count);
+                    int n = lc->exec_count < lc->exec_cap ? lc->exec_count : lc->exec_cap;
+                    if (lc->exec_times && n > 1) {
+                        for (int a = 0; a < n-1; a++)
+                            for (int b = a+1; b < n; b++)
+                                if (lc->exec_times[a] > lc->exec_times[b]) {
+                                    double tmp = lc->exec_times[a];
+                                    lc->exec_times[a] = lc->exec_times[b];
+                                    lc->exec_times[b] = tmp;
+                                }
+                        cJSON_AddNumberToObject(r, "p95_exec_ms", lc->exec_times[(int)(n*0.95)]);
+                        cJSON_AddNumberToObject(r, "p99_exec_ms", lc->exec_times[(int)(n*0.99)]);
+                    }
+                }
+                if (lc->plan_count > 0) {
+                    cJSON_AddNumberToObject(r, "avg_plan_ms",
+                        lc->plan_total_ms / lc->plan_count);
+                    int n = lc->plan_count < lc->plan_cap ? lc->plan_count : lc->plan_cap;
+                    if (lc->plan_times && n > 1) {
+                        for (int a = 0; a < n-1; a++)
+                            for (int b = a+1; b < n; b++)
+                                if (lc->plan_times[a] > lc->plan_times[b]) {
+                                    double tmp = lc->plan_times[a];
+                                    lc->plan_times[a] = lc->plan_times[b];
+                                    lc->plan_times[b] = tmp;
+                                }
+                        cJSON_AddNumberToObject(r, "p95_plan_ms", lc->plan_times[(int)(n*0.95)]);
+                        cJSON_AddNumberToObject(r, "p99_plan_ms", lc->plan_times[(int)(n*0.99)]);
+                    }
+                }
+            }
+        }
+
         cJSON_AddItemToArray(rows, r);
     }
 
     cJSON_AddNumberToObject(root, "db_time_ms", res.db_time_ms);
     emit_json(root);
 
+    if (qlc) {
+        for (int i = 0; i < QLC_HT_SIZE; i++) {
+            free(qlc[i].exec_times);
+            free(qlc[i].plan_times);
+        }
+        free(qlc);
+    }
     free(res.rows);
 }
 
