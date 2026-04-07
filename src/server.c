@@ -956,6 +956,7 @@ static void handle_top_queries(struct pgwt_server *srv, struct pgwt_request *req
         int exec_count, plan_count;
         double exec_total_ms, plan_total_ms;
         double *exec_times, *plan_times;
+        int exec_nsamples, plan_nsamples;  /* actual entries written */
         int exec_cap, plan_cap;
     };
     #define QLC_HT_SIZE 1024
@@ -999,14 +1000,14 @@ static void handle_top_queries(struct pgwt_server *srv, struct pgwt_request *req
                 if (!qlc[h].used) { qlc[h].used = 1; qlc[h].query_id = qid; }
                 qlc[h].exec_count++;
                 qlc[h].exec_total_ms += ms;
-                if (qlc[h].exec_count <= 10000) {
-                    if (qlc[h].exec_count > qlc[h].exec_cap) {
+                if (ms >= 0 && qlc[h].exec_nsamples < 10000) {
+                    if (qlc[h].exec_nsamples >= qlc[h].exec_cap) {
                         int nc = qlc[h].exec_cap ? qlc[h].exec_cap * 2 : 64;
                         double *t = realloc(qlc[h].exec_times, nc * sizeof(double));
                         if (t) { qlc[h].exec_times = t; qlc[h].exec_cap = nc; }
                     }
-                    if (qlc[h].exec_times && qlc[h].exec_count <= qlc[h].exec_cap)
-                        qlc[h].exec_times[qlc[h].exec_count - 1] = ms;
+                    if (qlc[h].exec_times && qlc[h].exec_nsamples < qlc[h].exec_cap)
+                        qlc[h].exec_times[qlc[h].exec_nsamples++] = ms;
                 }
             } else if (m == PGWT_MARKER_PLAN_START) {
                 pid_st[pi].plan_start_ns = ev->timestamp_ns;
@@ -1021,14 +1022,14 @@ static void handle_top_queries(struct pgwt_server *srv, struct pgwt_request *req
                 if (!qlc[h].used) { qlc[h].used = 1; qlc[h].query_id = qid; }
                 qlc[h].plan_count++;
                 qlc[h].plan_total_ms += ms;
-                if (qlc[h].plan_count <= 10000) {
-                    if (qlc[h].plan_count > qlc[h].plan_cap) {
+                if (ms >= 0 && qlc[h].plan_nsamples < 10000) {
+                    if (qlc[h].plan_nsamples >= qlc[h].plan_cap) {
                         int nc = qlc[h].plan_cap ? qlc[h].plan_cap * 2 : 64;
                         double *t = realloc(qlc[h].plan_times, nc * sizeof(double));
                         if (t) { qlc[h].plan_times = t; qlc[h].plan_cap = nc; }
                     }
-                    if (qlc[h].plan_times && qlc[h].plan_count <= qlc[h].plan_cap)
-                        qlc[h].plan_times[qlc[h].plan_count - 1] = ms;
+                    if (qlc[h].plan_times && qlc[h].plan_nsamples < qlc[h].plan_cap)
+                        qlc[h].plan_times[qlc[h].plan_nsamples++] = ms;
                 }
             }
         }
@@ -1099,7 +1100,7 @@ static void handle_top_queries(struct pgwt_server *srv, struct pgwt_request *req
                 if (lc->exec_count > 0) {
                     cJSON_AddNumberToObject(r, "avg_exec_ms",
                         lc->exec_total_ms / lc->exec_count);
-                    int n = lc->exec_count < lc->exec_cap ? lc->exec_count : lc->exec_cap;
+                    int n = lc->exec_nsamples;
                     if (lc->exec_times && n > 1) {
                         for (int a = 0; a < n-1; a++)
                             for (int b = a+1; b < n; b++)
@@ -1108,14 +1109,16 @@ static void handle_top_queries(struct pgwt_server *srv, struct pgwt_request *req
                                     lc->exec_times[a] = lc->exec_times[b];
                                     lc->exec_times[b] = tmp;
                                 }
-                        cJSON_AddNumberToObject(r, "p95_exec_ms", lc->exec_times[(int)(n*0.95)]);
-                        cJSON_AddNumberToObject(r, "p99_exec_ms", lc->exec_times[(int)(n*0.99)]);
+                        cJSON_AddNumberToObject(r, "p95_exec_ms",
+                            lc->exec_times[n > 20 ? (int)((n-1)*0.95) : n-1]);
+                        cJSON_AddNumberToObject(r, "p99_exec_ms",
+                            lc->exec_times[n > 100 ? (int)((n-1)*0.99) : n-1]);
                     }
                 }
                 if (lc->plan_count > 0) {
                     cJSON_AddNumberToObject(r, "avg_plan_ms",
                         lc->plan_total_ms / lc->plan_count);
-                    int n = lc->plan_count < lc->plan_cap ? lc->plan_count : lc->plan_cap;
+                    int n = lc->plan_nsamples;
                     if (lc->plan_times && n > 1) {
                         for (int a = 0; a < n-1; a++)
                             for (int b = a+1; b < n; b++)
@@ -1124,8 +1127,10 @@ static void handle_top_queries(struct pgwt_server *srv, struct pgwt_request *req
                                     lc->plan_times[a] = lc->plan_times[b];
                                     lc->plan_times[b] = tmp;
                                 }
-                        cJSON_AddNumberToObject(r, "p95_plan_ms", lc->plan_times[(int)(n*0.95)]);
-                        cJSON_AddNumberToObject(r, "p99_plan_ms", lc->plan_times[(int)(n*0.99)]);
+                        cJSON_AddNumberToObject(r, "p95_plan_ms",
+                            lc->plan_times[n > 20 ? (int)((n-1)*0.95) : n-1]);
+                        cJSON_AddNumberToObject(r, "p99_plan_ms",
+                            lc->plan_times[n > 100 ? (int)((n-1)*0.99) : n-1]);
                     }
                 }
             }
