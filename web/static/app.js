@@ -436,10 +436,72 @@ function switchTab(tab) {
 const chartEl = document.getElementById('chart-container');  // hidden, kept for legacy refs
 
 function initChart() {
-    /* AAS chart is now ApexCharts (rendered in apex-chart-container).
-     * ECharts is still used for heatmap, timeline, concurrency, transitions. */
     window.addEventListener('resize', () => {
         if (concurrencyChart) concurrencyChart.resize();
+    });
+
+    // -- Custom drag-to-zoom on ApexCharts --
+    let zoomDrag = null;
+    const zoomOverlay = document.createElement('div');
+    zoomOverlay.style.cssText = 'position:absolute;background:rgba(79,195,247,0.2);' +
+        'border-left:2px solid rgba(79,195,247,0.6);border-right:2px solid rgba(79,195,247,0.6);' +
+        'pointer-events:none;display:none;z-index:10;top:0;bottom:0';
+    apexEl.style.position = 'relative';
+    apexEl.appendChild(zoomOverlay);
+
+    apexEl.addEventListener('mousedown', (e) => {
+        if (e.button !== 0) return;
+        const rect = apexEl.getBoundingClientRect();
+        zoomDrag = { x: e.clientX - rect.left, rect };
+        zoomOverlay.style.left = zoomDrag.x + 'px';
+        zoomOverlay.style.width = '0px';
+        zoomOverlay.style.display = 'block';
+        e.preventDefault();
+    });
+
+    document.addEventListener('mousemove', (e) => {
+        if (!zoomDrag) return;
+        const x = e.clientX - zoomDrag.rect.left;
+        zoomOverlay.style.left = Math.min(zoomDrag.x, x) + 'px';
+        zoomOverlay.style.width = Math.abs(x - zoomDrag.x) + 'px';
+    });
+
+    document.addEventListener('mouseup', (e) => {
+        if (!zoomDrag) return;
+        zoomOverlay.style.display = 'none';
+        const rect = zoomDrag.rect;
+        const endX = e.clientX - rect.left;
+        const minX = Math.min(zoomDrag.x, endX);
+        const maxX = Math.max(zoomDrag.x, endX);
+        zoomDrag = null;
+
+        if (maxX - minX < 10) return;
+
+        // Map pixel range to time range using stored xmin/xmax (in ms)
+        const xmin = state.apexXmin || 0;
+        const xmax = state.apexXmax || 0;
+        if (!xmin || !xmax || xmax <= xmin) return;
+
+        // Chart area is roughly apexEl minus padding
+        const plotLeft = 55, plotRight = rect.width - 15;
+        const plotW = plotRight - plotLeft;
+        if (plotW <= 0) return;
+
+        const fromPct = Math.max(0, (minX - plotLeft) / plotW);
+        const toPct = Math.min(1, (maxX - plotLeft) / plotW);
+        const fromMs = xmin + fromPct * (xmax - xmin);
+        const toMs = xmin + toPct * (xmax - xmin);
+
+        if (toMs > fromMs) {
+            stopAutoRefresh();
+            zoomTo(fromMs * 1e6, toMs * 1e6);
+        }
+    });
+
+    // Double-click to zoom out
+    apexEl.addEventListener('dblclick', (e) => {
+        e.preventDefault();
+        zoomOut();
     });
 }
 
@@ -564,7 +626,9 @@ function renderApexChart(data) {
     // Build series as [x, y] pairs with x in milliseconds (fits JS doubles)
     let seriesList, colorList;
     const bns = data.bucket_ns || 0;
-    const categories = data.buckets.map(b => b.t);  // raw ns timestamps (for reference)
+    const categories = data.buckets.map(b => b.t);  // raw ns timestamps
+    state.apexXmin = data.buckets[0].t / 1e6;  // ms
+    state.apexXmax = data.buckets[data.buckets.length - 1].t / 1e6;  // ms
 
     if (isEventBreakdown) {
         seriesList = data.series.map((s, idx) => ({
@@ -593,30 +657,8 @@ function renderApexChart(data) {
             stacked: true,
             animations: { enabled: false },
             toolbar: { show: false },
-            zoom: {
-                enabled: true,
-                type: 'x',
-                autoScaleYaxis: false,
-            },
-            events: {
-                zoomed: function(ctx, { xaxis }) {
-                    if (state._apexZooming) return;
-                    if (xaxis.min != null && xaxis.max != null) {
-                        state._apexZooming = true;
-                        stopAutoRefresh();
-                        const fromNs = xaxis.min * 1e6;
-                        const toNs = xaxis.max * 1e6;
-                        if (toNs > fromNs) {
-                            zoomTo(fromNs, toNs);
-                        }
-                        setTimeout(() => { state._apexZooming = false; }, 500);
-                    }
-                },
-                beforeResetZoom: function() {
-                    // Prevent ApexCharts reset — we handle zoom via zoomTo/zoomOut
-                    return false;
-                },
-            },
+            zoom: { enabled: false },
+            selection: { enabled: false },
             background: 'transparent',
         },
         theme: { mode: 'dark' },
@@ -715,12 +757,13 @@ function renderApexChart(data) {
         dataLabels: { enabled: false },
     };
 
+    // Always destroy and recreate — prevents stale zoom/event state
     if (apexChart) {
-        apexChart.updateOptions(options, true, false, false);
-    } else {
-        apexChart = new ApexCharts(apexEl, options);
-        apexChart.render();
+        apexChart.destroy();
+        apexChart = null;
     }
+    apexChart = new ApexCharts(apexEl, options);
+    apexChart.render();
 
     // -- HTML legend (completely isolated from ECharts) --
     // Uses ONLY apexChart.showSeries/hideSeries/updateOptions — zero DOM queries
