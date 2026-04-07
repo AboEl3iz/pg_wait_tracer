@@ -420,6 +420,13 @@ function switchTab(tab) {
     document.querySelectorAll('.tab').forEach(b => {
         b.classList.toggle('active', b.dataset.tab === tab);
     });
+
+    // Show loading immediately for tabs that fetch data
+    const container = document.getElementById('table-container');
+    if (['histogram', 'timeline', 'transitions', 'concurrency'].includes(tab)) {
+        container.innerHTML = '<div class="loading">Loading...</div>';
+    }
+
     refreshChart();
     refreshTable();
 }
