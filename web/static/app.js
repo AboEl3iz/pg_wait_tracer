@@ -867,12 +867,12 @@ const TABLE_CONFIGS = {
     },
     queries: {
         columns: [
-            { key: 'query_id', label: 'Query ID', format: (r) =>
+            { key: 'query_id', label: 'Query ID', cls: 'sticky-col sticky-col-0', format: (r) =>
                 '<span class="query-id">' + r.query_id + '</span>' },
-            { key: 'text', label: 'Query Text', format: (r) => {
+            { key: 'text', label: 'Query Text', cls: 'sticky-col sticky-col-1', format: (r) => {
                 if (!r.text) return '<span style="color:#555">—</span>';
-                const truncated = esc(r.text.substring(0, 120)) +
-                    (r.text.length > 120 ? '...' : '');
+                const truncated = esc(r.text.substring(0, 80)) +
+                    (r.text.length > 80 ? '...' : '');
                 return '<span class="qt-hover" data-fulltext="' +
                     esc(r.text).replace(/"/g, '&quot;') + '">' +
                     dot(r.top_wait) + truncated + '</span>';

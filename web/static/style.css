@@ -240,6 +240,7 @@ h1 { font-size: 18px; font-weight: 600; color: #fff; }
 #table-container {
   padding: 0 20px 20px;
   border-top: 1px solid #2a2a4a;
+  overflow-x: auto;
 }
 table {
   width: 100%;
@@ -269,6 +270,39 @@ tr.clickable:hover td { background: #2a3a6a; }
 .num { text-align: right; font-variant-numeric: tabular-nums; }
 .indent-1 td:first-child { padding-left: 28px; }
 .indent-2 td:first-child { padding-left: 48px; }
+
+/* Sticky columns for wide tables (queries tab) */
+.sticky-col {
+  position: sticky;
+  z-index: 2;
+}
+th.sticky-col {
+  z-index: 3;
+}
+.sticky-col-0 {
+  left: 0;
+  background: #16213e;
+  min-width: 80px;
+  max-width: 160px;
+}
+td.sticky-col-0 {
+  background: #1a1a2e;
+}
+tr:hover td.sticky-col-0 { background: #2a2a5a; }
+.sticky-col-1 {
+  left: 160px;
+  background: #16213e;
+  max-width: 350px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+td.sticky-col-1 {
+  background: #1a1a2e;
+  max-width: 350px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+tr:hover td.sticky-col-1 { background: #2a2a5a; }
 
 /* Color dot for wait class */
 .class-dot {
