@@ -441,6 +441,72 @@ function initChart() {
     window.addEventListener('resize', () => {
         if (concurrencyChart) concurrencyChart.resize();
     });
+
+    // -- Drag-to-zoom on ApexCharts container --
+    let brushStart = null;
+    const overlay = document.createElement('div');
+    overlay.style.cssText = 'position:absolute;background:rgba(79,195,247,0.2);' +
+        'border-left:2px solid rgba(79,195,247,0.6);border-right:2px solid rgba(79,195,247,0.6);' +
+        'pointer-events:none;display:none;z-index:10;top:0;bottom:0';
+    apexEl.style.position = 'relative';
+    apexEl.appendChild(overlay);
+
+    apexEl.addEventListener('mousedown', (e) => {
+        if (e.button !== 0 || !state.apexCategories) return;
+        const rect = apexEl.getBoundingClientRect();
+        const x = e.clientX - rect.left;
+        brushStart = { x, left: 0, width: rect.width };
+        overlay.style.left = x + 'px';
+        overlay.style.width = '0px';
+        overlay.style.display = 'block';
+        e.preventDefault();
+    });
+
+    document.addEventListener('mousemove', (e) => {
+        if (!brushStart) return;
+        const rect = apexEl.getBoundingClientRect();
+        let x = Math.max(0, Math.min(e.clientX - rect.left, rect.width));
+        overlay.style.left = Math.min(brushStart.x, x) + 'px';
+        overlay.style.width = Math.abs(x - brushStart.x) + 'px';
+    });
+
+    document.addEventListener('mouseup', (e) => {
+        if (!brushStart) return;
+        overlay.style.display = 'none';
+        const rect = apexEl.getBoundingClientRect();
+        let endX = Math.max(0, Math.min(e.clientX - rect.left, rect.width));
+        const minX = Math.min(brushStart.x, endX);
+        const maxX = Math.max(brushStart.x, endX);
+        brushStart = null;
+
+        if (maxX - minX < 5) return;  // too small, ignore
+
+        // Map pixel to category index
+        const cats = state.apexCategories;
+        if (!cats || cats.length < 2) return;
+
+        // ApexCharts chart area has padding — estimate plot area
+        const plotLeft = 50;  // approximate left padding
+        const plotRight = rect.width - 20;
+        const plotWidth = plotRight - plotLeft;
+        if (plotWidth <= 0) return;
+
+        const startPct = Math.max(0, (minX - plotLeft) / plotWidth);
+        const endPct = Math.min(1, (maxX - plotLeft) / plotWidth);
+        const startIdx = Math.round(startPct * (cats.length - 1));
+        const endIdx = Math.round(endPct * (cats.length - 1));
+
+        if (startIdx < endIdx && cats[startIdx] && cats[endIdx]) {
+            stopAutoRefresh();
+            zoomTo(cats[startIdx], cats[endIdx]);
+        }
+    });
+
+    // Double-click to zoom out
+    apexEl.addEventListener('dblclick', (e) => {
+        e.preventDefault();
+        zoomOut();
+    });
 }
 
 // -- Chart resize handle --------------------------------------------------
@@ -565,6 +631,7 @@ function renderApexChart(data) {
     let seriesList, colorList;
     const bns = data.bucket_ns || 0;
     const categories = data.buckets.map(b => b.t);  // raw ns timestamps
+    state.apexCategories = categories;  // for drag-to-zoom handler
 
     if (isEventBreakdown) {
         seriesList = data.series.map((s, idx) => ({
@@ -593,30 +660,8 @@ function renderApexChart(data) {
             stacked: true,
             animations: { enabled: false },
             toolbar: { show: false },
-            zoom: {
-                enabled: true,
-                type: 'x',
-                autoScaleYaxis: false,
-            },
-            events: {
-                zoomed: function(ctx, { xaxis }) {
-                    if (xaxis.min != null && xaxis.max != null) {
-                        stopAutoRefresh();
-                        console.log('[zoom] xaxis:', xaxis.min, xaxis.max,
-                            'categories:', categories.length,
-                            'cat[0]:', categories[0], 'cat[-1]:', categories[categories.length-1]);
-                        // ApexCharts category zoom returns indices (0-based)
-                        const fromIdx = Math.max(0, Math.round(xaxis.min - 1));
-                        const toIdx = Math.min(categories.length - 1, Math.round(xaxis.max - 1));
-                        if (fromIdx < toIdx && categories[fromIdx] && categories[toIdx]) {
-                            state.viewFrom = categories[fromIdx];
-                            state.viewTo = categories[toIdx];
-                            updateTimeRange();
-                            refresh();
-                        }
-                    }
-                },
-            },
+            zoom: { enabled: false },
+            selection: { enabled: false },
             background: 'transparent',
         },
         theme: { mode: 'dark' },
