@@ -170,11 +170,18 @@ async function init() {
 
 // -- Refresh ------------------------------------------------------------------
 
+let _refreshRunning = false;
 async function refresh() {
-    /* Sequential, not parallel. The server processes one request at a time.
-     * Parallel requests cause queueing, backlog, and timeouts. */
-    await refreshChart();
-    await refreshTable();
+    /* Guard against concurrent refreshes — if one is already running,
+     * skip this call. The running one will show the latest state. */
+    if (_refreshRunning) return;
+    _refreshRunning = true;
+    try {
+        await refreshChart();
+        await refreshTable();
+    } finally {
+        _refreshRunning = false;
+    }
 }
 
 async function refreshChart() {
@@ -249,16 +256,16 @@ function updateTimeRange() {
     el.textContent = from + ' \u2013 ' + to + ' (' + dur + ')';
 }
 
-function zoomTo(from, to) {
+async function zoomTo(from, to) {
     state.zoomHistory.push({ from: state.viewFrom, to: state.viewTo });
     if (state.zoomHistory.length > 10) state.zoomHistory.shift();
     state.viewFrom = from;
     state.viewTo = to;
     updateTimeRange();
-    refresh();
+    await refresh();
 }
 
-function zoomOut() {
+async function zoomOut() {
     if (state.zoomHistory.length > 0) {
         const prev = state.zoomHistory.pop();
         state.viewFrom = prev.from;
@@ -270,7 +277,7 @@ function zoomOut() {
         state.viewTo = Math.min(state.toNs, mid + halfSpan);
     }
     updateTimeRange();
-    refresh();
+    await refresh();
 }
 
 function fmtTime(ns, bucketNs) {
@@ -427,8 +434,7 @@ function switchTab(tab) {
     document.getElementById('table-container').innerHTML = '<div class="loading">Loading...</div>';
     document.getElementById('summary-bar').innerHTML = '';
 
-    refreshChart();
-    refreshTable();
+    refresh();
 }
 
 // -- Chart container ----------------------------------------------------------
@@ -564,24 +570,25 @@ function initTimePicker() {
 
     // Quick range buttons — "last N" ranges auto-refresh
     picker.querySelectorAll('.tp-quick button').forEach(btn => {
-        btn.addEventListener('click', () => {
+        btn.addEventListener('click', async () => {
             const secs = parseInt(btn.dataset.range);
             picker.style.display = 'none';
             picker.querySelectorAll('.tp-quick button').forEach(b => b.classList.remove('active'));
             btn.classList.add('active');
 
-            // Stop any existing auto-refresh
             stopAutoRefresh();
 
             if (secs === 0) {
-                // "All" — full range, no auto-refresh
-                zoomTo(state.fromNs, state.toNs);
+                await zoomTo(state.fromNs, state.toNs);
             } else {
-                // "Last N" — always relative to server wall clock
                 state.liveRangeSecs = secs;
                 const end = state.serverNow || state.toNs;
                 const from = end - secs * 1e9;
-                zoomTo(from, end);
+                // Set view and refresh ONCE, then start auto-refresh
+                state.viewFrom = from;
+                state.viewTo = end;
+                updateTimeRange();
+                await refresh();
                 startAutoRefresh(secs);
             }
         });
@@ -757,13 +764,18 @@ function renderApexChart(data) {
         dataLabels: { enabled: false },
     };
 
-    // Always destroy and recreate — prevents stale zoom/event state
     if (apexChart) {
-        apexChart.destroy();
-        apexChart = null;
+        // Update existing chart — no destroy/recreate, no blip
+        apexChart.updateOptions({
+            xaxis: options.xaxis,
+            yaxis: options.yaxis,
+            annotations: options.annotations,
+        }, false, false, false);
+        apexChart.updateSeries(seriesList, false);
+    } else {
+        apexChart = new ApexCharts(apexEl, options);
+        apexChart.render();
     }
-    apexChart = new ApexCharts(apexEl, options);
-    apexChart.render();
 
     // -- HTML legend (completely isolated from ECharts) --
     // Uses ONLY apexChart.showSeries/hideSeries/updateOptions — zero DOM queries
