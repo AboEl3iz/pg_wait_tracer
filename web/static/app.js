@@ -299,9 +299,11 @@ function fmtDuration(ns) {
 }
 
 function fmtMs(ms) {
+    if (ms == null || isNaN(ms)) return '—';
     if (ms >= 1000) return (ms / 1000).toFixed(1) + 's';
     if (ms >= 1) return ms.toFixed(1) + 'ms';
-    return (ms * 1000).toFixed(0) + '\u00b5s';
+    if (ms >= 0.001) return (ms * 1000).toFixed(0) + '\u00b5s';
+    return '<1\u00b5s';
 }
 
 function fmtCount(n) {
@@ -421,11 +423,9 @@ function switchTab(tab) {
         b.classList.toggle('active', b.dataset.tab === tab);
     });
 
-    // Show loading immediately for tabs that fetch data
-    const container = document.getElementById('table-container');
-    if (['histogram', 'timeline', 'transitions', 'concurrency'].includes(tab)) {
-        container.innerHTML = '<div class="loading">Loading...</div>';
-    }
+    // Show loading immediately on all tabs
+    document.getElementById('table-container').innerHTML = '<div class="loading">Loading...</div>';
+    document.getElementById('summary-bar').innerHTML = '';
 
     refreshChart();
     refreshTable();
