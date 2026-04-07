@@ -378,8 +378,17 @@ SEC("uprobe")
 int on_report_query_id(struct pt_regs *ctx)
 {
     u64 query_id = PT_REGS_PARM1(ctx);
-    if (query_id == 0)
+
+    /* PostgreSQL calls pgstat_report_query_id(0) after each statement
+     * to reset the query_id. We must honor it — otherwise events between
+     * statements (like Client:ClientRead) get attributed to the previous
+     * query, inflating its Client wait time. */
+    if (query_id == 0) {
+        u32 pid = bpf_get_current_pid_tgid() >> 32;
+        struct pgwt_pid_state *st = bpf_map_lookup_elem(&state_map, &pid);
+        if (st) st->last_query_id = 0;
         return 0;
+    }
 
     u32 pid = bpf_get_current_pid_tgid() >> 32;
     struct pgwt_pid_state *st = bpf_map_lookup_elem(&state_map, &pid);
