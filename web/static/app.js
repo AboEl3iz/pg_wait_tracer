@@ -602,18 +602,13 @@ function renderApexChart(data) {
                 zoomed: function(ctx, { xaxis }) {
                     if (xaxis.min != null && xaxis.max != null) {
                         stopAutoRefresh();
-                        console.log('[zoom] xaxis:', xaxis.min, xaxis.max,
-                            'categories:', categories.length,
-                            'cat[0]:', categories[0], 'cat[-1]:', categories[categories.length-1]);
-                        // ApexCharts category zoom returns indices (0-based)
-                        const fromIdx = Math.max(0, Math.round(xaxis.min - 1));
-                        const toIdx = Math.min(categories.length - 1, Math.round(xaxis.max - 1));
-                        if (fromIdx < toIdx && categories[fromIdx] && categories[toIdx]) {
-                            state.viewFrom = categories[fromIdx];
-                            state.viewTo = categories[toIdx];
-                            updateTimeRange();
-                            refresh();
-                        }
+                        // xaxis.min/max are category indices
+                        const fromIdx = Math.max(0, Math.floor(xaxis.min));
+                        const toIdx = Math.min(categories.length - 1, Math.ceil(xaxis.max));
+                        state.viewFrom = categories[fromIdx];
+                        state.viewTo = categories[toIdx];
+                        updateTimeRange();
+                        refresh();
                     }
                 },
             },
