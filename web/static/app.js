@@ -449,16 +449,25 @@ function initChart() {
     });
 
     // -- Custom drag-to-zoom on ApexCharts --
+    // Overlay is added by ensureZoomOverlay() after chart first renders.
     let zoomDrag = null;
-    const zoomOverlay = document.createElement('div');
-    zoomOverlay.style.cssText = 'position:absolute;background:rgba(79,195,247,0.2);' +
-        'border-left:2px solid rgba(79,195,247,0.6);border-right:2px solid rgba(79,195,247,0.6);' +
-        'pointer-events:none;display:none;z-index:10;top:0;bottom:0';
-    apexEl.style.position = 'relative';
-    apexEl.appendChild(zoomOverlay);
+    let zoomOverlay = null;
+
+    function ensureZoomOverlay() {
+        if (zoomOverlay && zoomOverlay.parentNode) return;
+        zoomOverlay = document.createElement('div');
+        zoomOverlay.style.cssText = 'position:absolute;background:rgba(79,195,247,0.2);' +
+            'border-left:2px solid rgba(79,195,247,0.6);border-right:2px solid rgba(79,195,247,0.6);' +
+            'pointer-events:none;display:none;z-index:10;top:0;bottom:0';
+        apexEl.style.position = 'relative';
+        apexEl.appendChild(zoomOverlay);
+    }
+    // Expose so renderApexChart can call it after render
+    state._ensureZoomOverlay = ensureZoomOverlay;
 
     apexEl.addEventListener('mousedown', (e) => {
         if (e.button !== 0) return;
+        ensureZoomOverlay();
         const rect = apexEl.getBoundingClientRect();
         zoomDrag = { x: e.clientX - rect.left, rect };
         zoomOverlay.style.left = zoomDrag.x + 'px';
@@ -579,6 +588,7 @@ function initTimePicker() {
             btn.classList.add('active');
 
             stopAutoRefresh();
+            const myGen = _refreshGen + 1;  // what refresh(true) will set
 
             if (secs === 0) {
                 await zoomTo(state.fromNs, state.toNs);
@@ -586,12 +596,14 @@ function initTimePicker() {
                 state.liveRangeSecs = secs;
                 const end = state.serverNow || state.toNs;
                 const from = end - secs * 1e9;
-                // Set view and refresh ONCE, then start auto-refresh
                 state.viewFrom = from;
                 state.viewTo = end;
                 updateTimeRange();
                 await refresh(true);
-                startAutoRefresh(secs);
+                // Only start auto-refresh if this handler is still the latest
+                if (_refreshGen === myGen) {
+                    startAutoRefresh(secs);
+                }
             }
         });
     });
@@ -606,8 +618,8 @@ function initTimePicker() {
         if (fromNs >= toNs) return;
         picker.style.display = 'none';
         picker.querySelectorAll('.tp-quick button').forEach(b => b.classList.remove('active'));
-        stopAutoRefresh();  // Custom range stops auto-refresh
-        zoomTo(Math.max(state.fromNs, fromNs), Math.min(state.toNs, toNs));
+        stopAutoRefresh();
+        zoomTo(fromNs, toNs);
     });
 
     // Zoom out button
@@ -767,7 +779,6 @@ function renderApexChart(data) {
     };
 
     if (apexChart) {
-        // Update existing chart — no destroy/recreate, no blip
         apexChart.updateOptions({
             xaxis: options.xaxis,
             yaxis: options.yaxis,
@@ -778,6 +789,8 @@ function renderApexChart(data) {
         apexChart = new ApexCharts(apexEl, options);
         apexChart.render();
     }
+    // Re-add zoom overlay (chart render may have removed it)
+    if (state._ensureZoomOverlay) state._ensureZoomOverlay();
 
     // -- HTML legend (completely isolated from ECharts) --
     // Uses ONLY apexChart.showSeries/hideSeries/updateOptions — zero DOM queries
@@ -1711,7 +1724,10 @@ async function refreshConcurrency() {
 
 // -- Auto-refresh for "last N" ranges -----------------------------------------
 
-let autoRefreshInterval = null;
+/* Each auto-refresh loop gets a unique ID. When a new loop starts or
+ * stopAutoRefresh is called, the old ID becomes stale and the old loop
+ * exits. This prevents multiple concurrent loops with different rangeSecs. */
+let _autoRefreshId = 0;
 
 function startAutoRefresh(rangeSecs) {
     stopAutoRefresh();
@@ -1721,31 +1737,34 @@ function startAutoRefresh(rangeSecs) {
         liveBtn.textContent = 'Live ●';
     }
 
-    /* Use a sequential loop, not setInterval. Each tick waits for the
-     * previous one to complete before scheduling the next. This prevents
-     * request pile-up that causes timeouts on the transitions tab. */
-    autoRefreshInterval = true;  /* flag, not timer ID */
+    const myId = ++_autoRefreshId;
     (async function autoRefreshLoop() {
-        while (autoRefreshInterval) {
+        /* Wait before first tick — the caller already did refresh() */
+        await new Promise(r => setTimeout(r, 5000));
+
+        while (_autoRefreshId === myId) {
             try {
                 const info = await send('info', {});
+                if (_autoRefreshId !== myId) break;
                 if (info) {
                     if (info.to_ns) state.toNs = info.to_ns;
                     if (info.from_ns) state.fromNs = info.from_ns;
                     state.serverNow = info.now_ns || info.to_ns;
                     state.viewFrom = state.serverNow - rangeSecs * 1e9;
                     state.viewTo = state.serverNow;
+                    updateTimeRange();
                 }
+                if (_autoRefreshId !== myId) break;
                 await refresh();
-            } catch (e) { /* ignore on disconnect */ }
-            /* Wait 5 seconds AFTER completion before next tick */
+            } catch (e) { /* ignore */ }
+            if (_autoRefreshId !== myId) break;
             await new Promise(r => setTimeout(r, 5000));
         }
     })();
 }
 
 function stopAutoRefresh() {
-    autoRefreshInterval = null;  /* stops the loop */
+    _autoRefreshId++;  /* invalidates any running loop */
     const liveBtn = document.getElementById('live-btn');
     if (liveBtn) {
         liveBtn.classList.remove('active');
