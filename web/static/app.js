@@ -170,21 +170,23 @@ async function init() {
 
 // -- Refresh ------------------------------------------------------------------
 
-let _refreshRunning = false;
-async function refresh() {
-    /* Guard against concurrent refreshes — if one is already running,
-     * skip this call. The running one will show the latest state. */
-    if (_refreshRunning) return;
-    _refreshRunning = true;
-    try {
-        await refreshChart();
-        await refreshTable();
-    } finally {
-        _refreshRunning = false;
-    }
+/* Generation counter: increments on every user-initiated view change.
+ * Responses from older generations are discarded — prevents stale data
+ * from in-flight requests flashing on screen. */
+let _refreshGen = 0;
+
+async function refresh(userInitiated) {
+    /* User-initiated refreshes (zoom, tab switch, range change) increment
+     * the generation counter. Auto-refresh ticks do NOT — so a user action
+     * during auto-refresh discards the stale auto-refresh response. */
+    if (userInitiated) _refreshGen++;
+    const gen = _refreshGen;
+    await refreshChart(gen);
+    if (gen !== _refreshGen) return;
+    await refreshTable(gen);
 }
 
-async function refreshChart() {
+async function refreshChart(gen) {
     try {
         const params = {
             from: state.viewFrom,
@@ -192,13 +194,12 @@ async function refreshChart() {
             buckets: Math.min(Math.floor(apexEl.clientWidth / 4), 300),
             filters: state.filters,
         };
-        // Request per-event breakdown when drilled into a class (but not a specific event)
         if (state.filters.class && !state.filters.event_id) {
             params.detail = 'events';
         }
         const data = await send('aas', params);
+        if (gen !== _refreshGen) return;  // stale response — discard
         renderApexChart(data);
-        // Update status with current window info
         if (data && data.buckets) {
             const dur = fmtDuration(state.viewTo - state.viewFrom);
             const maxAas = data.max_aas ? data.max_aas.toFixed(1) : '0';
@@ -207,7 +208,7 @@ async function refreshChart() {
     } catch (e) { /* ignore on disconnect */ }
 }
 
-async function refreshTable() {
+async function refreshTable(gen) {
     if (state.activeTab === 'histogram') {
         await refreshHistogram();
         return;
@@ -236,6 +237,7 @@ async function refreshTable() {
             to: state.viewTo,
             filters: state.filters,
         });
+        if (gen !== _refreshGen) return;  // stale
         renderTable(state.activeTab, data);
     } catch (e) { /* ignore on disconnect */ }
 }
@@ -262,7 +264,7 @@ async function zoomTo(from, to) {
     state.viewFrom = from;
     state.viewTo = to;
     updateTimeRange();
-    await refresh();
+    await refresh(true);
 }
 
 async function zoomOut() {
@@ -277,7 +279,7 @@ async function zoomOut() {
         state.viewTo = Math.min(state.toNs, mid + halfSpan);
     }
     updateTimeRange();
-    await refresh();
+    await refresh(true);
 }
 
 function fmtTime(ns, bucketNs) {
@@ -434,7 +436,7 @@ function switchTab(tab) {
     document.getElementById('table-container').innerHTML = '<div class="loading">Loading...</div>';
     document.getElementById('summary-bar').innerHTML = '';
 
-    refresh();
+    refresh(true);
 }
 
 // -- Chart container ----------------------------------------------------------
@@ -588,7 +590,7 @@ function initTimePicker() {
                 state.viewFrom = from;
                 state.viewTo = end;
                 updateTimeRange();
-                await refresh();
+                await refresh(true);
                 startAutoRefresh(secs);
             }
         });
@@ -1151,7 +1153,7 @@ function drillDown(filterKey, filterValue, label) {
     }
 
     updateBreadcrumb();
-    refresh();
+    refresh(true);
 }
 
 function drillUp(index) {
@@ -1166,7 +1168,7 @@ function drillUp(index) {
         b.classList.toggle('active', b.dataset.tab === tab);
     });
     updateBreadcrumb();
-    refresh();
+    refresh(true);
 }
 
 function clearFilters() {
@@ -1179,7 +1181,7 @@ function clearFilters() {
     document.querySelectorAll('.tab').forEach(b => {
         b.classList.toggle('active', b.dataset.tab === 'overview');
     });
-    refresh();
+    refresh(true);
 }
 
 function updateBreadcrumb() {
@@ -1765,7 +1767,7 @@ function initLiveMode() {
             state.viewFrom = end - 300e9;
             state.viewTo = end;
             startAutoRefresh(300);
-            refresh();
+            refresh(true);
         }
     });
 }
