@@ -998,15 +998,10 @@ static void handle_top_queries(struct pgwt_server *srv, struct pgwt_request *req
     struct pgwt_trace_event *all_events = NULL;
     struct pgwt_queries_result res;
 
-    if (!has_event_filter && should_use_summaries(srv, req)) {
-        pgwt_compute_top_queries_from_summaries(srv->trace_dir, from, to,
-                                                 &req->filter, wall_ms, &res);
-        /* Still need events for lifecycle stats */
-        all_events = server_load_events(srv, req->from_ns, req->to_ns, &ecount);
-    } else {
-        all_events = server_load_events(srv, req->from_ns, req->to_ns, &ecount);
-        pgwt_compute_top_queries(all_events, ecount, &req->filter, wall_ms, &res);
-    }
+    /* Always use raw events for queries — need per-event breakdown
+     * and lifecycle stats. Summaries lack this detail. */
+    all_events = server_load_events(srv, req->from_ns, req->to_ns, &ecount);
+    pgwt_compute_top_queries(all_events, ecount, &req->filter, wall_ms, &res);
 
     /* Compute per-query exec/plan stats from markers (same events, no second load) */
     struct qid_lifecycle {
