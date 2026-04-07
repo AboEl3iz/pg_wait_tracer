@@ -193,6 +193,15 @@ int on_watchpoint(struct bpf_perf_event_data *ctx)
         /* Transition to new state */
         st->last_event = new_event;
         st->last_ts = now;
+
+        /* Clear query_id when entering Client:ClientRead or any idle event.
+         * At this point no query is running — the backend is waiting for
+         * the next command. Without this, Client:ClientRead time between
+         * statements gets attributed to the previous query. */
+        if (new_event == PG_WAIT_CLIENT_READ ||
+            WE_CLASS(new_event) == PG_WAIT_ACTIVITY) {
+            st->last_query_id = 0;
+        }
     } else {
         /* First event for this PID — initialize via double-deref,
          * cache the resolved address for future fast-path reads */
