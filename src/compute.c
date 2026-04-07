@@ -835,6 +835,19 @@ void pgwt_compute_top_queries(const struct pgwt_trace_event *events, int count,
         for (int c = 0; c < PGWT_NUM_CLASSES; c++)
             r->class_ms[c] = (double)ht[i].class_ns[c] / 1e6;
 
+        /* Add CPU as a pseudo-event in the list */
+        if (ht[i].class_ns[PGWT_CLASS_CPU] > 0) {
+            wlist[nw].eid = 0;  /* CPU */
+            wlist[nw].ns = ht[i].class_ns[PGWT_CLASS_CPU];
+            if (wlist[nw].ns > top_ns) {
+                top_ns = wlist[nw].ns;
+                top_id = 0;
+                snprintf(r->top_wait, sizeof(r->top_wait), "CPU*");
+                r->top_wait_id = 0;
+            }
+            nw++;
+        }
+
         /* Per-event breakdown: pick top 16 by time desc */
         r->num_events = 0;
         for (int k = 0; k < 16 && k < nw; k++) {
