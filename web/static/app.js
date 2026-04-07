@@ -1864,7 +1864,7 @@ async function refreshTransitions() {
             }
             if (variantDiv.innerHTML) container.appendChild(variantDiv);
         }
-    } catch (e) { /* ignore */ }
+    } catch (e) { console.error('[variants]', e); }
 }
 
 function renderVariantSection(vdata, title, container) {
