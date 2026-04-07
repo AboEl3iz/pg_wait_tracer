@@ -415,6 +415,28 @@ static int is_current_trace(const char *path)
 
 /* Get cached events for an immutable file. Reads once, caches forever.
  * Returns NULL for current.trace (handled separately). */
+/* Max total cached events across all files (~500MB at 36 bytes/event) */
+#define CACHE_MAX_EVENTS (14 * 1024 * 1024)
+
+static void cache_evict_oldest(struct pgwt_server *srv)
+{
+    if (srv->cache_count == 0) return;
+    /* Evict the first (oldest) cached entry */
+    free(srv->cache[0].events);
+    srv->cache[0].events = NULL;
+    memmove(&srv->cache[0], &srv->cache[1],
+            (srv->cache_count - 1) * sizeof(srv->cache[0]));
+    srv->cache_count--;
+}
+
+static int cache_total_events(struct pgwt_server *srv)
+{
+    int total = 0;
+    for (int i = 0; i < srv->cache_count; i++)
+        total += srv->cache[i].count;
+    return total;
+}
+
 static struct file_cache_entry *
 get_cached_immutable(struct pgwt_server *srv, const char *path)
 {
@@ -424,9 +446,11 @@ get_cached_immutable(struct pgwt_server *srv, const char *path)
             return &srv->cache[i];
     }
 
-    /* New entry — read entire file once */
-    if (srv->cache_count >= 256)
-        return NULL;
+    /* Evict old entries if cache is full (by slot count or memory) */
+    while (srv->cache_count >= 256 || cache_total_events(srv) > CACHE_MAX_EVENTS) {
+        cache_evict_oldest(srv);
+        if (srv->cache_count == 0) break;
+    }
 
     struct file_cache_entry *ce = &srv->cache[srv->cache_count++];
     memset(ce, 0, sizeof(*ce));
@@ -466,6 +490,21 @@ get_cached_immutable(struct pgwt_server *srv, const char *path)
         }
     }
     pgwt_reader_close(&reader);
+
+    /* Evict older entries if this new file pushed us over the memory limit */
+    while (srv->cache_count > 1 && cache_total_events(srv) > CACHE_MAX_EVENTS) {
+        /* Don't evict the entry we just loaded */
+        if (&srv->cache[0] == ce) break;
+        cache_evict_oldest(srv);
+        /* ce pointer may have shifted due to memmove */
+        for (int i = 0; i < srv->cache_count; i++) {
+            if (strcmp(srv->cache[i].path, path) == 0) {
+                ce = &srv->cache[i];
+                break;
+            }
+        }
+    }
+
     return ce;
 }
 
