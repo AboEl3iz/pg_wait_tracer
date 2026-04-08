@@ -426,8 +426,8 @@ void pgwt_compute_time_model(const struct pgwt_trace_event *events, int count,
     double idle_ms     = idle_time_ns / 1e6;
 
     /* Phase 2: build result rows */
-    /* Max rows: 1 (DB Time) + NUM_CLASSES * (1 class + 3 sub-events) = ~45 */
-    int max_rows = 1 + PGWT_NUM_CLASSES * 4;
+    /* Max rows: 1 (DB Time) + NUM_CLASSES * (1 class + 5 sub-events) = ~67 */
+    int max_rows = 1 + PGWT_NUM_CLASSES * 6;
     struct pgwt_tm_row *rows = calloc(max_rows, sizeof(*rows));
     int nr = 0;
 
@@ -484,19 +484,17 @@ void pgwt_compute_time_model(const struct pgwt_trace_event *events, int count,
         rows[nr].indent      = 1;
         nr++;
 
-        /* Top 3 sub-events for this class (skip CPU — no meaningful sub-events) */
+        /* Top 5 sub-events for this class (skip CPU — no meaningful sub-events) */
         if (strcasecmp(classes[c].name, "cpu") == 0)
             continue;
 
         int sub_count = 0;
-        for (int j = 0; j < num_ev_accum && sub_count < 3; j++) {
+        for (int j = 0; j < num_ev_accum && sub_count < 5; j++) {
             if (strcasecmp(ev_accum[j].class_name, classes[c].name) != 0)
                 continue;
 
             double sub_ms  = ev_accum[j].total_ns / 1e6;
             double sub_pct = db_time_ms > 0 ? sub_ms / db_time_ms * 100.0 : 0;
-            if (sub_pct < 0.1)
-                break;
 
             char buf[64];
             pgwt_event_full_name(ev_accum[j].event_id, buf, sizeof(buf));
