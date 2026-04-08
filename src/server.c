@@ -17,6 +17,7 @@
 #include <unistd.h>
 #include <ctype.h>
 #include <time.h>
+#include <sys/stat.h>
 
 /* ── Utility ──────────────────────────────────────────────── */
 
@@ -464,6 +465,19 @@ get_cached_immutable(struct pgwt_server *srv, const char *path)
             return &srv->cache[i];
     }
 
+    /* Check compressed file size — skip caching if too large.
+     * Decompressed size ~5x compressed. Skip if decompressed would exceed cache budget. */
+    {
+        struct stat st;
+        if (stat(path, &st) == 0) {
+            uint64_t estimated_events = (uint64_t)st.st_size * 5 / sizeof(struct pgwt_trace_event);
+            if (estimated_events > (uint64_t)CACHE_MAX_EVENTS) {
+                /* Too large to cache — fall through to on-demand reading */
+                return NULL;
+            }
+        }
+    }
+
     /* Evict old entries if cache is full (by slot count or memory) */
     while (srv->cache_count >= 256 || cache_total_events(srv) > CACHE_MAX_EVENTS) {
         cache_evict_oldest(srv);
@@ -624,9 +638,14 @@ server_load_events(struct pgwt_server *srv,
             load_current_trace_range(path, from_wall_ns, to_wall_ns,
                                      &events, &total, &cap);
         } else {
-            /* Immutable: use cache */
+            /* Immutable: try cache, fall back to on-demand for large files */
             struct file_cache_entry *ce = get_cached_immutable(srv, path);
-            if (!ce || !ce->events) continue;
+            if (!ce || !ce->events) {
+                /* Cache miss (file too large or alloc failed) — read on demand */
+                load_current_trace_range(path, from_wall_ns, to_wall_ns,
+                                         &events, &total, &cap);
+                continue;
+            }
 
             /* Skip file entirely if its time range doesn't overlap */
             if (ce->last_wall_ns > 0 && ce->first_wall_ns > to_wall_ns)
@@ -1113,6 +1132,23 @@ static void handle_top_queries(struct pgwt_server *srv, struct pgwt_request *req
         cJSON_AddNumberToObject(r, "pct", res.rows[i].pct_db);
         cJSON_AddStringToObject(r, "top_wait", res.rows[i].top_wait);
         cJSON_AddNumberToObject(r, "top_wait_id", res.rows[i].top_wait_id);
+
+        /* Override top_wait if CPU dominates (summary path doesn't track CPU as a wait) */
+        if (res.rows[i].class_ms[PGWT_CLASS_CPU] > 0) {
+            double cpu_ms = res.rows[i].class_ms[PGWT_CLASS_CPU];
+            /* Check if CPU is the largest class */
+            int cpu_is_top = 1;
+            for (int c = 0; c < PGWT_NUM_CLASSES; c++) {
+                if (c != PGWT_CLASS_CPU && res.rows[i].class_ms[c] > cpu_ms) {
+                    cpu_is_top = 0;
+                    break;
+                }
+            }
+            if (cpu_is_top) {
+                snprintf(res.rows[i].top_wait, sizeof(res.rows[i].top_wait), "CPU*");
+                res.rows[i].top_wait_id = 0;
+            }
+        }
 
         /* Add query text if available */
         const char *qt = qt_map_lookup(srv, res.rows[i].query_id);
