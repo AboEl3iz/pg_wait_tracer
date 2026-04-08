@@ -1206,7 +1206,7 @@ void pgwt_compute_time_model_from_summaries(
     double idle_ms    = ctx.idle_time_ns / 1e6;
 
     /* Build result rows (same format as raw compute) */
-    int max_rows = 1 + PGWT_NUM_CLASSES * 4;
+    int max_rows = 1 + PGWT_NUM_CLASSES * 6;
     struct pgwt_tm_row *rows = calloc(max_rows, sizeof(*rows));
     int nr = 0;
 
@@ -1246,12 +1246,11 @@ void pgwt_compute_time_model_from_summaries(
         if (strcasecmp(ctx.classes[c].name, "cpu") == 0) continue;
 
         int sub_count = 0;
-        for (int j = 0; j < ctx.num_ev_accum && sub_count < 3; j++) {
+        for (int j = 0; j < ctx.num_ev_accum && sub_count < 5; j++) {
             if (strcasecmp(ctx.ev_accum[j].class_name, ctx.classes[c].name) != 0)
                 continue;
             double sub_ms  = ctx.ev_accum[j].total_ns / 1e6;
             double sub_pct = db_time_ms > 0 ? sub_ms / db_time_ms * 100.0 : 0;
-            if (sub_pct < 0.1) break;
 
             char buf[64];
             pgwt_event_full_name(ctx.ev_accum[j].event_id, buf, sizeof(buf));
