@@ -1017,13 +1017,14 @@ static void handle_top_queries(struct pgwt_server *srv, struct pgwt_request *req
     struct pgwt_trace_event *all_events = NULL;
     struct pgwt_queries_result res;
 
-    /* Use summaries for large ranges (>120s) to avoid OOM.
-     * Raw events path gives per-event breakdown + lifecycle stats. */
+    /* Use summaries for large ranges (>120s) for the class breakdown.
+     * Always load raw events for lifecycle stats (exec/plan counts).
+     * Large files are read on-demand (not cached) so this is safe. */
+    all_events = server_load_events(srv, req->from_ns, req->to_ns, &ecount);
     if (!has_event_filter && should_use_summaries(srv, req)) {
         pgwt_compute_top_queries_from_summaries(srv->trace_dir, from, to,
                                                  &req->filter, wall_ms, &res);
     } else {
-        all_events = server_load_events(srv, req->from_ns, req->to_ns, &ecount);
         pgwt_compute_top_queries(all_events, ecount, &req->filter, wall_ms, &res);
     }
 
