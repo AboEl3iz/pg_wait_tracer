@@ -929,7 +929,8 @@ const TABLE_CONFIGS = {
                     esc(r.text).replace(/"/g, '&quot;') + '">' +
                     dot(r.top_wait) + truncated + '</span>';
             }},
-            { key: 'total_ms', label: 'Time', cls: 'num', format: (r) => fmtMs(r.total_ms) },
+            { key: 'total_ms', label: 'Exec Time', cls: 'num', format: (r) =>
+                fmtMs(r.exec_total_ms != null ? r.exec_total_ms : r.total_ms) },
             { key: 'pct', label: '%DB', cls: 'num', format: (r) => fmtPct(r.pct) },
             { key: 'classes', label: 'Wait Profile', format: (r) =>
                 r.events ? eventStackedBar(r.events, r.total_ms)

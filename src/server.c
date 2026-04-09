@@ -1190,6 +1190,7 @@ static void handle_top_queries(struct pgwt_server *srv, struct pgwt_request *req
                 cJSON_AddNumberToObject(r, "exec_count", lc->exec_count);
                 cJSON_AddNumberToObject(r, "plan_count", lc->plan_count);
                 if (lc->exec_count > 0) {
+                    cJSON_AddNumberToObject(r, "exec_total_ms", lc->exec_total_ms);
                     cJSON_AddNumberToObject(r, "avg_exec_ms",
                         lc->exec_total_ms / lc->exec_count);
                     int n = lc->exec_nsamples;
