@@ -37,9 +37,10 @@ up to ~30% on read-heavy workloads with high buffer miss rates. See
 ## Demo
 
 Captured from a 60-second pgbench TPC-B workload (8 clients, scale 10) on a
-2-CPU Rocky 9 + PostgreSQL 18 VM, with a few injected `LOCK TABLE` statements
-to add lock contention. ~7M wait-event transitions captured. See
-[`demos/`](demos/) for the source tape and raw text dump.
+tiny VM (2 vCPUs, Rocky 9 + PostgreSQL 18), with a few injected `LOCK TABLE`
+statements to add lock contention. ~7M wait-event transitions captured. See
+[`demos/README.md`](demos/README.md) for the recording tooling (one
+`make all` reproduces both gifs from a fresh VM).
 
 **Web investigation client** (`pgwt`) — drag-zoom AAS chart → drill into
 Events / Sessions / Queries → wait-event transition graph:
