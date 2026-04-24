@@ -34,6 +34,23 @@ Overhead scales with wait event transition rate: ~6% on write-heavy OLTP,
 up to ~30% on read-heavy workloads with high buffer miss rates. See
 [Performance](#performance) for details.
 
+## Demo
+
+Captured from a 60-second pgbench TPC-B workload (8 clients, scale 10) on a
+2-CPU Rocky 9 + PostgreSQL 18 VM, with a few injected `LOCK TABLE` statements
+to add lock contention. ~7M wait-event transitions captured. See
+[`demos/`](demos/) for the source tape and raw text dump.
+
+**Web investigation client** (`pgwt`) — drag-zoom AAS chart → drill into
+Events / Sessions / Queries → wait-event transition graph:
+
+![pgwt web UI](demos/web.gif)
+
+**Text dump** (`pgwt-server --dump`) — time model + top events + top sessions
++ top queries from any trace file, no TUI required:
+
+![pgwt-server --dump](demos/dump.gif)
+
 ## Quick Start
 
 ```bash

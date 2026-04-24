@@ -1,0 +1,101 @@
+════════════════════════════════════════════════════════════════════════════════
+pgwt-server — Summary    Events: 7061505    Duration: 91.3s
+════════════════════════════════════════════════════════════════════════════════
+
+  === Time Model ===
+
+  AAS: 6.41    DB Time: 585633.6 ms    Idle: 583167.1 ms
+
+  DB Time                            585633.6 ms   100.0%
+    Client                           189871.8 ms    32.4%
+      Client:ClientRead              189871.8 ms    32.4%
+    Lock                             124993.4 ms    21.3%
+      Lock:advisory                   78131.2 ms    13.3%
+      Lock:page                       43183.8 ms     7.4%
+      Lock:object                      3678.4 ms     0.6%
+    Extension                         91207.6 ms    15.6%
+      Extension:Extension             91207.6 ms    15.6%
+    CPU*                              69440.1 ms    11.9%
+    LWLock                            55738.0 ms     9.5%
+      LWLock:BufferContent            55524.8 ms     9.5%
+      LWLock:SInvalWrite                168.2 ms     0.0%
+      LWLock:SerialSLRU                  60.6 ms     0.0%
+      LWLock:SerializableXactHash        13.1 ms     0.0%
+      LWLock:Autovacuum                   4.6 ms     0.0%
+    IO                                42989.7 ms     7.3%
+      IO:WalSync                      39609.8 ms     6.8%
+      IO:WalWrite                      1288.6 ms     0.2%
+      IO:DataFileFlush                  754.5 ms     0.1%
+      IO:DataFileRead                   693.8 ms     0.1%
+      IO:DataFileWrite                  490.4 ms     0.1%
+    Timeout                           11348.4 ms     1.9%
+      Timeout:PgSleep                 10008.0 ms     1.7%
+      Timeout:VacuumDelay              1322.6 ms     0.2%
+      Timeout:SpinDelay                  17.8 ms     0.0%
+    IPC                                  44.5 ms     0.0%
+      IPC:BtreePage                      34.8 ms     0.0%
+      IPC:ExecuteGather                   4.2 ms     0.0%
+      IPC:BufferIo                        3.4 ms     0.0%
+      IPC:ProcarrayGroupUpdate            1.1 ms     0.0%
+      IPC:BgworkerShutdown                0.8 ms     0.0%
+
+  === Top Events ===
+
+  Wait Event                        Waits   Total (ms)   Avg (us)     % DB
+  ─────────────────────────────────────────────────────────────────────────
+  Client:ClientRead                925248     189871.8      205.2    32.4%
+  Extension:Extension                9011      91207.6    10121.8    15.6%
+  Lock:advisory                       120      78131.2   651093.0    13.3%
+  CPU*                            1415792      69440.1       49.0    11.9%
+  LWLock:BufferContent             149666      55524.8      371.0     9.5%
+  Lock:page                         45598      43183.8      947.1     7.4%
+  IO:WalSync                        87803      39609.8      451.1     6.8%
+  Timeout:PgSleep                      10      10008.0  1000803.8     1.7%
+  Lock:object                        5268       3678.4      698.3     0.6%
+  Timeout:VacuumDelay                 597       1322.6     2215.3     0.2%
+  IO:WalWrite                       87815       1288.6       14.7     0.2%
+  IO:DataFileFlush                  24064        754.5       31.4     0.1%
+  IO:DataFileRead                   37135        693.8       18.7     0.1%
+  IO:DataFileWrite                  31748        490.4       15.4     0.1%
+  LWLock:SInvalWrite                 3233        132.1       40.9     0.0%
+
+  === Top Sessions ===
+
+      PID  DB Time(ms)    CPU%   Wait%  Top Wait            
+  ─────────────────────────────────────────────────────────────────────────
+     5230      91342.0    0.1%   99.9%  Extension:Extension 
+     6612      60007.6   14.6%   85.4%  Client:ClientRead   
+     6614      60003.4   14.3%   85.7%  Client:ClientRead   
+     6616      60001.1   14.0%   86.0%  Client:ClientRead   
+     6613      60000.4   14.8%   85.2%  Client:ClientRead   
+     6618      59998.5   13.5%   86.5%  Client:ClientRead   
+     6617      59998.3   13.8%   86.2%  Client:ClientRead   
+     6615      59996.3   14.3%   85.7%  Client:ClientRead   
+     6619      59988.3   13.7%   86.3%  Client:ClientRead   
+     6676       2018.9    0.2%   99.8%  Timeout:PgSleep     
+     6670       2015.0    0.3%   99.7%  Timeout:PgSleep     
+     6679       2011.3    0.2%   99.8%  Timeout:PgSleep     
+     6631       2009.1    0.2%   99.8%  Timeout:PgSleep     
+     6634       2007.0    0.1%   99.9%  Timeout:PgSleep     
+     6680       1851.9   22.6%   77.4%  Timeout:VacuumDelay 
+
+  === Top Queries ===
+
+              query_id      Waits   Total (ms)     % DB  Top Wait            
+  ─────────────────────────────────────────────────────────────────────────
+   6097083398544187049    1047605     104413.8    46.9%  LWLock:BufferContent
+   3886912043147135675    1025074      50358.7    22.6%  Lock:page           
+  -1980831870093258527     939406      20080.7     9.0%  CPU*                
+  -6796648778530205384     997779      14144.1     6.4%  CPU*                
+  -8886085649470066503         40      10008.6     4.5%  Timeout:PgSleep     
+   5409612748292285639     660877       9996.6     4.5%  CPU*                
+    286264995346867541     927052       8848.6     4.0%  CPU*                
+   4854991825702068830     396488       4088.6     1.8%  CPU*                
+   2906267967483132965       2049        599.3     0.3%  CPU*                
+  -6403657805664847344         36          9.6     0.0%  Lock:advisory       
+   3596707314037099198         11          7.2     0.0%  IO:DataFileRead     
+  -2067751485102627314          7          1.1     0.0%  IO:WalSync          
+  -9189359825543653111          3          0.7     0.0%  CPU*                
+    529815254086806538          7          0.6     0.0%  CPU*                
+   8952345708235324496          5          0.3     0.0%  CPU*                
+
