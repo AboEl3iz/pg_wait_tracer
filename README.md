@@ -34,6 +34,21 @@ Overhead scales with wait event transition rate: ~6% on write-heavy OLTP,
 up to ~30% on read-heavy workloads with high buffer miss rates. See
 [Performance](#performance) for details.
 
+> **Requirements — Linux only.** pg_wait_tracer relies on Linux-specific
+> facilities (eBPF, `perf_event_open`, CPU hardware watchpoints) and cannot
+> run on macOS, Windows, or \*BSD. Minimum environment:
+>
+> - **Linux kernel >= 5.8** with BTF enabled (`/sys/kernel/btf/vmlinux` present)
+> - **Architecture**: x86_64 or aarch64
+> - **Privileges**: root, or `CAP_BPF` + `CAP_PERFMON` + `CAP_SYS_PTRACE`
+>   (older kernels: `CAP_SYS_ADMIN` + `CAP_SYS_PTRACE`)
+> - **PostgreSQL**: 17 or 18 (full support); 14-16 (limited — see
+>   [INSTALL.md](INSTALL.md))
+>
+> The web client (`pgwt`) and offline replay (`pg_wait_tracer --replay`,
+> `pgwt-server --dump`) do not require root or Linux on the *client* side —
+> only the DB server where tracing runs must meet the requirements above.
+
 ## Quick Start
 
 ```bash
