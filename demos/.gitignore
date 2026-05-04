@@ -1,0 +1,8 @@
+local-trace/
+.video/
+node_modules/
+package.json
+package-lock.json
+.pgwt.log
+.vm-id
+.vm-ip
