@@ -431,6 +431,47 @@ for the escalate flow against the mock.
 Acceptance: a mixed-fidelity trace is visually unambiguous about which
 data is which, and escalation is operable from the browser.
 
+### Phase B6 — New analysis views
+Depends on: B3 (view registry), A3 (fidelity declarations — all three
+require EXACT data and must report "needs full-fidelity data" over
+sampled-only windows). Each view is additive: a server view + a
+registry entry (requests / pure builder / mount) — this phase is also
+the proof that the restructure made views cheap.
+
+1. **Per-execution waterfall** (the 10046 view). Drill path: query
+   fingerprint → executions list (sorted by duration) → one
+   execution's lifetime as a span timeline — each wait a colored bar,
+   gaps = on-CPU, phase boundaries from the existing
+   `PGWT_MARKER_PLAN_START`/`EXEC_START` markers. Server: new
+   `executions` view (per-fingerprint execution list from markers) +
+   `execution_detail` (events for one pid/time range — existing
+   filtering covers it). Mount: ECharts custom series (same technique
+   as the session timeline).
+2. **Latency scatter**. Every wait as a dot on (time, log duration),
+   colored by class — exposes modes and outlier bands that aggregates
+   hide (two `DataFileRead` bands = cache vs disk; a stripe at a round
+   number = a timeout). Server: new `scatter` view with **server-side
+   density downsampling** (cap points per screen-pixel bucket, never
+   ship raw millions); response includes how many points were dropped
+   (no silent truncation). Click/lasso → drill to the underlying
+   events.
+3. **Transition matrix** — the Sankey's scalable sibling, same data:
+   from-event rows × to-event columns, color = count or total time,
+   ordered/grouped by wait class; readable where the Sankey saturates
+   (>~20 nodes); every cell drills to the matching transitions. Server:
+   reuse the existing transitions computation with a matrix-shaped
+   response. Offered as an alternate rendering on the transitions tab
+   (toggle Sankey ⇄ matrix).
+
+Tests: pure-builder Node tests with synthetic fixtures (waterfall span
+layout math, scatter bucket downsampling expectations against the
+mock, matrix ordering/grouping); mock server gains the three response
+shapes; B4 visual snapshots for each; Playwright drill-path test
+(fingerprint → execution → waterfall).
+Acceptance: each view lands as registry entry + server view with no
+view-manager/transport changes; all three correctly report
+unavailability over sampled-only windows.
+
 ---
 
 # Track C — Rocky 8 / RHEL 8 support (kernel 4.18 + backports)
@@ -560,8 +601,8 @@ VM (deps on remote only).
 
 ```
 Track A:  A0 ──▶ A1 ──▶ A2 ──▶ A3 ──▶ A4 ──▶ A5      A6 (anytime after A2)
-Track B:  B1 ──▶ B2 ──▶ B3 ──▶ B4 ─────────────▶ B5
-                                            (B5 needs A3+A4)
+Track B:  B1 ──▶ B2 ──▶ B3 ──▶ B4 ─────────────▶ B5 ──▶ B6
+                                            (B5 needs A3+A4; B6 needs B3+A3)
 Track C:        (A0+A2) ──▶ C1 ──▶ C2 ──▶ C3
 Track D:  D1 ──▶ D2  (independent; ideally with A2)      D3 if demanded
 ```
