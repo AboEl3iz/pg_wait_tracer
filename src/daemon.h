@@ -18,6 +18,18 @@
 /* Forward declaration for skeleton */
 struct pg_wait_tracer_bpf;
 struct ring_buffer;
+struct pgwt_control;
+
+/* Self-observability counters (D6). Plain uint64 increments on the
+ * single-threaded event path — exposed via the control socket
+ * (src/control.c) with stable snake_case metric names. */
+struct pgwt_counters {
+    uint64_t events_total;             /* trace events consumed from event_ringbuf */
+    uint64_t lifecycle_events_total;   /* fork/init/exit/query_text events */
+    uint64_t wp_attach_failures_total; /* watchpoint attach failures (incl. bootstrap) */
+    uint64_t prev_events_total;        /* events_total at previous timer tick */
+    double   events_per_sec;           /* recent rate, refreshed each tick */
+};
 
 /* View modes */
 enum pgwt_view {
@@ -106,6 +118,10 @@ struct pgwt_daemon {
 
     /* Event stream */
     struct pgwt_accumulator *event_accum;   /* heap-allocated, cumulative from events */
+
+    /* Control socket (D4) — created when trace_dir is set */
+    struct pgwt_control *control;           /* NULL if disabled/unavailable */
+    struct pgwt_counters counters;          /* self-observability (D6) */
 
     /* State */
     struct pgwt_backend_table backends;

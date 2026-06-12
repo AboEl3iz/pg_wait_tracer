@@ -1,0 +1,53 @@
+/* control.h — Daemon control socket: unix socket + JSON-line protocol
+ *
+ * Listens on {trace_dir}/pgwt.sock (mode 0600). One JSON object per
+ * line, request/response. Commands (Phase A0):
+ *   {"cmd":"status"}  → mode, uptime, backends tracked, pg_pid, version
+ *   {"cmd":"metrics"} → self-observability counters (stable snake_case
+ *                       names with units: *_total, *_per_sec, *_bytes —
+ *                       a future Prometheus exporter consumes these)
+ *
+ * Note on ringbuf drops: the BPF ringbuf does not expose a drop
+ * counter to userspace, and A0 makes no BPF changes. A2 (provider
+ * split) should add a BPF-side drop counter map; until then drop
+ * counts are not reported rather than reported as a misleading 0.
+ */
+#ifndef PGWT_CONTROL_H
+#define PGWT_CONTROL_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+struct pgwt_daemon;
+
+#define PGWT_CTRL_MAX_CLIENTS 16
+#define PGWT_CTRL_BUF_SIZE    4096
+
+/* Per-client connection state (line-buffered request parsing) */
+struct pgwt_control_client {
+    int    fd;                       /* -1 = free slot */
+    size_t len;                      /* bytes buffered (no '\n' yet) */
+    char   buf[PGWT_CTRL_BUF_SIZE];
+};
+
+struct pgwt_control {
+    int    listen_fd;
+    int    epoll_fd;                 /* daemon's epoll (not owned) */
+    char   sock_path[520];
+    struct pgwt_control_client clients[PGWT_CTRL_MAX_CLIENTS];
+    struct pgwt_daemon *d;           /* back-pointer for status/metrics */
+};
+
+/* Create {trace_dir}/pgwt.sock (mode 0600, stale socket unlinked) and
+ * register the listening fd with epoll_fd. Returns 0 on success. */
+int pgwt_control_init(struct pgwt_control *c, struct pgwt_daemon *d,
+                      int epoll_fd);
+
+/* Dispatch an epoll-ready fd. Returns 1 if the fd belongs to the
+ * control socket (listener or client) and was handled, 0 otherwise. */
+int pgwt_control_handle_fd(struct pgwt_control *c, int fd);
+
+/* Close all clients and the listener, unlink the socket. */
+void pgwt_control_cleanup(struct pgwt_control *c);
+
+#endif /* PGWT_CONTROL_H */

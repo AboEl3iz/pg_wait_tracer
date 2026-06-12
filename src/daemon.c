@@ -1,6 +1,7 @@
 /* daemon.c — Main event loop: epoll on ring buffer, timer, signals */
 #include "daemon.h"
 #include "backend.h"
+#include "control.h"
 #include "discovery.h"
 #include "event_stream.h"
 #include "event_writer.h"
@@ -30,6 +31,8 @@ static int handle_lifecycle_event(void *ctx, void *data, size_t data_sz)
     struct pgwt_lifecycle_event *ev = data;
 
     (void)data_sz;
+
+    d->counters.lifecycle_events_total++;
 
     switch (ev->type) {
     case PGWT_LIFECYCLE_FORK:
@@ -135,6 +138,14 @@ static void handle_timer(struct pgwt_daemon *d)
         pgwt_summary_check_rotation(d->summary_writer);
         if (d->tick > 0 && d->tick % 60 == 0)
             pgwt_summary_cleanup_old_files(d->summary_writer);
+    }
+
+    /* Refresh recent event rate for control-socket metrics */
+    if (d->interval > 0) {
+        d->counters.events_per_sec =
+            (double)(d->counters.events_total - d->counters.prev_events_total)
+            / d->interval;
+        d->counters.prev_events_total = d->counters.events_total;
     }
 
     d->tick++;
@@ -428,6 +439,21 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
     d->start_ts = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
     d->running = true;
 
+    /* Control socket at {trace_dir}/pgwt.sock (D4).
+     * Failure is non-fatal: tracing must not depend on the control plane. */
+    if (d->trace_dir) {
+        d->control = calloc(1, sizeof(*d->control));
+        if (d->control) {
+            if (pgwt_control_init(d->control, d, d->epoll_fd) != 0) {
+                free(d->control);
+                d->control = NULL;
+            } else if (d->verbose) {
+                fprintf(stderr, "INFO: control socket: %s/pgwt.sock\n",
+                        d->trace_dir);
+            }
+        }
+    }
+
     if (!d->quiet)
         pgwt_print_header(d);
     return 0;
@@ -481,6 +507,8 @@ int pgwt_daemon_run(struct pgwt_daemon *d)
                 ring_buffer__consume(d->event_rb);
             } else if (events[i].data.fd == d->signal_fd) {
                 handle_signal(d);
+            } else if (d->control) {
+                pgwt_control_handle_fd(d->control, events[i].data.fd);
             }
         }
 
@@ -501,6 +529,11 @@ int pgwt_daemon_run(struct pgwt_daemon *d)
 
 void pgwt_daemon_cleanup(struct pgwt_daemon *d)
 {
+    if (d->control) {
+        pgwt_control_cleanup(d->control);
+        free(d->control);
+        d->control = NULL;
+    }
     if (d->backend_meta) {
         pgwt_bm_close(d->backend_meta);
         free(d->backend_meta);

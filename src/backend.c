@@ -126,6 +126,7 @@ int pgwt_scan_existing_backends(struct pgwt_daemon *d)
         be->wp_fd = pgwt_open_watchpoint(pid, ptr, wp_prog_fd);
         if (be->wp_fd < 0) {
             /* Silently skip — process likely exited before attach */
+            d->counters.wp_attach_failures_total++;
             be->is_alive = false;
             be->pid = 0;
             continue;
@@ -209,6 +210,7 @@ int pgwt_handle_fork(struct pgwt_daemon *d, pid_t child_pid)
             return pgwt_handle_init(d, child_pid, ptr);
         }
         /* Silently skip — process exited before bootstrap attach */
+        d->counters.wp_attach_failures_total++;
         be->is_alive = false;
         be->pid = 0;
         return -1;
@@ -247,6 +249,7 @@ int pgwt_handle_init(struct pgwt_daemon *d, pid_t pid, uint64_t addr)
     be->wp_fd = pgwt_open_watchpoint(pid, addr, wp_prog_fd);
     if (be->wp_fd < 0) {
         /* Silently skip — process likely exited before attach */
+        d->counters.wp_attach_failures_total++;
         be->is_alive = false;
         be->pid = 0;
         return -1;
