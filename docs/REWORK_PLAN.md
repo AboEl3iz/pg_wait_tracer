@@ -28,6 +28,9 @@ UI grows fidelity-aware features on top of the restructured codebase.
 - No client-side compute relocation (server keeps computing views).
 - Cooperative tier (PG patch/extension hooks) is interface-only here;
   implementation belongs to the extension track.
+- Prometheus exporter for AAS/sampled metrics: planned for later, out
+  of scope here — but A3's view semantics and the A0 control socket
+  must not preclude it (stable metric names, queryable aggregates).
 
 ---
 
@@ -112,8 +115,10 @@ The format already has a version field (`PGWT_TRACE_VERSION`,
 - Sample blocks use the columnar layout minus the columns that don't
   apply (no `old_event`, no `duration_ns`): timestamp (delta varint),
   pid, event, query_id.
-- Reader accepts v1 (all blocks implicitly `TRANSITIONS`) and v2.
-  Writer always emits v2. `gen_test_traces` learns to emit both.
+- **v2-only** (decision 2026-06-15: no deployed installations exist
+  yet, so no v1 compatibility burden). Reader and writer speak v2
+  exclusively; the version field stays so v3 can be graceful. Old local
+  traces are regenerated, not migrated.
 
 Explicitly rejected: encoding samples via `PGWT_MARKER_*`-style sentinel
 values inside v1 — it would avoid a version bump but builds a lie into
