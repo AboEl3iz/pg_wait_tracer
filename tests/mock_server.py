@@ -84,12 +84,16 @@ _CANNED = {}
 _CANNED["info"] = {
     "from_ns": _FROM_NS,
     "to_ns": _TO_NS,
+    "now_ns": _TO_NS,
     "num_cpus": 4,
     "num_events": 1_250_000,
 }
 
 _CANNED["time_model"] = {
     "wall_ms": 3600000,
+    "db_time_ms": 12500,
+    "idle_time_ms": 45000,
+    "aas": 3.47,
     "rows": [
         {"indent": 0, "name": "DB Time",  "ms": 12500, "pct": 100.0, "aas": 3.47},
         {"indent": 1, "name": "CPU*",     "ms": 4800,  "pct": 38.4,  "aas": 1.33},
@@ -106,6 +110,7 @@ _CANNED["time_model"] = {
 }
 
 _CANNED["top_events"] = {
+    "db_time_ms": 12500,
     "rows": [
         {"name": "CPU*",             "event_id": 0,          "class": "CPU",
          "count": 250000, "total_ms": 4800, "avg_us": 19.2, "p50_us": 12,
@@ -137,64 +142,117 @@ _CANNED["top_events"] = {
 _CANNED["top_sessions"] = {
     "rows": [
         {"pid": 1001, "type": "client", "user": "postgres", "db": "testdb",
-         "db_time_ms": 5200, "cpu_pct": 45.0, "wait_pct": 55.0, "top_wait": "IO:DataFileRead"},
+         "db_time_ms": 5200, "cpu_pct": 45.0, "wait_pct": 55.0,
+         "top_wait": "IO:DataFileRead", "top_wait_id": 0x01000015},
         {"pid": 1002, "type": "client", "user": "postgres", "db": "testdb",
-         "db_time_ms": 3800, "cpu_pct": 38.0, "wait_pct": 62.0, "top_wait": "Lock:relation"},
+         "db_time_ms": 3800, "cpu_pct": 38.0, "wait_pct": 62.0,
+         "top_wait": "Lock:relation", "top_wait_id": 0x03000000},
         {"pid": 1003, "type": "client", "user": "app", "db": "mydb",
-         "db_time_ms": 2500, "cpu_pct": 52.0, "wait_pct": 48.0, "top_wait": "LWLock:WALWrite"},
+         "db_time_ms": 2500, "cpu_pct": 52.0, "wait_pct": 48.0,
+         "top_wait": "LWLock:WALWrite", "top_wait_id": 0x04000008},
         {"pid": 1004, "type": "client", "user": "app", "db": "mydb",
-         "db_time_ms": 1000, "cpu_pct": 30.0, "wait_pct": 70.0, "top_wait": "Timeout:PgSleep"},
+         "db_time_ms": 1000, "cpu_pct": 30.0, "wait_pct": 70.0,
+         "top_wait": "Timeout:PgSleep", "top_wait_id": 0x09000002},
         {"pid": 4870, "type": "checkpointer", "user": "", "db": "",
-         "db_time_ms": 800, "cpu_pct": 10.0, "wait_pct": 90.0, "top_wait": "Timeout:CheckpointWriteDelay"},
+         "db_time_ms": 800, "cpu_pct": 10.0, "wait_pct": 90.0,
+         "top_wait": "Timeout:CheckpointWriteDelay", "top_wait_id": 0x09000000},
         {"pid": 4871, "type": "bgwriter", "user": "", "db": "",
-         "db_time_ms": 200, "cpu_pct": 5.0, "wait_pct": 95.0, "top_wait": "IO:DataFileWrite"},
+         "db_time_ms": 200, "cpu_pct": 5.0, "wait_pct": 95.0,
+         "top_wait": "IO:DataFileWrite", "top_wait_id": 0x01000018},
     ],
 }
 
 _CANNED["top_queries"] = {
+    "db_time_ms": 12500,
     "rows": [
         {"query_id": "3886912043147135675", "text": "UPDATE pgbench_accounts SET abalance = abalance + $1 WHERE aid = $2",
          "total_ms": 4200, "pct": 33.6, "count": 45000, "avg_us": 93.3,
-         "top_wait": "IO:DataFileRead",
+         "top_wait": "IO:DataFileRead", "top_wait_id": 0x01000015,
+         # Lifecycle stats (emitted by the real server when plan/exec
+         # markers are present in the trace)
+         "exec_count": 45000, "plan_count": 45000,
+         "exec_total_ms": 4150.0, "avg_exec_ms": 0.092,
+         "p95_exec_ms": 0.31, "p99_exec_ms": 1.2,
+         "avg_plan_ms": 0.011, "p95_plan_ms": 0.04, "p99_plan_ms": 0.09,
          "classes": [2000, 1200, 500, 300, 0, 0, 100, 0, 0, 100, 0],
          "events": [
-            {"name": "CPU*", "ms": 2000},
-            {"name": "IO:DataFileRead", "ms": 1200},
-            {"name": "Lock:relation", "ms": 500},
-            {"name": "LWLock:WALWrite", "ms": 300},
-            {"name": "Extension:Extension", "ms": 100},
-            {"name": "Timeout:PgSleep", "ms": 100},
+            {"name": "CPU*", "id": 0, "ms": 2000},
+            {"name": "IO:DataFileRead", "id": 0x01000015, "ms": 1200},
+            {"name": "Lock:relation", "id": 0x03000000, "ms": 500},
+            {"name": "LWLock:WALWrite", "id": 0x04000008, "ms": 300},
+            {"name": "Extension:Extension", "id": 0x0a000000, "ms": 100},
+            {"name": "Timeout:PgSleep", "id": 0x09000002, "ms": 100},
          ]},
         {"query_id": "5371305355164922084", "text": "SELECT abalance FROM pgbench_accounts WHERE aid = $1",
          "total_ms": 3100, "pct": 24.8, "count": 45000, "avg_us": 68.9,
-         "top_wait": "IO:DataFileRead",
+         "top_wait": "IO:DataFileRead", "top_wait_id": 0x01000015,
          "classes": [1500, 900, 200, 300, 0, 0, 100, 0, 0, 100, 0],
          "events": [
-            {"name": "CPU*", "ms": 1500},
-            {"name": "IO:DataFileRead", "ms": 900},
-            {"name": "Lock:relation", "ms": 200},
-            {"name": "LWLock:WALWrite", "ms": 300},
-            {"name": "Extension:Extension", "ms": 100},
-            {"name": "Timeout:PgSleep", "ms": 100},
+            {"name": "CPU*", "id": 0, "ms": 1500},
+            {"name": "IO:DataFileRead", "id": 0x01000015, "ms": 900},
+            {"name": "Lock:relation", "id": 0x03000000, "ms": 200},
+            {"name": "LWLock:WALWrite", "id": 0x04000008, "ms": 300},
+            {"name": "Extension:Extension", "id": 0x0a000000, "ms": 100},
+            {"name": "Timeout:PgSleep", "id": 0x09000002, "ms": 100},
          ]},
         {"query_id": "-2312456789012345678", "text": "INSERT INTO pgbench_history (tid, bid, aid, delta, mtime) VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)",
          "total_ms": 2800, "pct": 22.4, "count": 45000, "avg_us": 62.2,
-         "top_wait": "LWLock:WALWrite",
+         "top_wait": "LWLock:WALWrite", "top_wait_id": 0x04000008,
          "classes": [1000, 800, 300, 500, 0, 0, 100, 0, 0, 100, 0],
          "events": [
-            {"name": "CPU*", "ms": 1000},
-            {"name": "IO:WalSync", "ms": 800},
-            {"name": "LWLock:WALWrite", "ms": 500},
-            {"name": "Lock:relation", "ms": 300},
-            {"name": "Extension:Extension", "ms": 100},
-            {"name": "Timeout:PgSleep", "ms": 100},
+            {"name": "CPU*", "id": 0, "ms": 1000},
+            {"name": "IO:WalSync", "id": 0x0100004e, "ms": 800},
+            {"name": "LWLock:WALWrite", "id": 0x04000008, "ms": 500},
+            {"name": "Lock:relation", "id": 0x03000000, "ms": 300},
+            {"name": "Extension:Extension", "id": 0x0a000000, "ms": 100},
+            {"name": "Timeout:PgSleep", "id": 0x09000002, "ms": 100},
          ]},
     ],
+}
+
+_CANNED["variants"] = {
+    "exec": {
+        "total": 45000,
+        "num_variants": 2,
+        "variants": [
+            {"exec_count": 30000, "num_queries": 1, "total_ms": 2790.0,
+             "avg_ms": 0.093, "p95_ms": 0.30, "avg_loop_n": 1,
+             "top_query_id": 3886912043147135675,
+             "steps": [
+                 {"name": "CPU*", "avg_ms": 0.04, "class": "cpu"},
+                 {"name": "IO:DataFileRead", "avg_ms": 0.03, "class": "IO"},
+                 {"name": "CPU*", "avg_ms": 0.023, "class": "cpu"},
+             ],
+             "query_text": "UPDATE pgbench_accounts SET abalance = abalance + $1 WHERE aid = $2"},
+            {"exec_count": 15000, "num_queries": 1, "total_ms": 1360.0,
+             "avg_ms": 0.09, "p95_ms": 0.28, "avg_loop_n": 1,
+             "top_query_id": 5371305355164922084,
+             "steps": [
+                 {"name": "CPU*", "avg_ms": 0.05, "class": "cpu"},
+                 {"name": "LWLock:WALWrite", "avg_ms": 0.04, "class": "LWLock"},
+             ],
+             "query_text": "SELECT abalance FROM pgbench_accounts WHERE aid = $1"},
+        ],
+    },
+    "plan": {
+        "total": 45000,
+        "num_variants": 1,
+        "variants": [
+            {"exec_count": 45000, "num_queries": 2, "total_ms": 495.0,
+             "avg_ms": 0.011, "p95_ms": 0.04, "avg_loop_n": 1,
+             "top_query_id": 3886912043147135675,
+             "steps": [
+                 {"name": "CPU*", "avg_ms": 0.011, "class": "cpu"},
+             ],
+             "query_text": "UPDATE pgbench_accounts SET abalance = abalance + $1 WHERE aid = $2"},
+        ],
+    },
 }
 
 _CANNED["heatmap"] = {
     "bucket_ns": _BUCKET_NS,
     "max_count": 5000,
+    "total_events": 402500,
     "times": [_FROM_NS + i * _BUCKET_NS for i in range(60)],
     "labels": ["<1", "1-2", "2-4", "4-8", "8-16", "16-32", "32-64",
                "64-128", "128-256", "256-512", "512-1K", "1K-2K",
@@ -213,21 +271,21 @@ _CANNED["session_timeline"] = {
     "pids": [1001, 1002],
     "events": [
         {"s": _FROM_NS + 100_000_000_000, "d": 50_000_000_000, "p": 1001,
-         "n": "CPU*", "c": 0, "q": "3886912043147135675"},
+         "n": "CPU*", "e": 0, "c": 0, "q": "3886912043147135675"},
         {"s": _FROM_NS + 150_000_000_000, "d": 30_000_000_000, "p": 1001,
-         "n": "IO:DataFileRead", "c": 1, "q": "3886912043147135675"},
+         "n": "IO:DataFileRead", "e": 0x01000015, "c": 1, "q": "3886912043147135675"},
         {"s": _FROM_NS + 180_000_000_000, "d": 20_000_000_000, "p": 1001,
-         "n": "Lock:relation", "c": 2, "q": "3886912043147135675"},
+         "n": "Lock:relation", "e": 0x03000000, "c": 2, "q": "3886912043147135675"},
         {"s": _FROM_NS + 200_000_000_000, "d": 40_000_000_000, "p": 1001,
-         "n": "CPU*", "c": 0, "q": "3886912043147135675"},
+         "n": "CPU*", "e": 0, "c": 0, "q": "3886912043147135675"},
         {"s": _FROM_NS + 100_000_000_000, "d": 80_000_000_000, "p": 1002,
-         "n": "Lock:relation", "c": 2, "q": "5371305355164922084"},
+         "n": "Lock:relation", "e": 0x03000000, "c": 2, "q": "5371305355164922084"},
         {"s": _FROM_NS + 180_000_000_000, "d": 25_000_000_000, "p": 1002,
-         "n": "CPU*", "c": 0, "q": "5371305355164922084"},
+         "n": "CPU*", "e": 0, "c": 0, "q": "5371305355164922084"},
         {"s": _FROM_NS + 205_000_000_000, "d": 35_000_000_000, "p": 1002,
-         "n": "IO:DataFileRead", "c": 1, "q": "5371305355164922084"},
+         "n": "IO:DataFileRead", "e": 0x01000015, "c": 1, "q": "5371305355164922084"},
         {"s": _FROM_NS + 240_000_000_000, "d": 15_000_000_000, "p": 1002,
-         "n": "LWLock:WALWrite", "c": 3, "q": "5371305355164922084"},
+         "n": "LWLock:WALWrite", "e": 0x04000008, "c": 3, "q": "5371305355164922084"},
     ],
 }
 
@@ -260,7 +318,9 @@ def handle_request(msg):
         if "class" in filters:
             cls = filters["class"]
             rows = [r for r in rows if r["class"].lower() == cls.lower()]
-        return {"id": req_id, "rows": rows}
+        return {"id": req_id,
+                "db_time_ms": _CANNED["top_events"]["db_time_ms"],
+                "rows": rows}
 
     if cmd == "top_sessions":
         return {"id": req_id, **_CANNED["top_sessions"]}
@@ -278,7 +338,12 @@ def handle_request(msg):
         return {"id": req_id, "events": [], "pids": [], "truncated": False, "total_count": 0}
 
     if cmd == "transitions":
-        return {"id": req_id, "total": 1500, "links": [
+        return {"id": req_id, "total": 1500, "nodes": [
+            {"name": "CPU*", "total_ms": 4800, "class": "CPU"},
+            {"name": "IO:DataFileRead", "total_ms": 2100, "class": "IO"},
+            {"name": "LWLock:WALInsert", "total_ms": 900, "class": "LWLock"},
+            {"name": "IO:WalSync", "total_ms": 800, "class": "IO"},
+        ], "links": [
             {"source": "CPU*", "target": "IO:DataFileRead", "value": 500, "duration_ms": 2500.0},
             {"source": "IO:DataFileRead", "target": "CPU*", "value": 480, "duration_ms": 1920.0},
             {"source": "CPU*", "target": "LWLock:WALInsert", "value": 300, "duration_ms": 900.0},
@@ -300,12 +365,21 @@ def handle_request(msg):
 
     if cmd == "concurrency":
         nb = msg.get("num_buckets", 60)
-        peaks = [{"t": 1711936000000000000 + i * 60000000000, "max": 3 + (i % 5), "event": "LWLock:BufferMapping"} for i in range(nb)]
+        peaks = [{"t": 1711936000000000000 + i * 60000000000,
+                  "t_ms": (1711936000000000000 + i * 60000000000) // 1000000,
+                  "max": 3 + (i % 5), "event": "LWLock:BufferMapping"} for i in range(nb)]
         bursts = [
-            {"timestamp_ns": 1711936180000000000, "event": "LWLock:BufferMapping", "sessions": 8, "pids": [1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008]},
-            {"timestamp_ns": 1711936300000000000, "event": "IO:DataFileRead", "sessions": 5, "pids": [1001, 1003, 1005, 1007, 1009]},
+            {"timestamp_ns": 1711936180000000000, "timestamp_ms": 1711936180000,
+             "event": "LWLock:BufferMapping", "sessions": 8,
+             "pids": [1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008]},
+            {"timestamp_ns": 1711936300000000000, "timestamp_ms": 1711936300000,
+             "event": "IO:DataFileRead", "sessions": 5,
+             "pids": [1001, 1003, 1005, 1007, 1009]},
         ]
         return {"id": req_id, "peaks": peaks, "bursts": bursts, "bucket_ns": 60000000000}
+
+    if cmd == "variants":
+        return {"id": req_id, **_CANNED["variants"]}
 
     if cmd == "fingerprints":
         return {"id": req_id, "rows": [
