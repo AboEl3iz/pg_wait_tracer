@@ -182,4 +182,4 @@ finally:
     import shutil
     shutil.rmtree(tmpdir, ignore_errors=True)
 
-t.summary()
+sys.exit(0 if t.summary() else 1)
