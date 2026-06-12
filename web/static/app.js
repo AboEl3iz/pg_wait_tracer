@@ -1,4 +1,3 @@
-setTimeout(() => { throw new Error("B1 acceptance canary: deliberate JS exception"); }, 500);
 /* pgwt — Web Investigation Client */
 
 // -- Wait class colors (Oracle ASH / RDS PI inspired) -------------------------
