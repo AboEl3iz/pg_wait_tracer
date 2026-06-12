@@ -22,12 +22,13 @@ import signal
 from http.server import SimpleHTTPRequestHandler, HTTPServer
 import threading
 
+# websockets is only needed to *run* the server.  Importers that just use
+# handle_request() (e.g. tests/test_protocol_drift.py) work without it.
 try:
-    import websockets
     import websockets.asyncio.server
+    _HAVE_WEBSOCKETS = True
 except ImportError:
-    print("ERROR: pip install websockets", file=sys.stderr)
-    sys.exit(1)
+    _HAVE_WEBSOCKETS = False
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                           "web", "static")
@@ -429,6 +430,10 @@ async def run_ws(port):
 
 
 def main():
+    if not _HAVE_WEBSOCKETS:
+        print("ERROR: pip install websockets", file=sys.stderr)
+        sys.exit(1)
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=18765,
                         help="HTTP port (WS = port+1)")

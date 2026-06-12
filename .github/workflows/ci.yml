@@ -28,14 +28,22 @@ jobs:
           sudo apt-get install -y clang llvm libbpf-dev libelf-dev \
             zlib1g-dev liblz4-dev linux-tools-common
           # bpftool ships in the kernel-matched linux-tools package; fall
-          # back to the generic one (and a direct binary path) if the exact
-          # version is unavailable on the runner.
+          # back to the generic one if the exact version is unavailable.
           sudo apt-get install -y "linux-tools-$(uname -r)" || \
             sudo apt-get install -y linux-tools-generic
-          BPFTOOL=bpftool
-          if ! bpftool version >/dev/null 2>&1; then
-            BPFTOOL=$(ls /usr/lib/linux-tools/*/bpftool | head -1)
+          # Resolve a working bpftool: try the wrapper, then the binary
+          # shipped by whatever linux-tools package is installed.
+          BPFTOOL=""
+          if command -v bpftool >/dev/null && bpftool version >/dev/null 2>&1; then
+            BPFTOOL=bpftool
+          else
+            BPFTOOL=$(dpkg -L "linux-tools-$(uname -r)" 2>/dev/null \
+                        | grep '/bpftool$' | head -1)
+            if [ -z "$BPFTOOL" ]; then
+              BPFTOOL=$(find /usr/lib -name bpftool -type f 2>/dev/null | head -1)
+            fi
           fi
+          test -n "$BPFTOOL"
           "$BPFTOOL" version
           echo "BPFTOOL=$BPFTOOL" >> "$GITHUB_ENV"
           # The BPF build generates vmlinux.h from the running kernel's BTF
