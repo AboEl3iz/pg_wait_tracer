@@ -126,10 +126,11 @@ static void test_client_events(void)
     CHECK_NAME(WEI(PG_WAIT_CLIENT, 8), "Client:WalSenderWriteData");
     CHECK(strcmp(pgwt_class_name(WEI(PG_WAIT_CLIENT, 0)), "Client") == 0,
           "class_name for Client");
-    /* Client:ClientRead is idle (like Oracle SQL*Net message from client) */
-    CHECK(pgwt_is_idle_event(WEI(PG_WAIT_CLIENT, 0)) != 0,
-          "Client:ClientRead should be idle");
-    /* Other Client events are NOT idle */
+    /* Client:ClientRead is deliberately NOT idle: it is a real wait event
+     * (time waiting for the client's next command) counted under the
+     * Client class — see pgwt_is_idle_event() in src/wait_event.c. */
+    CHECK(pgwt_is_idle_event(WEI(PG_WAIT_CLIENT, 0)) == 0,
+          "Client:ClientRead should NOT be idle");
     CHECK(pgwt_is_idle_event(WEI(PG_WAIT_CLIENT, 1)) == 0,
           "Client:ClientWrite should NOT be idle");
 }
