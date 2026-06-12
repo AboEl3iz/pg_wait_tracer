@@ -361,8 +361,21 @@ Scope:
 - Playwright assertions upgraded to read data via
   `page.evaluate(() => chart.getOption())` instead of canvas-exists;
   end-to-end filter test (set filter → table *rows* change).
+- Visual regression snapshots (Playwright `toHaveScreenshot`): baseline
+  screenshots of each view against the fixed mock dataset — AAS chart,
+  histogram heatmap, Sankey transitions, drill-down tables — with a
+  small pixel-diff tolerance to absorb antialiasing noise. Pin browser
+  version + viewport + device scale in the Playwright config so
+  baselines are deterministic in CI; animations disabled for snapshot
+  runs. Baselines committed to the repo; intentional visual changes are
+  reviewed as baseline diffs in the PR. This catches the
+  "renders without errors but looks wrong" class (missing series, color
+  regressions, layout breakage) that DOM and getOption() assertions
+  cannot see.
 Acceptance: a deliberate off-by-one in a builder is caught by a Node
-test in milliseconds, without Playwright.
+test in milliseconds, without Playwright; removing a series color
+mapping (no JS error, data still present) is caught by a snapshot diff
+in CI.
 
 ### Phase B5 — Fidelity-aware UI (joins Track A)
 Depends on: A3 (fidelity field in responses), A4 (escalation via
