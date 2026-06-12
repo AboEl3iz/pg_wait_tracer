@@ -131,6 +131,7 @@ static void test_client_events(void)
      * Client class — see pgwt_is_idle_event() in src/wait_event.c. */
     CHECK(pgwt_is_idle_event(WEI(PG_WAIT_CLIENT, 0)) == 0,
           "Client:ClientRead should NOT be idle");
+    /* Other Client events are NOT idle */
     CHECK(pgwt_is_idle_event(WEI(PG_WAIT_CLIENT, 1)) == 0,
           "Client:ClientWrite should NOT be idle");
 }
