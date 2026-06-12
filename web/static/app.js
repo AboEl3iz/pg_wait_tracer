@@ -458,7 +458,6 @@ function switchTab(tab) {
 
 // -- Chart container ----------------------------------------------------------
 
-const chartEl = document.getElementById('chart-container');  // hidden, kept for legacy refs
 
 function initChart() {
     window.addEventListener('resize', () => {
@@ -1551,7 +1550,8 @@ async function refreshConcurrency() {
     const container = document.getElementById('table-container');
 
     // Use same bucket count as main AAS chart for synchronized xAxis
-    const numBuckets = Math.min(Math.floor(chartEl.clientWidth / 4), 300);
+    const chartWidth = (apexEl && apexEl.clientWidth) || 800;
+    const numBuckets = Math.min(Math.floor(chartWidth / 4), 300);
 
     let data;
     try {
@@ -1698,9 +1698,11 @@ async function refreshConcurrency() {
  * stopAutoRefresh is called, the old ID becomes stale and the old loop
  * exits. This prevents multiple concurrent loops with different rangeSecs. */
 let _autoRefreshId = 0;
+let _autoRefreshOn = false;
 
 function startAutoRefresh(rangeSecs) {
     stopAutoRefresh();
+    _autoRefreshOn = true;
     const liveBtn = document.getElementById('live-btn');
     if (liveBtn) {
         liveBtn.classList.add('active');
@@ -1734,6 +1736,7 @@ function startAutoRefresh(rangeSecs) {
 }
 
 function stopAutoRefresh() {
+    _autoRefreshOn = false;
     _autoRefreshId++;  /* invalidates any running loop */
     const liveBtn = document.getElementById('live-btn');
     if (liveBtn) {
@@ -1747,7 +1750,7 @@ function initLiveMode() {
     if (!btn) return;
 
     btn.addEventListener('click', () => {
-        if (autoRefreshInterval) {
+        if (_autoRefreshOn) {
             stopAutoRefresh();
         } else {
             // Default: last 5 minutes from server wall clock
