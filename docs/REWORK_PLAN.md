@@ -21,7 +21,10 @@ UI grows fidelity-aware features on top of the restructured codebase.
 ## Non-goals
 
 - No userspace rewrite (C daemon/server, Go client stay).
-- No charting library change (ECharts stays).
+- No new charting framework. ECharts becomes the **only** chart
+  library: ApexCharts (currently rendering the main AAS chart) is
+  dropped in B3, and its drag-select-window UX is replaced by a custom
+  selection overlay (full visual control, ~100 lines, testable).
 - No client-side compute relocation (server keeps computing views).
 - Cooperative tier (PG patch/extension hooks) is interface-only here;
   implementation belongs to the extension track.
@@ -284,11 +287,18 @@ DOM and ECharts.**
 ```
 web/static/
   app.js                 → shrinks to bootstrap + router (~100 lines)
+  vendor/
+    echarts.min.js       → exact version, vendored (no CDN, no floating
+                           tags — deterministic builds, airgapped-safe,
+                           stable B4 snapshots)
   lib/
     transport.js         → WebSocket, request ids, single-flight, abort
     view-manager.js      → enter/leave lifecycle, response chokepoint
     state.js             → filters/breadcrumbs/time-range, explicit
     table.js             → the one shared table/drill-down component
+    selection.js         → drag-select window overlay: pointer events +
+                           styled band div + convertFromPixel → time
+                           range (replaces ApexCharts' selection UX)
   views/
     overview.js  events.js  sessions.js  queries.js
     histogram.js transitions.js active.js
@@ -345,12 +355,38 @@ this order (simplest → hardest): active → overview → events → sessions
 view-manager + transport (one refresh loop, superseding, honoring
 "last 15 min means NOW"). Shared table component extracted once, used
 by all table views.
+
+Chart library consolidation (during the overview view's migration):
+- **AAS chart moves from ApexCharts to ECharts**; ApexCharts is
+  deleted entirely (today: AAS on ApexCharts at `app.js:586-761`,
+  everything else on ECharts — two libraries to theme, learn, and
+  debug, with the SVG-based one carrying the most data-intensive
+  chart).
+- **Custom selection overlay** (`lib/selection.js`) replaces the
+  library's drag-select: pointer events on the chart container, a
+  styled band element, `convertFromPixel` to map pixels → time range.
+  Full visual control over the band (the reason ApexCharts was added),
+  reusable on the concurrency chart, and testable: unit-test the
+  pixel→time math in Node, drive the drag in Playwright, snapshot the
+  band's look in B4.
+- **Vendor exact-version ECharts** into `web/static/vendor/` and drop
+  the CDN `<script>` tags (`index.html:7-8` currently float
+  `echarts@5`): deterministic builds, works airgapped, stable visual
+  snapshots, no supply-chain exposure.
+- Builders stay library-agnostic: they emit view models; only the
+  mount layer speaks ECharts. (Keeps a future per-chart library
+  experiment — e.g. uPlot for AAS — a contained adapter swap, not a
+  migration.)
+
 Per-view definition of done: pure builder extracted with Node unit
 tests; chart owned by enter/leave; existing Playwright tests pass;
 chaos tests for that view pass.
 Acceptance: full chaos suite green; `app.js` is bootstrap-only; zero
-module-level chart variables; soak test (50 random tab/filter
-transitions) shows no console errors and stable listener counts.
+module-level chart variables; ApexCharts gone from `index.html`; no
+CDN script tags; drag-select on the AAS chart works via the overlay
+(Playwright-driven drag selects the expected time range); soak test
+(50 random tab/filter transitions) shows no console errors and stable
+listener counts.
 
 ### Phase B4 — Builder test suite + deepened assertions
 Scope:
