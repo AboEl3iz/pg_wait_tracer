@@ -1,12 +1,57 @@
 # Rework Plan: Tiered-Fidelity Capture + UI Restructure
 
-Status: PROPOSED
-Date: 2026-06-11
+Status: IN PROGRESS (B1, A0 merged)
+Date: 2026-06-11 (last updated 2026-06-13)
 
 Two tracks. Track A makes the daemon an always-on monitor with on-demand
 full-fidelity escalation. Track B makes the web UI testable, extensible,
 and supportable. The tracks are independent until Phase A5/B4, where the
 UI grows fidelity-aware features on top of the restructured codebase.
+
+---
+
+## Progress log
+
+Workflow: branch + PR per phase, user merges. Two phases land at a time
+(one per track, in parallel). Subagents do the work in worktrees.
+
+- **2026-06-13 — B1 (CI safety net) MERGED** (PR #6 → master 861c313).
+  Delivered the console-error/pageerror guard, `.github/workflows/ci.yml`
+  (build-and-unit, web-ui vs mock, protocol-drift jobs), and the
+  CI-fails-on-skip behavior. Acceptance proven (canary JS exception
+  failed the web-ui job). Bonus: the guard exposed and fixed **two real
+  app.js bugs** — the Live button (ReferenceError) and the Concurrency
+  tab never loading. Note: master history carries the canary+revert
+  pair (05628b1/91815c7, net-neutral).
+- **2026-06-13 — A0 (control socket + self-metrics) MERGED** (PR #7 →
+  master b1ef3c4, rebased onto B1). Live-validated on the test box:
+  `test_control.sh` 16/16 (socket, status/metrics JSON, counters rising
+  under load, error handling, concurrent clients + disconnect survival,
+  pgwt-server proxy, --dump block, SIGTERM clean unlink). Ringbuf drop
+  counter deliberately deferred to A2 (no BPF-side drop map yet).
+
+**Decisions locked in during execution:**
+- Trace format is **v2-only** — no deployed installs exist, so A1 drops
+  v1 reader compatibility (version field stays for future v3).
+- **Prometheus exporter** for AAS/sampled metrics is a planned future
+  consumer; A0 metric names are already snake_case + unit-suffixed for
+  it. Out of scope for these tracks.
+
+**Testing reality (important for every phase):**
+- CI (GitHub Actions) runs unit + synthetic + web-UI-vs-mock +
+  protocol-drift. It **cannot** run the live capture tests (no PG, no
+  hardware watchpoints on runners).
+- Live tests (`test_accuracy`, `test_control`, lwlock/cpu/lock/query
+  capture, overhead benchmark) run on **dmitry-micro-test** (Hetzner
+  cx23, Rocky 9.7, kernel 5.14, PG 18.4) — see [[test_server_ssh]].
+  On 2026-06-13 the watchpoint path verified healthy there:
+  test_accuracy 11/11, DB-Time consistency 0.0% error, pg_stat_io
+  cross-check ratio 0.80.
+- **Definition of done for any capture phase now includes a green live
+  run on the box, not just green CI.**
+
+**Pre-existing live-suite debt found on 2026-06-13 (baseline on master,
+NOT introduced by B1/A0)** — tracked as Track E below.
 
 ---
 
@@ -201,15 +246,23 @@ Each phase is independently shippable and keeps `make && tests/run_all.sh`
 green. The current single-mode behavior must remain the default until A4
 completes.
 
-### Phase A0 — Control socket + self-metrics (groundwork)
+### Phase A0 — Control socket + self-metrics (groundwork) ✅ DONE (2026-06-13, merge b1ef3c4)
 Scope: D4 socket with `status`/`metrics` only; daemon metrics counters;
 pgwt-server `control` proxy command; `--dump` prints daemon status if
 socket present.
-Files: `src/daemon.c`, new `src/control.c/h`, `src/server.c`.
-Tests: unit test for the socket protocol; integration check in
-`run_all.sh` (start daemon, query status).
-Acceptance: daemon answers status/metrics over the socket with zero
-change to capture behavior.
+Files: `src/daemon.c`, new `src/control.c/h`, `src/server.c`,
+`tests/test_control.sh`.
+Tests: `tests/test_control.sh` (standalone integration, 16/16 live on
+the box). Wiring it into `run_all.sh` deferred at merge time — **still
+TODO** (do it alongside the Track E cleanup, see E3).
+Metrics shipped: `events_total`, `events_per_sec`,
+`lifecycle_events_total`, `wp_attach_failures_total`,
+`trace_events_written_total`, `trace_bytes_written_total`,
+`backends_tracked`. Ringbuf drops intentionally NOT reported (no
+BPF-side drop map until A2 — `control.h` documents this; A2 must add it
+and surface it here).
+Acceptance: met — status/metrics answered over the socket, zero capture
+behavior change.
 
 ### Phase A1 — Trace format v2
 Scope: D2. Typed blocks, v1-compat reader, writer emits v2,
@@ -329,18 +382,25 @@ web/static/
 
 ## B.1 Phases
 
-### Phase B1 — Safety net (before touching anything)
+### Phase B1 — Safety net (before touching anything) ✅ DONE (2026-06-13, merge 861c313)
 Scope:
 - Playwright fixture fails any test on console error / pageerror /
-  unhandled rejection.
-- GitHub Actions workflow: build pgwt, run `test_web_ui.py` against
-  `mock_server.py` on every PR/push. In CI, missing Playwright is a
-  **failure**, not a skip (fix the silent skip at
-  `tests/run_all.sh:174-179` for CI context).
-- Real-server fixture: commit a small trace file (from
-  `gen_test_traces`), run one suite pass against actual
-  `pgwt-server --replay` to catch mock-vs-real protocol drift.
-Acceptance: a deliberately introduced JS exception fails CI.
+  unhandled rejection. (Allowlist only on the reconnection test, which
+  must stay last.)
+- GitHub Actions workflow (`.github/workflows/ci.yml`): build pgwt, run
+  `test_web_ui.py` against `mock_server.py` on every PR/push. Missing
+  Playwright is a **failure** in CI (env `CI` set), still a skip
+  locally.
+- Protocol-drift: `tests/test_protocol_drift.py` generates the fixture
+  in CI (no binary committed — deviation from the original "commit a
+  trace file" text) and diffs real `pgwt-server` vs mock response
+  schemas.
+Acceptance: met — canary JS exception failed the web-ui job, then
+reverted.
+Notes: the guard caught two real app.js bugs (Live button
+ReferenceError; Concurrency tab not loading), both fixed. CI builds
+bpftool from source (GH runners lack it). Several stale tests that were
+silently `exit 0` now propagate failure.
 
 ### Phase B2 — Adversarial mock
 Scope: chaos mode in `tests/mock_server.py` — configurable latency
@@ -602,21 +662,60 @@ doing D1 before/with A2 is ideal since the sampler shares the registry.
 Test matrix: PGDG 14–16 installed alongside 17/18 on the remote test
 VM (deps on remote only).
 
+# Track E — Live-suite cleanup (pre-existing debt)
+
+Surfaced 2026-06-13 when the full `run_all.sh` first ran on a real box
+since CI was added. These fail/flake on **master baseline** (NOT caused
+by B1/A0) and were invisible because CI can't run live capture tests.
+Small, independent, do early so "green live run" is a meaningful gate
+for later capture phases.
+
+### Phase E1 — De-flake and fix stale live tests
+- `test_cross_validate`: flaky — sampling side came back empty on a
+  freshly-started PG (passed on the second run). Add warmup / longer
+  sampling window / retry so it's deterministic.
+- `test_deterministic` "Lock:relation" assertion: gets `Lock:advisory`
+  on PG 18 (the lock wait IS captured; lock-hold/wait detection passes)
+  — fix the expected event for the PG version, or make the workload
+  take the intended relation lock.
+- `test_data_idle` / `test_client_wait`: stale ClientRead idle
+  semantics — **already fixed by B1**; confirm green after B1 on the
+  box (should be resolved).
+Acceptance: `run_all.sh` functional section green on dmitry-micro-test,
+twice in a row (no flakes).
+
+### Phase E2 — Skip-not-fail for extension-dependent tests
+Tests that require the **patched PG** (`pg_wait_event_timing` events,
+extension in time_model) currently FAIL on stock PG 18. They must
+detect the absent extension and **SKIP** (counted as skipped, not
+failed), so a stock-PG box can go fully green.
+Acceptance: on stock PG, extension tests skip; on patched PG, they run.
+
+### Phase E3 — Wire test_control.sh into run_all.sh
+Deferred from A0 (avoided colliding with B1's run_all.sh edits). Add it
+to the live suite. Acceptance: `run_all.sh` runs test_control 16/16.
+
+Independent of all other tracks. E1+E2+E3 are one small PR's worth.
+
 # Sequencing
 
 ```
-Track A:  A0 ──▶ A1 ──▶ A2 ──▶ A3 ──▶ A4 ──▶ A5      A6 (anytime after A2)
-Track B:  B1 ──▶ B2 ──▶ B3 ──▶ B4 ─────────────▶ B5 ──▶ B6
+Track A:  [A0✅] ─▶ A1 ──▶ A2 ──▶ A3 ──▶ A4 ──▶ A5    A6 (anytime after A2)
+Track B:  [B1✅] ─▶ B2 ──▶ B3 ──▶ B4 ──────────▶ B5 ──▶ B6
                                             (B5 needs A3+A4; B6 needs B3+A3)
-Track C:        (A0+A2) ──▶ C1 ──▶ C2 ──▶ C3
+Track C:        (A0✅+A2) ──▶ C1 ──▶ C2 ──▶ C3
 Track D:  D1 ──▶ D2  (independent; ideally with A2)      D3 if demanded
+Track E:  E1+E2+E3  (independent, do early — one small PR)
 ```
 
+- ✅ = merged to master (2026-06-13). **Next pair: A1 + B2.**
 - B1/B2 are small and should land **first** regardless of Track A —
   they protect everything else.
 - The tracks parallelize fully until B5.
 - Default daemon mode flips to `tiered` only after A4's
   cross-validation test passes its tolerances.
+- A capture phase is "done" only with a **green live run on the box**
+  (see Progress log → Testing reality), not just green CI.
 
 # Risks and open questions
 
