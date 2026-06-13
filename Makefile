@@ -93,6 +93,7 @@ $(BUILD_DIR):
 # Step 1: Generate vmlinux.h from kernel BTF
 $(INC_DIR)/vmlinux.h:
 	@echo "  VMLINUX  $@"
+	@mkdir -p $(INC_DIR)
 	@$(BPFTOOL) btf dump file /sys/kernel/btf/vmlinux format c > $@
 
 # Step 2: Compile BPF program

@@ -1,0 +1,105 @@
+# CI safety net (Phase B1 of docs/REWORK_PLAN.md)
+#
+# Three jobs:
+#   build-and-unit  — full build (BPF tracer + pgwt-server), C unit tests,
+#                     Python synthetic-data correctness tests
+#   web-ui          — Playwright suite against tests/mock_server.py; any
+#                     browser console error fails the test that caused it
+#   protocol-drift  — same JSON-line commands against the real pgwt-server
+#                     (trace fixture generated in CI, nothing committed) and
+#                     against the mock; response schemas must match
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  build-and-unit:
+    name: build-and-unit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libbpf-dev libelf-dev \
+            zlib1g-dev liblz4-dev linux-tools-common
+          # bpftool: the runner's HWE azure kernel ships linux-tools without
+          # a bpftool binary (only the dispatch wrapper), so a packaged
+          # bpftool may not exist. Use it if it works; otherwise build a
+          # pinned bpftool from source (~30s, needs only libelf/zlib).
+          if bpftool version >/dev/null 2>&1; then
+            BPFTOOL=$(command -v bpftool)
+          else
+            git clone --depth 1 --branch v7.5.0 --recurse-submodules \
+              https://github.com/libbpf/bpftool.git /tmp/bpftool
+            make -C /tmp/bpftool/src -j"$(nproc)"
+            BPFTOOL=/tmp/bpftool/src/bpftool
+          fi
+          "$BPFTOOL" version
+          echo "BPFTOOL=$BPFTOOL" >> "$GITHUB_ENV"
+          # The BPF build generates vmlinux.h from the running kernel's BTF
+          test -r /sys/kernel/btf/vmlinux
+
+      - name: Build (BPF tracer + pgwt-server)
+        run: make
+
+      - name: Build C unit tests
+        run: make -C tests
+
+      - name: Run C unit tests
+        run: |
+          tests/test_wait_event
+          tests/test_cmdline
+          tests/test_bucket
+          tests/test_event_writer
+          tests/test_event_reader
+
+      - name: Run synthetic data tests
+        run: |
+          set -e
+          for t in tests/test_data_*.py; do
+            echo "=== $t ==="
+            python3 "$t"
+          done
+          python3 tests/test_current_trace.py
+
+  web-ui:
+    name: web-ui
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Playwright + websockets
+        run: |
+          python3 -m pip install playwright websockets
+          python3 -m playwright install --with-deps chromium
+
+      - name: Run web UI tests (mock server)
+        run: python3 tests/test_web_ui.py
+
+  protocol-drift:
+    name: protocol-drift
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies (server only, no BPF)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zlib1g-dev liblz4-dev
+
+      - name: Build pgwt-server + trace generator
+        run: |
+          make pgwt-server
+          make -C tests gen_test_traces
+
+      - name: Run protocol drift test (real server vs mock)
+        run: python3 tests/test_protocol_drift.py

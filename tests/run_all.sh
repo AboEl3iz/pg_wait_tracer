@@ -90,6 +90,7 @@ if [[ -x "$PROJECT_DIR/pgwt-server" ]] && [[ -x "$SCRIPT_DIR/gen_test_traces" ]]
     run_test "test_data_transitions" python3 "$SCRIPT_DIR/test_data_transitions.py"
     run_test "test_data_lock_chains" python3 "$SCRIPT_DIR/test_data_lock_chains.py"
     run_test "test_current_trace" python3 "$SCRIPT_DIR/test_current_trace.py"
+    run_test "test_protocol_drift" python3 "$SCRIPT_DIR/test_protocol_drift.py"
 else
     skip_test "test_data_*" "pgwt-server or gen_test_traces not built"
 fi
@@ -172,8 +173,13 @@ else
 fi
 
 # Step 5: Web UI tests (needs playwright + websockets, no root needed)
+# Locally a missing dependency is a skip; in CI ($CI set) it is a FAILURE —
+# the UI suite silently not running is how regressions slip through.
 if python3 -c "import playwright, websockets" 2>/dev/null; then
     run_test "test_web_ui" python3 "$SCRIPT_DIR/test_web_ui.py"
+elif [[ -n "${CI:-}" ]]; then
+    run_test "test_web_ui" bash -c \
+        'echo "ERROR: playwright/websockets not installed — required in CI"; exit 1'
 else
     skip_test "test_web_ui" "playwright or websockets not installed"
 fi

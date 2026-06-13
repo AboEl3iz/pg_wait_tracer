@@ -30,7 +30,7 @@ except ImportError:
           file=sys.stderr)
     sys.exit(1)
 
-MOCK_PORT = 18799
+MOCK_PORT = int(os.environ.get("PGWT_TEST_PORT", "18799"))
 MOCK_URL = f"http://127.0.0.1:{MOCK_PORT}"
 MOCK_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mock_server.py")
 
@@ -48,6 +48,54 @@ def check(cond, msg):
     else:
         tests_failed += 1
         print(f"  FAIL: {msg}")
+
+
+# ── Console error guard (Phase B1) ───────────────────────────────────────────
+# Any browser console error, uncaught page exception, or unhandled promise
+# rejection fails the test during which it occurred.  Tests that *expect*
+# errors (e.g. the reconnection test kills the server) declare an explicit
+# allowlist of substrings — the check is never weakened globally.
+
+# Injected into every page before app code runs: turns unhandled promise
+# rejections into console errors so they are captured uniformly.
+UNHANDLED_REJECTION_HOOK = """
+window.addEventListener('unhandledrejection', e => {
+    const r = e.reason;
+    console.error('Unhandled rejection: ' +
+        ((r && (r.stack || r.message)) || String(r)));
+});
+"""
+
+
+class ConsoleErrorGuard:
+    """Collects console errors and page errors emitted by the page."""
+
+    def __init__(self, page):
+        self.errors = []
+        page.on("console", self._on_console)
+        page.on("pageerror", self._on_pageerror)
+
+    def _on_console(self, msg):
+        if msg.type == "error":
+            self.errors.append(f"console: {msg.text}")
+
+    def _on_pageerror(self, err):
+        self.errors.append(f"pageerror: {err}")
+
+    def drain(self):
+        errors = self.errors
+        self.errors = []
+        return errors
+
+
+def assert_no_console_errors(page, guard, name, allow=()):
+    """Fail the named test if it produced any non-allowlisted console error."""
+    page.wait_for_timeout(250)  # let async errors land
+    errors = guard.drain()
+    unexpected = [e for e in errors if not any(p in e for p in allow)]
+    check(len(unexpected) == 0,
+          f"[{name}] no console errors "
+          f"(got {len(unexpected)}: {unexpected[:3]})")
 
 
 def start_mock_server():
@@ -83,9 +131,11 @@ def test_page_load(page):
 
     page.goto(MOCK_URL)
     page.wait_for_selector("#status.connected", timeout=10000)
+    page.wait_for_timeout(1000)  # let the first aas response enrich the status
 
+    # Status format: "4 CPUs · 15.0m window · peak 4.5 AAS"
     status = page.text_content("#status")
-    check("CPUs" in status and "events" in status,
+    check("CPUs" in status and "AAS" in status,
           f"Status shows connection info: '{status}'")
 
     title = page.title()
@@ -427,7 +477,7 @@ def test_timeline_tab(page):
 
 
 def test_transitions_tab(page):
-    """12b. Transitions tab shows heatmap matrix and table with data."""
+    """12b. Transitions tab shows the directly-follows graph with data."""
     print("--- Test 12b: Transitions Tab ---")
 
     page.goto(MOCK_URL)
@@ -439,9 +489,11 @@ def test_transitions_tab(page):
     check(active and active.text_content() == "Transitions",
           "Transitions tab becomes active")
 
-    # Heatmap container must exist
-    container = page.query_selector("#transitions-chart")
-    check(container is not None, "Transitions heatmap container exists")
+    # DFG container and simplify slider must exist
+    container = page.query_selector("#dfg-container")
+    check(container is not None, "Transitions DFG container exists")
+    slider = page.query_selector("#dfg-slider")
+    check(slider is not None, "Simplify slider exists")
 
     # Must NOT show "No transitions found" or error
     table_container = page.query_selector("#table-container")
@@ -450,30 +502,19 @@ def test_transitions_tab(page):
           f"No 'No transitions' message (got: '{container_text[:60]}')")
     check("timeout" not in container_text.lower(),
           "No timeout error")
+    check("transitions" in container_text,
+          "Transition count shown")
 
-    # Capture any JS errors during rendering
-    js_errors = []
-    page.on("pageerror", lambda err: js_errors.append(str(err)))
-
-    # Re-click to trigger fresh render after error listener is attached
-    page.click(".tab[data-tab='overview']")
-    page.wait_for_timeout(500)
-    page.click(".tab[data-tab='transitions']")
-    page.wait_for_timeout(3000)
-
-    # Must have NO JavaScript errors
-    check(len(js_errors) == 0,
-          f"No JS errors during transitions render (got {len(js_errors)}: {js_errors[:2]})")
-
-    # Verify ECharts heatmap has data and rendered
+    # Verify the ECharts graph has nodes and rendered
     chart_status = page.evaluate("""
         () => {
-            const el = document.getElementById('transitions-chart');
+            const el = document.getElementById('dfg-container');
             if (!el) return 'no container';
             const c = echarts.getInstanceByDom(el);
             if (!c) return 'no echarts instance';
             const opt = c.getOption();
             if (!opt.series || !opt.series[0]) return 'no series';
+            if (opt.series[0].type !== 'graph') return 'not a graph';
             const data = opt.series[0].data;
             if (!data || data.length === 0) return 'no data';
             if (!el.querySelector('canvas') && !el.querySelector('svg')) return 'no visual';
@@ -481,13 +522,11 @@ def test_transitions_tab(page):
         }
     """)
     check(chart_status.startswith("ok"),
-          f"Transitions heatmap rendered with data ({chart_status})")
+          f"Transitions DFG rendered with data ({chart_status})")
 
-    # Top transitions table must exist
-    table = page.query_selector("#transitions-table table")
-    check(table is not None, "Top transitions table exists")
-    rows = page.query_selector_all("#transitions-table tbody tr")
-    check(len(rows) > 0, f"Top transitions table has rows ({len(rows)})")
+    # Variant sections (served by the mock's `variants` command) render below
+    check("Execution" in container_text or "Variant" in container_text,
+          "Variants section rendered below the DFG")
 
 
 def test_time_picker(page):
@@ -619,19 +658,27 @@ def test_auto_refresh(page):
 
 
 def test_chart_rendering(page):
-    """15. AAS chart is rendered with canvas."""
+    """15. AAS chart is rendered (ApexCharts SVG in #apex-chart-container)."""
     print("--- Test 15: Chart Rendering ---")
 
     page.goto(MOCK_URL)
     page.wait_for_selector("#status.connected", timeout=10000)
     page.wait_for_timeout(1500)
 
-    canvas = page.query_selector("#chart-container canvas")
-    check(canvas is not None, "AAS chart canvas rendered")
+    svg = page.query_selector("#apex-chart-container svg")
+    check(svg is not None, "AAS chart SVG rendered")
+
+    # Chart should actually draw series paths, not just an empty SVG shell
+    series_paths = page.query_selector_all(
+        "#apex-chart-container .apexcharts-series path")
+    check(len(series_paths) > 0,
+          f"AAS chart has series paths ({len(series_paths)})")
 
     # Chart container should have reasonable dimensions
-    height = page.evaluate(
-        "document.getElementById('chart-container').offsetHeight")
+    height = page.evaluate("""() => {
+        const el = document.getElementById('apex-chart-container');
+        return el ? el.offsetHeight : -1;
+    }""")
     check(height > 100, f"Chart height = {height}px (expected > 100)")
 
 
@@ -722,9 +769,9 @@ def test_session_drill_to_timeline(page):
     page.click("#table-container table tbody tr.clickable")
     page.wait_for_timeout(1500)
 
-    # Breadcrumb should show pid filter
+    # Breadcrumb should show pid filter (label format: "PID <n>")
     breadcrumb = page.text_content("#breadcrumb")
-    check("pid=" in breadcrumb,
+    check("PID" in breadcrumb and first_cell.strip() in breadcrumb,
           f"Breadcrumb shows pid filter: '{breadcrumb[:60]}'")
 
 
@@ -747,9 +794,11 @@ def test_query_drill(page):
         check(active and active.text_content() == "Events",
               "Query drill -> Events tab")
 
+        # Breadcrumb label for a query drill is the query text prefix
         breadcrumb = page.text_content("#breadcrumb")
-        check("query_id=" in breadcrumb,
-              f"Breadcrumb shows query_id filter")
+        check("UPDATE" in breadcrumb or "SELECT" in breadcrumb
+              or "Query" in breadcrumb,
+              f"Breadcrumb shows query filter: '{breadcrumb[:60]}'")
     else:
         check(False, "No query row to click")
         check(False, "(skipped query drill)")
@@ -1051,43 +1100,57 @@ def main():
                 window.WebSocket.CLOSED = _WS.CLOSED;
             }})();""")
 
+            # Capture unhandled promise rejections as console errors
+            context.add_init_script(UNHANDLED_REJECTION_HOOK)
+
             page = context.new_page()
+            guard = ConsoleErrorGuard(page)
 
-            # Run tests
-            test_page_load(page)
-            test_tabs(page)
-            test_summary_bar(page)
-            test_overview_table(page)
-            test_events_table(page)
-            test_column_sorting(page)
-            test_drill_down(page)
-            test_breadcrumb_navigation(page)
-            test_sessions_table(page)
-            test_queries_table(page)
-            test_histogram_tab(page)
-            test_timeline_tab(page)
-            test_transitions_tab(page)
-            test_time_picker(page)
-            test_zoom_out(page)
-            test_auto_refresh(page)
-            test_chart_rendering(page)
-            test_concurrency_tab(page)
-            test_session_drill_to_timeline(page)
-            test_query_drill(page)
+            # Every test is followed by a console-error assertion: any
+            # console error / pageerror / unhandled rejection produced
+            # while it ran fails that test.
+            tests = [
+                test_page_load,
+                test_tabs,
+                test_summary_bar,
+                test_overview_table,
+                test_events_table,
+                test_column_sorting,
+                test_drill_down,
+                test_breadcrumb_navigation,
+                test_sessions_table,
+                test_queries_table,
+                test_histogram_tab,
+                test_timeline_tab,
+                test_transitions_tab,
+                test_time_picker,
+                test_zoom_out,
+                test_auto_refresh,
+                test_chart_rendering,
+                test_concurrency_tab,
+                test_session_drill_to_timeline,
+                test_query_drill,
+                # Sprint 5.3: Exact data display tests
+                test_exact_summary_values,
+                test_exact_event_values,
+                test_exact_session_values,
+                test_exact_query_values,
+                test_timeline_bar_positions,
+                # Sprint 5.4: Regression tests
+                test_no_double_refresh,
+                test_filter_persists_across_tabs,
+            ]
+            for fn in tests:
+                fn(page)
+                assert_no_console_errors(page, guard, fn.__name__)
 
-            # Sprint 5.3: Exact data display tests
-            test_exact_summary_values(page)
-            test_exact_event_values(page)
-            test_exact_session_values(page)
-            test_exact_query_values(page)
-            test_timeline_bar_positions(page)
-
-            # Sprint 5.4: Regression tests
-            test_no_double_refresh(page)
-            test_filter_persists_across_tabs(page)
-
-            # Reconnection test (kills/restarts mock server)
+            # Reconnection test (kills/restarts mock server) — connection
+            # failures during the outage are expected, everything else fails.
             mock_proc = test_reconnection(page, mock_proc)
+            assert_no_console_errors(
+                page, guard, "test_reconnection",
+                allow=("WebSocket", "disconnected", "not connected",
+                       "Failed to load resource", "net::ERR"))
 
             browser.close()
     finally:

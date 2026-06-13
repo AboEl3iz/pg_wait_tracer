@@ -97,4 +97,4 @@ try:
 finally:
     cleanup_traces(trace_dir)
 
-t.summary()
+sys.exit(0 if t.summary() else 1)
