@@ -12,6 +12,9 @@ typedef uint32_t u32;
 typedef uint64_t u64;
 #endif
 
+/* ── Version ──────────────────────────────────────────────── */
+#define PGWT_VERSION         "0.8.0"
+
 /* ── Histogram ────────────────────────────────────────────── */
 #define HISTOGRAM_BUCKETS    16
 /* Bucket boundaries in microseconds:

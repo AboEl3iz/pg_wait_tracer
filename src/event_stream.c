@@ -24,6 +24,8 @@ int pgwt_handle_trace_event(void *ctx, void *data, size_t data_sz)
 
     (void)data_sz;
 
+    d->counters.events_total++;
+
     /* Write to trace file if recording is enabled (including markers) */
     if (d->event_writer)
         pgwt_writer_push_event(d->event_writer, evt);

@@ -17,7 +17,10 @@
 #include <unistd.h>
 #include <ctype.h>
 #include <time.h>
+#include <errno.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 
 /* ── Utility ──────────────────────────────────────────────── */
 
@@ -1818,7 +1821,127 @@ static void handle_variants(struct pgwt_server *srv, struct pgwt_request *req)
     emit_json(root);
 }
 
-static void dispatch(struct pgwt_server *srv, struct pgwt_request *req)
+/* ── Daemon control proxy ─────────────────────────────────── */
+
+/* Round-trip one JSON line to the daemon control socket at
+ * {trace_dir}/pgwt.sock. Returns 0 on success (resp filled, newline
+ * stripped), -1 if the socket does not exist (daemon not running),
+ * -2 on connect/IO errors. */
+static int control_roundtrip(const char *trace_dir, const char *req_line,
+                             char *resp, size_t resp_size)
+{
+    char sock_path[600];
+    snprintf(sock_path, sizeof(sock_path), "%s/pgwt.sock", trace_dir);
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    if (strlen(sock_path) >= sizeof(addr.sun_path))
+        return -2;
+    strcpy(addr.sun_path, sock_path);
+
+    struct stat st;
+    if (stat(sock_path, &st) != 0)
+        return -1;  /* no socket — daemon not running */
+
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0)
+        return -2;
+
+    /* Bounded waits — a stuck daemon must not hang the server */
+    struct timeval tv = { .tv_sec = 3 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        close(fd);
+        /* Stale socket file with no listener == daemon not running */
+        return (errno == ECONNREFUSED) ? -1 : -2;
+    }
+
+    /* Send request + newline (MSG_NOSIGNAL: no SIGPIPE if daemon dies) */
+    size_t req_len = strlen(req_line);
+    if (send(fd, req_line, req_len, MSG_NOSIGNAL) != (ssize_t)req_len ||
+        send(fd, "\n", 1, MSG_NOSIGNAL) != 1) {
+        close(fd);
+        return -2;
+    }
+
+    /* Read one response line */
+    size_t off = 0;
+    while (off < resp_size - 1) {
+        ssize_t r = read(fd, resp + off, resp_size - 1 - off);
+        if (r <= 0)
+            break;
+        off += (size_t)r;
+        if (memchr(resp, '\n', off))
+            break;
+    }
+    close(fd);
+
+    resp[off] = '\0';
+    char *nl = strchr(resp, '\n');
+    if (!nl)
+        return -2;  /* truncated/empty response */
+    *nl = '\0';
+    return 0;
+}
+
+/* Proxy a control command to the daemon:
+ *   {"id":N,"cmd":"control","request":{"cmd":"status"}}
+ * → {"id":N,"response":<daemon reply>}
+ * or {"id":N,"error":"daemon not running"} when the socket is absent. */
+static void handle_control(struct pgwt_server *srv, struct pgwt_request *req,
+                           const char *line)
+{
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddNumberToObject(root, "id", (double)req->id);
+
+    cJSON *outer = cJSON_Parse(line);
+    cJSON *inner = outer ? cJSON_GetObjectItem(outer, "request") : NULL;
+    if (!cJSON_IsObject(inner)) {
+        cJSON_AddStringToObject(root, "error", "missing request object");
+        cJSON_Delete(outer);
+        emit_json(root);
+        return;
+    }
+
+    char *inner_str = cJSON_PrintUnformatted(inner);
+    cJSON_Delete(outer);
+    if (!inner_str) {
+        cJSON_AddStringToObject(root, "error", "cannot serialize request");
+        emit_json(root);
+        return;
+    }
+
+    char resp[8192];
+    int rc = control_roundtrip(srv->trace_dir, inner_str, resp, sizeof(resp));
+    cJSON_free(inner_str);
+
+    if (rc == -1) {
+        cJSON_AddStringToObject(root, "error", "daemon not running");
+        emit_json(root);
+        return;
+    }
+    if (rc != 0) {
+        cJSON_AddStringToObject(root, "error", "control socket error");
+        emit_json(root);
+        return;
+    }
+
+    cJSON *daemon_resp = cJSON_Parse(resp);
+    if (!daemon_resp) {
+        cJSON_AddStringToObject(root, "error", "invalid daemon response");
+        emit_json(root);
+        return;
+    }
+
+    cJSON_AddItemToObject(root, "response", daemon_resp);
+    emit_json(root);
+}
+
+static void dispatch(struct pgwt_server *srv, struct pgwt_request *req,
+                     const char *line)
 {
     if (strcmp(req->cmd, "info") == 0)
         handle_info(srv, req);
@@ -1848,6 +1971,8 @@ static void dispatch(struct pgwt_server *srv, struct pgwt_request *req)
         handle_variants(srv, req);
     else if (strcmp(req->cmd, "interference") == 0)
         handle_interference(srv, req);
+    else if (strcmp(req->cmd, "control") == 0)
+        handle_control(srv, req, line);
     else {
         cJSON *root = cJSON_CreateObject();
         cJSON_AddNumberToObject(root, "id", (double)req->id);
@@ -1861,6 +1986,53 @@ static void dispatch(struct pgwt_server *srv, struct pgwt_request *req)
 /* ── Main ─────────────────────────────────────────────────── */
 
 /* ── Dump mode: text summary to stdout ──────────────────── */
+
+/* If a daemon control socket is present in the trace dir, print a short
+ * status block at the top of the dump. Silent when no daemon runs. */
+static void dump_daemon_status(const char *trace_dir)
+{
+    char resp[8192];
+
+    if (control_roundtrip(trace_dir, "{\"cmd\":\"status\"}",
+                          resp, sizeof(resp)) != 0)
+        return;
+
+    cJSON *status = cJSON_Parse(resp);
+    if (!status)
+        return;
+
+    const char *mode = "?";
+    double uptime_s = 0;
+    int backends = 0, pg_pid = 0;
+
+    cJSON *it;
+    if (cJSON_IsString((it = cJSON_GetObjectItem(status, "mode"))))
+        mode = it->valuestring;
+    if (cJSON_IsNumber((it = cJSON_GetObjectItem(status, "uptime_s"))))
+        uptime_s = it->valuedouble;
+    if (cJSON_IsNumber((it = cJSON_GetObjectItem(status, "backends"))))
+        backends = (int)it->valuedouble;
+    if (cJSON_IsNumber((it = cJSON_GetObjectItem(status, "pg_pid"))))
+        pg_pid = (int)it->valuedouble;
+
+    double events_per_sec = 0;
+    if (control_roundtrip(trace_dir, "{\"cmd\":\"metrics\"}",
+                          resp, sizeof(resp)) == 0) {
+        cJSON *metrics = cJSON_Parse(resp);
+        if (metrics) {
+            if (cJSON_IsNumber((it = cJSON_GetObjectItem(metrics,
+                                                         "events_per_sec"))))
+                events_per_sec = it->valuedouble;
+            cJSON_Delete(metrics);
+        }
+    }
+
+    printf("Daemon: running    mode: %s    uptime: %.0fs    "
+           "events/s: %.0f    backends: %d    pg_pid: %d\n\n",
+           mode, uptime_s, events_per_sec, backends, pg_pid);
+
+    cJSON_Delete(status);
+}
 
 static void dump_summary(struct pgwt_server *srv)
 {
@@ -1976,6 +2148,7 @@ int main(int argc, char **argv)
         return 1;
 
     if (dump_mode) {
+        dump_daemon_status(srv.trace_dir);
         dump_summary(&srv);
         return 0;
     }
@@ -1993,7 +2166,7 @@ int main(int argc, char **argv)
             continue;
         }
 
-        dispatch(&srv, &req);
+        dispatch(&srv, &req, line);
     }
 
     return 0;
