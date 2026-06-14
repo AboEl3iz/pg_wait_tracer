@@ -3,6 +3,7 @@
 #include "control.h"
 #include "daemon.h"
 #include "event_writer.h"
+#include "provider.h"
 #include "cJSON.h"
 
 #include <stdio.h>
@@ -49,11 +50,19 @@ static cJSON *build_status(const struct pgwt_daemon *d)
 {
     cJSON *root = cJSON_CreateObject();
     cJSON_AddBoolToObject(root, "ok", 1);
-    /* Capture tier: "full" today; A2/A4 add sampled/tiered modes.
-     * --lightweight is reported as its own mode so the answer is
-     * never a lie about what is being captured. */
-    cJSON_AddStringToObject(root, "mode",
-                            d->lightweight_mode ? "lightweight" : "full");
+    /* Capture tier. --lightweight is reported as its own mode so the answer
+     * is never a lie about what is being captured; otherwise report the
+     * active provider name ("full" | "sampled"), with tiered distinguished. */
+    const char *mode;
+    if (d->lightweight_mode)
+        mode = "lightweight";
+    else if (d->mode == PGWT_MODE_TIERED)
+        mode = "tiered";
+    else if (d->provider)
+        mode = d->provider->name;
+    else
+        mode = "full";
+    cJSON_AddStringToObject(root, "mode", mode);
     cJSON_AddNumberToObject(root, "uptime_s",
                             (double)(now_mono_ns() - d->start_ts) / 1e9);
     cJSON_AddNumberToObject(root, "backends", count_backends(d));
@@ -82,6 +91,20 @@ static cJSON *build_metrics(const struct pgwt_daemon *d)
                      ctr->wp_attach_failures_total);
 
     cJSON_AddNumberToObject(root, "backends_tracked", count_backends(d));
+
+    /* Sampled tier counters (0 when not sampling) */
+    cjson_add_uint64(root, "samples_total", ctr->samples_total);
+    cJSON_AddNumberToObject(root, "samples_per_sec", ctr->samples_per_sec);
+    cjson_add_uint64(root, "sample_read_faults_total",
+                     ctr->sample_read_faults_total);
+
+    /* Provider self-metrics. ringbuf_drops_total is the full tier's BPF-side
+     * event_ringbuf drop count (A2 wired this; A0 deliberately omitted it). */
+    struct pgwt_metrics pm;
+    memset(&pm, 0, sizeof(pm));
+    if (d->provider && d->provider->self_metrics)
+        d->provider->self_metrics((struct pgwt_daemon *)d, &pm);
+    cjson_add_uint64(root, "ringbuf_drops_total", pm.ringbuf_drops_total);
 
     /* Trace writer stats (0 when recording is disabled) */
     cjson_add_uint64(root, "trace_events_written_total",

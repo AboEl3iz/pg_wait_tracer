@@ -10,6 +10,7 @@
 #include "backend_meta.h"
 #include "map_reader.h"
 #include "snapshot.h"
+#include "provider.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -19,6 +20,7 @@
 struct pg_wait_tracer_bpf;
 struct ring_buffer;
 struct pgwt_control;
+struct pgwt_sampler;
 
 /* Self-observability counters (D6). Plain uint64 increments on the
  * single-threaded event path — exposed via the control socket
@@ -29,6 +31,12 @@ struct pgwt_counters {
     uint64_t wp_attach_failures_total; /* watchpoint attach failures (incl. bootstrap) */
     uint64_t prev_events_total;        /* events_total at previous timer tick */
     double   events_per_sec;           /* recent rate, refreshed each tick */
+
+    /* Sampled tier (A2). Maintained by the sampler in sampler.c. */
+    uint64_t samples_total;            /* SAMPLES records written */
+    uint64_t prev_samples_total;       /* samples_total at previous timer tick */
+    double   samples_per_sec;          /* recent sample rate, refreshed each tick */
+    uint64_t sample_read_faults_total; /* process_vm_readv partial/EFAULT fallbacks */
 };
 
 /* View modes */
@@ -72,6 +80,7 @@ struct pgwt_daemon {
     /* epoll */
     int epoll_fd;
     int timer_fd;
+    int sample_timer_fd;   /* high-rate sampler tick (sampled/tiered); -1 if unused */
     int signal_fd;
 
     /* Configuration */
@@ -95,6 +104,14 @@ struct pgwt_daemon {
     enum pgwt_sort_mode sort_mode;   /* sort mode for active view */
     bool        replay_mode;             /* true when running --replay */
     bool        daemon_mode;             /* true when running --daemon */
+
+    /* Capture tier (A2). mode picks the provider; default PGWT_MODE_FULL
+     * (today's watchpoint behavior). sample_rate_hz is the sampled tier's
+     * fixed rate (1..1000, default 10). */
+    enum pgwt_mode mode;
+    int         sample_rate_hz;
+    const struct pgwt_capture_provider *provider; /* active provider vtable */
+    struct pgwt_sampler *sampler;        /* sampled-tier state, NULL if unused */
     uint32_t    lightweight_mode;        /* 1 = BPF accumulator only (no ringbuf) */
     uint32_t    skip_query_id;          /* 1 = skip query_id reads in BPF */
     uint32_t    skip_usdt;             /* 1 = skip USDT query lifecycle probes */
@@ -132,6 +149,13 @@ struct pgwt_daemon {
     /* Placed at end of struct to survive field overflow corruption */
     char       *pg_binary_saved;        /* heap-allocated postgres binary path for USDT */
 };
+
+/* True when the active mode attaches hardware watchpoints (full tier).
+ * Sampled mode tracks backends in the registry but arms no watchpoints. */
+static inline bool pgwt_mode_uses_watchpoints(const struct pgwt_daemon *d)
+{
+    return d->mode != PGWT_MODE_SAMPLED;
+}
 
 /* Initialize daemon: load BPF, attach tracepoints, scan backends. */
 int pgwt_daemon_init(struct pgwt_daemon *d);

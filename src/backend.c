@@ -117,11 +117,39 @@ int pgwt_scan_existing_backends(struct pgwt_daemon *d)
             continue;
         }
 
-        /* Already initialized — attach real watchpoint directly */
+        /* Already initialized — record the address. */
         struct pgwt_backend *be = alloc_backend(&d->backends, pid);
         if (!be) continue;
 
         be->wp_addr = ptr;
+
+        /* Sampled mode: register the backend (address + metadata) but arm
+         * NO watchpoint. The sampler reads wp_addr directly each tick. Seed
+         * a state_map entry so the query_id uprobe can populate it (nothing
+         * else creates state_map entries in sampled mode). */
+        if (!pgwt_mode_uses_watchpoints(d)) {
+            be->attach_ts = now_ns();
+            pgwt_parse_cmdline(pid, &be->meta);
+            if (d->backend_meta)
+                pgwt_bm_write(d->backend_meta, pid, &be->meta);
+
+            int state_fd = bpf_map__fd(d->skel->maps.state_map);
+            struct pgwt_pid_state init_state = {
+                .last_ts = be->attach_ts,
+                .wait_event_addr = ptr,
+            };
+            uint32_t pid_key = pid;
+            bpf_map_update_elem(state_fd, &pid_key, &init_state, BPF_NOEXIST);
+
+            if (d->verbose)
+                fprintf(stderr, "INFO: tracking PID %d (%s), sampled at 0x%lx\n",
+                        pid, pgwt_backend_type_name(be->meta.backend_type),
+                        (unsigned long)ptr);
+            count++;
+            continue;
+        }
+
+        /* Full mode — attach real watchpoint directly */
         int wp_prog_fd = bpf_program__fd(d->skel->progs.on_watchpoint);
         be->wp_fd = pgwt_open_watchpoint(pid, ptr, wp_prog_fd);
         if (be->wp_fd < 0) {
@@ -197,6 +225,15 @@ int pgwt_handle_fork(struct pgwt_daemon *d, pid_t child_pid)
 
     struct pgwt_backend *be = alloc_backend(&d->backends, child_pid);
     if (!be) return -1;
+
+    /* Sampled mode: no bootstrap watchpoint. Register the backend now; the
+     * sampler lazily resolves wp_addr once the backend sets the pointer. */
+    if (!pgwt_mode_uses_watchpoints(d)) {
+        if (d->verbose)
+            fprintf(stderr, "INFO: fork detected PID %d (sampled, no watchpoint)\n",
+                    child_pid);
+        return 0;
+    }
 
     /* Attach bootstrap watchpoint on my_wait_event_info pointer address */
     int bootstrap_prog_fd = bpf_program__fd(d->skel->progs.on_bootstrap);

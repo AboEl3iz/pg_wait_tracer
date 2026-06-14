@@ -80,6 +80,31 @@ struct {
     __type(value, struct pgwt_accum_val);
 } accum_map SEC(".maps");
 
+/* event_ringbuf drop counter (A2). Single per-CPU u64 bumped when a
+ * bpf_ringbuf_output() into event_ringbuf fails (ring full). PERCPU so the
+ * hot path stays atomic-free; the daemon sums across CPUs and surfaces it as
+ * ringbuf_drops_total on the control socket. */
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, u64);
+} ringbuf_drops SEC(".maps");
+
+/* Emit a trace event to event_ringbuf, counting drops on failure.
+ * bpf_ringbuf_output() returns 0 on success, negative when the ring is full. */
+static __always_inline void emit_event(const struct pgwt_trace_event *evt)
+{
+    long rc = bpf_ringbuf_output(&event_ringbuf, (void *)evt, sizeof(*evt),
+                                 BPF_RB_NO_WAKEUP);
+    if (rc) {
+        u32 zero = 0;
+        u64 *drops = bpf_map_lookup_elem(&ringbuf_drops, &zero);
+        if (drops)
+            (*drops)++;
+    }
+}
+
 /* ── Helpers ──────────────────────────────────────────────── */
 
 /* Read query_id using cached be_entry pointer (1 probe_read instead of 2).
@@ -186,8 +211,7 @@ int on_watchpoint(struct bpf_perf_event_data *ctx)
                 .duration_ns = duration,
                 .query_id = st->last_query_id,
             };
-            bpf_ringbuf_output(&event_ringbuf, &evt, sizeof(evt),
-                               BPF_RB_NO_WAKEUP);
+            emit_event(&evt);
         }
 
         /* Transition to new state */
@@ -297,8 +321,7 @@ int on_exit(struct trace_event_raw_sched_process_template *ctx)
             .duration_ns = duration,
             .query_id = st->last_query_id,
         };
-        bpf_ringbuf_output(&event_ringbuf, &evt, sizeof(evt),
-                           BPF_RB_NO_WAKEUP);
+        emit_event(&evt);
     }
 
     /* Notify daemon */
@@ -347,7 +370,7 @@ static __always_inline void emit_marker(u32 marker)
         .duration_ns = 0,
         .query_id = qid,
     };
-    bpf_ringbuf_output(&event_ringbuf, &evt, sizeof(evt), BPF_RB_NO_WAKEUP);
+    emit_event(&evt);
 }
 
 SEC("usdt")
