@@ -21,7 +21,7 @@ import time
 import argparse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from testutil import find_postmaster
+from testutil import find_postmaster, pg_wait_sampling_available
 
 TRACER = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                       "pg_wait_tracer")
@@ -282,10 +282,10 @@ def main():
         print("ERROR: cannot find PostgreSQL postmaster PID")
         sys.exit(1)
 
-    # Check pg_wait_sampling is available
-    try:
-        psql("SELECT 1 FROM pg_wait_sampling_profile LIMIT 1")
-    except Exception:
+    # Check pg_wait_sampling is available. The local psql() returns "" on
+    # error instead of raising, so a try/except here never fires — probe
+    # via the process return code instead (see testutil).
+    if not pg_wait_sampling_available():
         print("SKIP: pg_wait_sampling not available")
         sys.exit(0)
 
