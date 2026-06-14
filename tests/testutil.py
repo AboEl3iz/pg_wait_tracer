@@ -10,6 +10,22 @@ import re
 import subprocess
 
 
+def pg_wait_sampling_available():
+    """Return True if the pg_wait_sampling extension is loaded and queryable.
+
+    Tests that cross-check against pg_wait_sampling (Extension-class waits,
+    sample-count cross-validation) must skip cleanly when it is absent —
+    e.g. on a stock PostgreSQL or in CI. Note: a per-test psql() helper
+    that returns "" on error cannot be used to detect this, since the
+    failure is silent; we must inspect the process return code here.
+    """
+    r = subprocess.run(
+        ["psql", "-U", "postgres", "-d", "postgres", "-tAc",
+         "SELECT 1 FROM pg_wait_sampling_profile LIMIT 1"],
+        capture_output=True, text=True)
+    return r.returncode == 0
+
+
 def find_postmaster(pg_version=None):
     """Find the PostgreSQL postmaster PID.
 

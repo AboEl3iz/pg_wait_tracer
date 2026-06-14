@@ -18,7 +18,7 @@ import time
 import argparse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from testutil import find_postmaster
+from testutil import find_postmaster, pg_wait_sampling_available
 
 TRACER = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                       "pg_wait_tracer")
@@ -239,10 +239,10 @@ def test_extension(pm_pid):
     """Verify Extension events are detected (pg_wait_sampling generates them)."""
     print("--- Test 3: Extension Events ---")
 
-    # Check pg_wait_sampling is loaded
-    try:
-        psql("SELECT 1 FROM pg_wait_sampling_profile LIMIT 1")
-    except Exception:
+    # Check pg_wait_sampling is loaded. The local psql() returns "" on
+    # error instead of raising, so a try/except here never fires — probe
+    # via the process return code instead (see testutil).
+    if not pg_wait_sampling_available():
         print("  SKIP: pg_wait_sampling not loaded")
         return
 
