@@ -12,6 +12,41 @@ The test_web_ui.py injects a script to point the WS at the correct port.
 Usage:
     python3 tests/mock_server.py              # HTTP :18765, WS :18766
     python3 tests/mock_server.py --port 9000  # HTTP :9000,  WS :9001
+
+Chaos mode (Phase B2)
+─────────────────────
+By default the mock answers every request synchronously with zero latency,
+in arrival order.  That is friendly to deterministic assertions but it never
+fires the async races the real network does — which is exactly why CI stays
+green while manual testing keeps finding bugs.
+
+Chaos mode reproduces real network conditions so the race-exposing tests in
+tests/test_web_ui_chaos.py can drive them.  It is OFF unless explicitly
+enabled (so existing tests are unaffected) and DETERMINISTIC: every chaos
+decision is derived from the request's monotonically-increasing index, never
+from wall-clock RNG, so a given action sequence always produces the same
+interleaving.
+
+Enable + tune via env vars (or --chaos on the CLI):
+    PGWT_CHAOS=1            enable chaos (default off)
+    PGWT_CHAOS_MIN_MS=50    min per-response latency  (default 50)
+    PGWT_CHAOS_MAX_MS=300   max per-response latency  (default 300)
+    PGWT_CHAOS_REORDER=1    deliver concurrent in-flight responses shuffled
+                            (default on when chaos is on)
+    PGWT_CHAOS_LATE_EVERY=7 every Nth request is a "late" response that is
+                            delayed far beyond the others, so it lands after
+                            the client has navigated away (0 = never;
+                            default 7)
+    PGWT_CHAOS_LATE_MS=900  extra delay added to a "late" response (default
+                            900, i.e. ~1s after a normal one)
+    PGWT_CHAOS_LATE_CMDS=   comma-separated command names whose responses are
+                            ALWAYS late (e.g. "transitions,heatmap"). Lets a
+                            test deterministically force one view's response
+                            to land after the user has moved on, without
+                            depending on request-index arithmetic. (default:
+                            empty)
+    PGWT_CHAOS_SEED=1337    seed mixed into the deterministic hash (default
+                            1337) — vary only to explore other interleavings
 """
 import asyncio
 import json
@@ -335,7 +370,16 @@ def handle_request(msg):
     if cmd == "session_timeline":
         filters = msg.get("filters", {})
         if "pid" in filters or "query_id" in filters:
-            return {"id": req_id, **_CANNED["session_timeline"]}
+            resp = {"id": req_id, **_CANNED["session_timeline"]}
+            # Protocol-faithful: the real server returns the timeline for the
+            # filtered pid. Reflecting the requested pid into the response also
+            # makes responses request-distinguishable, so a chaos test can
+            # detect a stale (wrong-pid) render overwriting a fresh one.
+            if "pid" in filters:
+                pid = filters["pid"]
+                resp["pids"] = [pid]
+                resp["events"] = [{**e, "p": pid} for e in resp["events"]]
+            return resp
         return {"id": req_id, "events": [], "pids": [], "truncated": False, "total_count": 0}
 
     if cmd == "transitions":
@@ -391,17 +435,133 @@ def handle_request(msg):
     return {"id": req_id, "error": f"unknown command: {cmd}"}
 
 
+# ── Chaos layer ──────────────────────────────────────────────────────────────
+# Reproduces real network conditions (jitter, out-of-order, late responses)
+# without any wall-clock RNG: every decision is a pure function of the
+# request's index, so chaos tests are reproducible.
+
+
+def _env_int(name, default):
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+class ChaosConfig:
+    """Deterministic chaos parameters, read once from env or kwargs."""
+
+    def __init__(self, enabled=None, min_ms=None, max_ms=None, reorder=None,
+                 late_every=None, late_ms=None, seed=None, late_cmds=None):
+        if enabled is None:
+            enabled = os.environ.get("PGWT_CHAOS", "0") not in ("0", "", "false")
+        self.enabled = enabled
+        self.min_ms = min_ms if min_ms is not None else _env_int("PGWT_CHAOS_MIN_MS", 50)
+        self.max_ms = max_ms if max_ms is not None else _env_int("PGWT_CHAOS_MAX_MS", 300)
+        if reorder is None:
+            reorder = os.environ.get("PGWT_CHAOS_REORDER", "1") not in ("0", "", "false")
+        self.reorder = reorder
+        self.late_every = late_every if late_every is not None else _env_int("PGWT_CHAOS_LATE_EVERY", 7)
+        self.late_ms = late_ms if late_ms is not None else _env_int("PGWT_CHAOS_LATE_MS", 900)
+        self.seed = seed if seed is not None else _env_int("PGWT_CHAOS_SEED", 1337)
+        if late_cmds is None:
+            raw = os.environ.get("PGWT_CHAOS_LATE_CMDS", "")
+            late_cmds = [c.strip() for c in raw.split(",") if c.strip()]
+        self.late_cmds = set(late_cmds)
+        if self.max_ms < self.min_ms:
+            self.max_ms = self.min_ms
+
+    def delay_ms(self, index, cmd=None):
+        """Deterministic per-request latency in ms.
+
+        Spreads jitter across [min_ms, max_ms] using a cheap integer hash of
+        the request index — so two requests in flight at once almost always
+        get different delays, producing out-of-order completion. A request is
+        additionally "late" (gets `late_ms` tacked on, so it lands long after
+        the client has moved on — the stale-overwrite race) when either its
+        index hits the late_every cadence or its command is in late_cmds.
+        """
+        if not self.enabled:
+            return 0
+        h = (index * 2654435761 + self.seed * 40503) & 0xFFFFFFFF
+        span = self.max_ms - self.min_ms + 1
+        base = self.min_ms + (h % span)
+        if self.is_late(index, cmd):
+            base += self.late_ms
+        return base
+
+    def is_late(self, index, cmd=None):
+        if not self.enabled:
+            return False
+        if cmd is not None and cmd in self.late_cmds:
+            return True
+        if self.late_every <= 0:
+            return False
+        # index is 1-based per connection; fire on the Nth, 2Nth, ...
+        return index % self.late_every == 0
+
+
 # ── WebSocket server ─────────────────────────────────────────────────────────
 
-async def ws_handler(websocket):
-    async for raw in websocket:
+async def ws_handler(websocket, chaos=None):
+    """Serve one WebSocket connection.
+
+    With chaos disabled this is the original synchronous request/response
+    loop. With chaos enabled, each request is answered by an independent
+    asyncio task whose send is delayed by ChaosConfig.delay_ms() — so
+    responses to concurrent in-flight requests naturally complete out of
+    order, and "late" requests land well after newer ones (and after the
+    client has navigated away). A per-connection asyncio.Lock keeps the
+    actual websocket.send() calls from interleaving on the wire.
+    """
+    if chaos is None:
+        chaos = ChaosConfig()
+
+    if not chaos.enabled:
+        async for raw in websocket:
+            try:
+                msg = json.loads(raw)
+                resp = handle_request(msg)
+                await websocket.send(json.dumps(resp))
+            except Exception as e:
+                err = {"id": 0, "error": str(e)}
+                await websocket.send(json.dumps(err))
+        return
+
+    send_lock = asyncio.Lock()
+    tasks = set()
+    req_index = 0
+
+    async def respond(raw, index):
         try:
-            msg = json.loads(raw)
-            resp = handle_request(msg)
-            await websocket.send(json.dumps(resp))
-        except Exception as e:
-            err = {"id": 0, "error": str(e)}
-            await websocket.send(json.dumps(err))
+            cmd = None
+            try:
+                msg = json.loads(raw)
+                cmd = msg.get("cmd")
+                resp = handle_request(msg)
+            except Exception as e:
+                resp = {"id": 0, "error": str(e)}
+            delay = chaos.delay_ms(index, cmd)
+            if delay:
+                await asyncio.sleep(delay / 1000.0)
+            async with send_lock:
+                try:
+                    await websocket.send(json.dumps(resp))
+                except Exception:
+                    pass  # connection closed while a delayed response waited
+        except asyncio.CancelledError:
+            pass
+
+    try:
+        async for raw in websocket:
+            req_index += 1
+            t = asyncio.ensure_future(respond(raw, req_index))
+            tasks.add(t)
+            t.add_done_callback(tasks.discard)
+    finally:
+        # Connection closed: drop any responses still waiting out their delay.
+        for t in list(tasks):
+            t.cancel()
 
 
 # ── HTTP server ──────────────────────────────────────────────────────────────
@@ -421,9 +581,11 @@ def run_http(port):
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
-async def run_ws(port):
+async def run_ws(port, chaos):
+    async def handler(ws):
+        await ws_handler(ws, chaos)
     async with websockets.asyncio.server.serve(
-        ws_handler, "127.0.0.1", port,
+        handler, "127.0.0.1", port,
         origins=None,
     ):
         await asyncio.Future()
@@ -437,7 +599,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=18765,
                         help="HTTP port (WS = port+1)")
+    parser.add_argument("--chaos", action="store_true",
+                        help="enable chaos mode (jitter / out-of-order / "
+                             "late responses); also via PGWT_CHAOS=1")
     args = parser.parse_args()
+
+    chaos = ChaosConfig(enabled=True) if args.chaos else ChaosConfig()
 
     http_port = args.port
     ws_port = args.port + 1
@@ -446,12 +613,17 @@ def main():
     http_thread = threading.Thread(target=run_http, args=(http_port,), daemon=True)
     http_thread.start()
 
+    mode = "CHAOS" if chaos.enabled else "normal"
     print(f"mock_server: HTTP http://127.0.0.1:{http_port}, "
-          f"WS ws://127.0.0.1:{ws_port}", flush=True)
+          f"WS ws://127.0.0.1:{ws_port} [{mode}]", flush=True)
+    if chaos.enabled:
+        print(f"mock_server: chaos latency {chaos.min_ms}-{chaos.max_ms}ms, "
+              f"reorder={chaos.reorder}, late_every={chaos.late_every} "
+              f"(+{chaos.late_ms}ms), seed={chaos.seed}", flush=True)
 
     # WS in asyncio
     try:
-        asyncio.run(run_ws(ws_port))
+        asyncio.run(run_ws(ws_port, chaos))
     except KeyboardInterrupt:
         pass
 
