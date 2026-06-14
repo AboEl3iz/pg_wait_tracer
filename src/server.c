@@ -1332,7 +1332,8 @@ static void handle_session_timeline(struct pgwt_server *srv, struct pgwt_request
         const struct pgwt_trace_event *ev = &events[i];
         if (!pgwt_filter_matches(&req->filter, ev))
             continue;
-        if (pgwt_is_idle_event(ev->old_event))
+        /* Timeline is a visibility view: keep Client:ClientRead bars. */
+        if (pgwt_is_hidden_event(ev->old_event))
             continue;
         total_matching++;
 
@@ -1426,7 +1427,8 @@ static void handle_session_timeline(struct pgwt_server *srv, struct pgwt_request
         const struct pgwt_trace_event *ev = &events[i];
         if (!pgwt_filter_matches(&req->filter, ev))
             continue;
-        if (pgwt_is_idle_event(ev->old_event))
+        /* Timeline is a visibility view: keep Client:ClientRead bars. */
+        if (pgwt_is_hidden_event(ev->old_event))
             continue;
 
         /* O(1) PID index lookup */
@@ -1511,7 +1513,8 @@ static void handle_transitions(struct pgwt_server *srv, struct pgwt_request *req
     for (int i = 0; i < count; i++) {
         const struct pgwt_trace_event *ev = &events[i];
         uint32_t eid = ev->old_event;
-        if (pgwt_is_idle_event(eid) || PGWT_IS_MARKER(eid))
+        /* Transition-graph node totals: visibility view, keep ClientRead. */
+        if (pgwt_is_hidden_event(eid) || PGWT_IS_MARKER(eid))
             continue;
         double ms = ev->duration_ns / 1e6;
         uint32_t h = (eid * 0x9e3779b9) & NODE_HT_MASK;

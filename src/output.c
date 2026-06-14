@@ -423,7 +423,8 @@ static void print_system_event_multi(struct pgwt_daemon *d)
         for (int i = 0; i < deltas[w].num_events && shown < 20; i++) {
             struct pgwt_snap_event *ev = &deltas[w].events[i];
             if (ev->count == 0) continue;
-            if (pgwt_is_idle_event(ev->wait_event)) continue;
+            /* System events list (visibility): keep Client:ClientRead. */
+            if (pgwt_is_hidden_event(ev->wait_event)) continue;
 
             char name[64];
             pgwt_event_full_name(ev->wait_event, name, sizeof(name));
@@ -480,7 +481,8 @@ void pgwt_print_system_event(struct pgwt_daemon *d)
     int shown = 0;
     for (int i = 0; i < n && shown < 20; i++) {
         if (sorted[i].count == 0) continue;
-        if (pgwt_is_idle_event(sorted[i].wait_event)) continue;
+        /* System events list (visibility): keep Client:ClientRead. */
+        if (pgwt_is_hidden_event(sorted[i].wait_event)) continue;
 
         char name[64];
         pgwt_event_full_name(sorted[i].wait_event, name, sizeof(name));
