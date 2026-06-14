@@ -47,45 +47,47 @@ int pgwt_sampler_read_targets(const struct pgwt_sample_target *targets, int n,
         riov[i].iov_len  = sizeof(uint32_t);
     }
 
-    /* All backends share PG's inherited anonymous-mmap shm, so every
-     * wait_event_info lives in the *same* address space — reading them via a
-     * single pid in one syscall is correct and cheapest. We read via the
-     * first target's pid; the remote iovecs point at every backend's
-     * (identical-across-processes) address. process_vm_readv reads in order
-     * and returns the number of bytes successfully transferred, so a partial
-     * result tells us exactly how many leading entries landed. */
-    pid_t reader_pid = targets[0].pid;
+    /* Most backends' wait_event_info lives in PG's shared-memory mmap, which
+     * is mapped at the SAME virtual address in every backend — so one
+     * process_vm_readv across all of them via a single reader pid resolves
+     * them in one syscall. A few processes (logger, some aux workers) keep a
+     * process-LOCAL wait_event_info whose address is only mapped in that
+     * process; reading it via another pid faults. process_vm_readv reads
+     * iovecs in order and returns the bytes transferred, stopping at the
+     * first faulting entry. We therefore sweep: read as far as possible in
+     * one syscall, per-pid pread() the single faulting entry, then RESUME the
+     * combined read for the remainder. One outlier costs one pread, not N. */
     int got = 0;
-    ssize_t r = process_vm_readv(reader_pid, liov, n, riov, n, 0);
+    int base = 0;   /* first not-yet-read index */
+    while (base < n) {
+        pid_t reader_pid = targets[base].pid;
+        int rem = n - base;
+        ssize_t r = process_vm_readv(reader_pid, liov + base, rem,
+                                     riov + base, rem, 0);
+        int done = (r > 0) ? (int)(r / sizeof(uint32_t)) : 0;
+        got  += done;
+        base += done;
+        if (base >= n)
+            break;
 
-    if (r == (ssize_t)(n * sizeof(uint32_t))) {
-        got = n;
-    } else if (r > 0) {
-        /* Partial: the first (r / 4) entries are valid; the entry that
-         * faulted and everything after it must be retried per-pid. */
-        got = (int)(r / sizeof(uint32_t));
-    }
-    /* r <= 0 (e.g. reader_pid exited between registry snapshot and syscall):
-     * got stays 0 and we fall through to the per-pid path for all entries. */
-
-    /* Per-pid fallback for the unread tail. Each is read against its OWN pid
-     * (the shared address still resolves there) so one dead backend can't
-     * sink the rest. */
-    for (int i = got; i < n; i++) {
+        /* targets[base] faulted under reader_pid (or the reader itself is
+         * gone). Read it against its own pid via /proc/<pid>/mem. */
         uint32_t val = 0;
         char path[64];
-        snprintf(path, sizeof(path), "/proc/%d/mem", targets[i].pid);
+        snprintf(path, sizeof(path), "/proc/%d/mem", targets[base].pid);
         int fd = open(path, O_RDONLY | O_CLOEXEC);
         if (fd >= 0) {
             if (pread(fd, &val, sizeof(val),
-                      (off_t)targets[i].wait_event_addr) == (ssize_t)sizeof(val)) {
-                out_vals[i] = val;
+                      (off_t)targets[base].wait_event_addr) ==
+                (ssize_t)sizeof(val)) {
+                out_vals[base] = val;
                 got++;
             }
             close(fd);
         }
         if (read_faults)
             (*read_faults)++;
+        base++;   /* move past the entry we just handled (or skipped) */
     }
 
     free(liov);
