@@ -6,7 +6,8 @@ CFLAGS    = -g -O2 -Wall -I../src -I../include
 BUILD     = ../build
 
 TESTS     = test_wait_event test_cmdline test_event_writer test_event_reader \
-            test_bucket gen_test_traces gen_bench_traces test_concurrent_rw
+            test_trace_v2 test_bucket gen_test_traces gen_bench_traces \
+            test_concurrent_rw
 
 .PHONY: all clean
 
@@ -27,6 +28,13 @@ test_event_reader: test_event_reader.c $(BUILD)/event_reader.o $(BUILD)/event_wr
 
 test_bucket: test_bucket.c
 	$(CC) $(CFLAGS) -o $@ $^
+
+# test_trace_v2: format round-trip (v2 typed blocks). Built against the
+# server objects (-DPGWT_SERVER) so it needs no BPF skeleton — buildable on
+# a box without bpftool and in CI's server-only jobs.
+test_trace_v2: test_trace_v2.c $(BUILD)/server_event_writer.o \
+               $(BUILD)/server_event_reader.o
+	$(CC) $(CFLAGS) -DPGWT_SERVER -o $@ $^ -llz4
 
 # Server-build objects for gen_test_traces
 SERVER_OBJS = $(BUILD)/server_event_writer.o $(BUILD)/server_summary_writer.o \
