@@ -85,6 +85,13 @@ jobs:
       - name: Run web UI tests (mock server)
         run: python3 tests/test_web_ui.py
 
+      - name: Run web UI chaos tests (adversarial mock — Phase B2)
+        # Drives the UI against mock_server.py in chaos mode (latency jitter,
+        # out-of-order + late responses). Race-exposing tests are classified
+        # gating vs xfail inside the suite, so this stays green; an xfail that
+        # starts passing is reported (XPASS) for promotion, never fatal.
+        run: python3 tests/test_web_ui_chaos.py
+
   protocol-drift:
     name: protocol-drift
     runs-on: ubuntu-latest
