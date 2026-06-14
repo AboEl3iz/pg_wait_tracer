@@ -13,10 +13,23 @@
  *   "queries":  [{"id": 12345, "text": "SELECT pg_sleep(1)"}],
  *   "events": [
  *     {"pid": 1000, "ts": 1000000000, "dur": 500000, "old": 167772181, "new": 0, "qid": 12345}
+ *   ],
+ *   "sample_period_ns": 100000000,
+ *   "samples": [
+ *     {"pid": 1000, "ts": 1000000000, "event": 167772181, "qid": 12345}
  *   ]
  * }
  *
- * Event IDs: old_event/new_event are uint32 wait_event_info values.
+ * "events"  → written as a TRANSITIONS block (trace format v2). The existing
+ *             columnar layout: ts, pid, old, new, dur, qid.
+ * "samples" → written as a SAMPLES block (trace format v2). Reduced layout:
+ *             ts, pid, event, qid — no old/new/dur. "event" is the single
+ *             sampled wait_event_info; "sample_period_ns" (top-level, default
+ *             100000000 = 10 Hz) is stored in the block header. Samples must
+ *             be sorted by ts ascending. A scenario may have events, samples,
+ *             or both. Both arrays produce A3 fixtures.
+ *
+ * Event IDs: old_event/new_event/event are uint32 wait_event_info values.
  *   CPU = 0, IO:DataFileRead = 0x0A000001, Lock:relation = 0x03000001, etc.
  *   Class byte << 24 | event_number.
  *
@@ -55,6 +68,12 @@ struct test_query {
 struct scenario {
     struct pgwt_trace_event events[MAX_EVENTS];
     int num_events;
+
+    /* SAMPLES block (trace format v2). The sampled event id is stored in
+     * each record's new_event field (what the writer's sample encoder reads). */
+    struct pgwt_trace_event samples[MAX_EVENTS];
+    int num_samples;
+    uint64_t sample_period_ns;
 
     struct test_backend backends[MAX_TEST_BACKENDS];
     int num_backends;
@@ -204,9 +223,42 @@ static int parse_events(const char *arr, struct scenario *sc)
     return 0;
 }
 
+static int parse_samples(const char *arr, struct scenario *sc)
+{
+    const char *p = skip_ws(arr);
+    if (*p != '[') return -1;
+    p++;
+
+    while (*p && sc->num_samples < MAX_EVENTS) {
+        p = skip_ws(p);
+        if (*p == ']') break;
+        if (*p == ',') { p++; continue; }
+        if (*p != '{') break;
+
+        const char *end = find_matching(p, '{', '}');
+        if (!end) break;
+
+        struct pgwt_trace_event *ev = &sc->samples[sc->num_samples];
+        memset(ev, 0, sizeof(*ev));
+
+        const char *v;
+        if ((v = find_key(p, "pid")))   ev->pid = (uint32_t)strtoull(v, NULL, 10);
+        if ((v = find_key(p, "ts")))    ev->timestamp_ns = strtoull(v, NULL, 10);
+        /* sampled event id → new_event (the field the sample encoder reads) */
+        if ((v = find_key(p, "event"))) ev->new_event = (uint32_t)strtoull(v, NULL, 10);
+        if ((v = find_key(p, "qid")))   ev->query_id = strtoull(v, NULL, 10);
+
+        sc->num_samples++;
+        p = end + 1;
+    }
+    return 0;
+}
+
 static int parse_scenario(const char *json, struct scenario *sc)
 {
     const char *v;
+
+    sc->sample_period_ns = 100000000ULL;  /* default 10 Hz */
 
     if ((v = find_key(json, "backends")))
         parse_backends(v, sc);
@@ -214,6 +266,10 @@ static int parse_scenario(const char *json, struct scenario *sc)
         parse_queries(v, sc);
     if ((v = find_key(json, "events")))
         parse_events(v, sc);
+    if ((v = find_key(json, "sample_period_ns")))
+        sc->sample_period_ns = strtoull(v, NULL, 10);
+    if ((v = find_key(json, "samples")))
+        parse_samples(v, sc);
 
     return 0;
 }
@@ -290,12 +346,23 @@ static int write_traces(const char *dir, struct scenario *sc)
         return -1;
     }
 
+    /* TRANSITIONS block(s): the "events" array. Also feeds the summary
+     * writer (summaries are transition-based; sampled summaries are A3). */
     for (int i = 0; i < sc->num_events; i++) {
         if (pgwt_writer_push_event(&ew, &sc->events[i]) != 0) {
             fprintf(stderr, "Failed to write event %d\n", i);
             break;
         }
         pgwt_summary_push_event(&sw, &sc->events[i]);
+    }
+
+    /* SAMPLES block: the "samples" array (trace format v2). Written after
+     * the transitions so a scenario with both produces a transition block
+     * followed by a sample block. */
+    if (sc->num_samples > 0) {
+        if (pgwt_writer_push_samples(&ew, sc->samples, sc->num_samples,
+                                     sc->sample_period_ns) != 0)
+            fprintf(stderr, "Failed to write %d samples\n", sc->num_samples);
     }
 
     /* Flush summary */
@@ -306,7 +373,8 @@ static int write_traces(const char *dir, struct scenario *sc)
     pgwt_writer_destroy(&ew);
     pgwt_summary_destroy(&sw);
 
-    fprintf(stderr, "Wrote %d events to %s\n", sc->num_events, dir);
+    fprintf(stderr, "Wrote %d events + %d samples to %s\n",
+            sc->num_events, sc->num_samples, dir);
     return 0;
 }
 
@@ -418,8 +486,8 @@ int main(int argc, char **argv)
     }
     free(json);
 
-    fprintf(stderr, "Scenario: %d events, %d backends, %d queries\n",
-            sc->num_events, sc->num_backends, sc->num_queries);
+    fprintf(stderr, "Scenario: %d events, %d samples, %d backends, %d queries\n",
+            sc->num_events, sc->num_samples, sc->num_backends, sc->num_queries);
 
     /* Write output files */
     int rc = 0;

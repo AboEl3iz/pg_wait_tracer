@@ -36,10 +36,36 @@ int pgwt_reader_open(struct pgwt_event_reader *r, const char *path);
 /* Close file and free internal buffers. */
 void pgwt_reader_close(struct pgwt_event_reader *r);
 
+/* Per-block metadata surfaced to consumers (trace format v2). */
+struct pgwt_block_info {
+    enum pgwt_block_type block_type;   /* TRANSITIONS or SAMPLES */
+    uint64_t sample_period_ns;         /* SAMPLES: nominal interval; else 0 */
+    uint64_t first_timestamp_ns;       /* monotonic */
+    uint64_t last_timestamp_ns;        /* monotonic */
+};
+
 /* Decode a single block by index into out[].
- * Returns number of events decoded, or -1 on error. */
+ * Returns number of events decoded, or -1 on error.
+ *
+ * Both block types decode into pgwt_trace_event. For a SAMPLES block, each
+ * record is a point observation: new_event = sampled event id, old_event = 0,
+ * duration_ns = 0, and flags has PGWT_EVENT_FLAG_SAMPLE set so consumers can
+ * distinguish samples from transition intervals per-record. For a TRANSITIONS
+ * block, flags is 0 and all columns are populated as before. */
 int pgwt_reader_decode_block(struct pgwt_event_reader *r, int block_idx,
                               struct pgwt_trace_event *out, int max_events);
+
+/* Like pgwt_reader_decode_block(), but also fills *info with the block's
+ * type and sample_period_ns (NULL allowed). Use this when block-level
+ * fidelity matters (e.g. A3's exact-wins merge needs the block time range
+ * and sample period). */
+int pgwt_reader_decode_block_info(struct pgwt_event_reader *r, int block_idx,
+                                   struct pgwt_trace_event *out, int max_events,
+                                   struct pgwt_block_info *info);
+
+/* Read just a block's header metadata (no decode). Returns 0 / -1. */
+int pgwt_reader_block_info(struct pgwt_event_reader *r, int block_idx,
+                           struct pgwt_block_info *info);
 
 /* Find the first block that could contain events at or after mono_ns.
  * Returns block index (0-based). */

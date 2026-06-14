@@ -38,8 +38,13 @@ int pgwt_reader_open(struct pgwt_event_reader *r, const char *path)
         return -1;
     }
     if (r->header.version != PGWT_TRACE_VERSION) {
-        fprintf(stderr, "WARN: unsupported version %d in %s\n",
-                r->header.version, path);
+        /* v2-only: no v1 compatibility (no deployed installs existed).
+         * A version mismatch is a clear, non-fatal-to-the-process error —
+         * the file is simply skipped — never a crash on a stale layout. */
+        fprintf(stderr,
+                "ERROR: unsupported trace version %u in %s "
+                "(this build reads version %u only; regenerate with this build)\n",
+                r->header.version, path, PGWT_TRACE_VERSION);
         fclose(r->fp); r->fp = NULL;
         return -1;
     }
@@ -187,8 +192,33 @@ void pgwt_reader_close(struct pgwt_event_reader *r)
     free(r->decode_buf); r->decode_buf = NULL;
 }
 
+int pgwt_reader_block_info(struct pgwt_event_reader *r, int block_idx,
+                           struct pgwt_block_info *info)
+{
+    if (block_idx < 0 || block_idx >= r->num_blocks || !r->fp || !info)
+        return -1;
+
+    fseek(r->fp, (long)r->block_index[block_idx].file_offset, SEEK_SET);
+    struct pgwt_trace_block_header bh;
+    if (fread(&bh, sizeof(bh), 1, r->fp) != 1)
+        return -1;
+
+    info->block_type        = (enum pgwt_block_type)bh.block_type;
+    info->sample_period_ns  = bh.sample_period_ns;
+    info->first_timestamp_ns = bh.first_timestamp_ns;
+    info->last_timestamp_ns  = bh.last_timestamp_ns;
+    return 0;
+}
+
 int pgwt_reader_decode_block(struct pgwt_event_reader *r, int block_idx,
                               struct pgwt_trace_event *out, int max_events)
+{
+    return pgwt_reader_decode_block_info(r, block_idx, out, max_events, NULL);
+}
+
+int pgwt_reader_decode_block_info(struct pgwt_event_reader *r, int block_idx,
+                                   struct pgwt_trace_event *out, int max_events,
+                                   struct pgwt_block_info *info)
 {
     if (block_idx < 0 || block_idx >= r->num_blocks || !r->fp)
         return -1;
@@ -199,6 +229,14 @@ int pgwt_reader_decode_block(struct pgwt_event_reader *r, int block_idx,
     struct pgwt_trace_block_header bh;
     if (fread(&bh, sizeof(bh), 1, r->fp) != 1)
         return -1;
+
+    enum pgwt_block_type block_type = (enum pgwt_block_type)bh.block_type;
+    if (info) {
+        info->block_type        = block_type;
+        info->sample_period_ns  = bh.sample_period_ns;
+        info->first_timestamp_ns = bh.first_timestamp_ns;
+        info->last_timestamp_ns  = bh.last_timestamp_ns;
+    }
 
     int count = (int)bh.num_events;
     if (count > max_events) count = max_events;
@@ -228,11 +266,11 @@ int pgwt_reader_decode_block(struct pgwt_event_reader *r, int block_idx,
     if (decompressed < 0)
         return -1;
 
-    /* Columnar decode — inverse of pgwt_encode_block() */
+    /* Columnar decode */
     const uint8_t *p = r->decode_buf;
     size_t avail = (size_t)decompressed;
 
-    /* Column 1: timestamps (delta varint) */
+    /* Column 1: timestamps (delta varint) — common to both block types */
     uint64_t prev_ts = 0;
     for (int i = 0; i < count; i++) {
         uint64_t delta;
@@ -243,11 +281,33 @@ int pgwt_reader_decode_block(struct pgwt_event_reader *r, int block_idx,
         out[i].timestamp_ns = prev_ts;
     }
 
-    /* Column 2: PIDs (raw uint32) */
+    /* Column 2: PIDs (raw uint32) — common to both block types */
     for (int i = 0; i < count; i++) {
         if (avail < 4) return -1;
         memcpy(&out[i].pid, p, 4); p += 4; avail -= 4;
     }
+
+    if (block_type == PGWT_BLOCK_SAMPLES) {
+        /* SAMPLES layout: event (u32), query_id (u64). No old_event,
+         * no duration. Surface as a point observation: sampled event in
+         * new_event, old_event/duration cleared, FLAG_SAMPLE set. */
+        for (int i = 0; i < count; i++) {
+            if (avail < 4) return -1;
+            memcpy(&out[i].new_event, p, 4); p += 4; avail -= 4;
+        }
+        for (int i = 0; i < count; i++) {
+            if (avail < 8) return -1;
+            memcpy(&out[i].query_id, p, 8); p += 8; avail -= 8;
+        }
+        for (int i = 0; i < count; i++) {
+            out[i].old_event = 0;
+            out[i].duration_ns = 0;
+            out[i].flags = PGWT_EVENT_FLAG_SAMPLE;
+        }
+        return count;
+    }
+
+    /* TRANSITIONS layout — inverse of pgwt_encode_block() */
 
     /* Column 3: old_events (raw uint32) */
     for (int i = 0; i < count; i++) {
@@ -274,9 +334,9 @@ int pgwt_reader_decode_block(struct pgwt_event_reader *r, int block_idx,
         memcpy(&out[i].query_id, p, 8); p += 8; avail -= 8;
     }
 
-    /* Clear padding */
+    /* Clear flags (transition records carry no per-record flag) */
     for (int i = 0; i < count; i++)
-        out[i]._pad = 0;
+        out[i].flags = 0;
 
     return count;
 }

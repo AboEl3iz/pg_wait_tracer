@@ -13,10 +13,27 @@
 /* ── On-disk format constants ─────────────────────────────── */
 
 #define PGWT_TRACE_MAGIC      0x54574750   /* "PGWT" little-endian */
-#define PGWT_TRACE_VERSION    1
+#define PGWT_TRACE_VERSION    2
 #define PGWT_FLAG_LZ4         0x0001
 
 #define PGWT_BLOCK_EVENTS     4096         /* events per block */
+
+/* Block type (trace format v2). Identifies what a block's columns mean.
+ *   TRANSITIONS — wait-event transition intervals (exact fidelity): the
+ *                 full columnar layout (ts, pid, old_event, new_event,
+ *                 duration_ns, query_id). This is what the watchpoint
+ *                 ("full") provider writes.
+ *   SAMPLES     — point observations of a backend's current wait event
+ *                 (sampled fidelity): a reduced columnar layout
+ *                 (ts, pid, event, query_id) — no old_event, no duration.
+ *                 This is what the A2 sampler writes. Each sample means
+ *                 "at timestamp T, pid P was in event E"; A3 treats it as
+ *                 a point observation worth `sample_period_ns`, never an
+ *                 interval. */
+enum pgwt_block_type {
+    PGWT_BLOCK_TRANSITIONS = 0,
+    PGWT_BLOCK_SAMPLES     = 1,
+};
 
 /* File header (28 bytes) */
 struct pgwt_trace_file_header {
@@ -28,13 +45,20 @@ struct pgwt_trace_file_header {
     uint64_t clock_offset_ns;    /* CLOCK_MONOTONIC at file creation */
 } __attribute__((packed));
 
-/* Block header (28 bytes) */
+/* Block header (v2: 40 bytes).
+ * block_type/sample_period_ns are new in v2. sample_period_ns is the
+ * nominal interval between samples in a SAMPLES block (0 for TRANSITIONS).
+ * reserved keeps the 8-byte fields naturally aligned and leaves room for
+ * a future v3 without another size bump. */
 struct pgwt_trace_block_header {
     uint64_t first_timestamp_ns;
     uint64_t last_timestamp_ns;
     uint32_t num_events;
     uint32_t compressed_size;
     uint32_t uncompressed_size;
+    uint16_t block_type;         /* enum pgwt_block_type */
+    uint16_t reserved;           /* 0; reserved for future use */
+    uint64_t sample_period_ns;   /* SAMPLES: nominal sample interval; TRANSITIONS: 0 */
 } __attribute__((packed));
 
 /* Block index entry (16 bytes) */
@@ -88,6 +112,20 @@ int  pgwt_writer_init(struct pgwt_event_writer *w, const char *trace_dir,
                       const char *group_name);
 int  pgwt_writer_push_event(struct pgwt_event_writer *w,
                             const struct pgwt_trace_event *evt);
+
+/* Write a SAMPLES block (trace format v2). The A2 sampler calls this once
+ * per drain with the samples it collected this tick-batch. Only the pid,
+ * new_event (= sampled event), query_id, and timestamp_ns fields of each
+ * struct are used; old_event/duration_ns are ignored (samples carry
+ * neither). `sample_period_ns` is recorded in the block header so the
+ * compute layer (A3) can weight each sample. Samples must be sorted by
+ * timestamp ascending (delta-varint encoding requires it). A pending
+ * TRANSITIONS block, if any, is flushed first so block boundaries stay
+ * clean. Returns 0 on success, -1 on error. */
+int  pgwt_writer_push_samples(struct pgwt_event_writer *w,
+                              const struct pgwt_trace_event *samples,
+                              int count, uint64_t sample_period_ns);
+
 int  pgwt_writer_check_rotation(struct pgwt_event_writer *w);
 int  pgwt_writer_close(struct pgwt_event_writer *w);
 int  pgwt_writer_cleanup_old_files(struct pgwt_event_writer *w);
@@ -95,8 +133,13 @@ void pgwt_writer_destroy(struct pgwt_event_writer *w);
 
 /* ── Exposed for unit testing ─────────────────────────────── */
 
+/* Encode a TRANSITIONS block (full columnar layout). */
 size_t pgwt_encode_block(const struct pgwt_trace_event *events, int count,
                          uint8_t *out, size_t out_size);
+/* Encode a SAMPLES block (reduced layout: ts, pid, event, query_id).
+ * Reads each event's new_event field as the sampled event id. */
+size_t pgwt_encode_sample_block(const struct pgwt_trace_event *events, int count,
+                                uint8_t *out, size_t out_size);
 int pgwt_encode_varint(uint64_t val, uint8_t *out);
 int pgwt_decode_varint(const uint8_t *in, size_t avail, uint64_t *val);
 

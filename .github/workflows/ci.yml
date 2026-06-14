@@ -57,6 +57,7 @@ jobs:
           tests/test_bucket
           tests/test_event_writer
           tests/test_event_reader
+          tests/test_trace_v2
 
       - name: Run synthetic data tests
         run: |
