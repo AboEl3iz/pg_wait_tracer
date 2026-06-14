@@ -17,6 +17,12 @@ void pgwt_init_event_names(int pg_major);
 int pgwt_load_event_names_from_pg(const char *pg_bindir, int pg_port,
                                   const char *pg_user);
 
+/* Load dynamic event names from an in-memory buffer of "Type|Name\n"
+ * lines (the pg_wait_events query output format). Same id-mapping logic
+ * as pgwt_load_event_names_from_pg, but without a live PG — used by unit
+ * tests. Returns 0 on success, -1 on failure. */
+int pgwt_load_event_names_from_buffer(const char *data);
+
 /* Write current event name mapping to a JSON sidecar file.
  * Path: <trace_dir>/wait_event_names.json
  * Returns 0 on success, -1 on failure. */

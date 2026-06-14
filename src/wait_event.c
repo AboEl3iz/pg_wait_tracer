@@ -602,12 +602,93 @@ static void dyn_add(int class_byte, int event_id, const char *name)
         dyn_max[class_byte] = event_id;
 }
 
+/* Return the hardcoded id→name table + max index for a wait-event class
+ * byte. Returns 1 if the class has a known table, 0 otherwise. */
+static int hardcoded_class_table(int cb, const char ***tbl, int *max)
+{
+    switch (cb) {
+    case PG_WAIT_IO:       *tbl = io_events;       *max = io_events_max;       return 1;
+    case PG_WAIT_LOCK:     *tbl = lock_events;     *max = LOCK_EVENTS_MAX;     return 1;
+    case PG_WAIT_TIMEOUT:  *tbl = timeout_events;  *max = TIMEOUT_EVENTS_MAX;  return 1;
+    case PG_WAIT_ACTIVITY: *tbl = activity_events; *max = ACTIVITY_EVENTS_MAX; return 1;
+    case PG_WAIT_CLIENT:   *tbl = client_events;   *max = CLIENT_EVENTS_MAX;   return 1;
+    case PG_WAIT_IPC:      *tbl = ipc_events;      *max = IPC_EVENTS_MAX;      return 1;
+    case PG_WAIT_LWLOCK:   *tbl = lwlock_tranches; *max = LWLOCK_TRANCHES_MAX; return 1;
+    default:               return 0;
+    }
+}
+
+/* Reverse lookup: event name → numeric event_id within a class's
+ * hardcoded table. Returns -1 if the name is not known. This is how we
+ * recover the correct enum id for a dynamically-discovered name —
+ * pg_wait_events exposes no id column, and its rows are NOT in enum
+ * order for every class (e.g. the Lock class follows LockTagType, which
+ * is not alphabetical), so positional id assignment is wrong. */
+static int hardcoded_event_id(int cb, const char *name)
+{
+    const char **tbl;
+    int max;
+    if (!hardcoded_class_table(cb, &tbl, &max))
+        return -1;
+    for (int i = 0; i <= max; i++)
+        if (tbl[i] && strcmp(tbl[i], name) == 0)
+            return i;
+    return -1;
+}
+
+/* Parse "Type|Name" lines from fp into the dynamic name table, assigning
+ * each name its CORRECT enum id by reverse-lookup against the hardcoded
+ * tables. We cannot derive the id from pg_wait_events: it has no id
+ * column, and `ORDER BY name` is not enum order for every class (the
+ * Lock class follows LockTagType — relation=0 … advisory=10 — which is
+ * not alphabetical), so positional id assignment mislabelled Lock
+ * subtypes (relation shown as advisory). Names unknown to this build (a
+ * newer PG version) are appended after the class's known maximum —
+ * best-effort forward-compat, since their true id is not available.
+ * Caller is responsible for dyn_clear() before and dyn_loaded after.
+ * Returns the number of names parsed. */
+static int load_names_from_fp(FILE *fp)
+{
+    char line[256];
+    int count = 0;
+    int cur_class = -1;
+    int next_unknown_id = 0;
+
+    while (fgets(line, sizeof(line), fp)) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+        if (line[0] == '\0') continue;
+
+        char *sep = strchr(line, '|');
+        if (!sep) continue;
+        *sep = '\0';
+
+        const char *type = line;
+        const char *name = sep + 1;
+        int cb = class_name_to_byte(type);
+        if (cb < 0) continue;
+
+        if (cb != cur_class) {
+            const char **tbl;
+            int max;
+            cur_class = cb;
+            next_unknown_id = hardcoded_class_table(cb, &tbl, &max) ? max + 1 : 0;
+        }
+
+        int id = hardcoded_event_id(cb, name);
+        if (id < 0)
+            id = next_unknown_id++;
+
+        dyn_add(cb, id, name);
+        count++;
+    }
+    return count;
+}
+
 int pgwt_load_event_names_from_pg(const char *pg_bindir, int pg_port,
                                   const char *pg_user)
 {
     char cmd[512];
-    char line[256];
-    int  count = 0;
 
     /* pg_wait_events view exists since PG17 */
     snprintf(cmd, sizeof(cmd),
@@ -620,39 +701,7 @@ int pgwt_load_event_names_from_pg(const char *pg_bindir, int pg_port,
         return -1;
 
     dyn_clear();
-
-    /* Track sequential event_id per class.
-     * pg_wait_events returns events in enum order within each class,
-     * so the nth event within a class has event_id = n. */
-    int cur_class = -1;
-    int cur_id = -1;
-
-    while (fgets(line, sizeof(line), fp)) {
-        /* Remove trailing newline */
-        char *nl = strchr(line, '\n');
-        if (nl) *nl = '\0';
-        if (line[0] == '\0') continue;
-
-        /* Parse "Type|Name" */
-        char *sep = strchr(line, '|');
-        if (!sep) continue;
-        *sep = '\0';
-
-        const char *type = line;
-        const char *name = sep + 1;
-        int cb = class_name_to_byte(type);
-        if (cb < 0) continue;
-
-        if (cb != cur_class) {
-            cur_class = cb;
-            cur_id = 0;
-        } else {
-            cur_id++;
-        }
-
-        dyn_add(cb, cur_id, name);
-        count++;
-    }
+    int count = load_names_from_fp(fp);
 
     int status = pclose(fp);
     if (status != 0 || count == 0) {
@@ -660,6 +709,29 @@ int pgwt_load_event_names_from_pg(const char *pg_bindir, int pg_port,
         return -1;
     }
 
+    dyn_loaded = 1;
+    return 0;
+}
+
+/* Test/forward-compat entry point: load names from an in-memory buffer
+ * of "Type|Name\n" lines (same format as the pg_wait_events query
+ * output). Lets the id-mapping logic be unit-tested without a live PG. */
+int pgwt_load_event_names_from_buffer(const char *data)
+{
+    if (!data)
+        return -1;
+    FILE *fp = fmemopen((void *)data, strlen(data), "r");
+    if (!fp)
+        return -1;
+
+    dyn_clear();
+    int count = load_names_from_fp(fp);
+    fclose(fp);
+
+    if (count == 0) {
+        dyn_clear();
+        return -1;
+    }
     dyn_loaded = 1;
     return 0;
 }

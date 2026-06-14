@@ -198,6 +198,47 @@ static void test_unknown_fallbacks(void)
           "class 0xFF should be unknown or numeric, got \"%s\"", buf);
 }
 
+/* Regression: dynamic names loaded from pg_wait_events arrive ordered by
+ * NAME (alphabetical), which is NOT enum order for the Lock class
+ * (LockTagType: relation=0 … advisory=10). The loader must map each name
+ * to its correct enum id, not its row position. Before the fix,
+ * Lock:relation (id 0) was mislabelled "advisory". */
+static void test_dynamic_name_mapping(void)
+{
+    printf("--- Dynamic Name Mapping (pg_wait_events order) ---\n");
+
+    /* Lock rows exactly as `SELECT type,name ... ORDER BY type,name`
+     * returns them: alphabetical by name. Includes a fabricated future
+     * event ("zzznewlock") to exercise the unknown-name fallback. */
+    const char *buf =
+        "Lock|advisory\n"
+        "Lock|applytransaction\n"
+        "Lock|extend\n"
+        "Lock|frozenid\n"
+        "Lock|object\n"
+        "Lock|page\n"
+        "Lock|relation\n"
+        "Lock|spectoken\n"
+        "Lock|transactionid\n"
+        "Lock|tuple\n"
+        "Lock|userlock\n"
+        "Lock|virtualxid\n"
+        "Lock|zzznewlock\n";
+
+    CHECK(pgwt_load_event_names_from_buffer(buf) == 0,
+          "load dynamic names from buffer");
+
+    /* Correct enum ids despite alphabetical input order */
+    CHECK_NAME(WEI(PG_WAIT_LOCK, 0),  "Lock:relation");
+    CHECK_NAME(WEI(PG_WAIT_LOCK, 1),  "Lock:extend");
+    CHECK_NAME(WEI(PG_WAIT_LOCK, 5),  "Lock:transactionid");
+    CHECK_NAME(WEI(PG_WAIT_LOCK, 6),  "Lock:virtualxid");
+    CHECK_NAME(WEI(PG_WAIT_LOCK, 10), "Lock:advisory");
+    CHECK_NAME(WEI(PG_WAIT_LOCK, 11), "Lock:applytransaction");
+    /* Unknown future name appended after the class max (11) */
+    CHECK_NAME(WEI(PG_WAIT_LOCK, 12), "Lock:zzznewlock");
+}
+
 int main(void)
 {
     printf("=== test_wait_event ===\n");
@@ -213,6 +254,7 @@ int main(void)
     test_bufferpin();
     test_extension();
     test_unknown_fallbacks();
+    test_dynamic_name_mapping();  /* must run last: sets dyn_loaded */
 
     printf("\n%d/%d tests passed\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;
