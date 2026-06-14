@@ -178,13 +178,20 @@ fi
 # Step 5: Web UI tests (needs playwright + websockets, no root needed)
 # Locally a missing dependency is a skip; in CI ($CI set) it is a FAILURE —
 # the UI suite silently not running is how regressions slip through.
+# test_web_ui_chaos runs the same UI against mock_server.py in CHAOS mode
+# (latency jitter / out-of-order / late responses) — its race-exposing tests
+# are classified gating vs xfail internally, so it stays CI-green either way.
 if python3 -c "import playwright, websockets" 2>/dev/null; then
     run_test "test_web_ui" python3 "$SCRIPT_DIR/test_web_ui.py"
+    run_test "test_web_ui_chaos" python3 "$SCRIPT_DIR/test_web_ui_chaos.py"
 elif [[ -n "${CI:-}" ]]; then
     run_test "test_web_ui" bash -c \
         'echo "ERROR: playwright/websockets not installed — required in CI"; exit 1'
+    run_test "test_web_ui_chaos" bash -c \
+        'echo "ERROR: playwright/websockets not installed — required in CI"; exit 1'
 else
     skip_test "test_web_ui" "playwright or websockets not installed"
+    skip_test "test_web_ui_chaos" "playwright or websockets not installed"
 fi
 
 # Summary
