@@ -4,10 +4,10 @@
 Verifies that Activity (idle) events are excluded from DB Time, AAS,
 top_events, top_sessions, and top_queries.
 
-Client:ClientRead is deliberately NOT idle (see pgwt_is_idle_event in
-src/wait_event.c): it is a real wait event — time spent waiting for the
-client to send the next command — and counts toward DB Time under the
-Client class.
+Client:ClientRead is treated as IDLE for load accounting (see the
+load-vs-visibility split in src/wait_event.c): like Oracle's "SQL*Net
+message from client", it is EXCLUDED from DB Time / AAS. But it is NOT
+hidden — it must still appear in top_events and the timeline.
 """
 import os
 import sys
@@ -25,11 +25,12 @@ def build_scenario():
     """Mix of active and idle events.
 
     PID 1000: IO:Read 5ms (active)
-    PID 1001: Activity:Idle 50ms (should be excluded)
+    PID 1001: Activity:Idle 50ms (idle + hidden — excluded everywhere)
     PID 1002: CPU 3ms (active)
-    PID 1003: Client:ClientRead 20ms (NOT idle — counts toward DB Time)
+    PID 1003: Client:ClientRead 20ms (idle — excluded from DB Time,
+              but still VISIBLE in top_events/timeline)
 
-    Expected DB Time = 5 + 3 + 20 = 28ms (not 78ms)
+    Expected DB Time = 5 + 3 = 8ms (Activity AND ClientRead excluded)
     """
     events = [
         {"pid": 1000, "ts": BASE_TS + 5_000_000, "dur": 5_000_000,
@@ -71,12 +72,12 @@ def main():
             rows = {r["name"]: r for r in resp["rows"]}
 
             print("--- DB Time excludes idle ---")
-            t.check_approx(rows["DB Time"]["ms"], 28.0, 0.001,
-                           "DB Time = 28ms (Activity excluded, ClientRead counted)")
+            t.check_approx(rows["DB Time"]["ms"], 8.0, 0.001,
+                           "DB Time = 8ms (Activity AND ClientRead excluded)")
 
-            # top_events should not contain Activity events, but
-            # Client:ClientRead is a real wait and must be present
-            print("--- top_events excludes idle ---")
+            # top_events must hide Activity events, but Client:ClientRead
+            # stays VISIBLE (idle for load, not hidden from views)
+            print("--- top_events hides Activity, keeps ClientRead ---")
             resp_ev = srv.query("top_events")
             idle_rows = [r for r in resp_ev.get("rows", [])
                          if "Activity" in r.get("name", "")
@@ -86,16 +87,22 @@ def main():
             client_rows = [r for r in resp_ev.get("rows", [])
                            if r.get("name", "") == "Client:ClientRead"]
             t.check(len(client_rows) == 1,
-                    "Client:ClientRead present in top_events (not idle)")
+                    "Client:ClientRead present in top_events (visible)")
 
-            # session_timeline should not show Activity bars
-            print("--- timeline excludes idle ---")
+            # session_timeline must hide Activity bars but KEEP ClientRead
+            print("--- timeline hides Activity, keeps ClientRead ---")
             resp_tl = srv.query("session_timeline")
-            idle_bars = [e for e in resp_tl.get("events", [])
+            tl_events = resp_tl.get("events", [])
+            idle_bars = [e for e in tl_events
                          if "Activity" in e.get("n", "")
                          or "Idle" in e.get("n", "")]
             t.check(len(idle_bars) == 0,
                     f"No Activity bars in timeline (found {len(idle_bars)})")
+            client_bars = [e for e in tl_events
+                           if "ClientRead" in e.get("n", "")]
+            t.check(len(client_bars) >= 1,
+                    f"Client:ClientRead bar present in timeline "
+                    f"(found {len(client_bars)})")
 
     finally:
         cleanup_traces(trace_dir)

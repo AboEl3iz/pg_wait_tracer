@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-"""test_client_wait.py — Verify Client:ClientRead idle classification.
+"""test_client_wait.py — Verify Client:ClientRead idle-but-visible contract.
 
-Client:ClientRead is an idle wait event (like Oracle's SQL*Net message from
-client).  When a backend is idle-in-transaction, it enters Client:ClientRead.
+Client:ClientRead is an idle wait event (like Oracle's "SQL*Net message from
+client").  When a backend is idle-in-transaction, it enters Client:ClientRead.
 
-This test verifies:
-  1. Client:ClientRead is excluded from system_event (idle, like Activity events)
-  2. An idle-in-transaction backend does not inflate DB Time
+The contract (load-vs-visibility split, see src/wait_event.c):
+  - Client:ClientRead is EXCLUDED from DB Time / AAS (it is idle load), so an
+    idle-in-transaction backend must NOT inflate DB Time.
+  - Client:ClientRead is NOT hidden: it must still APPEAR in the system_event
+    list (unlike Activity events, which are hidden).
+  - The idle time is still accounted — it shows up in the Activity/idle bucket
+    of the time model, not in DB Time.
 
 Requires: root, running PostgreSQL 18, pg_wait_tracer built.
 Usage: sudo python3 tests/test_client_wait.py [--pid POSTMASTER_PID]
@@ -78,15 +82,22 @@ def parse_time_model(output):
     model = {}
     for line in output.split('\n'):
         line = line.strip()
+        # Normal rows: "Name   <ms>   <pct>%"
         m = re.match(r'^(.+?)\s{2,}([\d.]+)\s+[\d.]+%', line)
         if m:
             model[m.group(1).strip()] = float(m.group(2))
+            continue
+        # Idle bucket row: "(Activity/Idle — excluded from DB Time)  <ms>  —"
+        m = re.match(r'^(\(Activity/Idle.*?\))\s{2,}([\d.]+)\s', line)
+        if m:
+            model['Idle'] = float(m.group(2))
     return model
 
 
-def test_client_read_excluded(pm_pid):
-    """Start an idle-in-transaction backend, verify Client:ClientRead is excluded."""
-    print("--- Test 1: Client:ClientRead Excluded from system_event ---")
+def test_client_read_visible_but_idle(pm_pid):
+    """Idle-in-transaction backend: ClientRead is VISIBLE in system_event
+    but does NOT inflate DB Time (idle for load accounting)."""
+    print("--- Test 1: Client:ClientRead visible but excluded from DB Time ---")
 
     # Start psql idle-in-transaction FIRST — before tracer
     psql_proc = subprocess.Popen(
@@ -153,26 +164,34 @@ def test_client_read_excluded(pm_pid):
     events = parse_system_events(output_se)
     model = parse_time_model(output_tm)
 
-    # Client:ClientRead should NOT appear in system_event (it's idle)
+    # Client:ClientRead MUST appear in system_event (idle but visible).
     client_read = [e for e in events if e['name'] == 'Client:ClientRead']
-    check(len(client_read) == 0,
-          f"Client:ClientRead excluded from system_event "
+    check(len(client_read) >= 1,
+          f"Client:ClientRead visible in system_event "
           f"(found {len(client_read)}, events: {[e['name'] for e in events]})")
 
-    # No Activity events should appear either (confirms idle exclusion works)
+    # Activity events stay hidden (they are idle AND hidden).
     activity = [e for e in events if 'Activity' in e['name']]
     check(len(activity) == 0,
-          f"Activity events excluded from system_event (found {len(activity)})")
+          f"Activity events hidden from system_event (found {len(activity)})")
 
-    # Activity time should capture the idle backend's Client:ClientRead time
-    # (routed to activity_time_ns alongside Activity class events)
-    if 'Activity' in model:
-        activity_time = model['Activity']
-        # The idle-in-transaction backend alone adds ~INTERVAL*1000ms
-        check(activity_time >= INTERVAL * 1000 * 0.8,
-              f"Activity time = {activity_time:.0f}ms >= "
+    # DB Time must NOT be inflated by the idle backend.  The idle backend
+    # contributes ~INTERVAL*1000ms of ClientRead; if that leaked into DB
+    # Time it would dominate.  DB Time should stay well below that.
+    if 'DB Time' in model:
+        db_time = model['DB Time']
+        idle_floor = INTERVAL * 1000 * 0.8
+        check(db_time < idle_floor,
+              f"DB Time = {db_time:.0f}ms < {idle_floor:.0f}ms "
+              f"(idle ClientRead NOT counted as DB Time)")
+
+    # The idle time is still accounted — routed to the Activity/idle bucket.
+    if 'Idle' in model:
+        idle_time = model['Idle']
+        check(idle_time >= INTERVAL * 1000 * 0.8,
+              f"Activity/idle time = {idle_time:.0f}ms >= "
               f"{INTERVAL * 1000 * 0.8:.0f}ms "
-              f"(includes Client:ClientRead idle time)")
+              f"(captures Client:ClientRead idle time)")
 
 
 def main():
@@ -197,7 +216,7 @@ def main():
 
     print(f"=== test_client_wait (postmaster PID {pm_pid}) ===")
 
-    test_client_read_excluded(pm_pid)
+    test_client_read_visible_but_idle(pm_pid)
 
     print(f"\n{tests_passed}/{tests_run} tests passed")
     sys.exit(0 if tests_failed == 0 else 1)
