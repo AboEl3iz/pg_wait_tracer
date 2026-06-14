@@ -568,10 +568,13 @@ void pgwt_compute_top_events(const struct pgwt_trace_event *events, int count,
 
     for (int i = 0; i < count; i++) {
         const struct pgwt_trace_event *ev = &events[i];
-        if (!pgwt_filter_matches(f, ev) || pgwt_is_idle_event(ev->old_event))
+        if (!pgwt_filter_matches(f, ev) || pgwt_is_hidden_event(ev->old_event))
             continue;
 
-        db_time_ns += ev->duration_ns;
+        /* Idle-but-visible events (Client:ClientRead) appear in the list
+         * but are excluded from DB Time, so their %DB stays meaningful. */
+        if (!pgwt_is_idle_event(ev->old_event))
+            db_time_ns += ev->duration_ns;
 
         /* Hash by event_id */
         uint32_t h = ev->old_event & EVENT_HT_MASK;
@@ -914,7 +917,8 @@ void pgwt_compute_heatmap(const struct pgwt_trace_event *events, int count,
 
     for (int i = 0; i < count; i++) {
         const struct pgwt_trace_event *ev = &events[i];
-        if (!pgwt_filter_matches(f, ev) || pgwt_is_idle_event(ev->old_event))
+        /* Visibility filter: keep Client:ClientRead in the latency heatmap. */
+        if (!pgwt_filter_matches(f, ev) || pgwt_is_hidden_event(ev->old_event))
             continue;
 
         uint64_t ev_ts = ev->timestamp_ns;
@@ -979,6 +983,30 @@ struct aas_summary_ctx {
     int has_query_filter;
 };
 
+/* Client:ClientRead time recorded for a query in this summary record
+ * (from its top_events). Used to subtract the idle-but-visible ClientRead
+ * portion out of the lumped Client class_ns so it is not counted as DB
+ * Time / AAS (load), while ClientRead still shows in event lists. */
+static double summary_query_clientread_ns(const struct pgwt_summary_query *sq)
+{
+    for (int j = 0; j < sq->num_top_events; j++)
+        if (sq->top_events[j].event_id == WEI(PG_WAIT_CLIENT, 0))
+            return (double)sq->top_events[j].total_ns;
+    return 0.0;
+}
+
+/* System-wide Client:ClientRead time recorded in this summary record
+ * (from the per-event table). Same purpose as above for the no-filter path. */
+static double summary_clientread_ns(const struct pgwt_summary_accum *rec)
+{
+    for (int e = 0; e < SUMMARY_MAX_EVENTS; e++) {
+        const struct pgwt_summary_event *se = &rec->events[e];
+        if (se->event_id == WEI(PG_WAIT_CLIENT, 0))
+            return (double)se->total_ns;
+    }
+    return 0.0;
+}
+
 static int aas_summary_visitor(const struct pgwt_summary_accum *rec, void *arg)
 {
     struct aas_summary_ctx *ctx = arg;
@@ -998,9 +1026,14 @@ static int aas_summary_visitor(const struct pgwt_summary_accum *rec, void *arg)
             const struct pgwt_summary_query *sq = &rec->queries[q];
             if (sq->query_id == 0 && sq->count == 0) continue;
             if (sq->query_id != ctx->f->query_id) continue;
+            /* AAS is active load: exclude idle Client:ClientRead from the
+             * lumped Client class_ns. */
+            double cr_ns = summary_query_clientread_ns(sq);
             for (int c = 0; c < PGWT_NUM_CLASSES; c++) {
                 if (c == PGWT_CLASS_ACTIVITY) continue;
-                ctx->buckets[bi].class_aas[c] += (double)sq->class_ns[c];
+                double cls_ns = (double)sq->class_ns[c];
+                if (c == PGWT_CLASS_CLIENT) cls_ns -= cr_ns;
+                ctx->buckets[bi].class_aas[c] += cls_ns;
             }
             break;
         }
@@ -1008,9 +1041,13 @@ static int aas_summary_visitor(const struct pgwt_summary_accum *rec, void *arg)
     }
 
     if (!ctx->has_class_filter && !ctx->has_event_filter) {
+        /* AAS is active load: exclude idle Client:ClientRead. */
+        double cr_ns = summary_clientread_ns(rec);
         for (int c = 0; c < PGWT_NUM_CLASSES; c++) {
             if (c == PGWT_CLASS_ACTIVITY) continue;
-            ctx->buckets[bi].class_aas[c] += (double)rec->class_ns[c];
+            double cls_ns = (double)rec->class_ns[c];
+            if (c == PGWT_CLASS_CLIENT) cls_ns -= cr_ns;
+            ctx->buckets[bi].class_aas[c] += cls_ns;
         }
     } else {
         for (int e = 0; e < SUMMARY_MAX_EVENTS; e++) {
@@ -1103,14 +1140,21 @@ static int tm_summary_visitor(const struct pgwt_summary_accum *rec, void *arg)
             if (sq->query_id == 0 && sq->count == 0) continue;
             if (sq->query_id != f->query_id) continue;
 
+            /* Client:ClientRead is idle: route it to the idle bucket, not
+             * DB Time, even though it is lumped into the Client class_ns. */
+            double cr_ns = summary_query_clientread_ns(sq);
             for (int c = 0; c < PGWT_NUM_CLASSES; c++) {
-                if (c == PGWT_CLASS_ACTIVITY)
+                double cls_ns = (double)sq->class_ns[c];
+                if (c == PGWT_CLASS_CLIENT)
+                    cls_ns -= cr_ns;
+                if (c == PGWT_CLASS_ACTIVITY) {
                     ctx->idle_time_ns += (double)sq->class_ns[c];
-                else {
-                    ctx->classes[c].total_ns += (double)sq->class_ns[c];
-                    ctx->db_time_ns += (double)sq->class_ns[c];
+                } else {
+                    ctx->classes[c].total_ns += cls_ns;
+                    ctx->db_time_ns += cls_ns;
                 }
             }
+            ctx->idle_time_ns += cr_ns;
             for (int j = 0; j < sq->num_top_events; j++) {
                 uint32_t eid = sq->top_events[j].event_id;
                 if (pgwt_is_idle_event(eid)) continue;
@@ -1138,14 +1182,21 @@ static int tm_summary_visitor(const struct pgwt_summary_accum *rec, void *arg)
 
     /* If no class/event filter: use class_ns directly */
     if (f->class_name[0] == '\0' && f->event_id == 0) {
+        /* Client:ClientRead is idle: subtract it out of the lumped Client
+         * class_ns so it counts toward idle time, not DB Time. */
+        double cr_ns = summary_clientread_ns(rec);
         for (int c = 0; c < PGWT_NUM_CLASSES; c++) {
-            if (c == PGWT_CLASS_ACTIVITY)
+            double cls_ns = (double)rec->class_ns[c];
+            if (c == PGWT_CLASS_CLIENT)
+                cls_ns -= cr_ns;
+            if (c == PGWT_CLASS_ACTIVITY) {
                 ctx->idle_time_ns += (double)rec->class_ns[c];
-            else {
-                ctx->classes[c].total_ns += (double)rec->class_ns[c];
-                ctx->db_time_ns += (double)rec->class_ns[c];
+            } else {
+                ctx->classes[c].total_ns += cls_ns;
+                ctx->db_time_ns += cls_ns;
             }
         }
+        ctx->idle_time_ns += cr_ns;
     }
 
     /* Per-event stats: iterate event entries */
@@ -1295,10 +1346,12 @@ static int te_summary_visitor(const struct pgwt_summary_accum *rec, void *arg)
 
             for (int j = 0; j < sq->num_top_events; j++) {
                 uint32_t eid = sq->top_events[j].event_id;
-                if (pgwt_is_idle_event(eid)) continue;
+                if (pgwt_is_hidden_event(eid)) continue;
                 if (!summary_event_matches_filter(ctx->f, eid)) continue;
 
-                ctx->db_time_ns += sq->top_events[j].total_ns;
+                /* Idle-but-visible (ClientRead): list it, exclude from DB Time. */
+                if (!pgwt_is_idle_event(eid))
+                    ctx->db_time_ns += sq->top_events[j].total_ns;
 
                 uint32_t h = eid & EVENT_HT_MASK;
                 while (ctx->ht[h].count > 0 && ctx->ht[h].event_id != eid)
@@ -1319,10 +1372,12 @@ static int te_summary_visitor(const struct pgwt_summary_accum *rec, void *arg)
     for (int e = 0; e < SUMMARY_MAX_EVENTS; e++) {
         const struct pgwt_summary_event *se = &rec->events[e];
         if (se->event_id == 0 && se->count == 0) continue;
-        if (pgwt_is_idle_event(se->event_id)) continue;
+        if (pgwt_is_hidden_event(se->event_id)) continue;
         if (!summary_event_matches_filter(ctx->f, se->event_id)) continue;
 
-        ctx->db_time_ns += se->total_ns;
+        /* Idle-but-visible (ClientRead): list it, exclude from DB Time. */
+        if (!pgwt_is_idle_event(se->event_id))
+            ctx->db_time_ns += se->total_ns;
 
         uint32_t h = se->event_id & EVENT_HT_MASK;
         while (ctx->ht[h].count > 0 && ctx->ht[h].event_id != se->event_id)
@@ -1676,7 +1731,8 @@ static int hm_summary_visitor(const struct pgwt_summary_accum *rec, void *arg)
     for (int e = 0; e < SUMMARY_MAX_EVENTS; e++) {
         const struct pgwt_summary_event *se = &rec->events[e];
         if (se->event_id == 0 && se->count == 0) continue;
-        if (pgwt_is_idle_event(se->event_id)) continue;
+        /* Visibility filter: keep Client:ClientRead in the latency heatmap. */
+        if (pgwt_is_hidden_event(se->event_id)) continue;
         if (!summary_event_matches_filter(ctx->f, se->event_id)) continue;
 
         for (int b = 0; b < HISTOGRAM_BUCKETS; b++) {
@@ -1771,7 +1827,8 @@ void pgwt_compute_transitions(const struct pgwt_trace_event *events, int count,
         const struct pgwt_trace_event *ev = &events[i];
         if (!pgwt_filter_matches(f, ev))
             continue;
-        if (pgwt_is_idle_event(ev->old_event) || pgwt_is_idle_event(ev->new_event))
+        /* Visibility filter: Client:ClientRead transitions stay in the graph. */
+        if (pgwt_is_hidden_event(ev->old_event) || pgwt_is_hidden_event(ev->new_event))
             continue;
         if (ev->new_event == PGWT_EVENT_EXIT)
             continue;

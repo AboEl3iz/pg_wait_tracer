@@ -10,7 +10,7 @@
 static int tests_run = 0;
 static int tests_passed = 0;
 
-#define WEI(cls, id) (((uint32_t)(cls) << 24) | (id))
+/* WEI is provided by pg_wait_tracer.h */
 
 #define CHECK(cond, fmt, ...) do { \
     tests_run++; \
@@ -34,6 +34,7 @@ static void test_cpu(void)
     CHECK(strcmp(pgwt_event_name(0), "CPU") == 0,
           "event_name(0) expected CPU");
     CHECK(pgwt_is_idle_event(0) == 0, "CPU should not be idle");
+    CHECK(pgwt_is_hidden_event(0) == 0, "CPU should not be hidden");
 }
 
 static void test_io_events(void)
@@ -52,9 +53,11 @@ static void test_io_events(void)
     /* Class name */
     CHECK(strcmp(pgwt_class_name(WEI(PG_WAIT_IO, 0)), "IO") == 0,
           "class_name for IO");
-    /* Not idle */
+    /* Not idle, not hidden */
     CHECK(pgwt_is_idle_event(WEI(PG_WAIT_IO, 21)) == 0,
           "IO events should not be idle");
+    CHECK(pgwt_is_hidden_event(WEI(PG_WAIT_IO, 21)) == 0,
+          "IO events should not be hidden");
 }
 
 static void test_lock_events(void)
@@ -126,14 +129,19 @@ static void test_client_events(void)
     CHECK_NAME(WEI(PG_WAIT_CLIENT, 8), "Client:WalSenderWriteData");
     CHECK(strcmp(pgwt_class_name(WEI(PG_WAIT_CLIENT, 0)), "Client") == 0,
           "class_name for Client");
-    /* Client:ClientRead is deliberately NOT idle: it is a real wait event
-     * (time waiting for the client's next command) counted under the
-     * Client class — see pgwt_is_idle_event() in src/wait_event.c. */
-    CHECK(pgwt_is_idle_event(WEI(PG_WAIT_CLIENT, 0)) == 0,
-          "Client:ClientRead should NOT be idle");
-    /* Other Client events are NOT idle */
+    /* Client:ClientRead is IDLE for LOAD accounting — excluded from DB
+     * Time / AAS, like Oracle's "SQL*Net message from client" — but it is
+     * NOT hidden: it must remain visible in event lists/graphs. See the
+     * load-vs-visibility split in src/wait_event.c. */
+    CHECK(pgwt_is_idle_event(WEI(PG_WAIT_CLIENT, 0)) == 1,
+          "Client:ClientRead should be idle (excluded from DB Time)");
+    CHECK(pgwt_is_hidden_event(WEI(PG_WAIT_CLIENT, 0)) == 0,
+          "Client:ClientRead should NOT be hidden (stays visible)");
+    /* Other Client events are NOT idle and NOT hidden */
     CHECK(pgwt_is_idle_event(WEI(PG_WAIT_CLIENT, 1)) == 0,
           "Client:ClientWrite should NOT be idle");
+    CHECK(pgwt_is_hidden_event(WEI(PG_WAIT_CLIENT, 1)) == 0,
+          "Client:ClientWrite should NOT be hidden");
 }
 
 static void test_activity_events(void)
@@ -143,11 +151,15 @@ static void test_activity_events(void)
     CHECK_NAME(WEI(PG_WAIT_ACTIVITY, 4),  "Activity:CheckpointerMain");
     CHECK_NAME(WEI(PG_WAIT_ACTIVITY, 6),  "Activity:IoWorkerMain");
     CHECK_NAME(WEI(PG_WAIT_ACTIVITY, 17), "Activity:WalWriterMain");
-    /* Activity events ARE idle */
+    /* Activity events ARE idle AND hidden */
     CHECK(pgwt_is_idle_event(WEI(PG_WAIT_ACTIVITY, 0)) != 0,
           "Activity events should be idle");
     CHECK(pgwt_is_idle_event(WEI(PG_WAIT_ACTIVITY, 4)) != 0,
           "Activity:CheckpointerMain should be idle");
+    CHECK(pgwt_is_hidden_event(WEI(PG_WAIT_ACTIVITY, 0)) != 0,
+          "Activity events should be hidden");
+    CHECK(pgwt_is_hidden_event(WEI(PG_WAIT_ACTIVITY, 4)) != 0,
+          "Activity:CheckpointerMain should be hidden");
     CHECK(strcmp(pgwt_class_name(WEI(PG_WAIT_ACTIVITY, 0)), "Activity") == 0,
           "class_name for Activity");
 }

@@ -549,13 +549,34 @@ void pgwt_event_full_name(uint32_t wei, char *buf, size_t bufsz)
         snprintf(buf, bufsz, "%s:id=%d", cls, WE_EVENT(wei));
 }
 
+/* LOAD vs VISIBILITY — two distinct concepts, intentionally split:
+ *
+ *  - pgwt_is_idle_event(): "excluded from DB Time / AAS / active load."
+ *    True for Activity-class AND Client:ClientRead. Client:ClientRead is
+ *    idle time spent waiting for the next command from the client (the
+ *    direct analogue of Oracle's "SQL*Net message from client"); counting
+ *    it as DB Time wrongly inflates load when connections sit idle (e.g.
+ *    idle-in-transaction). So it is excluded from load accounting here.
+ *
+ *  - pgwt_is_hidden_event(): "do not display in lists/graphs/breakdowns."
+ *    True for Activity-class ONLY. Client:ClientRead must stay VISIBLE in
+ *    event lists, timelines, transition graphs, histograms and class
+ *    drill-downs, so it is NOT hidden — only excluded from load.
+ *
+ * Conflating these two is what previously forced ClientRead to be marked
+ * non-idle (otherwise the visibility filters deleted it from every view,
+ * producing an empty Client class breakdown). Keeping them separate lets
+ * ClientRead be both excluded-from-load and still-visible.
+ */
 int pgwt_is_idle_event(uint32_t wei)
 {
-    /* Only Activity-class events are idle (AutoVacuumMain, idle, etc.).
-     * Client:ClientRead is NOT idle — it's a real wait event showing
-     * time spent waiting for the client to send the next command.
-     * Filtering it caused inconsistent behavior between zoom levels
-     * and empty Client class breakdown. */
+    return WE_CLASS(wei) == PG_WAIT_ACTIVITY ||
+           wei == WEI(PG_WAIT_CLIENT, 0);   /* Client:ClientRead */
+}
+
+int pgwt_is_hidden_event(uint32_t wei)
+{
+    /* Activity-class only — never hides Client:ClientRead. */
     return WE_CLASS(wei) == PG_WAIT_ACTIVITY;
 }
 

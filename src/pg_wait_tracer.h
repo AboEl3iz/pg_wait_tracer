@@ -102,6 +102,8 @@ struct pgwt_query_text_event {
 
 #define WE_CLASS(x)  (((x) >> 24) & 0xFF)
 #define WE_EVENT(x)  ((x) & 0x00FFFFFF)
+/* Compose a wait_event_info from class byte + event id. */
+#define WEI(cls, id) (((uint32_t)(cls) << 24) | (uint32_t)(id))
 
 /* Client:ClientRead — idle between queries (like Oracle's SQL*Net message from client) */
 #define PG_WAIT_CLIENT_READ  ((PG_WAIT_CLIENT << 24) | 0x000000)
