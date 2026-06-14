@@ -92,6 +92,45 @@ size_t pgwt_encode_block(const struct pgwt_trace_event *events, int count,
     return (size_t)(p - out);
 }
 
+/* ── Columnar SAMPLE block encoder ────────────────────────── */
+/* Samples are point observations: no old_event, no duration. The sampled
+ * event id lives in new_event (the field the daemon's sampler populates).
+ * Layout: ts (delta varint), pid (u32), event (u32), query_id (u64). */
+size_t pgwt_encode_sample_block(const struct pgwt_trace_event *events, int count,
+                                uint8_t *out, size_t out_size)
+{
+    uint8_t *p = out;
+    (void)out_size;  /* caller guarantees sufficient space */
+
+    /* Column 1: timestamps, delta-encoded as varint */
+    uint64_t prev_ts = 0;
+    for (int i = 0; i < count; i++) {
+        uint64_t delta = events[i].timestamp_ns - prev_ts;
+        p += pgwt_encode_varint(delta, p);
+        prev_ts = events[i].timestamp_ns;
+    }
+
+    /* Column 2: PIDs as raw uint32 */
+    for (int i = 0; i < count; i++) {
+        uint32_t pid = events[i].pid;
+        memcpy(p, &pid, 4); p += 4;
+    }
+
+    /* Column 3: events as raw uint32 (the sampled event id, from new_event) */
+    for (int i = 0; i < count; i++) {
+        uint32_t ev = events[i].new_event;
+        memcpy(p, &ev, 4); p += 4;
+    }
+
+    /* Column 4: query_ids as raw uint64 */
+    for (int i = 0; i < count; i++) {
+        uint64_t qid = events[i].query_id;
+        memcpy(p, &qid, 8); p += 8;
+    }
+
+    return (size_t)(p - out);
+}
+
 /* ── File operations (static) ─────────────────────────────── */
 
 static int write_footer(struct pgwt_event_writer *w)
@@ -159,13 +198,21 @@ static int open_trace_file(struct pgwt_event_writer *w, uint64_t first_mono_ns)
     return 0;
 }
 
-static int flush_block(struct pgwt_event_writer *w)
+/* Encode, compress, and write one typed block (TRANSITIONS or SAMPLES).
+ * `events`/`count` are the records; block_type selects the columnar layout;
+ * sample_period_ns is recorded in the header (0 for TRANSITIONS). Updates
+ * the block index, stats, and the committed-block meta file. */
+static int write_typed_block(struct pgwt_event_writer *w,
+                             const struct pgwt_trace_event *events, int count,
+                             enum pgwt_block_type block_type,
+                             uint64_t sample_period_ns)
 {
-    if (w->num_events == 0 || !w->fp) return 0;
+    if (count <= 0 || !w->fp) return 0;
 
-    /* Columnar encode */
-    size_t encoded_size = pgwt_encode_block(
-        w->events, w->num_events, w->encode_buf, w->encode_buf_size);
+    /* Columnar encode (layout depends on block type) */
+    size_t encoded_size = (block_type == PGWT_BLOCK_SAMPLES)
+        ? pgwt_encode_sample_block(events, count, w->encode_buf, w->encode_buf_size)
+        : pgwt_encode_block(events, count, w->encode_buf, w->encode_buf_size);
 
     /* LZ4 compress */
     int compressed_size = LZ4_compress_default(
@@ -173,7 +220,6 @@ static int flush_block(struct pgwt_event_writer *w)
         (int)encoded_size, (int)w->compress_buf_size);
     if (compressed_size <= 0) {
         fprintf(stderr, "WARN: LZ4 compression failed\n");
-        w->num_events = 0;
         return -1;
     }
 
@@ -194,17 +240,20 @@ static int flush_block(struct pgwt_event_writer *w)
     /* Record block index entry */
     long file_offset = ftell(w->fp);
     w->block_index[w->num_blocks++] = (struct pgwt_block_index_entry){
-        .timestamp_ns = w->events[0].timestamp_ns,
+        .timestamp_ns = events[0].timestamp_ns,
         .file_offset = (uint64_t)file_offset,
     };
 
     /* Write block header + compressed data */
     struct pgwt_trace_block_header bh = {
-        .first_timestamp_ns = w->events[0].timestamp_ns,
-        .last_timestamp_ns = w->events[w->num_events - 1].timestamp_ns,
-        .num_events = (uint32_t)w->num_events,
+        .first_timestamp_ns = events[0].timestamp_ns,
+        .last_timestamp_ns = events[count - 1].timestamp_ns,
+        .num_events = (uint32_t)count,
         .compressed_size = (uint32_t)compressed_size,
         .uncompressed_size = (uint32_t)encoded_size,
+        .block_type = (uint16_t)block_type,
+        .reserved = 0,
+        .sample_period_ns = sample_period_ns,
     };
     if (fwrite(&bh, sizeof(bh), 1, w->fp) != 1 ||
         fwrite(w->compress_buf, 1, compressed_size, w->fp) != (size_t)compressed_size) {
@@ -213,9 +262,8 @@ static int flush_block(struct pgwt_event_writer *w)
         return -1;
     }
 
-    w->total_events_written += w->num_events;
+    w->total_events_written += count;
     w->total_bytes_written += sizeof(bh) + compressed_size;
-    w->num_events = 0;
 
     /* Flush to OS page cache so concurrent readers can see this block */
     fflush(w->fp);
@@ -237,6 +285,16 @@ static int flush_block(struct pgwt_event_writer *w)
     }
 
     return 0;
+}
+
+static int flush_block(struct pgwt_event_writer *w)
+{
+    if (w->num_events == 0 || !w->fp) return 0;
+
+    int rc = write_typed_block(w, w->events, w->num_events,
+                               PGWT_BLOCK_TRANSITIONS, 0);
+    w->num_events = 0;
+    return rc;
 }
 
 /* ── Public API ───────────────────────────────────────────── */
@@ -306,6 +364,43 @@ int pgwt_writer_push_event(struct pgwt_event_writer *w,
 
     if (w->num_events >= PGWT_BLOCK_EVENTS)
         return flush_block(w);
+
+    return 0;
+}
+
+int pgwt_writer_push_samples(struct pgwt_event_writer *w,
+                             const struct pgwt_trace_event *samples,
+                             int count, uint64_t sample_period_ns)
+{
+    if (!w->enabled) return 0;
+    if (count <= 0) return 0;
+
+    /* Lazy file open on first write */
+    if (!w->fp) {
+        if (open_trace_file(w, samples[0].timestamp_ns) != 0) {
+            w->enabled = false;
+            return -1;
+        }
+    }
+
+    /* Flush any pending buffered TRANSITIONS block first so block
+     * boundaries stay clean (one block is either all transitions or all
+     * samples — never mixed). */
+    if (w->num_events > 0) {
+        if (flush_block(w) != 0)
+            return -1;
+    }
+
+    /* Samples can exceed one block; split into PGWT_BLOCK_EVENTS chunks. */
+    int off = 0;
+    while (off < count) {
+        int chunk = count - off;
+        if (chunk > PGWT_BLOCK_EVENTS) chunk = PGWT_BLOCK_EVENTS;
+        if (write_typed_block(w, samples + off, chunk,
+                              PGWT_BLOCK_SAMPLES, sample_period_ns) != 0)
+            return -1;
+        off += chunk;
+    }
 
     return 0;
 }

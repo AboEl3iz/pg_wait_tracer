@@ -62,10 +62,17 @@ struct pgwt_trace_event {
     u32 pid;            /* backend PID */
     u32 old_event;      /* previous wait_event_info */
     u32 new_event;      /* new wait_event_info (0xFFFFFFFF = exit) */
-    u32 _pad;           /* alignment */
+    u32 flags;          /* reader-side annotation (PGWT_EVENT_FLAG_*); 0 on the wire */
     u64 duration_ns;    /* time spent in old_event */
     u64 query_id;       /* active query during old_event */
 };
+
+/* flags bits — set by the trace reader, never on the wire/ringbuf.
+ * SAMPLE marks a record decoded from a SAMPLES block: it is a point
+ * observation (new_event = sampled event; old_event = 0; duration_ns = 0),
+ * not a transition interval. A3's compute must treat it as worth one
+ * sample_period_ns, not as an interval duration. */
+#define PGWT_EVENT_FLAG_SAMPLE  0x1U
 
 #define PGWT_EVENT_EXIT  0xFFFFFFFFU  /* sentinel new_event for process exit */
 
