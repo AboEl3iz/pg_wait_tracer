@@ -84,7 +84,39 @@ struct pgwt_trace_event {
 #define PGWT_MARKER_PLAN_START   0xFFFFFFF2U  /* query planning start (pg_plan_query entry) */
 #define PGWT_MARKER_PLAN_END     0xFFFFFFF3U  /* query planning end (pg_plan_query return) */
 
-#define PGWT_IS_MARKER(e) ((e) >= 0xFFFFFFF0U && (e) <= 0xFFFFFFF3U)
+/* Escalation window markers (A4). Written by the daemon (pid = 0, a value no
+ * PG backend uses) when a tiered-mode full-fidelity window opens/closes, so a
+ * reader/UI can show WHY exact data exists for a time range. Convention
+ * (matches the query markers so duration-consuming views are unaffected):
+ *   old_event = new_event = marker type
+ *   duration_ns           = 0  (markers never carry a wait duration)
+ *   query_id              = PGWT_ESC_PACK(window_seconds, reason): the granted
+ *                           window length (START) or elapsed seconds (END) in
+ *                           the high bits, the reason code in the low byte.
+ * Forward-compatible: a reader that doesn't know these treats them as plain
+ * markers (skipped from wait accumulation by PGWT_IS_MARKER). */
+#define PGWT_MARKER_ESCALATE_START 0xFFFFFFF4U  /* full-fidelity window opened */
+#define PGWT_MARKER_ESCALATE_END   0xFFFFFFF5U  /* full-fidelity window closed */
+
+#define PGWT_IS_MARKER(e) ((e) >= 0xFFFFFFF0U && (e) <= 0xFFFFFFF5U)
+
+/* Pack/unpack the escalation marker payload carried in query_id. */
+#define PGWT_ESC_PACK(secs, reason) \
+    (((uint64_t)(secs) << 8) | ((uint64_t)(reason) & 0xFFU))
+#define PGWT_ESC_UNPACK_SECS(qid)   ((uint64_t)(qid) >> 8)
+#define PGWT_ESC_UNPACK_REASON(qid) ((unsigned)((qid) & 0xFFU))
+
+/* Reason a tiered escalation window opened/closed, recorded in the marker's
+ * query_id slot. Manual is the only A4 producer; anomaly triggers (A5) and
+ * budget/expiry close reasons are reserved here so the trace schema is stable
+ * across phases. */
+enum pgwt_escalation_reason {
+    PGWT_ESC_REASON_MANUAL   = 0,  /* operator requested via control socket */
+    PGWT_ESC_REASON_ANOMALY  = 1,  /* anomaly trigger (A5) */
+    PGWT_ESC_REASON_EXPIRED  = 2,  /* window reached its deadline (close) */
+    PGWT_ESC_REASON_REQUEST  = 3,  /* explicit deescalate request (close) */
+    PGWT_ESC_REASON_SHUTDOWN = 4,  /* daemon stopping (close) */
+};
 
 /* ── Query Text Event (lifecycle ringbuf) ─────────────────── */
 #define PGWT_QUERY_TEXT_LEN 256

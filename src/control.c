@@ -4,6 +4,7 @@
 #include "daemon.h"
 #include "event_writer.h"
 #include "provider.h"
+#include "escalation.h"
 #include "cJSON.h"
 
 #include <stdio.h>
@@ -68,6 +69,25 @@ static cJSON *build_status(const struct pgwt_daemon *d)
     cJSON_AddNumberToObject(root, "backends", count_backends(d));
     cJSON_AddNumberToObject(root, "pg_pid", d->postmaster_pid);
     cJSON_AddStringToObject(root, "version", PGWT_VERSION);
+
+    /* Current capture tier and escalation state (A4). "tier" is what is being
+     * captured right now: in tiered mode it flips between "sampled" (always-on
+     * baseline) and "escalated" (full-fidelity window open); for full/sampled
+     * it mirrors the fixed provider fidelity. */
+    const char *tier;
+    if (d->escalation.enabled)
+        tier = d->escalation.active ? "escalated" : "sampled";
+    else if (d->provider &&
+             d->provider->fidelity == PGWT_FIDELITY_EXACT)
+        tier = "escalated";   /* full mode: always full fidelity */
+    else
+        tier = "sampled";
+    cJSON_AddStringToObject(root, "tier", tier);
+    cJSON_AddBoolToObject(root, "escalation_supported", d->escalation.enabled);
+    cJSON_AddNumberToObject(root, "escalation_seconds_remaining",
+                            pgwt_escalation_remaining_s(d));
+    cJSON_AddNumberToObject(root, "escalation_budget_remaining_s",
+                            pgwt_escalation_budget_remaining_s(d));
     return root;
 }
 
@@ -112,6 +132,19 @@ static cJSON *build_metrics(const struct pgwt_daemon *d)
     cjson_add_uint64(root, "trace_bytes_written_total",
                      d->event_writer ? d->event_writer->total_bytes_written : 0);
 
+    /* Escalation accounting (A4). 0/false when not in tiered mode. */
+    cJSON_AddStringToObject(root, "tier",
+                            d->escalation.active ? "escalated" : "sampled");
+    cJSON_AddBoolToObject(root, "escalation_active", d->escalation.active);
+    cJSON_AddNumberToObject(root, "escalation_seconds_remaining",
+                            pgwt_escalation_remaining_s(d));
+    cJSON_AddNumberToObject(root, "escalation_budget_remaining_s",
+                            pgwt_escalation_budget_remaining_s(d));
+    cjson_add_uint64(root, "escalation_windows_total",
+                     d->escalation.windows_total);
+    cjson_add_uint64(root, "escalation_denied_total",
+                     d->escalation.denied_total);
+
     return root;
 }
 
@@ -120,6 +153,55 @@ static cJSON *build_error(const char *msg)
     cJSON *root = cJSON_CreateObject();
     cJSON_AddBoolToObject(root, "ok", 0);
     cJSON_AddStringToObject(root, "error", msg);
+    return root;
+}
+
+/* {"cmd":"escalate","duration_s":N,"reason":"..."} → grant a bounded,
+ * budgeted full-fidelity window. Acks with the granted seconds, or denies
+ * with a reason (over budget / not tiered / bad args). An escalate while a
+ * window is already open EXTENDS its deadline (subject to budget). */
+static cJSON *build_escalate(struct pgwt_daemon *d, cJSON *req)
+{
+    cJSON *dur = cJSON_GetObjectItem(req, "duration_s");
+    int duration_s = cJSON_IsNumber(dur) ? (int)dur->valuedouble : 60;
+
+    cJSON *root = cJSON_CreateObject();
+    int granted = 0;
+    const char *why = NULL;
+    if (pgwt_escalate(d, duration_s, PGWT_ESC_REASON_MANUAL,
+                      &granted, &why) != 0) {
+        cJSON_AddBoolToObject(root, "ok", 0);
+        cJSON_AddStringToObject(root, "error",
+                                why ? why : "escalation denied");
+        cJSON_AddNumberToObject(root, "budget_remaining_s",
+                                pgwt_escalation_budget_remaining_s(d));
+        return root;
+    }
+    cJSON_AddBoolToObject(root, "ok", 1);
+    cJSON_AddBoolToObject(root, "escalated", 1);
+    cJSON_AddNumberToObject(root, "granted_s", granted);
+    cJSON_AddNumberToObject(root, "seconds_remaining",
+                            pgwt_escalation_remaining_s(d));
+    cJSON_AddNumberToObject(root, "budget_remaining_s",
+                            pgwt_escalation_budget_remaining_s(d));
+    return root;
+}
+
+/* {"cmd":"deescalate"} → detach watchpoints now (idempotent). */
+static cJSON *build_deescalate(struct pgwt_daemon *d)
+{
+    cJSON *root = cJSON_CreateObject();
+    if (!d->escalation.enabled) {
+        cJSON_AddBoolToObject(root, "ok", 0);
+        cJSON_AddStringToObject(root, "error",
+                                "escalation requires --mode tiered");
+        return root;
+    }
+    pgwt_deescalate(d, PGWT_ESC_REASON_REQUEST);
+    cJSON_AddBoolToObject(root, "ok", 1);
+    cJSON_AddBoolToObject(root, "escalated", 0);
+    cJSON_AddNumberToObject(root, "budget_remaining_s",
+                            pgwt_escalation_budget_remaining_s(d));
     return root;
 }
 
@@ -182,6 +264,10 @@ static int handle_request(struct pgwt_control *c,
         resp = build_status(c->d);
     else if (strcmp(cmd->valuestring, "metrics") == 0)
         resp = build_metrics(c->d);
+    else if (strcmp(cmd->valuestring, "escalate") == 0)
+        resp = build_escalate(c->d, req);
+    else if (strcmp(cmd->valuestring, "deescalate") == 0)
+        resp = build_deescalate(c->d);
     else
         resp = build_error("unknown command");
 

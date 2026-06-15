@@ -43,6 +43,14 @@ int pgwt_handle_init(struct pgwt_daemon *d, pid_t pid, uint64_t addr);
 /* Handle backend exit. Close watchpoint, flush stats, cleanup. */
 int pgwt_handle_exit(struct pgwt_daemon *d, pid_t pid);
 
+/* Attach a hardware watchpoint to an already-resolved backend (be->wp_addr
+ * must be set) and pre-seed its BPF state_map with the current wait state.
+ * Used by the full-mode scan and by the A4 escalation engine. Returns 0 on
+ * success, -1 on attach failure (caller decides cleanup). No-op (returns 0)
+ * if the backend already has a watchpoint. */
+int pgwt_attach_backend_watchpoint(struct pgwt_daemon *d,
+                                   struct pgwt_backend *be);
+
 /* Find backend by PID. Returns NULL if not found. */
 struct pgwt_backend *pgwt_find_backend(struct pgwt_backend_table *bt, pid_t pid);
 

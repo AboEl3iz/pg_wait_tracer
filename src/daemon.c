@@ -332,10 +332,15 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
     }
     pgwt_accum_init(d->event_accum);
 
-    /* The event ringbuf consumer is only needed by the FULL tier (watchpoint
-     * transitions + USDT markers). Lightweight mode accumulates in BPF;
-     * sampled mode arms no watchpoints, so nothing is written there. */
-    bool needs_event_rb = !d->lightweight_mode && pgwt_mode_uses_watchpoints(d);
+    /* The event ringbuf consumer carries watchpoint transitions (FULL tier).
+     * Lightweight mode accumulates in BPF; pure sampled mode arms no
+     * watchpoints, so nothing is ever written there. TIERED mode starts
+     * de-escalated (no watchpoints yet) but MUST have the ringbuf ready so an
+     * escalation can begin consuming immediately — D5: skeleton + ringbuf are
+     * loaded at daemon start, escalation only attaches watchpoints + starts
+     * consuming. An idle ringbuf costs nothing. */
+    bool needs_event_rb = !d->lightweight_mode
+        && (pgwt_mode_uses_watchpoints(d) || d->mode == PGWT_MODE_TIERED);
     if (needs_event_rb) {
         int event_rb_map_fd = bpf_map__fd(d->skel->maps.event_ringbuf);
         d->event_rb = ring_buffer__new(event_rb_map_fd, pgwt_handle_trace_event, d, NULL);
@@ -524,6 +529,14 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
         }
     }
 
+    /* Escalation engine (D5/A4). Enabled only in --mode tiered; creates the
+     * bounded-window deadline timerfd on the daemon epoll. Failure is
+     * non-fatal — tiered then runs sampled-only with no escalation path. */
+    if (pgwt_escalation_init(d, d->escalation_budget_s) != 0) {
+        fprintf(stderr, "WARN: escalation engine unavailable; "
+                "tiered mode will run sampled-only\n");
+    }
+
     /* Arm the active capture provider. For the full tier this is a no-op
      * (watchpoints were armed during the backend scan); for the sampled tier
      * it allocates the sampler state. */
@@ -595,6 +608,8 @@ int pgwt_daemon_run(struct pgwt_daemon *d)
                 ring_buffer__consume(d->event_rb);
             } else if (events[i].data.fd == d->signal_fd) {
                 handle_signal(d);
+            } else if (pgwt_escalation_is_timer_fd(d, events[i].data.fd)) {
+                pgwt_escalation_on_timer(d);
             } else if (d->control) {
                 pgwt_control_handle_fd(d->control, events[i].data.fd);
             }
@@ -617,6 +632,10 @@ int pgwt_daemon_run(struct pgwt_daemon *d)
 
 void pgwt_daemon_cleanup(struct pgwt_daemon *d)
 {
+    /* Close any open escalation window (detaches watchpoints, writes the END
+     * marker) before the event writer is torn down. */
+    pgwt_escalation_cleanup(d);
+
     /* Stop the active capture provider (detach/free its state). */
     if (d->provider && d->provider->stop)
         d->provider->stop(d);

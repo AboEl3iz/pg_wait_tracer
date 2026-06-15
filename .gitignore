@@ -20,6 +20,8 @@ tests/test_trace_v2
 tests/test_sampler
 tests/gen_test_traces
 tests/gen_bench_traces
+tests/cross_validate
+tests/test_concurrent_rw
 tests/__pycache__/
 
 # Go build artifacts
