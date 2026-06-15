@@ -59,6 +59,7 @@ jobs:
           tests/test_event_reader
           tests/test_trace_v2
           tests/test_sampler
+          tests/test_anomaly
 
       - name: Run synthetic data tests
         run: |

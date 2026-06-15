@@ -1,0 +1,257 @@
+/* anomaly.c — Anomaly-triggered escalation rules (Track A, D5 / Phase A5)
+ *
+ * See anomaly.h for the design. The pure rule core (pgwt_anomaly_eval and
+ * pgwt_anomaly_metrics_from_batch) is free of BPF and the escalation engine so
+ * the unit test (tests/test_anomaly.c) can drive it with scripted sample
+ * streams. The daemon-side wrapper (pgwt_anomaly_tick) connects the FIRE
+ * decision to A4's pgwt_escalate() and logs every near-trigger.
+ *
+ * The pure core is compiled into both the daemon and (via -DPGWT_SERVER) the
+ * unit test; the daemon wrapper is guarded out of the server build.
+ */
+#include "anomaly.h"
+#include "pg_wait_tracer.h"   /* WE_CLASS, PG_WAIT_LOCK, marker macros */
+
+#include <stdio.h>
+#include <string.h>
+
+/* ── Pure rule core (no BPF, no escalation) ───────────────────────────── */
+
+/* The on-CPU sample is never recorded by the sampler (build_batch skips
+ * event 0). Idle waits (Activity class, Client:ClientRead) ARE in the batch
+ * but must be excluded from "active sessions" exactly as the AAS/DB-Time views
+ * do. We inline the same predicate here to keep the pure core dependency-free
+ * (pgwt_is_idle_event lives in wait_event.c, which the unit test does not
+ * link); the definition must stay in sync with pgwt_is_idle_event(). */
+static bool sample_is_idle(uint32_t wei)
+{
+    return WE_CLASS(wei) == PG_WAIT_ACTIVITY        /* Activity class */
+        || wei == WEI(PG_WAIT_CLIENT, 0);           /* Client:ClientRead */
+}
+
+void pgwt_anomaly_metrics_from_batch(const struct pgwt_trace_event *samples,
+                                     int n, double *out_aas,
+                                     double *out_lock_fraction)
+{
+    int active = 0;
+    int locks = 0;
+    for (int i = 0; i < n; i++) {
+        uint32_t we = samples[i].new_event;
+        if (we == 0 || sample_is_idle(we))
+            continue;   /* on-CPU or idle: not an active session */
+        active++;
+        if (WE_CLASS(we) == PG_WAIT_LOCK)
+            locks++;
+    }
+    if (out_aas)
+        *out_aas = (double)active;
+    if (out_lock_fraction)
+        *out_lock_fraction = active > 0 ? (double)locks / (double)active : 0.0;
+}
+
+void pgwt_anomaly_init(struct pgwt_anomaly *a, bool enabled,
+                       int sample_rate_hz)
+{
+    memset(a, 0, sizeof(*a));
+    a->enabled       = enabled;
+    a->aas_factor    = PGWT_ANOMALY_DEF_AAS_FACTOR;
+    a->aas_ticks     = PGWT_ANOMALY_DEF_AAS_TICKS;
+    a->lock_fraction = PGWT_ANOMALY_DEF_LOCK_FRAC;
+    a->lock_ticks    = PGWT_ANOMALY_DEF_LOCK_TICKS;
+    a->cooldown_ns   = (uint64_t)PGWT_ANOMALY_DEF_COOLDOWN_S * 1000000000ULL;
+    a->escalation_s  = PGWT_ANOMALY_DEF_ESCALATE_S;
+
+    /* Baseline EWMA: pick alpha so the baseline has roughly a 60-second
+     * memory regardless of tick rate. With one update per tick, a half-life
+     * of H ticks needs alpha = 1 - 2^(-1/H); approximate with alpha ~ 1/H for
+     * the small-alpha regime. H = 60s * rate. Warm up over ~5s of ticks. */
+    int hz = sample_rate_hz > 0 ? sample_rate_hz : 10;
+    double half_life_ticks = 60.0 * (double)hz;
+    if (half_life_ticks < 1.0)
+        half_life_ticks = 1.0;
+    a->baseline_alpha  = 1.0 / half_life_ticks;
+    a->warmup_needed   = 5 * hz;        /* ~5 seconds of normal data */
+    a->baseline_aas    = 0.0;
+    a->baseline_warmup = 0;
+}
+
+struct pgwt_anomaly_decision
+pgwt_anomaly_eval(struct pgwt_anomaly *a, double aas, double lock_fraction,
+                  uint64_t now_ns)
+{
+    struct pgwt_anomaly_decision d;
+    memset(&d, 0, sizeof(d));
+    d.action        = PGWT_ANOMALY_NONE;
+    d.aas           = aas;
+    d.lock_fraction = lock_fraction;
+    d.baseline      = a->baseline_aas;
+
+    if (!a->enabled)
+        return d;
+
+    /* ── AAS-vs-baseline rule ──────────────────────────────────────────── */
+    bool baseline_warm = a->baseline_warmup >= a->warmup_needed;
+    bool aas_over = false;
+    if (baseline_warm && a->aas_factor > 0.0) {
+        double threshold = a->aas_factor * a->baseline_aas;
+        /* Guard against a near-zero baseline: a tiny absolute AAS over a
+         * 0-ish baseline is noise, not an incident. Require at least 2 active
+         * sessions before the multiplicative rule can fire. */
+        aas_over = (aas >= 2.0) && (aas > threshold);
+    }
+    if (aas_over)
+        a->aas_over_streak++;
+    else
+        a->aas_over_streak = 0;
+    bool aas_fire = aas_over && (a->aas_over_streak >= a->aas_ticks);
+
+    /* ── Lock-class fraction rule ──────────────────────────────────────── */
+    bool lock_over = (a->lock_fraction > 0.0) && (lock_fraction > a->lock_fraction);
+    if (lock_over)
+        a->lock_over_streak++;
+    else
+        a->lock_over_streak = 0;
+    bool lock_fire = lock_over && (a->lock_over_streak >= a->lock_ticks);
+
+    /* ── Baseline maintenance ──────────────────────────────────────────── */
+    /* Only learn from NORMAL ticks: do not fold an anomalous AAS back into the
+     * baseline (that would let a sustained incident silently raise the bar
+     * until the rule stops firing). A tick is "normal" for baseline purposes
+     * when AAS is not currently over the multiplicative threshold. While
+     * warming up we always learn (there is no baseline to protect yet). */
+    if (!baseline_warm) {
+        /* Simple running mean during warmup so the EWMA starts sane. */
+        a->baseline_warmup++;
+        double w = (double)a->baseline_warmup;
+        a->baseline_aas += (aas - a->baseline_aas) / w;
+    } else if (!aas_over) {
+        a->baseline_aas += a->baseline_alpha * (aas - a->baseline_aas);
+    }
+    d.baseline = a->baseline_aas;
+
+    /* ── Decision ──────────────────────────────────────────────────────── */
+    if (!aas_fire && !lock_fire) {
+        /* Surface a near-trigger if a metric crossed but did not sustain. */
+        unsigned near = PGWT_NEAR_NONE;
+        if (aas_over && !aas_fire)
+            near |= PGWT_NEAR_AAS_SUSTAIN;
+        if (lock_over && !lock_fire)
+            near |= PGWT_NEAR_LOCK_SUSTAIN;
+        if (!baseline_warm && aas >= 2.0)
+            near |= PGWT_NEAR_BASELINE;
+        if (near) {
+            d.action = PGWT_ANOMALY_NEAR;
+            d.near_mask = near;
+            a->near_total++;
+        }
+        return d;
+    }
+
+    /* A rule wants to fire. Enforce cooldown (hysteresis against flapping). */
+    unsigned fired = (aas_fire ? PGWT_RULE_AAS : 0)
+                   | (lock_fire ? PGWT_RULE_LOCK : 0);
+    if (a->last_fire_ns != 0 &&
+        now_ns - a->last_fire_ns < a->cooldown_ns) {
+        d.action = PGWT_ANOMALY_NEAR;
+        d.near_mask = PGWT_NEAR_COOLDOWN;
+        d.fired_mask = fired;   /* what WOULD have fired */
+        a->near_total++;
+        a->dropped_cooldown++;
+        return d;
+    }
+
+    d.action = PGWT_ANOMALY_FIRE;
+    d.fired_mask = fired;
+    a->last_fire_ns = now_ns;
+    a->fires_total++;
+    return d;
+}
+
+/* ── Daemon-side wrapper ──────────────────────────────────────────────── */
+
+#ifndef PGWT_SERVER
+
+#include "daemon.h"
+#include "escalation.h"
+
+#include <time.h>
+
+static uint64_t anomaly_mono_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+static const char *rule_names(unsigned mask, char *buf, size_t len)
+{
+    buf[0] = '\0';
+    if (mask & PGWT_RULE_AAS)
+        snprintf(buf + strlen(buf), len - strlen(buf), "aas ");
+    if (mask & PGWT_RULE_LOCK)
+        snprintf(buf + strlen(buf), len - strlen(buf), "lock ");
+    if (buf[0] == '\0')
+        snprintf(buf, len, "(none)");
+    return buf;
+}
+
+void pgwt_anomaly_tick(struct pgwt_daemon *d,
+                       const struct pgwt_trace_event *samples, int n)
+{
+    struct pgwt_anomaly *a = &d->anomaly;
+    if (!a->enabled)
+        return;
+
+    double aas = 0.0, lock_fraction = 0.0;
+    pgwt_anomaly_metrics_from_batch(samples, n, &aas, &lock_fraction);
+
+    uint64_t now = anomaly_mono_ns();
+    struct pgwt_anomaly_decision dec =
+        pgwt_anomaly_eval(a, aas, lock_fraction, now);
+
+    char rb[32];
+    switch (dec.action) {
+    case PGWT_ANOMALY_NONE:
+        break;
+
+    case PGWT_ANOMALY_NEAR:
+        /* Log EVERY near-trigger so thresholds can be tuned from data. This is
+         * the observability requirement (D5.4): a metric crossed but cooldown
+         * / budget / sustain blocked the fire. */
+        fprintf(stderr,
+                "INFO: anomaly near-trigger: aas=%.1f baseline=%.2f "
+                "lock_frac=%.2f%s%s%s%s\n",
+                dec.aas, dec.baseline, dec.lock_fraction,
+                (dec.near_mask & PGWT_NEAR_AAS_SUSTAIN) ? " [aas-sustain]" : "",
+                (dec.near_mask & PGWT_NEAR_LOCK_SUSTAIN) ? " [lock-sustain]" : "",
+                (dec.near_mask & PGWT_NEAR_COOLDOWN) ? " [cooldown]" : "",
+                (dec.near_mask & PGWT_NEAR_BASELINE) ? " [baseline-warmup]" : "");
+        break;
+
+    case PGWT_ANOMALY_FIRE: {
+        int granted = 0;
+        const char *why = NULL;
+        rule_names(dec.fired_mask, rb, sizeof(rb));
+        int rc = pgwt_escalate(d, a->escalation_s, PGWT_ESC_REASON_ANOMALY,
+                               &granted, &why);
+        if (rc == 0) {
+            fprintf(stderr,
+                    "INFO: anomaly AUTO-escalation: rule=%saas=%.1f "
+                    "baseline=%.2f lock_frac=%.2f -> full fidelity %ds\n",
+                    rb, dec.aas, dec.baseline, dec.lock_fraction, granted);
+        } else {
+            /* Over budget: dropped SILENTLY (log only, no error to anyone) —
+             * unlike a manual escalate which returns a denial to its caller. */
+            a->dropped_budget++;
+            fprintf(stderr,
+                    "INFO: anomaly trigger DROPPED (budget): rule=%saas=%.1f "
+                    "lock_frac=%.2f (%s)\n",
+                    rb, dec.aas, dec.lock_fraction,
+                    why ? why : "budget exhausted");
+        }
+        break;
+    }
+    }
+}
+
+#endif /* !PGWT_SERVER */

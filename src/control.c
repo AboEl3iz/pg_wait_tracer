@@ -145,6 +145,16 @@ static cJSON *build_metrics(const struct pgwt_daemon *d)
     cjson_add_uint64(root, "escalation_denied_total",
                      d->escalation.denied_total);
 
+    /* Anomaly-trigger accounting (A5). 0 when not in tiered mode. */
+    cjson_add_uint64(root, "anomaly_fires_total", d->anomaly.fires_total);
+    cjson_add_uint64(root, "anomaly_near_total", d->anomaly.near_total);
+    cjson_add_uint64(root, "anomaly_dropped_budget_total",
+                     d->anomaly.dropped_budget);
+    cjson_add_uint64(root, "anomaly_dropped_cooldown_total",
+                     d->anomaly.dropped_cooldown);
+    cJSON_AddNumberToObject(root, "anomaly_baseline_aas",
+                            d->anomaly.baseline_aas);
+
     return root;
 }
 

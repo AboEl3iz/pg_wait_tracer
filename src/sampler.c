@@ -264,6 +264,13 @@ int pgwt_sampler_poll(struct pgwt_daemon *d)
 
     int count = pgwt_sampler_build_batch(targets, s->read_vals, n, tick_ts,
                                          s->samples);
+
+    /* Anomaly-trigger rules (A5) run on the live sample batch every tick — in
+     * tiered mode they may AUTO-escalate to full fidelity. Evaluated even when
+     * count == 0 (an all-idle / all-CPU tick is a legitimate low-AAS reading
+     * that the rolling baseline must learn from). No-op outside tiered mode. */
+    pgwt_anomaly_tick(d, s->samples, count);
+
     if (count == 0)
         return 0;
 

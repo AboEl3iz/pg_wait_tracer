@@ -314,17 +314,38 @@ Acceptance: tiered mode survives PG restarts (existing re-attach logic),
 escalation windows produce mixed traces that all views handle, default
 mode can flip to `tiered`.
 
-### Phase A5 — Anomaly-triggered escalation
-Scope: D5 rules engine: AAS-vs-baseline and lock-class-fraction
-triggers, hysteresis, cooldown, budget interaction, escalation-reason
-records in the trace.
-Files: `src/escalation.c`, `src/compute.c` (rolling baseline on the
-live sample stream).
-Tests: synthetic trigger tests (scripted sample streams → expected
-fire/no-fire); live test with injected `LOCK TABLE` contention
-(reuse `demos/workload.sh`).
-Acceptance: an injected lock storm auto-escalates, captures full
-transitions, de-escalates, and the trace records why.
+### Phase A5 — Anomaly-triggered escalation ✅ DONE
+Delivered: AAS-vs-baseline + lock-class-fraction rules on the live sampled
+stream (`src/anomaly.c/h`), evaluated each sampler tick. Rolling EWMA
+baseline (not updated while AAS is anomalous, so a sustained incident can't
+raise the bar and silence the rule). Hysteresis (sustained-N-ticks) +
+cooldown so a flapping metric can't burst-burn the budget; an anomaly while
+escalated EXTENDS the window via A4's `pgwt_escalate` extend path. Over-budget
+anomaly triggers are dropped SILENTLY (log only) — unlike manual escalate
+which denies. Every near-trigger is logged for data-driven tuning. Anomaly
+windows carry `PGWT_ESC_REASON_ANOMALY` in the trace markers, distinct from
+manual. Config flags (tiered-only, conservative defaults):
+`--anomaly-aas-factor` (3.0), `--anomaly-aas-ticks` (3),
+`--anomaly-lock-fraction` (0.30), `--anomaly-cooldown-s` (120),
+`--anomaly-window-s` (60). Counters exposed via the control-socket metrics
+(`anomaly_fires_total`, `anomaly_near_total`, `anomaly_dropped_budget_total`,
+`anomaly_dropped_cooldown_total`, `anomaly_baseline_aas`).
+Tests: `tests/test_anomaly.c` — 74/74 pure-rule checks (sustain, cooldown,
+baseline-protection, budget boundary, metrics derivation, combined fire);
+wired into run_all.sh + CI. Live on the box: `tests/test_anomaly_live.sh`
+11/11 — a 12-backend `LOCK TABLE` storm AUTO-escalated (tier=escalated,
+START reason=anomaly), the bounded window captured transitions and
+auto-de-escalated (END reason=expired), and cooldown blocked an immediate
+re-fire. `tests/dump_markers.c` decodes the reason-tagged markers (no view
+surfaces them until B5).
+Note for B5: anomaly-reason escalations are already in the trace (marker
+reason byte = 1) and in the metrics; the UI just needs to render them.
+
+Implementation note vs. the original plan: the rule state + rolling
+baseline live in the new `src/anomaly.c/h` (a pure, unit-testable core)
+rather than in `escalation.c`/`compute.c` — the baseline is derived from
+the sampler's per-tick batch in `sampler.c`, so no `compute.c` change was
+needed.
 
 ### Phase A6 — Cooperative provider stub (interface freeze only)
 Scope: `coop` provider compiled but returning "not available"; document
