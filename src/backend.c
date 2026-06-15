@@ -71,6 +71,75 @@ static uint64_t now_ns(void)
     return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 }
 
+/* Pre-seed the BPF state_map for a backend whose wait_event_info address is
+ * already resolved (be->wp_addr). Reads the backend's CURRENT wait_event_info
+ * and query_id and writes them as the initial state, so the first watchpoint
+ * fire ACCUMULATES the in-progress wait instead of discarding it (otherwise a
+ * backend already blocked at attach time — e.g. Lock:relation — loses its
+ * opening interval). Idempotent via BPF_NOEXIST. */
+static void preseed_state_map(struct pgwt_daemon *d, pid_t pid, uint64_t addr,
+                              uint64_t attach_ts)
+{
+    char mem_path[64];
+    snprintf(mem_path, sizeof(mem_path), "/proc/%d/mem", pid);
+    int mem_fd = open(mem_path, O_RDONLY);
+    if (mem_fd < 0)
+        return;
+
+    uint32_t current_wei = 0;
+    if (pread(mem_fd, &current_wei, sizeof(current_wei), addr) ==
+        sizeof(current_wei)) {
+        /* Read current query_id from MyBEEntry->st_query_id */
+        uint64_t current_qid = 0;
+        if (d->my_be_entry_addr && d->st_query_id_offset > 0) {
+            uint64_t be_ptr = 0;
+            if (pread(mem_fd, &be_ptr, sizeof(be_ptr),
+                      d->my_be_entry_addr) == sizeof(be_ptr)
+                && be_ptr
+                && pread(mem_fd, &current_qid,
+                         sizeof(current_qid),
+                         be_ptr + d->st_query_id_offset)
+                   != sizeof(current_qid))
+                current_qid = 0;
+        }
+
+        int state_fd = bpf_map__fd(d->skel->maps.state_map);
+        struct pgwt_pid_state init_state = {
+            .last_event = current_wei,
+            .last_ts = attach_ts,
+            .last_query_id = current_qid,
+            .wait_event_addr = addr,
+        };
+        uint32_t pid_key = pid;
+        /* BPF_ANY (not NOEXIST): on first full-mode attach this creates the
+         * entry; on tiered RE-escalation it REFRESHES a reset/sampled entry to
+         * the backend's CURRENT wait state, so an in-progress wait at escalate
+         * time is captured instead of being lost behind a stale last_event. */
+        bpf_map_update_elem(state_fd, &pid_key, &init_state, BPF_ANY);
+    }
+    close(mem_fd);
+}
+
+int pgwt_attach_backend_watchpoint(struct pgwt_daemon *d,
+                                   struct pgwt_backend *be)
+{
+    if (be->wp_addr == 0 || be->wp_fd >= 0)
+        return be->wp_fd >= 0 ? 0 : -1;
+
+    int wp_prog_fd = bpf_program__fd(d->skel->progs.on_watchpoint);
+    be->wp_fd = pgwt_open_watchpoint(be->pid, be->wp_addr, wp_prog_fd);
+    if (be->wp_fd < 0) {
+        /* Process likely exited before attach — caller decides on cleanup. */
+        d->counters.wp_attach_failures_total++;
+        return -1;
+    }
+
+    if (be->attach_ts == 0)
+        be->attach_ts = now_ns();
+    preseed_state_map(d, be->pid, be->wp_addr, be->attach_ts);
+    return 0;
+}
+
 int pgwt_scan_existing_backends(struct pgwt_daemon *d)
 {
     DIR *proc = opendir("/proc");
@@ -149,63 +218,21 @@ int pgwt_scan_existing_backends(struct pgwt_daemon *d)
             continue;
         }
 
-        /* Full mode — attach real watchpoint directly */
-        int wp_prog_fd = bpf_program__fd(d->skel->progs.on_watchpoint);
-        be->wp_fd = pgwt_open_watchpoint(pid, ptr, wp_prog_fd);
-        if (be->wp_fd < 0) {
+        /* Full mode — attach real watchpoint directly. The shared helper
+         * opens the watchpoint and pre-seeds the BPF state_map with the
+         * backend's current wait state (so an in-progress wait at attach
+         * time is not lost). The same helper is reused on escalation. */
+        be->attach_ts = now_ns();
+        if (pgwt_attach_backend_watchpoint(d, be) != 0) {
             /* Silently skip — process likely exited before attach */
-            d->counters.wp_attach_failures_total++;
             be->is_alive = false;
             be->pid = 0;
             continue;
         }
 
-        be->attach_ts = now_ns();
         pgwt_parse_cmdline(pid, &be->meta);
         if (d->backend_meta)
             pgwt_bm_write(d->backend_meta, pid, &be->meta);
-
-        /* Pre-initialize BPF state_map so the first watchpoint fire
-         * ACCUMULATES the current wait state instead of just initializing.
-         * Without this, backends already in a wait (e.g. Lock:relation)
-         * would lose their initial interval because on_watchpoint treats
-         * the first fire as state_map initialization. */
-        {
-            char mem_path[64];
-            snprintf(mem_path, sizeof(mem_path), "/proc/%d/mem", pid);
-            int mem_fd = open(mem_path, O_RDONLY);
-            if (mem_fd >= 0) {
-                uint32_t current_wei = 0;
-                if (pread(mem_fd, &current_wei, sizeof(current_wei), ptr) ==
-                    sizeof(current_wei)) {
-                    /* Read current query_id from MyBEEntry->st_query_id */
-                    uint64_t current_qid = 0;
-                    if (d->my_be_entry_addr && d->st_query_id_offset > 0) {
-                        uint64_t be_ptr = 0;
-                        if (pread(mem_fd, &be_ptr, sizeof(be_ptr),
-                                  d->my_be_entry_addr) == sizeof(be_ptr)
-                            && be_ptr
-                            && pread(mem_fd, &current_qid,
-                                     sizeof(current_qid),
-                                     be_ptr + d->st_query_id_offset)
-                               != sizeof(current_qid))
-                            current_qid = 0;
-                    }
-
-                    int state_fd = bpf_map__fd(d->skel->maps.state_map);
-                    struct pgwt_pid_state init_state = {
-                        .last_event = current_wei,
-                        .last_ts = be->attach_ts,
-                        .last_query_id = current_qid,
-                        .wait_event_addr = ptr,
-                    };
-                    uint32_t pid_key = pid;
-                    bpf_map_update_elem(state_fd, &pid_key, &init_state,
-                                        BPF_NOEXIST);
-                }
-                close(mem_fd);
-            }
-        }
 
         if (d->verbose)
             fprintf(stderr, "INFO: attached to PID %d (%s), watchpoint at 0x%lx\n",

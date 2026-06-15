@@ -54,8 +54,12 @@ static void usage(const char *prog)
         "      --mode <MODE>          full (default) | sampled | tiered\n"
         "                             full: hardware watchpoints, exact transitions.\n"
         "                             sampled: userspace ASH-style sampling, ~zero PG cost.\n"
-        "                             tiered: sampler always-on (escalation: A4)\n"
+        "                             tiered: sampler always-on; escalate to full\n"
+        "                                     fidelity for bounded, budgeted windows.\n"
         "      --sample-rate <HZ>     Sampling rate for sampled/tiered (1-1000, default 10)\n"
+        "      --escalation-budget <S>  Tiered: full-fidelity seconds allowed per\n"
+        "                             rolling hour (default 300). Escalate via the\n"
+        "                             control socket: {\"cmd\":\"escalate\",\"duration_s\":N}.\n"
         "\n"
         "Performance tuning:\n"
         "      --lightweight          BPF accumulator only (no per-event ringbuf).\n"
@@ -186,6 +190,7 @@ static enum pgwt_mode parse_mode(const char *s)
 #define OPT_SKIP_USDT    263
 #define OPT_MODE         264
 #define OPT_SAMPLE_RATE  265
+#define OPT_ESC_BUDGET   266
 
 static struct option long_opts[] = {
     {"pid",        required_argument, NULL, 'p'},
@@ -212,6 +217,7 @@ static struct option long_opts[] = {
     {"skip-usdt",       no_argument,       NULL, OPT_SKIP_USDT},
     {"mode",            required_argument, NULL, OPT_MODE},
     {"sample-rate",     required_argument, NULL, OPT_SAMPLE_RATE},
+    {"escalation-budget", required_argument, NULL, OPT_ESC_BUDGET},
     {"quiet",           no_argument,       NULL, 'q'},
     {"verbose",         no_argument,       NULL, 'v'},
     {"help",            no_argument,       NULL, 'h'},
@@ -234,6 +240,7 @@ int main(int argc, char **argv)
     d->view      = PGWT_VIEW_TIME_MODEL;
     d->mode      = PGWT_MODE_FULL;   /* default: today's watchpoint behavior */
     d->sample_rate_hz = 10;          /* default sampled rate (D1) */
+    d->escalation_budget_s = 300;    /* tiered: full-fidelity s / rolling hour (D5) */
 
     pid_t pm_pid = 0;
     const char *pgdata = NULL;
@@ -276,6 +283,7 @@ int main(int argc, char **argv)
         case OPT_SKIP_USDT:   d->skip_usdt = 1; break;
         case OPT_MODE:        d->mode = parse_mode(optarg); break;
         case OPT_SAMPLE_RATE: d->sample_rate_hz = atoi(optarg); break;
+        case OPT_ESC_BUDGET:  d->escalation_budget_s = atoi(optarg); break;
         case 'q': d->quiet = true; break;
         case 'v': d->verbose = true; break;
         case 'h': usage(argv[0]); free(d); return 0;
@@ -352,6 +360,15 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    /* Validate: --escalation-budget (tiered only). 0 disables the limit
+     * (escalations always granted) — allowed for testing but warned. */
+    if (d->escalation_budget_s < 0) {
+        fprintf(stderr, "FATAL: --escalation-budget must be >= 0 (got %d)\n",
+                d->escalation_budget_s);
+        free(d);
+        return 1;
+    }
+
     /* Validate: --mode sampled/tiered is incompatible with --lightweight
      * (lightweight is a watchpoint-only BPF-accumulator mode). */
     if (d->mode != PGWT_MODE_FULL && d->lightweight_mode) {
@@ -361,12 +378,12 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* A2 note: tiered escalation arrives in A4. For now tiered runs the
-     * sampler always-on with no escalation engine — log it so the operator
-     * isn't surprised that full-fidelity windows aren't produced yet. */
+    /* Tiered (A4): sampler always-on; full-fidelity escalation on demand via
+     * the control socket, bounded by --escalation-budget per rolling hour. */
     if (d->mode == PGWT_MODE_TIERED)
         fprintf(stderr, "INFO: --mode tiered: sampler always-on; on-demand "
-                "full-fidelity escalation lands in A4 (not yet active)\n");
+                "full-fidelity escalation (budget %ds/hour)\n",
+                d->escalation_budget_s);
 
     /* Check root */
     if (geteuid() != 0) {

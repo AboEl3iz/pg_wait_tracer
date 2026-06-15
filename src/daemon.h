@@ -11,6 +11,7 @@
 #include "map_reader.h"
 #include "snapshot.h"
 #include "provider.h"
+#include "escalation.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -110,8 +111,10 @@ struct pgwt_daemon {
      * fixed rate (1..1000, default 10). */
     enum pgwt_mode mode;
     int         sample_rate_hz;
+    int         escalation_budget_s;     /* tiered: full-fidelity s / rolling hour */
     const struct pgwt_capture_provider *provider; /* active provider vtable */
     struct pgwt_sampler *sampler;        /* sampled-tier state, NULL if unused */
+    struct pgwt_escalation escalation;   /* tiered escalation engine (D5/A4) */
     uint32_t    lightweight_mode;        /* 1 = BPF accumulator only (no ringbuf) */
     uint32_t    skip_query_id;          /* 1 = skip query_id reads in BPF */
     uint32_t    skip_usdt;             /* 1 = skip USDT query lifecycle probes */
@@ -150,11 +153,29 @@ struct pgwt_daemon {
     char       *pg_binary_saved;        /* heap-allocated postgres binary path for USDT */
 };
 
-/* True when the active mode attaches hardware watchpoints (full tier).
- * Sampled mode tracks backends in the registry but arms no watchpoints. */
+/* True when watchpoints should be attached RIGHT NOW.
+ *   FULL    — always (the original watchpoint behavior).
+ *   SAMPLED — never (registry only, the sampler reads memory directly).
+ *   TIERED  — only while escalated: the sampler runs always-on and full
+ *             fidelity is armed for bounded windows. De-escalated, tiered
+ *             behaves exactly like sampled (no traps on PG).
+ * Used by the fork/exit lifecycle to decide whether a new backend gets a
+ * bootstrap watchpoint, and by the daemon to gate watchpoint-only setup. */
 static inline bool pgwt_mode_uses_watchpoints(const struct pgwt_daemon *d)
 {
-    return d->mode != PGWT_MODE_SAMPLED;
+    if (d->mode == PGWT_MODE_SAMPLED)
+        return false;
+    if (d->mode == PGWT_MODE_TIERED)
+        return d->escalation.active;
+    return true;   /* PGWT_MODE_FULL */
+}
+
+/* True when the mode runs the always-on userspace sampler (sampled + tiered).
+ * Distinct from pgwt_mode_uses_watchpoints(): in tiered mode BOTH can be true
+ * at once (sampler always on, watchpoints on during an escalation window). */
+static inline bool pgwt_mode_uses_sampler(const struct pgwt_daemon *d)
+{
+    return d->mode == PGWT_MODE_SAMPLED || d->mode == PGWT_MODE_TIERED;
 }
 
 /* Initialize daemon: load BPF, attach tracepoints, scan backends. */
