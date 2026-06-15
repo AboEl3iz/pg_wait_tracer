@@ -215,28 +215,13 @@ int main(int argc, char **argv)
         }
     }
 
-    /* Top-5 overlap. */
+    /* Top-N overlap: does the top-N by exact share match the top-N by sampled
+     * estimate? Rank a copy by sampled_ns, then intersect the two top-N sets. */
     int top = nl < 5 ? nl : 5;
     int overlap = 0;
-    for (int i = 0; i < top; i++) {
-        /* rank by sampled too */
-        struct evt_acc s[MAX_DISTINCT];
-        memcpy(s, list, nl * sizeof(list[0]));
-        for (int a = 1; a < nl; a++) {
-            struct evt_acc tmp = s[a]; int j = a - 1;
-            while (j >= 0 && s[j].sampled_ns < tmp.sampled_ns) {
-                s[j+1] = s[j]; j--;
-            }
-            s[j+1] = tmp;
-        }
-        for (int k = 0; k < top; k++)
-            if (s[k].event_id == list[i].event_id) { overlap++; break; }
-        break;   /* compute overlap once below */
-    }
-    /* recompute overlap cleanly */
     {
         struct evt_acc s[MAX_DISTINCT];
-        memcpy(s, list, nl * sizeof(list[0]));
+        memcpy(s, list, (size_t)nl * sizeof(list[0]));
         for (int a = 1; a < nl; a++) {
             struct evt_acc tmp = s[a]; int j = a - 1;
             while (j >= 0 && s[j].sampled_ns < tmp.sampled_ns) {
@@ -244,7 +229,6 @@ int main(int argc, char **argv)
             }
             s[j+1] = tmp;
         }
-        overlap = 0;
         for (int i = 0; i < top; i++)
             for (int k = 0; k < top; k++)
                 if (list[i].event_id == s[k].event_id) { overlap++; break; }
