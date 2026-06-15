@@ -7,8 +7,8 @@
  * label } rather than performing navigation, keeping the config free of app
  * wiring. The view translates the intent into filters.drill().
  *
- * This PR migrates overview + events. sessions/queries configs are included so
- * the shared component is exercised, but their views migrate in B3 part 2.
+ * Used by the migrated overview, events, sessions and queries views (the
+ * drill-down tables all share lib/table.js via these configs).
  */
 
 import {
