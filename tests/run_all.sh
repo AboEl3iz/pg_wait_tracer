@@ -130,6 +130,7 @@ if [[ $(id -u) -eq 0 ]] && pgrep -x postgres > /dev/null 2>&1; then
     run_test "test_idle_exclusion" python3 "$SCRIPT_DIR/test_idle_exclusion.py" $PID_ARG
     run_test "test_daemon_server" python3 "$SCRIPT_DIR/test_daemon_server.py" $PID_ARG
     run_test "test_control" bash "$SCRIPT_DIR/test_control.sh" $PID_ARG
+    run_test "test_escalation" bash "$SCRIPT_DIR/test_escalation.sh" $PID_ARG
 else
     if [[ $(id -u) -ne 0 ]]; then
         skip_test "test_lifecycle" "requires root"
@@ -153,6 +154,7 @@ else
         skip_test "test_idle_exclusion" "requires root"
         skip_test "test_daemon_server" "requires root"
         skip_test "test_control" "requires root"
+        skip_test "test_escalation" "requires root"
     else
         skip_test "test_lifecycle" "PostgreSQL not running"
         skip_test "test_cross_validate" "PostgreSQL not running"
@@ -175,6 +177,7 @@ else
         skip_test "test_idle_exclusion" "PostgreSQL not running"
         skip_test "test_daemon_server" "PostgreSQL not running"
         skip_test "test_control" "PostgreSQL not running"
+        skip_test "test_escalation" "PostgreSQL not running"
     fi
 fi
 

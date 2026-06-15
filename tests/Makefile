@@ -7,7 +7,7 @@ BUILD     = ../build
 
 TESTS     = test_wait_event test_cmdline test_event_writer test_event_reader \
             test_trace_v2 test_sampler test_bucket gen_test_traces \
-            gen_bench_traces test_concurrent_rw
+            gen_bench_traces test_concurrent_rw cross_validate
 
 .PHONY: all clean
 
@@ -55,6 +55,14 @@ gen_bench_traces: gen_bench_traces.c $(SERVER_OBJS)
 test_concurrent_rw: test_concurrent_rw.c $(BUILD)/event_reader.o $(BUILD)/event_writer.o \
                     $(BUILD)/map_reader.o $(BUILD)/wait_event.o $(BUILD)/cJSON.o
 	$(CC) $(CFLAGS) -o $@ $^ -llz4 -lbpf -lelf -lz
+
+# cross_validate: A4 sampled-vs-exact comparison tool. Server build
+# (-DPGWT_SERVER) so it needs no BPF skeleton — runs anywhere the server
+# builds. Reads a tiered trace dir and reports estimator agreement.
+cross_validate: cross_validate.c $(BUILD)/server_event_reader.o \
+                $(BUILD)/server_event_writer.o $(BUILD)/server_wait_event.o \
+                $(BUILD)/server_cJSON.o
+	$(CC) $(CFLAGS) -DPGWT_SERVER -o $@ $^ -llz4 -lz
 
 clean:
 	rm -f $(TESTS)
