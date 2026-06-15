@@ -20,6 +20,7 @@
 #include "daemon.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int tests_run = 0;
@@ -56,16 +57,18 @@ int main(void)
 
     /* --- behavior: start() refuses cleanly, no crash --- */
     printf("--- clean not-available ---\n");
-    struct pgwt_daemon d;
-    memset(&d, 0, sizeof(d));
-    d.verbose = false;
+    /* struct pgwt_daemon is large (embeds the snapshot ring etc.) — heap it. */
+    struct pgwt_daemon *dp = calloc(1, sizeof(*dp));
+    if (!dp) { printf("  FAIL: calloc daemon\n"); return 1; }
+    struct pgwt_daemon *d = dp;
+    d->verbose = false;
 
-    int rc = p->start(&d);
+    int rc = p->start(d);
     CHECK(rc == -1, "start() must return -1 (not available), got %d", rc);
 
     /* verbose path also must not crash */
-    d.verbose = true;
-    rc = p->start(&d);
+    d->verbose = true;
+    rc = p->start(d);
     CHECK(rc == -1, "start() (verbose) must return -1, got %d", rc);
 
     /* the not-available message is present and mentions the extension */
@@ -77,15 +80,17 @@ int main(void)
 
     /* --- behavior: stop/poll/metrics are safe no-ops while unarmed --- */
     printf("--- safe no-ops while unarmed ---\n");
-    CHECK(p->stop(&d) == 0, "stop() must succeed (idempotent no-op)");
-    CHECK(p->poll(&d) == 0, "poll() must succeed (nothing to drain)");
+    CHECK(p->stop(d) == 0, "stop() must succeed (idempotent no-op)");
+    CHECK(p->poll(d) == 0, "poll() must succeed (nothing to drain)");
 
     struct pgwt_metrics m;
     memset(&m, 0xab, sizeof(m));   /* poison; no-op metrics must not touch it */
     struct pgwt_metrics before = m;
-    p->self_metrics(&d, &m);
+    p->self_metrics(d, &m);
     CHECK(memcmp(&m, &before, sizeof(m)) == 0,
           "self_metrics() must be a no-op (no coop counters yet)");
+
+    free(dp);
 
     /* --- start()/stop()/poll() must tolerate a NULL daemon (defensive) --- */
     printf("--- NULL-daemon tolerance ---\n");
