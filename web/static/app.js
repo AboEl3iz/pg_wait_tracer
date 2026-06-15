@@ -3,12 +3,12 @@
  * B3 part 1: the 2000-line monolith is being restructured into native ES
  * modules (no build step — still embeddable via go:embed). This file is the
  * bootstrap + router. The migrated views (active = AAS chart, overview = time
- * model table, events = the wait-events table) live in views/ as pure builders
- * + thin mounts; the not-yet-migrated tabs (sessions/queries/histogram/timeline/
+ * model table, events/sessions = drill-down tables) live in views/ as pure
+ * builders + thin mounts; the not-yet-migrated tabs (queries/histogram/timeline/
  * transitions/concurrency) are wrapped as legacy view adapters so they ALL flow
  * through the same view-manager chokepoint and transport single-flight — which is
  * what keeps the B2 chaos races fixed while they await their turn to be migrated
- * to pure builders (sessions/queries land later in this PR; the charts in part 3).
+ * to pure builders (queries lands next in this PR; the charts in part 3).
  *
  * State is explicit (lib/state.js): no grab-bag global mutated mid-flight.
  * Stale-response superseding is structural (lib/transport.js channels +
@@ -23,10 +23,11 @@ import {
     WAIT_CLASSES, EVENT_PALETTE, classColor,
     fmtTime, fmtTimeMs, fmtDuration, fmtMs, fmtUs, fmtCount, esc,
 } from './lib/format.js';
-import { sessionsConfig, queriesConfig } from './lib/builders/table-configs.js';
+import { queriesConfig } from './lib/builders/table-configs.js';
 import { createActiveView } from './views/active.js';
 import { createOverviewView } from './views/overview.js';
 import { createEventsView } from './views/events.js';
+import { createSessionsView } from './views/sessions.js';
 
 // ── Core services ─────────────────────────────────────────────────────────────
 
@@ -196,7 +197,7 @@ function initTabs() {
 
     vm.register(createOverviewView());
     vm.register(createEventsView());
-    vm.register(makeSessionsView());
+    vm.register(createSessionsView());
     vm.register(makeQueriesView());
     vm.register(makeHistogramView());
     vm.register(makeTimelineView());
@@ -501,7 +502,6 @@ function makeTableTabView(id, cmd, config) {
     };
 }
 
-function makeSessionsView() { return makeTableTabView('sessions', 'top_sessions', sessionsConfig); }
 function makeQueriesView()  { return makeTableTabView('queries', 'top_queries', queriesConfig); }
 
 function renderLegacyTable(container, tab, config, data) {
