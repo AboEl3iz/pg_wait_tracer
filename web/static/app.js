@@ -3,12 +3,12 @@
  * B3 part 1: the 2000-line monolith is being restructured into native ES
  * modules (no build step — still embeddable via go:embed). This file is the
  * bootstrap + router. The migrated views (active = AAS chart, overview = time
- * model table) live in views/ as pure builders + thin mounts; the not-yet-
- * migrated tabs (events/sessions/queries/histogram/timeline/transitions/
- * concurrency) are wrapped as legacy view adapters so they ALL flow through the
- * same view-manager chokepoint and transport single-flight — which is what
- * keeps the B2 chaos races fixed while they await their turn to be migrated to
- * pure builders in B3 part 2.
+ * model table, events/sessions/queries = the drill-down tables) live in views/
+ * as pure builders + thin mounts; the not-yet-migrated tabs (histogram/timeline/
+ * transitions/concurrency) are wrapped as legacy view adapters so they ALL flow
+ * through the same view-manager chokepoint and transport single-flight — which is
+ * what keeps the B2 chaos races fixed while they await their turn to be migrated
+ * to pure builders in B3 part 3.
  *
  * State is explicit (lib/state.js): no grab-bag global mutated mid-flight.
  * Stale-response superseding is structural (lib/transport.js channels +
@@ -18,14 +18,16 @@
 import { ServerInfo, TimeRange, FilterStack, FIFTEEN_MIN_NS } from './lib/state.js';
 import { Transport } from './lib/transport.js';
 import { ViewManager } from './lib/view-manager.js';
-import { mountTable, buildTableModel } from './lib/table.js';
+import { mountTable } from './lib/table.js';
 import {
-    WAIT_CLASSES, EVENT_PALETTE, classColor,
-    fmtTime, fmtTimeMs, fmtDuration, fmtMs, fmtUs, fmtCount, esc,
+    WAIT_CLASSES, classColor,
+    fmtTime, fmtTimeMs, fmtDuration, fmtUs, fmtCount, esc,
 } from './lib/format.js';
-import { eventsConfig, sessionsConfig, queriesConfig } from './lib/builders/table-configs.js';
 import { createActiveView } from './views/active.js';
 import { createOverviewView } from './views/overview.js';
+import { createEventsView } from './views/events.js';
+import { createSessionsView } from './views/sessions.js';
+import { createQueriesView } from './views/queries.js';
 
 // ── Core services ─────────────────────────────────────────────────────────────
 
@@ -45,9 +47,17 @@ let reconnectTimer = null;
 let autoRefreshId = 0;
 let autoRefreshOn = false;
 
-// Sort state per tab (legacy table views read/write this).
-const sortCol = {};
-const sortAsc = {};
+// Sort state per table view. getSort returns the current { key, asc } (or null
+// for server order); toggleSort cycles desc→asc on repeated clicks of the same
+// column. Kept here (not in a view) so it survives tab switches, matching the
+// old per-tab behavior.
+const tabSort = {};   // tab -> { key, asc }
+function getSort(tab) { return tabSort[tab] || null; }
+function toggleSort(tab, key) {
+    const cur = tabSort[tab];
+    if (cur && cur.key === key) tabSort[tab] = { key, asc: !cur.asc };
+    else tabSort[tab] = { key, asc: false };
+}
 
 // ── DOM handles (resolved once at bootstrap) ──────────────────────────────────
 
@@ -64,8 +74,10 @@ function makeCtx() {
         setStatus,
         onDrill: drill,
         onZoom: (from, to) => { stopAutoRefresh(); zoomTo(from, to); },
-        // Legacy adapters need these:
-        sortCol, sortAsc,
+        // Table views: per-tab sort state + a re-render hook used after a
+        // header-sort click (re-runs requests/build/mount under a fresh epoch).
+        getSort, toggleSort,
+        refresh: () => vm.refresh(),
     };
 }
 
@@ -177,9 +189,9 @@ function initTabs() {
     vm.setContainer(tableEl);
 
     vm.register(createOverviewView());
-    vm.register(makeEventsView());
-    vm.register(makeSessionsView());
-    vm.register(makeQueriesView());
+    vm.register(createEventsView());
+    vm.register(createSessionsView());
+    vm.register(createQueriesView());
     vm.register(makeHistogramView());
     vm.register(makeTimelineView());
     vm.register(makeTransitionsView());
@@ -456,61 +468,16 @@ function initLiveMode() {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// LEGACY VIEW ADAPTERS — not yet migrated to pure builders (B3 part 2).
+// LEGACY VIEW ADAPTERS — the chart/Sankey views awaiting B3 part 3.
 //
-// Each wraps the original app.js render logic in the { id, requests, build,
-// mount, enter, leave } contract so it flows through the view-manager chokepoint
-// + transport single-flight. requests() returns the raw response (possibly
-// several joined fetches), build() is identity (kept impure for now — the
-// migration to a pure builder + Node tests happens per-view in part 2), and
+// After B3 part 2, only histogram/timeline/transitions/concurrency remain on the
+// legacy path: each wraps the original app.js render logic in the { id, requests,
+// build, mount, enter, leave } contract so it flows through the view-manager
+// chokepoint + transport single-flight. requests() returns the raw response
+// (possibly several joined fetches), build() is identity (kept impure for now —
+// migration to a pure builder + Node tests happens per-view in part 3), and
 // mount() runs the legacy DOM/ECharts rendering. enter/leave own any chart.
 // ══════════════════════════════════════════════════════════════════════════════
-
-function makeTableTabView(id, cmd, config) {
-    return {
-        id,
-        async requests(ctx) {
-            return ctx.transport.request(ctx.channel('table'), cmd, {
-                from: ctx.timeRange.from, to: ctx.timeRange.to,
-                filters: ctx.filters.snapshot(),
-            });
-        },
-        build(data) { return data; },
-        mount(el, data) {
-            renderLegacyTable(el, id, config, data);
-        },
-        enter() {}, leave() {},
-    };
-}
-
-function makeEventsView()   { return makeTableTabView('events', 'top_events', eventsConfig); }
-function makeSessionsView() { return makeTableTabView('sessions', 'top_sessions', sessionsConfig); }
-function makeQueriesView()  { return makeTableTabView('queries', 'top_queries', queriesConfig); }
-
-function renderLegacyTable(container, tab, config, data) {
-    summaryEl.innerHTML = '';
-    if (!config || !data) {
-        container.innerHTML = '<div class="loading">No data</div>';
-        return;
-    }
-    const rows = data.rows || [];
-    if (rows.length === 0) {
-        container.innerHTML = '<div class="loading">No data for selected range</div>';
-        return;
-    }
-    const sort = sortCol[tab] ? { key: sortCol[tab], asc: sortAsc[tab] } : null;
-    const model = buildTableModel(config, rows, sort);
-    mountTable(container, config, model, {
-        sort,
-        onSort: (key) => {
-            if (sortCol[tab] === key) sortAsc[tab] = !sortAsc[tab];
-            else { sortCol[tab] = key; sortAsc[tab] = false; }
-            renderLegacyTable(container, tab, config, data);
-        },
-        onRowClick: (row) => { const i = config.onClick(row); if (i) drill(i); },
-        tooltipEl,
-    });
-}
 
 // ── Histogram (heatmap) ───────────────────────────────────────────────────────
 
