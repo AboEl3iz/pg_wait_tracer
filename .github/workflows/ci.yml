@@ -60,6 +60,7 @@ jobs:
           tests/test_trace_v2
           tests/test_sampler
           tests/test_anomaly
+          tests/test_coop
 
       - name: Run synthetic data tests
         run: |

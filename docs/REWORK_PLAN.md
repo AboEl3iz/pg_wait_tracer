@@ -347,10 +347,40 @@ rather than in `escalation.c`/`compute.c` — the baseline is derived from
 the sampler's per-tick batch in `sampler.c`, so no `compute.c` change was
 needed.
 
-### Phase A6 — Cooperative provider stub (interface freeze only)
+### Phase A6 — Cooperative provider stub (interface freeze only) ✅ DONE
 Scope: `coop` provider compiled but returning "not available"; document
 the contract the extension must satisfy (same event schema, EXACT
 fidelity, its own start/stop). No further work in this track.
+
+Delivered: `src/provider_coop.{c,h}` — a `coop` provider implementing the
+`struct pgwt_capture_provider` vtable, advertising `PGWT_FIDELITY_EXACT`,
+whose `start()` cleanly reports "cooperative provider not available in this
+build" and returns -1 so the daemon aborts startup with a clear message (no
+crash). `enum pgwt_mode` gains `PGWT_MODE_COOP`; `--mode coop` parses to it
+(`src/pg_wait_tracer.c`) and `pgwt_daemon_init()` selects the stub
+(`src/daemon.c`); coop arms neither watchpoints nor the sampler
+(`pgwt_mode_uses_watchpoints`/`_uses_sampler` in `daemon.h`). Default
+behavior and full/sampled/tiered selection are unchanged.
+
+The FROZEN CONTRACT for the extension track is documented in detail in the
+`provider_coop.h` header comment. In short, the cooperative provider must:
+(1) emit the SAME v2 trace records as the other tiers — a wait transition is
+a TRANSITIONS record byte-identical to the `full` tier's; (2) advertise
+`PGWT_FIDELITY_EXACT` so it satisfies the EXACT-required views with no
+view-side change; (3) hand every event to the trace writer through the SAME
+path the full tier uses (poll() drains the extension's delivery into
+`src/event_stream.c` `handle_event` → `src/event_writer.c`), taking backend
+identity from the SHARED registry (`src/backend.c`); (4) implement all four
+vtable entry points (start/stop/poll/self_metrics); (5) not own backend
+discovery (mode-independent registry/lifecycle stays in the daemon). The
+extension track replaces the stub bodies in `provider_coop.c`; nothing else
+in the daemon changes.
+
+Tests: `tests/test_coop.c` — BPF-free unit test (built `-DPGWT_SERVER`,
+matching test_sampler/test_anomaly) asserting the coop provider registers,
+advertises EXACT, exposes the full vtable, and that `start()` returns the
+clean not-available status (with NULL-daemon tolerance and no-op stop/poll/
+metrics while unarmed). Wired into `run_all.sh` C-unit + CI build-and-unit.
 
 ---
 

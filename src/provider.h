@@ -80,9 +80,14 @@ enum pgwt_mode {
     PGWT_MODE_FULL = 0,    /* watchpoints only — today's default */
     PGWT_MODE_SAMPLED,     /* userspace sampler only, no watchpoints */
     PGWT_MODE_TIERED,      /* sampler always on; escalation lands in A4 */
+    PGWT_MODE_COOP,        /* cooperative (PG extension) — A6 interface freeze,
+                              implemented in the extension track. The stub
+                              recognizes the mode but refuses activation with
+                              a clean "not available in this build" message. */
 };
 
-/* The two real providers (A2). coop is A6. */
+/* The two real providers (A2). coop (A6) is an interface-frozen stub; its
+ * vtable lives in provider_coop.h. */
 extern const struct pgwt_capture_provider pgwt_provider_full;
 extern const struct pgwt_capture_provider pgwt_provider_sampled;
 
