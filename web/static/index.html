@@ -18,6 +18,10 @@
     <span id="status" class="status connecting">Connecting...</span>
   </div>
   <div class="header-right">
+    <!-- Escalate control (B5): visible only when the daemon supports tiered
+         escalation; wired through pgwt-server's control proxy. -->
+    <span id="escalate-control" class="escalate-control" style="display:none"></span>
+    <button id="metrics-btn" class="metrics-btn" title="Daemon self-metrics" style="display:none">⚙</button>
     <button id="zoom-out-btn" class="zoom-out-btn" title="Zoom out">&#x2296;</button>
     <span id="time-range" class="time-range-btn"></span>
     <button id="live-btn" class="live-btn" title="Auto-refresh (5s)">Live</button>
@@ -47,6 +51,9 @@
     </div>
   </div>
 </header>
+
+<!-- Daemon self-metrics panel (B5): toggled by #metrics-btn. -->
+<div id="daemon-metrics" class="daemon-metrics" style="display:none"></div>
 
 <div id="aas-chart-container" style="padding:0 20px;background:#1e1e3a"></div>
 <div id="chart-resize"></div>

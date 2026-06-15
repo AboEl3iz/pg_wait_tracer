@@ -12,11 +12,16 @@
  */
 
 import { WAIT_CLASSES, EVENT_PALETTE, fmtTime } from '../format.js';
+import {
+    buildFidelityShading, buildEscalationAnnotation, fidelityOf, fidelityLabel,
+} from './fidelity.js';
 
-/* data: aas response { buckets[], bucket_ns, max_aas, breakdown?, series? }
- * opts: { numCpus }
- * Returns { option, seriesNames, seriesColors } — names/colors drive the
- * external HTML legend (kept out of the chart for full control, as before). */
+/* data: aas response { buckets[], bucket_ns, max_aas, breakdown?, series?,
+ *                      fidelity, sample_period_ns, fidelity_ranges? }
+ * opts: { numCpus, win:{from,to}, escalationStatus }
+ * Returns { option, seriesNames, seriesColors, fidelity, shading } — names/
+ * colors drive the external HTML legend; fidelity + shading drive the
+ * sampled/exact legend chip and the background band (Phase B5). */
 export function buildAasOption(data, opts) {
     opts = opts || {};
     const numCpus = opts.numCpus || 0;
@@ -62,22 +67,56 @@ export function buildAasOption(data, opts) {
         data: s.data,
     }));
 
-    // CPU reference line as a markLine on the first series.
-    if (numCpus > 0 && series.length) {
-        series[0].markLine = {
-            silent: true,
-            symbol: 'none',
+    // Fidelity shading + escalation annotation are attached to the first
+    // series' markArea / markLine (they paint behind the stacked areas). The
+    // window for full-extent bands comes from opts.win, falling back to the
+    // bucket span so a sampled window shades end-to-end even with sparse data.
+    const win = opts.win || { from: xMin, to: xMax };
+    const shading = buildFidelityShading(data, win);
+    const escAnno = buildEscalationAnnotation(opts.escalationStatus, win);
+
+    // markArea: fidelity band(s) first, then the escalation window on top.
+    let markAreaData = [];
+    if (shading.markArea) markAreaData = markAreaData.concat(shading.markArea.data);
+    if (escAnno && escAnno.markArea) markAreaData = markAreaData.concat(escAnno.markArea.data);
+
+    // markLine: CPU reference line plus an optional escalation-edge line. Both
+    // live in one markLine.data array (per-entry label/lineStyle) so we keep a
+    // single markLine per series — no extra series that would pollute the
+    // legend or the "series with data" assertions.
+    const markLineData = [];
+    if (numCpus > 0) {
+        markLineData.push({
+            yAxis: numCpus,
             lineStyle: { color: '#E53935', type: 'dashed', width: 1 },
             label: {
-                formatter: numCpus + ' CPUs',
-                position: 'insideEndTop',
-                color: '#fff',
-                backgroundColor: '#E53935',
-                padding: [2, 5, 2, 5],
-                fontSize: 11,
+                formatter: numCpus + ' CPUs', position: 'insideEndTop',
+                color: '#fff', backgroundColor: '#E53935',
+                padding: [2, 5, 2, 5], fontSize: 11,
             },
-            data: [{ yAxis: numCpus }],
-        };
+        });
+    }
+    if (escAnno && escAnno.to != null) {
+        const border = escAnno.isAnomaly
+            ? 'rgba(229, 57, 53, 0.8)' : 'rgba(79, 195, 247, 0.7)';
+        markLineData.push({
+            xAxis: escAnno.to,
+            lineStyle: { color: border, type: 'solid', width: 1 },
+            label: {
+                formatter: escAnno.label, position: 'insideStartTop',
+                color: '#fff', backgroundColor: border,
+                padding: [2, 5, 2, 5], fontSize: 10,
+            },
+        });
+    }
+
+    if (series.length) {
+        if (markAreaData.length) {
+            series[0].markArea = { silent: true, data: markAreaData };
+        }
+        if (markLineData.length) {
+            series[0].markLine = { silent: true, symbol: 'none', data: markLineData };
+        }
     }
 
     const option = {
@@ -126,6 +165,11 @@ export function buildAasOption(data, opts) {
         seriesColors,
         maxAas,
         hasData: buckets.length > 0,
+        // Fidelity surface (B5): drives the sampled/exact legend chip + tooltip.
+        fidelity: fidelityOf(data),
+        fidelityLabel: fidelityLabel(fidelityOf(data)),
+        shading,
+        escalation: escAnno,
     };
 }
 

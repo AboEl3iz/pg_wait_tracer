@@ -15,6 +15,9 @@
  */
 
 import { buildAasOption } from '../lib/builders/aas.js';
+import {
+    SAMPLED_BAND_COLOR, MIXED_BAND_COLOR, SAMPLED_BORDER, MIXED_BORDER,
+} from '../lib/builders/fidelity.js';
 import { attachSelection } from '../lib/selection.js';
 import { esc, fmtDuration } from '../lib/format.js';
 
@@ -43,15 +46,22 @@ export function createActiveView() {
             return ctx.transport.request(ctx.channel('aas'), 'aas', params);
         },
 
-        /* PURE: data -> ECharts option + legend metadata. */
+        /* PURE: data -> ECharts option + legend metadata. Threads the current
+         * window (for full-extent fidelity bands) and the daemon escalation
+         * status (for the active-window annotation) through to the builder. */
         build(data, ctx) {
-            return buildAasOption(data, { numCpus: ctx.server.numCpus });
+            return buildAasOption(data, {
+                numCpus: ctx.server.numCpus,
+                win: { from: ctx.timeRange.from, to: ctx.timeRange.to },
+                escalationStatus: ctx.getEscalationStatus ? ctx.getEscalationStatus() : null,
+            });
         },
 
         mount(_el, model, ctx) {
             if (!chart || !model.hasData) return;   // disposed / no data
             chart.setOption(model.option, true);
             renderLegend(model, chart, ctx, () => selected, (s) => { selected = s; });
+            renderFidelityChip(model, ctx);
 
             // Status line: window + peak AAS (kept identical to old behavior).
             if (ctx.setStatus) {
@@ -78,12 +88,66 @@ export function createActiveView() {
         leave() {
             if (detachSel) { detachSel(); detachSel = null; }
             if (chart) { chart.dispose(); chart = null; }
+            const chip = document.getElementById('aas-fidelity-chip');
+            if (chip) chip.remove();
             el = null;
             selected = null;
         },
 
         resize() { if (chart) chart.resize(); },
     };
+}
+
+/* Fidelity legend chip: explains the sampled/exact distinction next to the AAS
+ * legend. Rendered into a small host inserted after the series legend so the
+ * shading band on the chart is never unexplained. Hidden for fully-exact
+ * windows (the common case) to avoid noise. */
+function renderFidelityChip(model, ctx) {
+    const host = ctx.chartEl;
+    if (!host || !host.parentNode) return;
+
+    let chip = document.getElementById('aas-fidelity-chip');
+    const fid = model.fidelity;
+    const showBand = model.shading && model.shading.showLegend;
+
+    if (!showBand) {
+        if (chip) chip.remove();
+        return;
+    }
+    if (!chip) {
+        chip = document.createElement('div');
+        chip.id = 'aas-fidelity-chip';
+        chip.style.cssText =
+            'display:flex;flex-wrap:wrap;gap:10px;justify-content:center;' +
+            'padding:0 20px 8px;background:#1e1e3a;font-size:11px;color:#aaa;';
+        const legDiv = document.getElementById('aas-legend');
+        if (legDiv && legDiv.parentNode) legDiv.parentNode.insertBefore(chip, legDiv.nextSibling);
+        else host.parentNode.insertBefore(chip, host.nextSibling);
+    }
+
+    const sampledSwatch =
+        '<span style="width:14px;height:10px;display:inline-block;border-radius:2px;' +
+        'background:' + SAMPLED_BAND_COLOR + ';border:1px dashed ' + SAMPLED_BORDER + '"></span>';
+    const mixedSwatch =
+        '<span style="width:14px;height:10px;display:inline-block;border-radius:2px;' +
+        'background:' + MIXED_BAND_COLOR + ';border:1px dashed ' + MIXED_BORDER + '"></span>';
+
+    let html = '<span>' + esc(model.fidelityLabel) + '</span>';
+    if (fid === 'sampled') {
+        html += '<span style="display:inline-flex;align-items:center;gap:5px">' +
+            sampledSwatch + 'shaded = sampled (estimated, not exact)</span>';
+    } else if (fid === 'mixed') {
+        html += '<span style="display:inline-flex;align-items:center;gap:5px">' +
+            sampledSwatch + 'sampled</span>' +
+            '<span style="display:inline-flex;align-items:center;gap:5px">' +
+            mixedSwatch + 'mixed window</span>';
+    }
+    if (model.escalation) {
+        html += '<span style="color:' +
+            (model.escalation.isAnomaly ? '#E53935' : '#4fc3f7') + '">● ' +
+            esc(model.escalation.label) + '</span>';
+    }
+    chip.innerHTML = html;
 }
 
 /* External HTML legend with solo / multi-select / hover — kept out of the chart
