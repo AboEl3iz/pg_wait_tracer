@@ -127,6 +127,10 @@ export class ViewManager {
                 self._channels.add(ch);
                 return ch;
             },
+            /* True while this view is still the active one. Views with their own
+             * in-view async re-fetches (e.g. the histogram's selector change)
+             * use this as the chokepoint, mirroring the manager's own check. */
+            isActive() { return self.active && self.active.id === id; },
         });
     }
 

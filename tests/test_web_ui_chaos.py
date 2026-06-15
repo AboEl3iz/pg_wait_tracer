@@ -431,6 +431,106 @@ def test_dragzoom_during_refresh(page):
           "view window self-consistent (from < to) after drag-zoom")
 
 
+# ── Soak test (B3 acceptance) ───────────────────────────────────────────────────
+# ~50 random tab/filter transitions under chaos. Asserts no console errors AND
+# that resources do not leak across the churn: the live ECharts-instance count
+# settles to a small bound (the persistent AAS chart + at most the one active
+# tab's chart), and nothing is left pending in the transport. This is the B3
+# "stable listener/handler counts (no leak)" acceptance item — the restructure's
+# enter()/leave() chart ownership must dispose every per-tab chart it created.
+
+# Count of live ECharts instances + pending transport requests. Each per-tab
+# chart view disposes its instance in leave(); a leak would show as a growing
+# instance count after many switches. We scan every element ECharts could have
+# attached to (it stamps a private id on the host node).
+_LEAK_PROBE = """() => {
+    let charts = 0;
+    if (typeof echarts !== 'undefined') {
+        for (const el of document.querySelectorAll('*')) {
+            try { if (echarts.getInstanceByDom(el)) charts++; } catch (e) {}
+        }
+    }
+    const t = window.__pgwt && window.__pgwt.transport;
+    const pending = t ? Object.keys(t.pending).length : -1;
+    return { charts, pending };
+}"""
+
+# A pseudo-random but deterministic action stream (no wall-clock RNG) so the
+# soak is reproducible. Mixes tab switches across ALL tabs (including the heavy
+# chart tabs migrated in B3 p3), row-drills, and breadcrumb clears.
+_TABS = ["overview", "events", "sessions", "queries",
+         "histogram", "timeline", "transitions", "concurrency"]
+
+
+def test_soak_random_navigation(page):
+    """SOAK: 50 random tab/filter transitions, assert no leak + no errors."""
+    goto_ready(page)
+    page.click("#live-btn")          # stop auto-refresh so the churn is the only driver
+    page.wait_for_timeout(200)
+
+    # Deterministic LCG over the action space.
+    seed = 12345
+    def nxt():
+        nonlocal seed
+        seed = (seed * 1103515245 + 12345) & 0x7fffffff
+        return seed
+
+    N = 50
+    for i in range(N):
+        r = nxt() % 10
+        if r < 6:
+            # Tab switch (covers all eight tabs).
+            tab = _TABS[nxt() % len(_TABS)]
+            page.click(f".tab[data-tab='{tab}']")
+        elif r < 8:
+            # Drill into the first clickable row, if any (events/sessions/queries).
+            row = page.query_selector(
+                "#table-container table tbody tr.clickable")
+            if row:
+                try:
+                    row.click()
+                except Exception:
+                    pass
+        else:
+            # Clear filters via the breadcrumb ✕, if present.
+            clr = page.query_selector("#breadcrumb .crumb-clear")
+            if clr:
+                try:
+                    clr.click()
+                except Exception:
+                    pass
+        # Switch faster than the 50-300ms chaos latency for the first half, then
+        # let things settle for the second half so late responses land mid-churn.
+        page.wait_for_timeout(40 if i < N // 2 else 120)
+
+    # Land deterministically on a table tab and let every in-flight + late
+    # response drain.
+    page.click(".tab[data-tab='overview']")
+    page.wait_for_timeout(5000)
+
+    check(active_tab(page) == "Overview",
+          f"soak ends on Overview (got {active_tab(page)})")
+
+    probe = page.evaluate(_LEAK_PROBE)
+    # On a no-chart table tab, only the persistent AAS chart should remain.
+    # Allow a small slack (>=1, <=2) to absorb a just-disposed/just-created
+    # transient, but a leak (one per switch) would push this to dozens.
+    check(probe["charts"] <= 2,
+          f"no ECharts instance leak after {N} transitions "
+          f"(live instances={probe['charts']}, expected ~1 AAS)")
+    check(probe["pending"] == 0,
+          f"no transport requests left pending after soak "
+          f"(pending={probe['pending']})")
+
+    # Re-run the probe after a second settle window to confirm it's stable, not
+    # mid-transition.
+    page.wait_for_timeout(1500)
+    probe2 = page.evaluate(_LEAK_PROBE)
+    check(probe2["charts"] <= 2 and probe2["pending"] == 0,
+          f"resource counts stable on re-probe (charts={probe2['charts']}, "
+          f"pending={probe2['pending']})")
+
+
 # ── Registry ──────────────────────────────────────────────────────────────────
 # Tests are registered as either gating (must pass) or xfail (B3 targets:
 # expected to fail today, reported but non-fatal). If an xfail test starts
@@ -444,6 +544,7 @@ GATING_TESTS = [
     test_click_drilldown_before_load,
     test_toggle_live_mid_refresh,
     test_dragzoom_during_refresh,
+    test_soak_random_navigation,
 ]
 
 # B3 acceptance list: race-exposing tests that fail against current code.

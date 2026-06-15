@@ -1,0 +1,89 @@
+/* Node unit tests for the pure timeline builder (lib/builders/timeline.js).
+ *
+ * Runs under `node --test`. Proves the session_timeline data -> ECharts
+ * custom-series option mapping: bar [start, end] math (Bug-1 regression: start
+ * = s, NOT s+d), pid->row indexing, x-axis window bounds, truncation flags, and
+ * empty-input handling. The renderItem is exercised against a fake api so the
+ * rect geometry is locked too.
+ */
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { buildTimelineOption, timelineRenderItem } from '../../web/static/lib/builders/timeline.js';
+
+function data() {
+    return {
+        truncated: false, total_count: 3, pids: [1001, 1002],
+        events: [
+            { s: 100, d: 50, p: 1001, n: 'CPU*', c: 0, q: '42' },
+            { s: 150, d: 30, p: 1001, n: 'IO:DataFileRead', c: 1, q: '42' },
+            { s: 100, d: 80, p: 1002, n: 'Lock:relation', c: 2, q: '7' },
+        ],
+    };
+}
+
+test('bar data: [start=s, end=s+d, pidIdx, name, classIdx, query, dur]', () => {
+    const { option } = buildTimelineOption(data(), { from: 0, to: 1000 });
+    const bars = option.series[0].data;
+    assert.deepEqual(bars[0], [100, 150, 0, 'CPU*', 0, '42', 50]);
+    assert.deepEqual(bars[1], [150, 180, 0, 'IO:DataFileRead', 1, '42', 30]);
+    // pid 1002 maps to row index 1
+    assert.deepEqual(bars[2], [100, 180, 1, 'Lock:relation', 2, '7', 80]);
+});
+
+test('start uses s (not s+d) — Bug 1 regression', () => {
+    const { option } = buildTimelineOption(data(), { from: 0, to: 1000 });
+    const first = option.series[0].data[0];
+    assert.equal(first[0], 100);           // start = s
+    assert.equal(first[1] - first[0], 50); // duration preserved
+});
+
+test('y categories are "PID <n>" in pids order; x spans the view window', () => {
+    const { option } = buildTimelineOption(data(), { from: 5, to: 900 });
+    assert.deepEqual(option.yAxis.data, ['PID 1001', 'PID 1002']);
+    assert.equal(option.xAxis.min, 5);
+    assert.equal(option.xAxis.max, 900);
+    assert.equal(option.series[0].type, 'custom');
+});
+
+test('chartHeight scales with pid count; truncation surfaced', () => {
+    const m = buildTimelineOption(data(), { from: 0, to: 1 });
+    assert.equal(m.chartHeight, Math.max(200, 2 * 50 + 80));  // 200
+    const t = buildTimelineOption({ ...data(), truncated: true, total_count: 99 },
+        { from: 0, to: 1 });
+    assert.equal(t.truncated, true);
+    assert.equal(t.total_count, 99);
+    assert.equal(t.count, 3);
+});
+
+test('empty events -> hasData false, no option', () => {
+    const m = buildTimelineOption({ events: [], pids: [] }, { from: 0, to: 1 });
+    assert.equal(m.hasData, false);
+    assert.equal(m.option, null);
+});
+
+test('renderItem draws a class-colored rect at the bar start, 60% band height', () => {
+    // Fake ECharts api: value(i) reads the bar tuple; coord maps [val,cat] ->
+    // pixels; size returns the band dimensions.
+    const bar = [100, 150, 0, 'CPU*', 0, '42', 50];
+    const api = {
+        value: (i) => bar[i],
+        coord: ([v]) => [v, 200],          // x=value, fixed y
+        size: () => [0, 40],               // band height 40
+    };
+    const r = timelineRenderItem({}, api);
+    assert.equal(r.type, 'rect');
+    assert.equal(r.shape.x, 100);          // starts at s
+    assert.equal(r.shape.width, 50);       // end-start
+    assert.equal(r.shape.height, 24);      // 40 * 0.6
+    assert.equal(r.shape.y, 200 - 12);     // centered
+    // class 0 (CPU) color from WAIT_CLASSES
+    assert.equal(r.style.fill, 'rgb(80,250,123)');
+});
+
+test('renderItem: unknown classIdx falls back to grey, width >= 1', () => {
+    const bar = [100, 100, 0, 'X', 99, '', 0];  // zero-width, bad class
+    const api = { value: (i) => bar[i], coord: ([v]) => [v, 10], size: () => [0, 20] };
+    const r = timelineRenderItem({}, api);
+    assert.equal(r.style.fill, '#888');
+    assert.equal(r.shape.width, 1);             // clamped to >= 1px
+});
