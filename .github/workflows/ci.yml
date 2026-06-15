@@ -69,6 +69,12 @@ jobs:
           done
           python3 tests/test_current_trace.py
 
+      - name: Run web UI builder unit tests (Node, no browser — Phase B3)
+        # Pure builders (data -> ECharts option / table model) and the state /
+        # transport / selection modules are Node-testable without a browser.
+        # A builder off-by-one fails here in milliseconds, no Playwright needed.
+        run: node --test 'tests/web_unit/*.test.mjs'
+
   web-ui:
     name: web-ui
     runs-on: ubuntu-latest

@@ -140,7 +140,7 @@ h1 { font-size: 18px; font-weight: 600; color: #fff; }
 /* Brush overlay removed — using ECharts built-in brush component */
 
 /* Chart */
-#apex-chart-container {
+#aas-chart-container {
   min-height: 300px;
   background: #1e1e3a;
 }

@@ -658,25 +658,40 @@ def test_auto_refresh(page):
 
 
 def test_chart_rendering(page):
-    """15. AAS chart is rendered (ApexCharts SVG in #apex-chart-container)."""
+    """15. AAS chart is rendered (ECharts in #aas-chart-container).
+
+    B3: the AAS chart migrated from ApexCharts to ECharts (the "active" view
+    owns its own ECharts instance). The assertion now checks the ECharts
+    instance + a stacked-area series with data, instead of ApexCharts SVG paths.
+    """
     print("--- Test 15: Chart Rendering ---")
 
     page.goto(MOCK_URL)
     page.wait_for_selector("#status.connected", timeout=10000)
     page.wait_for_timeout(1500)
 
-    svg = page.query_selector("#apex-chart-container svg")
-    check(svg is not None, "AAS chart SVG rendered")
+    # ECharts renders into a canvas inside the container.
+    canvas = page.query_selector("#aas-chart-container canvas")
+    check(canvas is not None, "AAS chart canvas rendered")
 
-    # Chart should actually draw series paths, not just an empty SVG shell
-    series_paths = page.query_selector_all(
-        "#apex-chart-container .apexcharts-series path")
-    check(len(series_paths) > 0,
-          f"AAS chart has series paths ({len(series_paths)})")
+    # The ECharts instance must hold series with actual data points.
+    chart_status = page.evaluate("""() => {
+        const el = document.getElementById('aas-chart-container');
+        if (!el) return 'no container';
+        const c = echarts.getInstanceByDom(el);
+        if (!c) return 'no echarts instance';
+        const opt = c.getOption();
+        if (!opt.series || !opt.series.length) return 'no series';
+        const withData = opt.series.filter(s => s.data && s.data.length > 0);
+        if (withData.length === 0) return 'no series data';
+        return 'ok:' + withData.length;
+    }""")
+    check(chart_status.startswith("ok"),
+          f"AAS chart has series with data ({chart_status})")
 
     # Chart container should have reasonable dimensions
     height = page.evaluate("""() => {
-        const el = document.getElementById('apex-chart-container');
+        const el = document.getElementById('aas-chart-container');
         return el ? el.offsetHeight : -1;
     }""")
     check(height > 100, f"Chart height = {height}px (expected > 100)")
@@ -984,11 +999,13 @@ def test_no_double_refresh(page):
     page.wait_for_selector("#status.connected", timeout=10000)
     page.wait_for_timeout(1000)
 
-    # Install WS message counter
+    # Install WS message counter. The UI no longer has a global `state`; the
+    # WebSocket lives on the transport module, exposed for tests via __pgwt.
     page.evaluate("""() => {
         window.__wsMsgLog = [];
-        const origSend = state.ws.send.bind(state.ws);
-        state.ws.send = function(data) {
+        const ws = window.__pgwt.transport.ws;
+        const origSend = ws.send.bind(ws);
+        ws.send = function(data) {
             window.__wsMsgLog.push(JSON.parse(data));
             return origSend(data);
         };
