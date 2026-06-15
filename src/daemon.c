@@ -79,11 +79,16 @@ static void handle_timer(struct pgwt_daemon *d)
         pgwt_read_accum_map(d);
 
     /* Copy cumulative event_accum to display accum,
-     * then add open intervals from state_map */
+     * then add open intervals from state_map.
+     * Sampled mode has no watchpoint-maintained state_map intervals (entries
+     * exist only to carry query_id), so reading it would manufacture bogus
+     * open intervals — skip it. The live display for sampled mode is not
+     * fidelity-aware until A3; recorded SAMPLES blocks carry the real data. */
     struct pgwt_time_model saved_tm = d->accum.tm;
     pgwt_accum_copy_used(&d->accum, d->event_accum);
     d->accum.prev_tm = saved_tm;
-    pgwt_read_state_map(d);
+    if (pgwt_mode_uses_watchpoints(d))
+        pgwt_read_state_map(d);
 
     if (d->ring.slots)
         pgwt_ring_push(&d->ring, &d->accum);
@@ -140,17 +145,31 @@ static void handle_timer(struct pgwt_daemon *d)
             pgwt_summary_cleanup_old_files(d->summary_writer);
     }
 
-    /* Refresh recent event rate for control-socket metrics */
+    /* Refresh recent event/sample rates for control-socket metrics */
     if (d->interval > 0) {
         d->counters.events_per_sec =
             (double)(d->counters.events_total - d->counters.prev_events_total)
             / d->interval;
         d->counters.prev_events_total = d->counters.events_total;
+
+        d->counters.samples_per_sec =
+            (double)(d->counters.samples_total - d->counters.prev_samples_total)
+            / d->interval;
+        d->counters.prev_samples_total = d->counters.samples_total;
     }
 
     d->tick++;
     if (d->count > 0 && d->tick >= d->count)
         d->running = false;
+}
+
+static void handle_sample_timer(struct pgwt_daemon *d)
+{
+    uint64_t expirations;
+    ssize_t r = read(d->sample_timer_fd, &expirations, sizeof(expirations));
+    (void)r;
+    if (d->provider && d->provider->poll)
+        d->provider->poll(d);
 }
 
 static void handle_signal(struct pgwt_daemon *d)
@@ -164,6 +183,20 @@ static void handle_signal(struct pgwt_daemon *d)
 int pgwt_daemon_init(struct pgwt_daemon *d)
 {
     int err;
+
+    /* Select the capture provider for this mode. FULL (default) is the
+     * original watchpoint path; SAMPLED is the userspace tier; TIERED runs
+     * the sampler always-on (escalation engine lands in A4). */
+    switch (d->mode) {
+    case PGWT_MODE_SAMPLED:
+    case PGWT_MODE_TIERED:
+        d->provider = &pgwt_provider_sampled;
+        break;
+    case PGWT_MODE_FULL:
+    default:
+        d->provider = &pgwt_provider_full;
+        break;
+    }
 
     /* Init backend table and accumulator */
     pgwt_backend_init(&d->backends);
@@ -249,29 +282,37 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
                         (unsigned long)qid_func_off);
         }
 
-        /* USDT probes AFTER uprobe — query_id is already cached when these fire */
-        d->skel->links.on_exec_start =
-            bpf_program__attach_usdt(d->skel->progs.on_exec_start,
-                                     -1, bin,
-                                     "postgresql", "query__execute__start", NULL);
-        d->skel->links.on_exec_done =
-            bpf_program__attach_usdt(d->skel->progs.on_exec_done,
-                                     -1, bin,
-                                     "postgresql", "query__execute__done", NULL);
-        d->skel->links.on_plan_start =
-            bpf_program__attach_usdt(d->skel->progs.on_plan_start,
-                                     -1, bin,
-                                     "postgresql", "query__plan__start", NULL);
-        d->skel->links.on_plan_done =
-            bpf_program__attach_usdt(d->skel->progs.on_plan_done,
-                                     -1, bin,
-                                     "postgresql", "query__plan__done", NULL);
+        /* USDT marker probes write into event_ringbuf, which only the FULL
+         * tier consumes. In sampled mode they would be pure overhead with no
+         * reader, so attach them only when watchpoints are in use. The
+         * query_id uprobe above stays in every mode — the sampler joins
+         * pid->query_id from the state_map it maintains. */
+        if (pgwt_mode_uses_watchpoints(d)) {
+            d->skel->links.on_exec_start =
+                bpf_program__attach_usdt(d->skel->progs.on_exec_start,
+                                         -1, bin,
+                                         "postgresql", "query__execute__start", NULL);
+            d->skel->links.on_exec_done =
+                bpf_program__attach_usdt(d->skel->progs.on_exec_done,
+                                         -1, bin,
+                                         "postgresql", "query__execute__done", NULL);
+            d->skel->links.on_plan_start =
+                bpf_program__attach_usdt(d->skel->progs.on_plan_start,
+                                         -1, bin,
+                                         "postgresql", "query__plan__start", NULL);
+            d->skel->links.on_plan_done =
+                bpf_program__attach_usdt(d->skel->progs.on_plan_done,
+                                         -1, bin,
+                                         "postgresql", "query__plan__done", NULL);
 
-        if (d->skel->links.on_exec_start && d->skel->links.on_exec_done
-            && d->skel->links.on_report_query_id)
-            fprintf(stderr, "INFO: attached USDT + query_id uprobe\n");
-        else
-            fprintf(stderr, "WARN: could not attach query probes (lifecycle tracking disabled)\n");
+            if (d->skel->links.on_exec_start && d->skel->links.on_exec_done
+                && d->skel->links.on_report_query_id)
+                fprintf(stderr, "INFO: attached USDT + query_id uprobe\n");
+            else
+                fprintf(stderr, "WARN: could not attach query probes (lifecycle tracking disabled)\n");
+        } else if (d->skel->links.on_report_query_id) {
+            fprintf(stderr, "INFO: attached query_id uprobe (sampled mode)\n");
+        }
     }
 
     /* Set up lifecycle ring buffer consumer */
@@ -291,8 +332,11 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
     }
     pgwt_accum_init(d->event_accum);
 
-    /* In lightweight mode, skip event ringbuf consumer (BPF accumulates directly) */
-    if (!d->lightweight_mode) {
+    /* The event ringbuf consumer is only needed by the FULL tier (watchpoint
+     * transitions + USDT markers). Lightweight mode accumulates in BPF;
+     * sampled mode arms no watchpoints, so nothing is written there. */
+    bool needs_event_rb = !d->lightweight_mode && pgwt_mode_uses_watchpoints(d);
+    if (needs_event_rb) {
         int event_rb_map_fd = bpf_map__fd(d->skel->maps.event_ringbuf);
         d->event_rb = ring_buffer__new(event_rb_map_fd, pgwt_handle_trace_event, d, NULL);
         if (!d->event_rb) {
@@ -388,6 +432,25 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
     };
     timerfd_settime(d->timer_fd, 0, &its, NULL);
 
+    /* High-rate sampler timer (sampled/tiered tiers): fires at sample_rate_hz
+     * independently of the per-second display interval. */
+    if (d->provider && d->provider->fidelity == PGWT_FIDELITY_SAMPLED) {
+        d->sample_timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC);
+        if (d->sample_timer_fd < 0) {
+            perror("timerfd_create (sampler)");
+            goto fail;
+        }
+        int hz = d->sample_rate_hz > 0 ? d->sample_rate_hz : 10;
+        uint64_t period_ns = 1000000000ULL / (uint64_t)hz;
+        struct itimerspec sits = {
+            .it_interval = { .tv_sec = (time_t)(period_ns / 1000000000ULL),
+                             .tv_nsec = (long)(period_ns % 1000000000ULL) },
+            .it_value    = { .tv_sec = (time_t)(period_ns / 1000000000ULL),
+                             .tv_nsec = (long)(period_ns % 1000000000ULL) },
+        };
+        timerfd_settime(d->sample_timer_fd, 0, &sits, NULL);
+    }
+
     /* Create signal fd */
     sigset_t mask;
     sigemptyset(&mask);
@@ -429,6 +492,13 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
     ev.data.fd = d->timer_fd;
     epoll_ctl(d->epoll_fd, EPOLL_CTL_ADD, d->timer_fd, &ev);
 
+    /* Add sampler timer fd (sampled/tiered tiers) */
+    if (d->sample_timer_fd >= 0) {
+        ev.events = EPOLLIN;
+        ev.data.fd = d->sample_timer_fd;
+        epoll_ctl(d->epoll_fd, EPOLL_CTL_ADD, d->sample_timer_fd, &ev);
+    }
+
     /* Add signal fd */
     ev.events = EPOLLIN;
     ev.data.fd = d->signal_fd;
@@ -453,6 +523,21 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
             }
         }
     }
+
+    /* Arm the active capture provider. For the full tier this is a no-op
+     * (watchpoints were armed during the backend scan); for the sampled tier
+     * it allocates the sampler state. */
+    if (d->provider && d->provider->start) {
+        if (d->provider->start(d) != 0) {
+            fprintf(stderr, "FATAL: capture provider '%s' failed to start\n",
+                    d->provider->name);
+            goto fail;
+        }
+    }
+    if (d->verbose)
+        fprintf(stderr, "INFO: capture provider: %s (%s fidelity)\n",
+                d->provider->name,
+                d->provider->fidelity == PGWT_FIDELITY_EXACT ? "exact" : "sampled");
 
     if (!d->quiet)
         pgwt_print_header(d);
@@ -501,6 +586,9 @@ int pgwt_daemon_run(struct pgwt_daemon *d)
         for (int i = 0; i < n; i++) {
             if (events[i].data.fd == d->timer_fd) {
                 handle_timer(d);
+            } else if (d->sample_timer_fd >= 0
+                       && events[i].data.fd == d->sample_timer_fd) {
+                handle_sample_timer(d);
             } else if (events[i].data.fd == rb_fd) {
                 ring_buffer__consume(d->rb);
             } else if (events[i].data.fd == event_rb_fd) {
@@ -529,6 +617,10 @@ int pgwt_daemon_run(struct pgwt_daemon *d)
 
 void pgwt_daemon_cleanup(struct pgwt_daemon *d)
 {
+    /* Stop the active capture provider (detach/free its state). */
+    if (d->provider && d->provider->stop)
+        d->provider->stop(d);
+
     if (d->control) {
         pgwt_control_cleanup(d->control);
         free(d->control);
@@ -581,5 +673,6 @@ void pgwt_daemon_cleanup(struct pgwt_daemon *d)
     }
     if (d->epoll_fd >= 0) { close(d->epoll_fd); d->epoll_fd = -1; }
     if (d->timer_fd >= 0) { close(d->timer_fd); d->timer_fd = -1; }
+    if (d->sample_timer_fd >= 0) { close(d->sample_timer_fd); d->sample_timer_fd = -1; }
     if (d->signal_fd >= 0) { close(d->signal_fd); d->signal_fd = -1; }
 }

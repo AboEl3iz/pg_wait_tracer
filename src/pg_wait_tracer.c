@@ -50,6 +50,13 @@ static void usage(const char *prog)
         "Daemon:\n"
         "      --daemon               Run as daemon (reconnect on PG restart)\n"
         "\n"
+        "Capture tier:\n"
+        "      --mode <MODE>          full (default) | sampled | tiered\n"
+        "                             full: hardware watchpoints, exact transitions.\n"
+        "                             sampled: userspace ASH-style sampling, ~zero PG cost.\n"
+        "                             tiered: sampler always-on (escalation: A4)\n"
+        "      --sample-rate <HZ>     Sampling rate for sampled/tiered (1-1000, default 10)\n"
+        "\n"
         "Performance tuning:\n"
         "      --lightweight          BPF accumulator only (no per-event ringbuf).\n"
         "                             Reduces overhead ~40%%, loses histogram/session/query views\n"
@@ -159,6 +166,15 @@ static enum pgwt_format parse_format(const char *s)
     exit(1);
 }
 
+static enum pgwt_mode parse_mode(const char *s)
+{
+    if (strcmp(s, "full") == 0)     return PGWT_MODE_FULL;
+    if (strcmp(s, "sampled") == 0)  return PGWT_MODE_SAMPLED;
+    if (strcmp(s, "tiered") == 0)   return PGWT_MODE_TIERED;
+    fprintf(stderr, "ERROR: unknown mode '%s' (use: full, sampled, tiered)\n", s);
+    exit(1);
+}
+
 /* Long-only option values (no short form) */
 #define OPT_REPLAY 256
 #define OPT_FROM   257
@@ -168,6 +184,8 @@ static enum pgwt_format parse_format(const char *s)
 #define OPT_LIGHTWEIGHT  261
 #define OPT_SKIP_QID     262
 #define OPT_SKIP_USDT    263
+#define OPT_MODE         264
+#define OPT_SAMPLE_RATE  265
 
 static struct option long_opts[] = {
     {"pid",        required_argument, NULL, 'p'},
@@ -192,6 +210,8 @@ static struct option long_opts[] = {
     {"lightweight",     no_argument,       NULL, OPT_LIGHTWEIGHT},
     {"skip-query-id",   no_argument,       NULL, OPT_SKIP_QID},
     {"skip-usdt",       no_argument,       NULL, OPT_SKIP_USDT},
+    {"mode",            required_argument, NULL, OPT_MODE},
+    {"sample-rate",     required_argument, NULL, OPT_SAMPLE_RATE},
     {"quiet",           no_argument,       NULL, 'q'},
     {"verbose",         no_argument,       NULL, 'v'},
     {"help",            no_argument,       NULL, 'h'},
@@ -208,9 +228,12 @@ int main(int argc, char **argv)
     }
     d->epoll_fd  = -1;
     d->timer_fd  = -1;
+    d->sample_timer_fd = -1;
     d->signal_fd = -1;
     d->interval  = 5;
     d->view      = PGWT_VIEW_TIME_MODEL;
+    d->mode      = PGWT_MODE_FULL;   /* default: today's watchpoint behavior */
+    d->sample_rate_hz = 10;          /* default sampled rate (D1) */
 
     pid_t pm_pid = 0;
     const char *pgdata = NULL;
@@ -251,6 +274,8 @@ int main(int argc, char **argv)
         case OPT_LIGHTWEIGHT: d->lightweight_mode = 1; break;
         case OPT_SKIP_QID:    d->skip_query_id = 1; break;
         case OPT_SKIP_USDT:   d->skip_usdt = 1; break;
+        case OPT_MODE:        d->mode = parse_mode(optarg); break;
+        case OPT_SAMPLE_RATE: d->sample_rate_hz = atoi(optarg); break;
         case 'q': d->quiet = true; break;
         case 'v': d->verbose = true; break;
         case 'h': usage(argv[0]); free(d); return 0;
@@ -318,6 +343,30 @@ int main(int argc, char **argv)
         free(d);
         return 1;
     }
+
+    /* Validate: --sample-rate range (only meaningful for sampled/tiered) */
+    if (d->sample_rate_hz < 1 || d->sample_rate_hz > 1000) {
+        fprintf(stderr, "FATAL: --sample-rate must be 1..1000 Hz (got %d)\n",
+                d->sample_rate_hz);
+        free(d);
+        return 1;
+    }
+
+    /* Validate: --mode sampled/tiered is incompatible with --lightweight
+     * (lightweight is a watchpoint-only BPF-accumulator mode). */
+    if (d->mode != PGWT_MODE_FULL && d->lightweight_mode) {
+        fprintf(stderr, "ERROR: --mode %s is incompatible with --lightweight\n",
+                d->mode == PGWT_MODE_SAMPLED ? "sampled" : "tiered");
+        free(d);
+        return 1;
+    }
+
+    /* A2 note: tiered escalation arrives in A4. For now tiered runs the
+     * sampler always-on with no escalation engine — log it so the operator
+     * isn't surprised that full-fidelity windows aren't produced yet. */
+    if (d->mode == PGWT_MODE_TIERED)
+        fprintf(stderr, "INFO: --mode tiered: sampler always-on; on-demand "
+                "full-fidelity escalation lands in A4 (not yet active)\n");
 
     /* Check root */
     if (geteuid() != 0) {

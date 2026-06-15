@@ -2048,8 +2048,16 @@ static void dump_summary(struct pgwt_server *srv)
     int count;
     struct pgwt_trace_event *events = server_load_events(srv, from, to, &count);
 
+    /* Count sample vs transition records so a sampled-mode trace is visible
+     * at a glance (A2 evidence: SAMPLES blocks landed). */
+    int n_samples = 0;
+    for (int i = 0; i < count; i++)
+        if (events[i].flags & PGWT_EVENT_FLAG_SAMPLE)
+            n_samples++;
+
     printf("════════════════════════════════════════════════════════════════════════════════\n");
-    printf("pgwt-server — Summary    Events: %d    Duration: %.1fs\n", count, wall_ms / 1000.0);
+    printf("pgwt-server — Summary    Events: %d (%d transitions, %d samples)    Duration: %.1fs\n",
+           count, count - n_samples, n_samples, wall_ms / 1000.0);
     printf("════════════════════════════════════════════════════════════════════════════════\n");
 
     /* Time Model */

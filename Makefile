@@ -25,6 +25,8 @@ LDFLAGS    = -lbpf -lelf -lz -llz4
 USER_SRCS  = $(SRC_DIR)/pg_wait_tracer.c \
              $(SRC_DIR)/daemon.c \
              $(SRC_DIR)/control.c \
+             $(SRC_DIR)/provider_full.c \
+             $(SRC_DIR)/sampler.c \
              $(SRC_DIR)/backend.c \
              $(SRC_DIR)/discovery.c \
              $(SRC_DIR)/map_reader.c \
