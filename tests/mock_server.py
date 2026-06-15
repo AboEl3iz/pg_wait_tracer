@@ -326,11 +326,30 @@ _CANNED["session_timeline"] = {
 }
 
 
+# View commands that carry a per-window "fidelity" indicator (A3 / D3).
+# The mock's canned dataset is full-fidelity transition data, so every view
+# reports "exact" — matching what the real server returns for the
+# transition-only protocol-drift fixture.
+_FIDELITY_VIEWS = {
+    "aas", "time_model", "top_events", "top_sessions", "top_queries",
+    "heatmap", "session_timeline", "transitions", "fingerprints",
+    "concurrency", "lock_chains", "interference", "variants",
+}
+
+
 def handle_request(msg):
     """Dispatch a WebSocket JSON request and return canned response."""
     cmd = msg.get("cmd", "")
     req_id = msg.get("id", 0)
+    resp = _handle_request_inner(cmd, req_id, msg)
+    # Tag every view response with its window fidelity (A3). Done centrally so
+    # the schema stays aligned with the real server across all views.
+    if cmd in _FIDELITY_VIEWS and "fidelity" not in resp and "error" not in resp:
+        resp["fidelity"] = "exact"
+    return resp
 
+
+def _handle_request_inner(cmd, req_id, msg):
     if cmd == "info":
         return {"id": req_id, **_CANNED["info"]}
 
