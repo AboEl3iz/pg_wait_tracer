@@ -77,6 +77,7 @@ run_test "test_cmdline" "$SCRIPT_DIR/test_cmdline"
 run_test "test_bucket" "$SCRIPT_DIR/test_bucket"
 run_test "test_trace_v2" "$SCRIPT_DIR/test_trace_v2"
 run_test "test_sampler" "$SCRIPT_DIR/test_sampler"
+run_test "test_anomaly" "$SCRIPT_DIR/test_anomaly"
 
 # Step 2.5: Synthetic data correctness tests (no root needed, needs pgwt-server)
 if [[ -x "$PROJECT_DIR/pgwt-server" ]] && [[ -x "$SCRIPT_DIR/gen_test_traces" ]]; then

@@ -6,8 +6,8 @@ CFLAGS    = -g -O2 -Wall -I../src -I../include
 BUILD     = ../build
 
 TESTS     = test_wait_event test_cmdline test_event_writer test_event_reader \
-            test_trace_v2 test_sampler test_bucket gen_test_traces \
-            gen_bench_traces test_concurrent_rw cross_validate
+            test_trace_v2 test_sampler test_anomaly test_bucket gen_test_traces \
+            gen_bench_traces test_concurrent_rw cross_validate dump_markers
 
 .PHONY: all clean
 
@@ -42,6 +42,13 @@ test_trace_v2: test_trace_v2.c $(BUILD)/server_event_writer.o \
 test_sampler: test_sampler.c ../src/sampler.c
 	$(CC) $(CFLAGS) -DPGWT_SERVER -o $@ $^
 
+# test_anomaly: anomaly rule engine (AAS-vs-baseline, lock-fraction,
+# hysteresis/cooldown, baseline protection, metrics derivation). Compiles
+# anomaly.c with -DPGWT_SERVER so only the pure rule core is built — no
+# skeleton, no escalation engine, runnable in CI's server-only jobs.
+test_anomaly: test_anomaly.c ../src/anomaly.c
+	$(CC) $(CFLAGS) -DPGWT_SERVER -o $@ $^
+
 # Server-build objects for gen_test_traces
 SERVER_OBJS = $(BUILD)/server_event_writer.o $(BUILD)/server_summary_writer.o \
               $(BUILD)/server_wait_event.o $(BUILD)/server_cJSON.o
@@ -62,6 +69,14 @@ test_concurrent_rw: test_concurrent_rw.c $(BUILD)/event_reader.o $(BUILD)/event_
 cross_validate: cross_validate.c $(BUILD)/server_event_reader.o \
                 $(BUILD)/server_event_writer.o $(BUILD)/server_wait_event.o \
                 $(BUILD)/server_cJSON.o
+	$(CC) $(CFLAGS) -DPGWT_SERVER -o $@ $^ -llz4 -lz
+
+# dump_markers: A5 helper — decode escalation-window markers (reason + length)
+# from a trace dir. Used by the live anomaly test to prove an ANOMALY-reason
+# window was recorded. Server build (no BPF skeleton).
+dump_markers: dump_markers.c $(BUILD)/server_event_reader.o \
+              $(BUILD)/server_event_writer.o $(BUILD)/server_wait_event.o \
+              $(BUILD)/server_cJSON.o
 	$(CC) $(CFLAGS) -DPGWT_SERVER -o $@ $^ -llz4 -lz
 
 clean:

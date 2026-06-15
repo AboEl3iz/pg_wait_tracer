@@ -537,6 +537,34 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
                 "tiered mode will run sampled-only\n");
     }
 
+    /* Anomaly-trigger rules (A5): armed only when the escalation engine is
+     * live (tiered mode with a working deadline timer). Rate-derived defaults
+     * are then overridden by any --anomaly-* flags. */
+    pgwt_anomaly_init(&d->anomaly, d->escalation.enabled, d->sample_rate_hz);
+    if (d->anomaly.enabled) {
+        if (d->anomaly_aas_factor > 0.0)
+            d->anomaly.aas_factor = d->anomaly_aas_factor;
+        if (d->anomaly_aas_ticks > 0)
+            d->anomaly.aas_ticks = d->anomaly_aas_ticks;
+        if (d->anomaly_lock_fraction >= 0.0)
+            d->anomaly.lock_fraction = d->anomaly_lock_fraction;
+        if (d->anomaly_cooldown_s >= 0)
+            d->anomaly.cooldown_ns =
+                (uint64_t)d->anomaly_cooldown_s * 1000000000ULL;
+        d->anomaly.escalation_s = d->escalation_budget_s > 0 &&
+            PGWT_ANOMALY_DEF_ESCALATE_S > d->escalation_budget_s
+            ? d->escalation_budget_s : PGWT_ANOMALY_DEF_ESCALATE_S;
+        if (d->verbose)
+            fprintf(stderr,
+                    "INFO: anomaly triggers armed: aas>%.1f*baseline for %d "
+                    "ticks, lock_frac>%.2f for %d ticks, cooldown %llus, "
+                    "window %ds\n",
+                    d->anomaly.aas_factor, d->anomaly.aas_ticks,
+                    d->anomaly.lock_fraction, d->anomaly.lock_ticks,
+                    (unsigned long long)(d->anomaly.cooldown_ns / 1000000000ULL),
+                    d->anomaly.escalation_s);
+    }
+
     /* Arm the active capture provider. For the full tier this is a no-op
      * (watchpoints were armed during the backend scan); for the sampled tier
      * it allocates the sampler state. */

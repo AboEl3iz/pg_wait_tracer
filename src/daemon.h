@@ -12,6 +12,7 @@
 #include "snapshot.h"
 #include "provider.h"
 #include "escalation.h"
+#include "anomaly.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -115,6 +116,13 @@ struct pgwt_daemon {
     const struct pgwt_capture_provider *provider; /* active provider vtable */
     struct pgwt_sampler *sampler;        /* sampled-tier state, NULL if unused */
     struct pgwt_escalation escalation;   /* tiered escalation engine (D5/A4) */
+    struct pgwt_anomaly anomaly;         /* anomaly-trigger rules engine (D5/A5) */
+    /* Anomaly config (parsed flags; copied into anomaly state after init so
+     * --anomaly-* overrides apply on top of the rate-derived defaults). */
+    double      anomaly_aas_factor;      /* --anomaly-aas-factor (<=0 = default) */
+    int         anomaly_aas_ticks;       /* --anomaly-aas-ticks (<=0 = default) */
+    double      anomaly_lock_fraction;   /* --anomaly-lock-fraction (<0 = default) */
+    int         anomaly_cooldown_s;      /* --anomaly-cooldown-s (<0 = default) */
     uint32_t    lightweight_mode;        /* 1 = BPF accumulator only (no ringbuf) */
     uint32_t    skip_query_id;          /* 1 = skip query_id reads in BPF */
     uint32_t    skip_usdt;             /* 1 = skip USDT query lifecycle probes */

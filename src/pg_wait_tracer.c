@@ -61,6 +61,13 @@ static void usage(const char *prog)
         "                             rolling hour (default 300). Escalate via the\n"
         "                             control socket: {\"cmd\":\"escalate\",\"duration_s\":N}.\n"
         "\n"
+        "Anomaly triggers (tiered mode — auto-escalate on the sampled stream):\n"
+        "      --anomaly-aas-factor <K>   Fire when AAS > K*rolling_baseline (default 3.0)\n"
+        "      --anomaly-aas-ticks <N>    ...sustained for N consecutive ticks (default 3)\n"
+        "      --anomaly-lock-fraction <F>  Fire when Lock-class share of active\n"
+        "                             samples > F (default 0.30), sustained N ticks\n"
+        "      --anomaly-cooldown-s <S>   Min seconds between auto-escalations (default 120)\n"
+        "\n"
         "Performance tuning:\n"
         "      --lightweight          BPF accumulator only (no per-event ringbuf).\n"
         "                             Reduces overhead ~40%%, loses histogram/session/query views\n"
@@ -191,6 +198,10 @@ static enum pgwt_mode parse_mode(const char *s)
 #define OPT_MODE         264
 #define OPT_SAMPLE_RATE  265
 #define OPT_ESC_BUDGET   266
+#define OPT_ANOM_AAS_FACTOR 267
+#define OPT_ANOM_AAS_TICKS  268
+#define OPT_ANOM_LOCK_FRAC  269
+#define OPT_ANOM_COOLDOWN   270
 
 static struct option long_opts[] = {
     {"pid",        required_argument, NULL, 'p'},
@@ -218,6 +229,10 @@ static struct option long_opts[] = {
     {"mode",            required_argument, NULL, OPT_MODE},
     {"sample-rate",     required_argument, NULL, OPT_SAMPLE_RATE},
     {"escalation-budget", required_argument, NULL, OPT_ESC_BUDGET},
+    {"anomaly-aas-factor",  required_argument, NULL, OPT_ANOM_AAS_FACTOR},
+    {"anomaly-aas-ticks",   required_argument, NULL, OPT_ANOM_AAS_TICKS},
+    {"anomaly-lock-fraction", required_argument, NULL, OPT_ANOM_LOCK_FRAC},
+    {"anomaly-cooldown-s",  required_argument, NULL, OPT_ANOM_COOLDOWN},
     {"quiet",           no_argument,       NULL, 'q'},
     {"verbose",         no_argument,       NULL, 'v'},
     {"help",            no_argument,       NULL, 'h'},
@@ -241,6 +256,12 @@ int main(int argc, char **argv)
     d->mode      = PGWT_MODE_FULL;   /* default: today's watchpoint behavior */
     d->sample_rate_hz = 10;          /* default sampled rate (D1) */
     d->escalation_budget_s = 300;    /* tiered: full-fidelity s / rolling hour (D5) */
+    /* Anomaly triggers (A5): negative sentinels = "use the built-in default"
+     * (pgwt_anomaly_init derives them); only an explicit flag overrides. */
+    d->anomaly_aas_factor    = -1.0;
+    d->anomaly_aas_ticks     = -1;
+    d->anomaly_lock_fraction = -1.0;
+    d->anomaly_cooldown_s    = -1;
 
     pid_t pm_pid = 0;
     const char *pgdata = NULL;
@@ -284,6 +305,10 @@ int main(int argc, char **argv)
         case OPT_MODE:        d->mode = parse_mode(optarg); break;
         case OPT_SAMPLE_RATE: d->sample_rate_hz = atoi(optarg); break;
         case OPT_ESC_BUDGET:  d->escalation_budget_s = atoi(optarg); break;
+        case OPT_ANOM_AAS_FACTOR: d->anomaly_aas_factor = atof(optarg); break;
+        case OPT_ANOM_AAS_TICKS:  d->anomaly_aas_ticks = atoi(optarg); break;
+        case OPT_ANOM_LOCK_FRAC:  d->anomaly_lock_fraction = atof(optarg); break;
+        case OPT_ANOM_COOLDOWN:   d->anomaly_cooldown_s = atoi(optarg); break;
         case 'q': d->quiet = true; break;
         case 'v': d->verbose = true; break;
         case 'h': usage(argv[0]); free(d); return 0;
@@ -365,6 +390,24 @@ int main(int argc, char **argv)
     if (d->escalation_budget_s < 0) {
         fprintf(stderr, "FATAL: --escalation-budget must be >= 0 (got %d)\n",
                 d->escalation_budget_s);
+        free(d);
+        return 1;
+    }
+
+    /* Validate: --anomaly-* (tiered only; ignored otherwise). Negative =
+     * "unset, use default", so only reject out-of-range explicit values. */
+    if (d->anomaly_aas_factor == 0.0) {
+        fprintf(stderr, "FATAL: --anomaly-aas-factor must be > 0\n");
+        free(d);
+        return 1;
+    }
+    if (d->anomaly_aas_ticks == 0) {
+        fprintf(stderr, "FATAL: --anomaly-aas-ticks must be >= 1\n");
+        free(d);
+        return 1;
+    }
+    if (d->anomaly_lock_fraction > 1.0) {
+        fprintf(stderr, "FATAL: --anomaly-lock-fraction must be in (0, 1]\n");
         free(d);
         return 1;
     }
