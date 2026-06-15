@@ -343,7 +343,7 @@ def test_toggle_live_mid_refresh(page):
     page.click(".tp-quick button[data-range='0']")  # All -> frozen
     page.wait_for_timeout(2500)
 
-    target = page.evaluate("() => [state.viewFrom, state.viewTo]")
+    target = page.evaluate("() => [window.__pgwt.timeRange.from, window.__pgwt.timeRange.to]")
 
     # Toggle Live on then off rapidly so an auto-refresh tick is mid-flight
     # when we stop, then re-assert the frozen window.
@@ -367,7 +367,7 @@ def test_toggle_live_mid_refresh(page):
     check(("●" in label) == bool(is_active),
           f"Live label/class consistent (label='{label}', active={is_active})")
 
-    final = page.evaluate("() => [state.viewFrom, state.viewTo]")
+    final = page.evaluate("() => [window.__pgwt.timeRange.from, window.__pgwt.timeRange.to]")
     # A stale live tick would shove the window to (serverNow - N, serverNow).
     # The frozen "All" window must survive.
     check(final == target,
@@ -377,23 +377,24 @@ def test_toggle_live_mid_refresh(page):
 def test_dragzoom_during_refresh(page):
     """RACE: drag-zoom on the AAS chart while a refresh is in flight.
 
-    Symptom (manual): start a drag-select zoom on the ApexCharts AAS chart
-    while a chaos-delayed aas response is still pending. The pending response
-    repaints the chart out from under the active selection, the zoom maps to
-    the wrong time range, or the chart instance is mutated mid-render.
+    Symptom (manual): start a drag-select zoom on the AAS chart while a
+    chaos-delayed aas response is still pending. The pending response repaints
+    the chart out from under the active selection, the zoom maps to the wrong
+    time range, or the chart instance is mutated mid-render.
 
-    Root cause: renderApexChart() reuses a module-level chart instance with no
-    coordination against beforeZoom -> zoomTo -> refresh(true); responses are
-    gen-guarded but the chart object itself is shared mutable state. B3 moves
-    drag-select to a custom overlay owned by the view's enter/leave.
+    B3: the AAS chart is now an ECharts instance owned by the "active" view
+    (created in enter, disposed in leave — no module-level chart global), and
+    drag-select is a custom overlay (lib/selection.js: pointer events + a band
+    div + convertFromPixel). The aas fetch is single-flight on the active.aas
+    transport channel, so a new refresh supersedes the pending one structurally.
     """
     goto_ready(page)
     page.click("#live-btn")
     page.wait_for_timeout(200)
 
     # Kick a refresh (zoom out) so an aas request is in flight, then
-    # immediately drag-select across the chart.
-    box = page.query_selector("#apex-chart-container").bounding_box()
+    # immediately drag-select across the chart via the custom overlay.
+    box = page.query_selector("#aas-chart-container").bounding_box()
     page.click("#zoom-out-btn")
     page.wait_for_timeout(40)  # response not back yet (chaos >= 50ms)
 
@@ -408,19 +409,26 @@ def test_dragzoom_during_refresh(page):
 
     page.wait_for_timeout(3500)  # let zoom + late responses settle
 
-    # The chart must still be a live, rendered ApexCharts SVG with series.
-    svg = page.query_selector("#apex-chart-container svg")
-    check(svg is not None, "AAS chart SVG still present after drag-zoom")
-    series_paths = page.query_selector_all(
-        "#apex-chart-container .apexcharts-series path")
-    check(len(series_paths) > 0,
-          f"AAS chart still has series paths ({len(series_paths)})")
+    # The chart must still be a live, rendered ECharts instance with series.
+    canvas = page.query_selector("#aas-chart-container canvas")
+    check(canvas is not None, "AAS chart canvas still present after drag-zoom")
+    has_series = page.evaluate("""() => {
+        const el = document.getElementById('aas-chart-container');
+        if (!el || typeof echarts === 'undefined') return false;
+        const c = echarts.getInstanceByDom(el);
+        if (!c) return false;
+        const opt = c.getOption();
+        return !!(opt.series && opt.series.some(s => s.data && s.data.length));
+    }""")
+    check(has_series is True,
+          "AAS chart still has ECharts series with data after drag-zoom")
 
-    # Time range and view window must be self-consistent (from < to).
+    # Time range and view window must be self-consistent (from < to). State is
+    # now the explicit TimeRange module, exposed for tests as window.__pgwt.
     consistent = page.evaluate(
-        "() => (typeof state !== 'undefined') && state.viewFrom < state.viewTo")
+        "() => !!(window.__pgwt) && window.__pgwt.timeRange.from < window.__pgwt.timeRange.to")
     check(consistent is True,
-          "view window self-consistent (viewFrom < viewTo) after drag-zoom")
+          "view window self-consistent (from < to) after drag-zoom")
 
 
 # ── Registry ──────────────────────────────────────────────────────────────────
