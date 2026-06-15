@@ -35,6 +35,75 @@ static const char *pgwt_class_display[PGWT_NUM_CLASSES] = {
 /* Map wait_event_info → class index (0–10) */
 int pgwt_wait_class_index(uint32_t event_id);
 
+/* ── Fidelity (trace format v2 — D3) ───────────────────────── */
+
+/* The fidelity of the data covering a queried time window.
+ *
+ *   EXACT   — every covered range has TRANSITIONS (full-fidelity) blocks.
+ *   SAMPLED — every covered range has only SAMPLES blocks (point
+ *             observations); estimators use ASH math (each sample worth
+ *             one sample_period_ns).
+ *   MIXED   — the window spans both. Per the exact-wins merge rule,
+ *             transition data is authoritative inside transition-covered
+ *             ranges; samples only contribute outside them.
+ *   NONE    — no data at all in the window.
+ *
+ * The integer ordering is meaningful for merging window fidelities
+ * (see pgwt_fidelity_merge): NONE < EXACT < SAMPLED < MIXED. */
+enum pgwt_fidelity {
+    PGWT_FIDELITY_NONE    = 0,
+    PGWT_FIDELITY_EXACT   = 1,
+    PGWT_FIDELITY_SAMPLED = 2,
+    PGWT_FIDELITY_MIXED   = 3,
+};
+
+/* The fidelity a view requires to produce a meaningful result.
+ *   SAMPLED-capable views (time_model, system/session/query events, AAS,
+ *     active/sessions) work from samples via ASH math.
+ *   EXACT-required views (histogram/heatmap, transitions, fingerprints,
+ *     lock chains, interference, variants, concurrency) need real
+ *     intervals/order and report "unavailable" over a sampled-only window. */
+enum pgwt_required_fidelity {
+    PGWT_REQ_SAMPLED = 0,   /* samples are enough */
+    PGWT_REQ_EXACT   = 1,   /* needs full-fidelity transitions */
+};
+
+/* Derive the overall fidelity of a loaded window from what block types
+ * actually contributed records after the exact-wins merge. */
+static inline enum pgwt_fidelity
+pgwt_fidelity_of(int has_transitions, int has_samples)
+{
+    if (has_transitions && has_samples) return PGWT_FIDELITY_MIXED;
+    if (has_transitions)                return PGWT_FIDELITY_EXACT;
+    if (has_samples)                    return PGWT_FIDELITY_SAMPLED;
+    return PGWT_FIDELITY_NONE;
+}
+
+/* Lowercase token used in JSON responses ("exact"|"sampled"|"mixed"|"none"). */
+static inline const char *pgwt_fidelity_str(enum pgwt_fidelity fid)
+{
+    switch (fid) {
+    case PGWT_FIDELITY_EXACT:   return "exact";
+    case PGWT_FIDELITY_SAMPLED: return "sampled";
+    case PGWT_FIDELITY_MIXED:   return "mixed";
+    default:                    return "none";
+    }
+}
+
+/* True when a view requiring `req` fidelity cannot be produced from a
+ * window of the given `fid`. EXACT-required views are unavailable over a
+ * window that contributed no transition data (SAMPLED or NONE). */
+static inline int
+pgwt_fidelity_unavailable(enum pgwt_required_fidelity req, enum pgwt_fidelity fid)
+{
+    if (req != PGWT_REQ_EXACT)
+        return 0;
+    return (fid != PGWT_FIDELITY_EXACT && fid != PGWT_FIDELITY_MIXED);
+}
+
+/* Canonical message for an EXACT-required view over a sampled-only window. */
+#define PGWT_UNAVAILABLE_MSG "requires full-fidelity data"
+
 /* ── Filters ──────────────────────────────────────────────── */
 
 struct pgwt_filter {
