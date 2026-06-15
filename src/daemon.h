@@ -123,6 +123,8 @@ struct pgwt_daemon {
     int         anomaly_aas_ticks;       /* --anomaly-aas-ticks (<=0 = default) */
     double      anomaly_lock_fraction;   /* --anomaly-lock-fraction (<0 = default) */
     int         anomaly_cooldown_s;      /* --anomaly-cooldown-s (<0 = default) */
+    int         anomaly_window_s;        /* --anomaly-window-s: per-trigger
+                                          * escalation duration (<=0 = default) */
     uint32_t    lightweight_mode;        /* 1 = BPF accumulator only (no ringbuf) */
     uint32_t    skip_query_id;          /* 1 = skip query_id reads in BPF */
     uint32_t    skip_usdt;             /* 1 = skip USDT query lifecycle probes */

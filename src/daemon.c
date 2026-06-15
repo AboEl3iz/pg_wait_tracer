@@ -551,9 +551,8 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
         if (d->anomaly_cooldown_s >= 0)
             d->anomaly.cooldown_ns =
                 (uint64_t)d->anomaly_cooldown_s * 1000000000ULL;
-        d->anomaly.escalation_s = d->escalation_budget_s > 0 &&
-            PGWT_ANOMALY_DEF_ESCALATE_S > d->escalation_budget_s
-            ? d->escalation_budget_s : PGWT_ANOMALY_DEF_ESCALATE_S;
+        if (d->anomaly_window_s > 0)
+            d->anomaly.escalation_s = d->anomaly_window_s;
         if (d->verbose)
             fprintf(stderr,
                     "INFO: anomaly triggers armed: aas>%.1f*baseline for %d "

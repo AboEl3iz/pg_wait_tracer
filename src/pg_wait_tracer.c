@@ -67,6 +67,7 @@ static void usage(const char *prog)
         "      --anomaly-lock-fraction <F>  Fire when Lock-class share of active\n"
         "                             samples > F (default 0.30), sustained N ticks\n"
         "      --anomaly-cooldown-s <S>   Min seconds between auto-escalations (default 120)\n"
+        "      --anomaly-window-s <S>     Full-fidelity window length per auto-trigger (default 60)\n"
         "\n"
         "Performance tuning:\n"
         "      --lightweight          BPF accumulator only (no per-event ringbuf).\n"
@@ -202,6 +203,7 @@ static enum pgwt_mode parse_mode(const char *s)
 #define OPT_ANOM_AAS_TICKS  268
 #define OPT_ANOM_LOCK_FRAC  269
 #define OPT_ANOM_COOLDOWN   270
+#define OPT_ANOM_WINDOW     271
 
 static struct option long_opts[] = {
     {"pid",        required_argument, NULL, 'p'},
@@ -233,6 +235,7 @@ static struct option long_opts[] = {
     {"anomaly-aas-ticks",   required_argument, NULL, OPT_ANOM_AAS_TICKS},
     {"anomaly-lock-fraction", required_argument, NULL, OPT_ANOM_LOCK_FRAC},
     {"anomaly-cooldown-s",  required_argument, NULL, OPT_ANOM_COOLDOWN},
+    {"anomaly-window-s",    required_argument, NULL, OPT_ANOM_WINDOW},
     {"quiet",           no_argument,       NULL, 'q'},
     {"verbose",         no_argument,       NULL, 'v'},
     {"help",            no_argument,       NULL, 'h'},
@@ -309,6 +312,7 @@ int main(int argc, char **argv)
         case OPT_ANOM_AAS_TICKS:  d->anomaly_aas_ticks = atoi(optarg); break;
         case OPT_ANOM_LOCK_FRAC:  d->anomaly_lock_fraction = atof(optarg); break;
         case OPT_ANOM_COOLDOWN:   d->anomaly_cooldown_s = atoi(optarg); break;
+        case OPT_ANOM_WINDOW:     d->anomaly_window_s = atoi(optarg); break;
         case 'q': d->quiet = true; break;
         case 'v': d->verbose = true; break;
         case 'h': usage(argv[0]); free(d); return 0;

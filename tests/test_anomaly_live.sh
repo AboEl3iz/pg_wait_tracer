@@ -46,10 +46,12 @@ SOCK="$TRACE_DIR/pgwt.sock"
 TRACER_PID=""
 declare -a STORM_PIDS=()
 
-# Budget large enough for two windows; cooldown short enough to test re-fire
-# after it elapses, long enough to block the second storm fired during it.
+# Budget large enough for several windows. The per-trigger window is short so
+# it de-escalates within the test. The cooldown is long enough that a second
+# storm injected right after the first window closes is still INSIDE cooldown
+# (so it must NOT re-fire).
 BUDGET=200
-COOLDOWN=20
+COOLDOWN=45
 WINDOW=8
 
 passed=0; failed=0
@@ -119,7 +121,8 @@ q "CREATE TABLE IF NOT EXISTS $LOCK_TABLE (x int);" >/dev/null 2>&1
 "$TRACER" --daemon --pid "$PM_PID" -i 1 -T "$TRACE_DIR" \
     --mode tiered --sample-rate 50 --escalation-budget "$BUDGET" \
     --anomaly-aas-factor 3.0 --anomaly-aas-ticks 5 \
-    --anomaly-lock-fraction 0.30 --anomaly-cooldown-s "$COOLDOWN" -v \
+    --anomaly-lock-fraction 0.30 --anomaly-cooldown-s "$COOLDOWN" \
+    --anomaly-window-s "$WINDOW" -v \
     >/dev/null 2>"$DAEMON_LOG" &
 TRACER_PID=$!
 
