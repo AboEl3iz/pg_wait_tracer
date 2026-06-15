@@ -3,12 +3,12 @@
  * B3 part 1: the 2000-line monolith is being restructured into native ES
  * modules (no build step — still embeddable via go:embed). This file is the
  * bootstrap + router. The migrated views (active = AAS chart, overview = time
- * model table) live in views/ as pure builders + thin mounts; the not-yet-
- * migrated tabs (events/sessions/queries/histogram/timeline/transitions/
- * concurrency) are wrapped as legacy view adapters so they ALL flow through the
- * same view-manager chokepoint and transport single-flight — which is what
- * keeps the B2 chaos races fixed while they await their turn to be migrated to
- * pure builders in B3 part 2.
+ * model table, events = the wait-events table) live in views/ as pure builders
+ * + thin mounts; the not-yet-migrated tabs (sessions/queries/histogram/timeline/
+ * transitions/concurrency) are wrapped as legacy view adapters so they ALL flow
+ * through the same view-manager chokepoint and transport single-flight — which is
+ * what keeps the B2 chaos races fixed while they await their turn to be migrated
+ * to pure builders (sessions/queries land later in this PR; the charts in part 3).
  *
  * State is explicit (lib/state.js): no grab-bag global mutated mid-flight.
  * Stale-response superseding is structural (lib/transport.js channels +
@@ -23,9 +23,10 @@ import {
     WAIT_CLASSES, EVENT_PALETTE, classColor,
     fmtTime, fmtTimeMs, fmtDuration, fmtMs, fmtUs, fmtCount, esc,
 } from './lib/format.js';
-import { eventsConfig, sessionsConfig, queriesConfig } from './lib/builders/table-configs.js';
+import { sessionsConfig, queriesConfig } from './lib/builders/table-configs.js';
 import { createActiveView } from './views/active.js';
 import { createOverviewView } from './views/overview.js';
+import { createEventsView } from './views/events.js';
 
 // ── Core services ─────────────────────────────────────────────────────────────
 
@@ -44,6 +45,19 @@ let reconnectTimer = null;
 // Auto-refresh (live mode) bookkeeping.
 let autoRefreshId = 0;
 let autoRefreshOn = false;
+
+// Sort state per table view. getSort returns the current { key, asc } (or null
+// for server order); toggleSort cycles desc→asc on repeated clicks of the same
+// column. Kept here (not in a view) so it survives tab switches, matching the
+// old per-tab behavior. (Legacy sortCol/sortAsc remain for the not-yet-migrated
+// sessions/queries adapters until they migrate in this PR's later commits.)
+const tabSort = {};   // tab -> { key, asc }
+function getSort(tab) { return tabSort[tab] || null; }
+function toggleSort(tab, key) {
+    const cur = tabSort[tab];
+    if (cur && cur.key === key) tabSort[tab] = { key, asc: !cur.asc };
+    else tabSort[tab] = { key, asc: false };
+}
 
 // Sort state per tab (legacy table views read/write this).
 const sortCol = {};
@@ -64,7 +78,11 @@ function makeCtx() {
         setStatus,
         onDrill: drill,
         onZoom: (from, to) => { stopAutoRefresh(); zoomTo(from, to); },
-        // Legacy adapters need these:
+        // Table views: per-tab sort state + a re-render hook used after a
+        // header-sort click (re-runs requests/build/mount under a fresh epoch).
+        getSort, toggleSort,
+        refresh: () => vm.refresh(),
+        // Legacy adapters (sessions/queries until migrated) need these:
         sortCol, sortAsc,
     };
 }
@@ -177,7 +195,7 @@ function initTabs() {
     vm.setContainer(tableEl);
 
     vm.register(createOverviewView());
-    vm.register(makeEventsView());
+    vm.register(createEventsView());
     vm.register(makeSessionsView());
     vm.register(makeQueriesView());
     vm.register(makeHistogramView());
@@ -483,7 +501,6 @@ function makeTableTabView(id, cmd, config) {
     };
 }
 
-function makeEventsView()   { return makeTableTabView('events', 'top_events', eventsConfig); }
 function makeSessionsView() { return makeTableTabView('sessions', 'top_sessions', sessionsConfig); }
 function makeQueriesView()  { return makeTableTabView('queries', 'top_queries', queriesConfig); }
 
