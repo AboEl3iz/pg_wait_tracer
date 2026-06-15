@@ -102,6 +102,15 @@ struct bm_entry {
 
 /* ── Server state ─────────────────────────────────────────── */
 
+/* A time range [start, end] in wall ns covered by a TRANSITIONS block.
+ * Used for the exact-wins merge (D3): samples inside a transition-covered
+ * range are dropped at read time so a sampler running through a
+ * full-fidelity window does not double-count. */
+struct trans_range {
+    uint64_t start_wall_ns;
+    uint64_t end_wall_ns;
+};
+
 /* Per-file event cache — for immutable .trace.lz4 files only */
 struct file_cache_entry {
     char     path[512];
@@ -110,6 +119,24 @@ struct file_cache_entry {
     int      immutable;
     uint64_t first_wall_ns;  /* earliest event timestamp (for range skip) */
     uint64_t last_wall_ns;   /* latest event timestamp */
+
+    /* Fidelity (trace format v2). Samples are stored already normalized:
+     * old_event = sampled event, duration_ns = sample_period_ns, with the
+     * PGWT_EVENT_FLAG_SAMPLE bit set so estimators apply ASH math and the
+     * exact-wins merge can identify them. */
+    int       has_transitions;
+    int       has_samples;
+    uint64_t  sample_period_ns;
+    struct trans_range *trans_ranges;  /* malloc'd; TRANSITIONS block ranges */
+    int       num_trans_ranges;
+};
+
+/* Fidelity summary of a loaded window, returned alongside the event array
+ * so handlers can tag responses and gate EXACT-required views. */
+struct pgwt_load_info {
+    int      has_transitions;   /* a TRANSITIONS block contributed records */
+    int      has_samples;       /* a SAMPLES record survived the merge */
+    uint64_t sample_period_ns;  /* nominal sample interval (0 if no samples) */
 };
 
 struct pgwt_server {
@@ -446,6 +473,8 @@ static void cache_evict_oldest(struct pgwt_server *srv)
     /* Evict the first (oldest) cached entry */
     free(srv->cache[0].events);
     srv->cache[0].events = NULL;
+    free(srv->cache[0].trans_ranges);
+    srv->cache[0].trans_ranges = NULL;
     memmove(&srv->cache[0], &srv->cache[1],
             (srv->cache_count - 1) * sizeof(srv->cache[0]));
     srv->cache_count--;
@@ -509,8 +538,35 @@ get_cached_immutable(struct pgwt_server *srv, const char *path)
             reader.block_index[reader.num_blocks - 1].timestamp_ns);
     }
 
+    int tr_cap = 0;
     for (int b = 0; b < reader.num_blocks; b++) {
-        int n = pgwt_reader_decode_block(&reader, b, block_buf, PGWT_BLOCK_EVENTS);
+        struct pgwt_block_info bi;
+        int n = pgwt_reader_decode_block_info(&reader, b, block_buf,
+                                              PGWT_BLOCK_EVENTS, &bi);
+        if (n < 0) continue;
+
+        if (bi.block_type == PGWT_BLOCK_SAMPLES) {
+            ce->has_samples = 1;
+            if (bi.sample_period_ns)
+                ce->sample_period_ns = bi.sample_period_ns;
+        } else {
+            ce->has_transitions = 1;
+            /* Record this transition block's wall range for the merge. */
+            if (ce->num_trans_ranges >= tr_cap) {
+                tr_cap = tr_cap ? tr_cap * 2 : 16;
+                struct trans_range *tmp = realloc(ce->trans_ranges,
+                                                  tr_cap * sizeof(*tmp));
+                if (tmp) ce->trans_ranges = tmp;
+            }
+            if (ce->trans_ranges && ce->num_trans_ranges < tr_cap) {
+                ce->trans_ranges[ce->num_trans_ranges].start_wall_ns =
+                    pgwt_reader_mono_to_wall(&reader, bi.first_timestamp_ns);
+                ce->trans_ranges[ce->num_trans_ranges].end_wall_ns =
+                    pgwt_reader_mono_to_wall(&reader, bi.last_timestamp_ns);
+                ce->num_trans_ranges++;
+            }
+        }
+
         for (int i = 0; i < n; i++) {
             if (ce->count >= cap) {
                 cap *= 2;
@@ -519,6 +575,13 @@ get_cached_immutable(struct pgwt_server *srv, const char *path)
                 ce->events = tmp;
             }
             ce->events[ce->count] = block_buf[i];
+            /* Normalize samples into interval shape so the duration-based
+             * estimators apply ASH math (each sample worth sample_period_ns).
+             * Keep the SAMPLE flag for the exact-wins merge and fidelity. */
+            if (block_buf[i].flags & PGWT_EVENT_FLAG_SAMPLE) {
+                ce->events[ce->count].old_event = block_buf[i].new_event;
+                ce->events[ce->count].duration_ns = bi.sample_period_ns;
+            }
             ce->events[ce->count].timestamp_ns =
                 pgwt_reader_mono_to_wall(&reader, block_buf[i].timestamp_ns);
             ce->count++;
@@ -543,14 +606,37 @@ get_cached_immutable(struct pgwt_server *srv, const char *path)
     return ce;
 }
 
-/* Read events from current.trace for a time range — on demand, no caching.
+/* Append one transition range to a growable collector. */
+static void trans_ranges_add(struct trans_range **ranges, int *count, int *cap,
+                             uint64_t start_wall_ns, uint64_t end_wall_ns)
+{
+    if (*count >= *cap) {
+        int newcap = *cap ? *cap * 2 : 16;
+        struct trans_range *tmp = realloc(*ranges, newcap * sizeof(**ranges));
+        if (!tmp) return;
+        *ranges = tmp;
+        *cap = newcap;
+    }
+    (*ranges)[*count].start_wall_ns = start_wall_ns;
+    (*ranges)[*count].end_wall_ns   = end_wall_ns;
+    (*count)++;
+}
+
+/* Read events from a trace file for a time range — on demand, no caching.
  * Opens file, seeks to the right blocks via block index, decodes only
  * the blocks that overlap [from_wall_ns, to_wall_ns].
- * Appends to events array at *total, growing if needed. */
+ * Appends events at *total (growing as needed) and, for the exact-wins
+ * merge, appends each TRANSITIONS block's wall range to *ranges. Sets
+ * fidelity flags / sample period in *info. SAMPLES records are normalized
+ * to interval shape (old_event = sampled event, duration_ns =
+ * sample_period_ns) so the duration-based estimators apply ASH math. */
 static void load_current_trace_range(const char *path,
                                       uint64_t from_wall_ns, uint64_t to_wall_ns,
                                       struct pgwt_trace_event **events,
-                                      int *total, int *cap)
+                                      int *total, int *cap,
+                                      struct trans_range **ranges,
+                                      int *nranges, int *ranges_cap,
+                                      struct pgwt_load_info *info)
 {
     struct pgwt_event_reader reader;
     if (pgwt_reader_open(&reader, path) != 0)
@@ -566,7 +652,20 @@ static void load_current_trace_range(const char *path,
         if (reader.block_index[b].timestamp_ns > to_mono)
             break;
 
-        int n = pgwt_reader_decode_block(&reader, b, block_buf, PGWT_BLOCK_EVENTS);
+        struct pgwt_block_info bi;
+        int n = pgwt_reader_decode_block_info(&reader, b, block_buf,
+                                              PGWT_BLOCK_EVENTS, &bi);
+        if (n < 0) continue;
+
+        if (bi.block_type == PGWT_BLOCK_SAMPLES) {
+            if (info && bi.sample_period_ns)
+                info->sample_period_ns = bi.sample_period_ns;
+        } else if (ranges) {
+            trans_ranges_add(ranges, nranges, ranges_cap,
+                pgwt_reader_mono_to_wall(&reader, bi.first_timestamp_ns),
+                pgwt_reader_mono_to_wall(&reader, bi.last_timestamp_ns));
+        }
+
         for (int i = 0; i < n; i++) {
             uint64_t ts_mono = block_buf[i].timestamp_ns;
             if (ts_mono < from_mono) continue;
@@ -580,6 +679,10 @@ static void load_current_trace_range(const char *path,
             }
 
             (*events)[*total] = block_buf[i];
+            if (block_buf[i].flags & PGWT_EVENT_FLAG_SAMPLE) {
+                (*events)[*total].old_event = block_buf[i].new_event;
+                (*events)[*total].duration_ns = bi.sample_period_ns;
+            }
             (*events)[*total].timestamp_ns =
                 pgwt_reader_mono_to_wall(&reader, ts_mono);
             (*total)++;
@@ -607,18 +710,37 @@ static uint64_t get_current_trace_latest(const char *path)
 
 /* ── Event loading ────────────────────────────────────────── */
 
+/* True if wall_ns falls inside any collected transition range [start,end]. */
+static int ts_in_trans_range(const struct trans_range *ranges, int n,
+                             uint64_t wall_ns)
+{
+    for (int i = 0; i < n; i++)
+        if (wall_ns >= ranges[i].start_wall_ns &&
+            wall_ns <= ranges[i].end_wall_ns)
+            return 1;
+    return 0;
+}
+
 /*
  * Load events in [from_wall_ns, to_wall_ns] from trace files.
  * Immutable .trace.lz4: from cache (read once per session).
  * current.trace: on-demand block reads (no caching, no memory growth).
  * Returns malloc'd array. Caller must free(). Sets *out_count.
+ *
+ * Fidelity (trace format v2, D3): SAMPLES records are normalized so the
+ * duration-based estimators apply ASH math. The exact-wins merge drops any
+ * sample whose timestamp falls inside a TRANSITIONS block's range, so a
+ * sampler running through a full-fidelity window does not double-count.
+ * When `info` is non-NULL it is filled with what actually contributed
+ * (has_transitions / has_samples / sample_period_ns).
  */
 static struct pgwt_trace_event *
-server_load_events(struct pgwt_server *srv,
-                   uint64_t from_wall_ns, uint64_t to_wall_ns,
-                   int *out_count)
+server_load_events_fi(struct pgwt_server *srv,
+                      uint64_t from_wall_ns, uint64_t to_wall_ns,
+                      int *out_count, struct pgwt_load_info *info)
 {
     *out_count = 0;
+    if (info) memset(info, 0, sizeof(*info));
 
     /* Quick rescan for new files (directory listing only, no file opens) */
     srv->num_files = pgwt_scan_trace_files(srv->trace_dir, srv->files, 256);
@@ -633,20 +755,36 @@ server_load_events(struct pgwt_server *srv,
     if (!events) return NULL;
     int total = 0;
 
+    /* Build the set of transition-covered ranges first, across ALL files,
+     * so the exact-wins merge sees a sampler in one file overlapping an
+     * escalation window in another. */
+    struct trans_range *ranges = NULL;
+    int nranges = 0, ranges_cap = 0;
+    uint64_t sample_period_ns = 0;
+
     for (int fi = 0; fi < srv->num_files; fi++) {
         const char *path = srv->files[fi].path;
 
         if (is_current_trace(path)) {
             /* On-demand: read only blocks in [from, to] */
+            struct pgwt_load_info fileinfo = {0};
             load_current_trace_range(path, from_wall_ns, to_wall_ns,
-                                     &events, &total, &cap);
+                                     &events, &total, &cap,
+                                     &ranges, &nranges, &ranges_cap, &fileinfo);
+            if (fileinfo.sample_period_ns)
+                sample_period_ns = fileinfo.sample_period_ns;
         } else {
             /* Immutable: try cache, fall back to on-demand for large files */
             struct file_cache_entry *ce = get_cached_immutable(srv, path);
             if (!ce || !ce->events) {
                 /* Cache miss (file too large or alloc failed) — read on demand */
+                struct pgwt_load_info fileinfo = {0};
                 load_current_trace_range(path, from_wall_ns, to_wall_ns,
-                                         &events, &total, &cap);
+                                         &events, &total, &cap,
+                                         &ranges, &nranges, &ranges_cap,
+                                         &fileinfo);
+                if (fileinfo.sample_period_ns)
+                    sample_period_ns = fileinfo.sample_period_ns;
                 continue;
             }
 
@@ -655,6 +793,15 @@ server_load_events(struct pgwt_server *srv,
                 continue;
             if (ce->last_wall_ns > 0 && ce->last_wall_ns < from_wall_ns)
                 continue;
+
+            if (ce->sample_period_ns)
+                sample_period_ns = ce->sample_period_ns;
+
+            /* Contribute this file's transition ranges to the merge set */
+            for (int r = 0; r < ce->num_trans_ranges; r++)
+                trans_ranges_add(&ranges, &nranges, &ranges_cap,
+                                 ce->trans_ranges[r].start_wall_ns,
+                                 ce->trans_ranges[r].end_wall_ns);
 
             /* Filter cached events by time range */
             for (int i = 0; i < ce->count; i++) {
@@ -665,7 +812,7 @@ server_load_events(struct pgwt_server *srv,
                 if (total >= cap) {
                     cap *= 2;
                     struct pgwt_trace_event *tmp = realloc(events, cap * sizeof(*tmp));
-                    if (!tmp) { *out_count = total; return events; }
+                    if (!tmp) { free(ranges); *out_count = total; return events; }
                     events = tmp;
                 }
                 events[total++] = ce->events[i];
@@ -673,8 +820,41 @@ server_load_events(struct pgwt_server *srv,
         }
     }
 
+    /* Exact-wins merge: drop samples inside any transition range, then
+     * derive what actually contributed for the fidelity indicator. */
+    int has_transitions = 0, has_samples = 0;
+    int kept = 0;
+    for (int i = 0; i < total; i++) {
+        if (events[i].flags & PGWT_EVENT_FLAG_SAMPLE) {
+            if (nranges > 0 &&
+                ts_in_trans_range(ranges, nranges, events[i].timestamp_ns))
+                continue;  /* transition data is authoritative here */
+            has_samples = 1;
+        } else {
+            has_transitions = 1;
+        }
+        events[kept++] = events[i];
+    }
+    total = kept;
+    free(ranges);
+
+    if (info) {
+        info->has_transitions = has_transitions;
+        info->has_samples = has_samples;
+        info->sample_period_ns = has_samples ? sample_period_ns : 0;
+    }
+
     *out_count = total;
     return events;
+}
+
+/* Backward-compatible wrapper for callers that don't need fidelity info. */
+static struct pgwt_trace_event *
+server_load_events(struct pgwt_server *srv,
+                   uint64_t from_wall_ns, uint64_t to_wall_ns,
+                   int *out_count)
+{
+    return server_load_events_fi(srv, from_wall_ns, to_wall_ns, out_count, NULL);
 }
 
 /* ── Server init ──────────────────────────────────────────── */
@@ -756,6 +936,43 @@ static int should_use_summaries(struct pgwt_server *srv, struct pgwt_request *re
     return (range_ns >= 120ULL * 1000000000ULL);
 }
 
+/* ── Fidelity (trace format v2, D3) ───────────────────────── */
+
+/* Derive the window fidelity from a load and add it as a "fidelity" field
+ * to a response. Every view carries this so the client (B5) can render the
+ * exact/sampled/mixed distinction. */
+static enum pgwt_fidelity load_fidelity(const struct pgwt_load_info *info)
+{
+    return pgwt_fidelity_of(info->has_transitions, info->has_samples);
+}
+
+static void add_fidelity(cJSON *root, const struct pgwt_load_info *info)
+{
+    enum pgwt_fidelity fid = load_fidelity(info);
+    cJSON_AddStringToObject(root, "fidelity", pgwt_fidelity_str(fid));
+    if (info->has_samples && info->sample_period_ns)
+        cjson_add_uint64(root, "sample_period_ns", info->sample_period_ns);
+}
+
+/* When summaries are used the window is full-fidelity transition data
+ * (summaries are derived from the watchpoint path). */
+static void add_fidelity_exact(cJSON *root)
+{
+    cJSON_AddStringToObject(root, "fidelity", "exact");
+}
+
+/* Emit the structured "unavailable" response for an EXACT-required view over
+ * a window with no transition coverage (sampled-only). NEVER a silent empty
+ * result — the client renders an explicit "escalate to capture" state. */
+static void emit_unavailable(uint64_t req_id, enum pgwt_fidelity fid)
+{
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddNumberToObject(root, "id", (double)req_id);
+    cJSON_AddStringToObject(root, "unavailable", PGWT_UNAVAILABLE_MSG);
+    cJSON_AddStringToObject(root, "fidelity", pgwt_fidelity_str(fid));
+    emit_json(root);
+}
+
 /* ── Command handlers ─────────────────────────────────────── */
 
 static void handle_info(struct pgwt_server *srv, struct pgwt_request *req)
@@ -808,15 +1025,18 @@ static void handle_aas(struct pgwt_server *srv, struct pgwt_request *req)
     int detail_events = (strcmp(req->detail, "events") == 0);
 
     struct pgwt_aas_result aas;
+    struct pgwt_load_info linfo = {0};
+    int from_summaries = 0;
 
     /* Event-detail mode always uses raw events (no summary path yet) */
     if (!detail_events && should_use_summaries(srv, req)) {
         pgwt_compute_aas_from_summaries(srv->trace_dir, from, to,
                                          &req->filter, num_buckets, &aas);
+        from_summaries = 1;
     } else {
         int count;
         struct pgwt_trace_event *events =
-            server_load_events(srv, req->from_ns, req->to_ns, &count);
+            server_load_events_fi(srv, req->from_ns, req->to_ns, &count, &linfo);
         pgwt_compute_aas(events, count, &req->filter, from, to, num_buckets,
                          detail_events, AAS_MAX_EVENT_SERIES, &aas);
         free(events);
@@ -824,6 +1044,8 @@ static void handle_aas(struct pgwt_server *srv, struct pgwt_request *req)
 
     cJSON *root = cJSON_CreateObject();
     cJSON_AddNumberToObject(root, "id", (double)req->id);
+    if (from_summaries) add_fidelity_exact(root);
+    else                add_fidelity(root, &linfo);
 
     if (aas.num_event_series > 0) {
         /* Event-breakdown mode */
@@ -877,20 +1099,25 @@ static void handle_time_model(struct pgwt_server *srv, struct pgwt_request *req)
     double wall_ms = (double)(to - from) / 1e6;
 
     struct pgwt_tm_result tm;
+    struct pgwt_load_info linfo = {0};
+    int from_summaries = 0;
 
     if (should_use_summaries(srv, req)) {
         pgwt_compute_time_model_from_summaries(srv->trace_dir, from, to,
                                                 &req->filter, wall_ms, &tm);
+        from_summaries = 1;
     } else {
         int count;
         struct pgwt_trace_event *events =
-            server_load_events(srv, req->from_ns, req->to_ns, &count);
+            server_load_events_fi(srv, req->from_ns, req->to_ns, &count, &linfo);
         pgwt_compute_time_model(events, count, &req->filter, wall_ms, &tm);
         free(events);
     }
 
     cJSON *root = cJSON_CreateObject();
     cJSON_AddNumberToObject(root, "id", (double)req->id);
+    if (from_summaries) add_fidelity_exact(root);
+    else                add_fidelity(root, &linfo);
 
     cJSON *rows = cJSON_AddArrayToObject(root, "rows");
     for (int i = 0; i < tm.num_rows; i++) {
@@ -919,20 +1146,25 @@ static void handle_top_events(struct pgwt_server *srv, struct pgwt_request *req)
     double wall_ms = (double)(to - from) / 1e6;
 
     struct pgwt_events_result res;
+    struct pgwt_load_info linfo = {0};
+    int from_summaries = 0;
 
     if (should_use_summaries(srv, req)) {
         pgwt_compute_top_events_from_summaries(srv->trace_dir, from, to,
                                                 &req->filter, wall_ms, &res);
+        from_summaries = 1;
     } else {
         int count;
         struct pgwt_trace_event *events =
-            server_load_events(srv, req->from_ns, req->to_ns, &count);
+            server_load_events_fi(srv, req->from_ns, req->to_ns, &count, &linfo);
         pgwt_compute_top_events(events, count, &req->filter, wall_ms, &res);
         free(events);
     }
 
     cJSON *root = cJSON_CreateObject();
     cJSON_AddNumberToObject(root, "id", (double)req->id);
+    if (from_summaries) add_fidelity_exact(root);
+    else                add_fidelity(root, &linfo);
 
     cJSON *rows = cJSON_AddArrayToObject(root, "rows");
     for (int i = 0; i < res.num_rows; i++) {
@@ -966,21 +1198,26 @@ static void handle_top_sessions(struct pgwt_server *srv, struct pgwt_request *re
     double wall_ms = (double)(to - from) / 1e6;
 
     struct pgwt_sessions_result res;
+    struct pgwt_load_info linfo = {0};
+    int from_summaries = 0;
 
     /* Sessions + query_id: summaries lack per-session query data, use raw events */
     if (should_use_summaries(srv, req) && req->filter.query_id == 0) {
         pgwt_compute_top_sessions_from_summaries(srv->trace_dir, from, to,
                                                   &req->filter, wall_ms, &res);
+        from_summaries = 1;
     } else {
         int count;
         struct pgwt_trace_event *events =
-            server_load_events(srv, req->from_ns, req->to_ns, &count);
+            server_load_events_fi(srv, req->from_ns, req->to_ns, &count, &linfo);
         pgwt_compute_top_sessions(events, count, &req->filter, wall_ms, &res);
         free(events);
     }
 
     cJSON *root = cJSON_CreateObject();
     cJSON_AddNumberToObject(root, "id", (double)req->id);
+    if (from_summaries) add_fidelity_exact(root);
+    else                add_fidelity(root, &linfo);
 
     cJSON *rows = cJSON_AddArrayToObject(root, "rows");
     for (int i = 0; i < res.num_rows; i++) {
@@ -1019,14 +1256,18 @@ static void handle_top_queries(struct pgwt_server *srv, struct pgwt_request *req
     int ecount = 0;
     struct pgwt_trace_event *all_events = NULL;
     struct pgwt_queries_result res;
+    struct pgwt_load_info linfo = {0};
+    int from_summaries = 0;
 
     /* Use summaries for large ranges (>120s) for the class breakdown.
      * Always load raw events for lifecycle stats (exec/plan counts).
      * Large files are read on-demand (not cached) so this is safe. */
-    all_events = server_load_events(srv, req->from_ns, req->to_ns, &ecount);
+    all_events = server_load_events_fi(srv, req->from_ns, req->to_ns, &ecount,
+                                       &linfo);
     if (!has_event_filter && should_use_summaries(srv, req)) {
         pgwt_compute_top_queries_from_summaries(srv->trace_dir, from, to,
                                                  &req->filter, wall_ms, &res);
+        from_summaries = 1;
     } else {
         pgwt_compute_top_queries(all_events, ecount, &req->filter, wall_ms, &res);
     }
@@ -1119,6 +1360,8 @@ static void handle_top_queries(struct pgwt_server *srv, struct pgwt_request *req
 
     cJSON *root = cJSON_CreateObject();
     cJSON_AddNumberToObject(root, "id", (double)req->id);
+    if (from_summaries) add_fidelity_exact(root);
+    else                add_fidelity(root, &linfo);
 
     cJSON *rows = cJSON_AddArrayToObject(root, "rows");
     for (int i = 0; i < res.num_rows; i++) {
@@ -1256,15 +1499,25 @@ static void handle_heatmap(struct pgwt_server *srv, struct pgwt_request *req)
     int num_buckets = req->num_buckets > 0 ? req->num_buckets : 200;
 
     struct pgwt_heatmap_result res;
+    int from_summaries = 0;
 
-    /* Heatmap + query_id: summaries lack per-query histograms, use raw events */
+    /* Heatmap (latency distribution) is EXACT-required: it needs real
+     * per-event durations, which samples do not carry. */
     if (should_use_summaries(srv, req) && req->filter.query_id == 0) {
         pgwt_compute_heatmap_from_summaries(srv->trace_dir, from, to,
                                              &req->filter, num_buckets, &res);
+        from_summaries = 1;
     } else {
         int count;
+        struct pgwt_load_info linfo = {0};
         struct pgwt_trace_event *events =
-            server_load_events(srv, req->from_ns, req->to_ns, &count);
+            server_load_events_fi(srv, req->from_ns, req->to_ns, &count, &linfo);
+        enum pgwt_fidelity fid = load_fidelity(&linfo);
+        if (pgwt_fidelity_unavailable(PGWT_REQ_EXACT, fid)) {
+            free(events);
+            emit_unavailable(req->id, fid);
+            return;
+        }
         pgwt_compute_heatmap(events, count, &req->filter,
                              from, to, num_buckets, &res);
         free(events);
@@ -1280,6 +1533,8 @@ static void handle_heatmap(struct pgwt_server *srv, struct pgwt_request *req)
 
     cJSON *root = cJSON_CreateObject();
     cJSON_AddNumberToObject(root, "id", (double)req->id);
+    add_fidelity_exact(root);
+    (void)from_summaries;
 
     cJSON *times_arr = cJSON_AddArrayToObject(root, "times");
     for (int i = 0; i < res.num_buckets; i++)
@@ -1320,8 +1575,9 @@ static void handle_heatmap(struct pgwt_server *srv, struct pgwt_request *req)
 static void handle_session_timeline(struct pgwt_server *srv, struct pgwt_request *req)
 {
     int count;
+    struct pgwt_load_info linfo = {0};
     struct pgwt_trace_event *events =
-        server_load_events(srv, req->from_ns, req->to_ns, &count);
+        server_load_events_fi(srv, req->from_ns, req->to_ns, &count, &linfo);
 
     /* First pass: count matching events and collect unique PIDs */
     uint32_t pids[TIMELINE_MAX_PIDS];
@@ -1368,6 +1624,7 @@ static void handle_session_timeline(struct pgwt_server *srv, struct pgwt_request
     /* Build JSON response */
     cJSON *root = cJSON_CreateObject();
     cJSON_AddNumberToObject(root, "id", (double)req->id);
+    add_fidelity(root, &linfo);
 
     cJSON *pids_arr = cJSON_AddArrayToObject(root, "pids");
     for (int p = 0; p < num_pids; p++)
@@ -1491,8 +1748,17 @@ static void handle_session_timeline(struct pgwt_server *srv, struct pgwt_request
 static void handle_transitions(struct pgwt_server *srv, struct pgwt_request *req)
 {
     int count;
+    struct pgwt_load_info linfo = {0};
     struct pgwt_trace_event *events =
-        server_load_events(srv, req->from_ns, req->to_ns, &count);
+        server_load_events_fi(srv, req->from_ns, req->to_ns, &count, &linfo);
+
+    /* Transitions need real old→new order: EXACT-required. */
+    enum pgwt_fidelity fid = load_fidelity(&linfo);
+    if (pgwt_fidelity_unavailable(PGWT_REQ_EXACT, fid)) {
+        free(events);
+        emit_unavailable(req->id, fid);
+        return;
+    }
 
     int max_rows = req->num_buckets > 0 ? req->num_buckets : 50;
     struct pgwt_transitions_result res;
@@ -1500,6 +1766,7 @@ static void handle_transitions(struct pgwt_server *srv, struct pgwt_request *req
 
     cJSON *root = cJSON_CreateObject();
     cJSON_AddNumberToObject(root, "id", (double)req->id);
+    cJSON_AddStringToObject(root, "fidelity", pgwt_fidelity_str(fid));
     cjson_add_uint64(root, "total", res.total_transitions);
 
     /* Compute per-node total time directly from ALL events.
@@ -1577,8 +1844,17 @@ static void handle_transitions(struct pgwt_server *srv, struct pgwt_request *req
 static void handle_fingerprints(struct pgwt_server *srv, struct pgwt_request *req)
 {
     int count;
+    struct pgwt_load_info linfo = {0};
     struct pgwt_trace_event *events =
-        server_load_events(srv, req->from_ns, req->to_ns, &count);
+        server_load_events_fi(srv, req->from_ns, req->to_ns, &count, &linfo);
+
+    /* Fingerprints aggregate transition sequences: EXACT-required. */
+    enum pgwt_fidelity fid = load_fidelity(&linfo);
+    if (pgwt_fidelity_unavailable(PGWT_REQ_EXACT, fid)) {
+        free(events);
+        emit_unavailable(req->id, fid);
+        return;
+    }
 
     struct pgwt_fingerprint_result res;
     pgwt_compute_fingerprints(events, count, &req->filter, &res);
@@ -1586,6 +1862,7 @@ static void handle_fingerprints(struct pgwt_server *srv, struct pgwt_request *re
 
     cJSON *root = cJSON_CreateObject();
     cJSON_AddNumberToObject(root, "id", (double)req->id);
+    cJSON_AddStringToObject(root, "fidelity", pgwt_fidelity_str(fid));
 
     cJSON *rows = cJSON_AddArrayToObject(root, "rows");
     for (int i = 0; i < res.num_rows; i++) {
@@ -1621,8 +1898,17 @@ static void handle_fingerprints(struct pgwt_server *srv, struct pgwt_request *re
 static void handle_lock_chains(struct pgwt_server *srv, struct pgwt_request *req)
 {
     int count;
+    struct pgwt_load_info linfo = {0};
     struct pgwt_trace_event *events =
-        server_load_events(srv, req->from_ns, req->to_ns, &count);
+        server_load_events_fi(srv, req->from_ns, req->to_ns, &count, &linfo);
+
+    /* Lock-chain inference needs real wait/CPU overlap intervals: EXACT. */
+    enum pgwt_fidelity fid = load_fidelity(&linfo);
+    if (pgwt_fidelity_unavailable(PGWT_REQ_EXACT, fid)) {
+        free(events);
+        emit_unavailable(req->id, fid);
+        return;
+    }
 
     struct pgwt_lock_chains_result res;
     pgwt_compute_lock_chains(events, count, &req->filter, 50, &res);
@@ -1630,6 +1916,7 @@ static void handle_lock_chains(struct pgwt_server *srv, struct pgwt_request *req
 
     cJSON *root = cJSON_CreateObject();
     cJSON_AddNumberToObject(root, "id", (double)req->id);
+    cJSON_AddStringToObject(root, "fidelity", pgwt_fidelity_str(fid));
 
     cJSON *chains = cJSON_AddArrayToObject(root, "chains");
     for (int i = 0; i < res.num_links; i++) {
@@ -1650,8 +1937,17 @@ static void handle_lock_chains(struct pgwt_server *srv, struct pgwt_request *req
 static void handle_interference(struct pgwt_server *srv, struct pgwt_request *req)
 {
     int count;
+    struct pgwt_load_info linfo = {0};
     struct pgwt_trace_event *events =
-        server_load_events(srv, req->from_ns, req->to_ns, &count);
+        server_load_events_fi(srv, req->from_ns, req->to_ns, &count, &linfo);
+
+    /* Interference scoring needs real simultaneous-wait overlap: EXACT. */
+    enum pgwt_fidelity fid = load_fidelity(&linfo);
+    if (pgwt_fidelity_unavailable(PGWT_REQ_EXACT, fid)) {
+        free(events);
+        emit_unavailable(req->id, fid);
+        return;
+    }
 
     struct pgwt_interference_result res;
     pgwt_compute_interference(events, count, &req->filter, 30, &res);
@@ -1659,6 +1955,7 @@ static void handle_interference(struct pgwt_server *srv, struct pgwt_request *re
 
     cJSON *root = cJSON_CreateObject();
     cJSON_AddNumberToObject(root, "id", (double)req->id);
+    cJSON_AddStringToObject(root, "fidelity", pgwt_fidelity_str(fid));
 
     cJSON *rows = cJSON_AddArrayToObject(root, "rows");
     for (int i = 0; i < res.num_rows; i++) {
@@ -1679,8 +1976,17 @@ static void handle_interference(struct pgwt_server *srv, struct pgwt_request *re
 static void handle_concurrency(struct pgwt_server *srv, struct pgwt_request *req)
 {
     int count;
+    struct pgwt_load_info linfo = {0};
     struct pgwt_trace_event *events =
-        server_load_events(srv, req->from_ns, req->to_ns, &count);
+        server_load_events_fi(srv, req->from_ns, req->to_ns, &count, &linfo);
+
+    /* Burst detection needs real simultaneous-wait intervals: EXACT. */
+    enum pgwt_fidelity fid = load_fidelity(&linfo);
+    if (pgwt_fidelity_unavailable(PGWT_REQ_EXACT, fid)) {
+        free(events);
+        emit_unavailable(req->id, fid);
+        return;
+    }
 
     uint64_t from = req->from_ns ? req->from_ns : srv->earliest_wall_ns;
     uint64_t to   = req->to_ns   ? req->to_ns   : srv->latest_wall_ns;
@@ -1696,6 +2002,7 @@ static void handle_concurrency(struct pgwt_server *srv, struct pgwt_request *req
 
     cJSON *root = cJSON_CreateObject();
     cJSON_AddNumberToObject(root, "id", (double)req->id);
+    cJSON_AddStringToObject(root, "fidelity", pgwt_fidelity_str(fid));
     cjson_add_uint64(root, "bucket_ns", res.bucket_ns);
 
     /* Peak concurrency per bucket */
@@ -1787,8 +2094,18 @@ static cJSON *serialize_variants(struct pgwt_server *srv,
 static void handle_variants(struct pgwt_server *srv, struct pgwt_request *req)
 {
     int count;
+    struct pgwt_load_info linfo = {0};
     struct pgwt_trace_event *events =
-        server_load_events(srv, req->from_ns, req->to_ns, &count);
+        server_load_events_fi(srv, req->from_ns, req->to_ns, &count, &linfo);
+
+    /* Variants are built from marker-delimited transition sequences, which
+     * only exist in full-fidelity data: EXACT-required. */
+    enum pgwt_fidelity fid = load_fidelity(&linfo);
+    if (pgwt_fidelity_unavailable(PGWT_REQ_EXACT, fid)) {
+        free(events);
+        emit_unavailable(req->id, fid);
+        return;
+    }
 
     int max_v = req->num_buckets > 0 ? req->num_buckets : 20;
 
@@ -1806,6 +2123,7 @@ static void handle_variants(struct pgwt_server *srv, struct pgwt_request *req)
 
     cJSON *root = cJSON_CreateObject();
     cJSON_AddNumberToObject(root, "id", (double)req->id);
+    cJSON_AddStringToObject(root, "fidelity", pgwt_fidelity_str(fid));
 
     /* Execution */
     cJSON *exec_obj = cJSON_AddObjectToObject(root, "exec");
@@ -2044,9 +2362,11 @@ static void dump_summary(struct pgwt_server *srv)
     double wall_ms = (double)(to - from) / 1e6;
     struct pgwt_filter filt = {0};
 
-    /* Load all events */
+    /* Load all events (fidelity-aware: samples normalized, exact-wins merge) */
     int count;
-    struct pgwt_trace_event *events = server_load_events(srv, from, to, &count);
+    struct pgwt_load_info linfo = {0};
+    struct pgwt_trace_event *events =
+        server_load_events_fi(srv, from, to, &count, &linfo);
 
     /* Count sample vs transition records so a sampled-mode trace is visible
      * at a glance (A2 evidence: SAMPLES blocks landed). */
@@ -2055,9 +2375,20 @@ static void dump_summary(struct pgwt_server *srv)
         if (events[i].flags & PGWT_EVENT_FLAG_SAMPLE)
             n_samples++;
 
+    enum pgwt_fidelity fid = load_fidelity(&linfo);
+
     printf("════════════════════════════════════════════════════════════════════════════════\n");
     printf("pgwt-server — Summary    Events: %d (%d transitions, %d samples)    Duration: %.1fs\n",
            count, count - n_samples, n_samples, wall_ms / 1000.0);
+    printf("Fidelity: %s", pgwt_fidelity_str(fid));
+    if (linfo.has_samples && linfo.sample_period_ns)
+        printf("    Sample period: %.1f ms (%.0f Hz)",
+               (double)linfo.sample_period_ns / 1e6,
+               1e9 / (double)linfo.sample_period_ns);
+    printf("\n");
+    if (fid == PGWT_FIDELITY_SAMPLED)
+        printf("Note: histogram / transitions / lock chains / interference / variants "
+               "require full-fidelity data and are unavailable for this window.\n");
     printf("════════════════════════════════════════════════════════════════════════════════\n");
 
     /* Time Model */
