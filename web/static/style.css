@@ -418,3 +418,89 @@ tr:hover td.sticky-col-1 { background: #2a2a5a; }
   padding: 40px;
   color: #666;
 }
+
+/* ── Fidelity-aware UI (Phase B5) ──────────────────────────────────────────── */
+
+/* Header escalate control */
+.escalate-control { display: inline-flex; align-items: center; gap: 6px; }
+.escalate-btn {
+  background: none;
+  border: 1px solid #4fc3f7;
+  color: #4fc3f7;
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background 0.2s, color 0.2s;
+}
+.escalate-btn:hover { background: #15324a; }
+.escalate-btn.active { background: #15324a; border-color: #E53935; color: #ff8a80; }
+.escalate-btn:disabled { opacity: 0.4; cursor: default; }
+.deescalate-btn {
+  background: none;
+  border: 1px solid #E53935;
+  color: #ff8a80;
+  font-size: 11px;
+  padding: 4px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.deescalate-btn:hover { background: #3a1414; }
+.escalate-budget { font-size: 11px; color: #888; }
+
+.metrics-btn {
+  background: none;
+  border: 1px solid #444;
+  color: #888;
+  font-size: 13px;
+  padding: 3px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.metrics-btn:hover { background: #2a2a4a; color: #ccc; }
+.metrics-btn.active { background: #2a2a4a; color: #4fc3f7; border-color: #4fc3f7; }
+
+/* Daemon self-metrics panel */
+.daemon-metrics {
+  background: #16162e;
+  border-bottom: 1px solid #2a2a4a;
+  padding: 10px 20px;
+}
+.daemon-metrics-title {
+  font-size: 11px;
+  color: #888;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 6px;
+}
+.daemon-metrics-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 6px 16px;
+}
+.dm-row {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+  border-bottom: 1px dotted #2a2a4a;
+  padding: 2px 0;
+}
+.dm-label { color: #888; }
+.dm-value { color: #e0e0e0; font-variant-numeric: tabular-nums; }
+.dm-row.warn .dm-value { color: #ff8a80; }
+
+/* Unavailable / escalate-to-capture panel for EXACT-only views */
+.unavailable-panel {
+  text-align: center;
+  padding: 48px 24px;
+  color: #aaa;
+  max-width: 560px;
+  margin: 0 auto;
+}
+.unavailable-icon { font-size: 40px; color: #ffc107; margin-bottom: 12px; }
+.unavailable-title { font-size: 16px; color: #e0e0e0; margin-bottom: 10px; }
+.unavailable-hint { font-size: 13px; line-height: 1.5; color: #999; margin-bottom: 18px; }
+.unavailable-panel .escalate-btn { font-size: 13px; padding: 6px 16px; }
+.unavailable-status { margin-top: 12px; font-size: 12px; min-height: 16px; }
+.unavailable-status.ok { color: #4f4; }
+.unavailable-status.err { color: #ff8a80; }

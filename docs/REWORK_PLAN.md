@@ -529,23 +529,45 @@ test in milliseconds, without Playwright; removing a series color
 mapping (no JS error, data still present) is caught by a snapshot diff
 in CI.
 
-### Phase B5 — Fidelity-aware UI (joins Track A)
+### Phase B5 — Fidelity-aware UI (joins Track A) ✅ DONE
 Depends on: A3 (fidelity field in responses), A4 (escalation via
 control proxy), B3 (view registry).
-Scope:
-- AAS chart shades sampled-fidelity time ranges (subtle background
-  band); legend explains it.
-- Views that require EXACT render an explicit "no full-fidelity data in
-  this window — escalate to capture" state instead of an empty chart.
-- "Escalate 60s" button wired through pgwt-server's control proxy;
-  shows budget remaining; escalation windows and trigger reasons
-  rendered as chart annotations.
-- Daemon self-metrics panel (events/s, drops, overhead estimate).
-Tests: mock server extended with fidelity-tagged responses + control
-commands; builder tests for shading/annotation models; Playwright test
-for the escalate flow against the mock.
-Acceptance: a mixed-fidelity trace is visually unambiguous about which
-data is which, and escalation is operable from the browser.
+Delivered (pure-builder + thin-mount + view-manager pattern, no B3 regression):
+- **Sampled shading**: `lib/builders/fidelity.js` turns a view response's
+  top-level `fidelity` ("exact"|"sampled"|"mixed") + optional
+  `fidelity_ranges` into an ECharts markArea band model; the AAS builder
+  attaches it behind the stacked areas. Sampled → amber band over the whole
+  window; mixed → bands only over sampled sub-ranges if present, else the
+  window marked mixed. A legend chip (`#aas-fidelity-chip`) explains it.
+- **Unavailable panels**: the EXACT-required views (histogram, transitions,
+  concurrency) detect the `{"unavailable":"requires full-fidelity data"}`
+  shape and render an explicit "No full-fidelity data in this window —
+  escalate to capture" panel (with the escalate affordance) instead of an
+  empty chart — `buildUnavailablePanel` + `lib/panels.js`.
+- **Escalate control**: header "Escalate 60s" button + budget readout + a
+  Stop affordance while active, wired through `lib/control.js` →
+  pgwt-server's `control` proxy (escalate/deescalate). Shows granted window /
+  budget remaining / denial reason. Hidden when no daemon (static replay).
+- **Escalation annotations**: the active escalation window is rendered on the
+  AAS timeline (markArea + labeled markLine), visually distinguishing
+  reason=manual (cyan) vs reason=anomaly (red). Drove a small server addition:
+  `build_status` now emits `escalation_reason` for the open window.
+- **Daemon self-metrics panel** (`#metrics-btn`): events/s, samples/s,
+  ringbuf drops, estimated overhead, anomaly counters, budget remaining —
+  from the control-socket `metrics`.
+Mock: `tests/mock_server.py` gained `PGWT_MOCK_FIDELITY` (exact|sampled|mixed
++ `sample_period_ns`), the `{"unavailable":...}` shape for EXACT views over a
+sampled window, and the `control` command (status/metrics/escalate/deescalate
+state machine mirroring src/control.c, incl. over-budget denial). Defaults
+keep every existing test + protocol-drift green (exact, no daemon).
+Tests: `tests/web_unit/fidelity.test.mjs` — 29 Node builder checks (markArea
+model, mixed sub-ranges, unavailable panel, manual-vs-anomaly annotation,
+metrics + escalate-control models, overhead). Playwright: 4 new B5 tests
+(sampled shading, unavailable panels, escalate flow, metrics panel) against a
+second sampled+daemon mock. Gates: test_web_ui 171/171 + chaos 25/25 green,
+zero console errors, no chart-global regressions.
+Acceptance: met — a sampled/mixed window is visually unambiguous, and
+escalation is operable from the browser.
 
 ### Phase B6 — New analysis views
 Depends on: B3 (view registry), A3 (fidelity declarations — all three

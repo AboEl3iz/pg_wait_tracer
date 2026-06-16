@@ -35,6 +35,21 @@ static void cjson_add_uint64(cJSON *obj, const char *name, uint64_t val)
     cJSON_AddRawToObject(obj, name, buf);
 }
 
+/* Lowercase token for an escalation reason ("manual"|"anomaly"|...). Used so
+ * the UI can distinguish WHY a full-fidelity window is open (e.g. annotate a
+ * manual escalate differently from an anomaly-triggered one). */
+static const char *esc_reason_str(int reason)
+{
+    switch (reason) {
+    case PGWT_ESC_REASON_MANUAL:   return "manual";
+    case PGWT_ESC_REASON_ANOMALY:  return "anomaly";
+    case PGWT_ESC_REASON_EXPIRED:  return "expired";
+    case PGWT_ESC_REASON_REQUEST:  return "request";
+    case PGWT_ESC_REASON_SHUTDOWN: return "shutdown";
+    default:                       return "unknown";
+    }
+}
+
 /* Count live tracked backends */
 static int count_backends(const struct pgwt_daemon *d)
 {
@@ -88,6 +103,12 @@ static cJSON *build_status(const struct pgwt_daemon *d)
                             pgwt_escalation_remaining_s(d));
     cJSON_AddNumberToObject(root, "escalation_budget_remaining_s",
                             pgwt_escalation_budget_remaining_s(d));
+    /* Reason of the currently-open window (so the UI can annotate manual vs
+     * anomaly escalations distinctly). "none" while not escalated. */
+    cJSON_AddStringToObject(root, "escalation_reason",
+                            d->escalation.active
+                                ? esc_reason_str(d->escalation.window_reason)
+                                : "none");
     return root;
 }
 

@@ -70,6 +70,13 @@ STATIC_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file
 
 # ── Canned data ──────────────────────────────────────────────────────────────
 
+def _env_int(name, default):
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
 _TO_NS   = 1_774_000_000_000_000_000
 _FROM_NS = _TO_NS - 3600_000_000_000
 _BUCKET_NS = 60_000_000_000
@@ -336,16 +343,169 @@ _FIDELITY_VIEWS = {
     "concurrency", "lock_chains", "interference", "variants",
 }
 
+# EXACT-required views (mirror src/server.c's PGWT_REQ_EXACT handlers): over a
+# sampled-only window these return the structured unavailable marker instead of
+# data. The web UI renders the "escalate to capture" panel for these.
+_EXACT_VIEWS = {"heatmap", "transitions", "concurrency", "lock_chains",
+                "interference"}
+
+# ── Fidelity + control configuration (Phase B5) ───────────────────────────────
+# The mock can present a SAMPLED or MIXED window so the UI's fidelity shading +
+# unavailable panels can be driven deterministically. Configured via env (like
+# chaos) so test_web_ui.py can launch a mock in any fidelity mode without a new
+# protocol surface. The control command implements a small escalate/deescalate
+# state machine mirroring src/control.c so the escalate flow is exercisable.
+#
+#   PGWT_MOCK_FIDELITY=exact|sampled|mixed   window fidelity for all views
+#                                            (default exact — keeps existing
+#                                            tests + protocol-drift green)
+#   PGWT_MOCK_SAMPLE_PERIOD_NS=100000000     sample period reported when sampled
+#   PGWT_MOCK_DAEMON=1                        enable the control command (escalate
+#                                            etc.); 0 → "daemon not running"
+#                                            (default 0, matching static replay)
+#   PGWT_MOCK_TIER=sampled|escalated         initial daemon tier (default sampled)
+#   PGWT_MOCK_BUDGET_S=300                    escalation budget remaining seconds
+
+
+class FidelityConfig:
+    def __init__(self):
+        self.fidelity = os.environ.get("PGWT_MOCK_FIDELITY", "exact")
+        if self.fidelity not in ("exact", "sampled", "mixed"):
+            self.fidelity = "exact"
+        self.sample_period_ns = _env_int("PGWT_MOCK_SAMPLE_PERIOD_NS", 100_000_000)
+
+
+_FID = FidelityConfig()
+
+
+class DaemonState:
+    """Minimal escalate/deescalate state machine mirroring src/control.c.
+
+    Lets the Playwright escalate-flow test drive a real state transition
+    (sampled → escalated → budget decreases) against the mock without a daemon.
+    """
+
+    def __init__(self):
+        self.enabled = os.environ.get("PGWT_MOCK_DAEMON", "0") not in ("0", "", "false")
+        self.tier = os.environ.get("PGWT_MOCK_TIER", "sampled")
+        self.budget_remaining_s = float(_env_int("PGWT_MOCK_BUDGET_S", 300))
+        self.seconds_remaining = 60.0 if self.tier == "escalated" else 0.0
+        self.reason = "manual" if self.tier == "escalated" else "none"
+        self.windows_total = 1 if self.tier == "escalated" else 0
+        self.denied_total = 0
+
+    def status(self):
+        return {
+            "ok": True,
+            "mode": "tiered",
+            "uptime_s": 123.4,
+            "backends": 6,
+            "pg_pid": 4000,
+            "version": "mock",
+            "tier": self.tier,
+            "escalation_supported": True,
+            "escalation_seconds_remaining": self.seconds_remaining,
+            "escalation_budget_remaining_s": self.budget_remaining_s,
+            "escalation_reason": self.reason if self.tier == "escalated" else "none",
+        }
+
+    def metrics(self):
+        return {
+            "ok": True,
+            "uptime_s": 123.4,
+            "events_total": 1_250_000,
+            "events_per_sec": 4200.0,
+            "lifecycle_events_total": 90000,
+            "wp_attach_failures_total": 0,
+            "backends_tracked": 6,
+            "samples_total": 540000,
+            "samples_per_sec": 60.0,
+            "sample_read_faults_total": 0,
+            "ringbuf_drops_total": 3,
+            "trace_events_written_total": 1_250_000,
+            "trace_bytes_written_total": 18_000_000,
+            "tier": self.tier,
+            "escalation_active": self.tier == "escalated",
+            "escalation_seconds_remaining": self.seconds_remaining,
+            "escalation_budget_remaining_s": self.budget_remaining_s,
+            "escalation_windows_total": self.windows_total,
+            "escalation_denied_total": self.denied_total,
+            "anomaly_fires_total": 2,
+            "anomaly_near_total": 5,
+            "anomaly_dropped_budget_total": 1,
+            "anomaly_dropped_cooldown_total": 0,
+            "anomaly_baseline_aas": 1.85,
+        }
+
+    def escalate(self, duration_s, reason):
+        duration_s = float(duration_s or 60)
+        if duration_s > self.budget_remaining_s:
+            self.denied_total += 1
+            return {"ok": False, "error": "over budget",
+                    "budget_remaining_s": self.budget_remaining_s}
+        if self.tier != "escalated":
+            self.windows_total += 1
+        self.tier = "escalated"
+        self.reason = reason or "manual"
+        self.seconds_remaining = max(self.seconds_remaining, duration_s)
+        self.budget_remaining_s = max(0.0, self.budget_remaining_s - duration_s)
+        return {"ok": True, "escalated": True, "granted_s": duration_s,
+                "seconds_remaining": self.seconds_remaining,
+                "budget_remaining_s": self.budget_remaining_s}
+
+    def deescalate(self):
+        self.tier = "sampled"
+        self.seconds_remaining = 0.0
+        self.reason = "none"
+        return {"ok": True, "escalated": False,
+                "budget_remaining_s": self.budget_remaining_s}
+
+
+_DAEMON = DaemonState()
+
+
+def _handle_control(req_id, msg):
+    """Proxy a control command (mirrors src/server.c handle_control)."""
+    request = msg.get("request")
+    if not isinstance(request, dict):
+        return {"id": req_id, "error": "missing request object"}
+    if not _DAEMON.enabled:
+        return {"id": req_id, "error": "daemon not running"}
+    cmd = request.get("cmd")
+    if cmd == "status":
+        return {"id": req_id, "response": _DAEMON.status()}
+    if cmd == "metrics":
+        return {"id": req_id, "response": _DAEMON.metrics()}
+    if cmd == "escalate":
+        return {"id": req_id, "response": _DAEMON.escalate(
+            request.get("duration_s"), request.get("reason"))}
+    if cmd == "deescalate":
+        return {"id": req_id, "response": _DAEMON.deescalate()}
+    return {"id": req_id, "response": {"ok": False, "error": "unknown command"}}
+
 
 def handle_request(msg):
     """Dispatch a WebSocket JSON request and return canned response."""
     cmd = msg.get("cmd", "")
     req_id = msg.get("id", 0)
+
+    if cmd == "control":
+        return _handle_control(req_id, msg)
+
+    # EXACT-required views over a sampled-only window return the structured
+    # unavailable marker (mirrors src/server.c emit_unavailable). A mixed
+    # window still has transition data, so it stays available.
+    if cmd in _EXACT_VIEWS and _FID.fidelity == "sampled":
+        return {"id": req_id, "unavailable": "requires full-fidelity data",
+                "fidelity": "sampled"}
+
     resp = _handle_request_inner(cmd, req_id, msg)
     # Tag every view response with its window fidelity (A3). Done centrally so
     # the schema stays aligned with the real server across all views.
     if cmd in _FIDELITY_VIEWS and "fidelity" not in resp and "error" not in resp:
-        resp["fidelity"] = "exact"
+        resp["fidelity"] = _FID.fidelity
+        if _FID.fidelity in ("sampled", "mixed"):
+            resp["sample_period_ns"] = _FID.sample_period_ns
     return resp
 
 
@@ -458,13 +618,6 @@ def _handle_request_inner(cmd, req_id, msg):
 # Reproduces real network conditions (jitter, out-of-order, late responses)
 # without any wall-clock RNG: every decision is a pure function of the
 # request's index, so chaos tests are reproducible.
-
-
-def _env_int(name, default):
-    try:
-        return int(os.environ.get(name, default))
-    except (TypeError, ValueError):
-        return default
 
 
 class ChaosConfig:

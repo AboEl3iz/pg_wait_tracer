@@ -15,6 +15,8 @@
  */
 
 import { buildConcurrencyOption, buildConcurrencyTables } from '../lib/builders/concurrency.js';
+import { isUnavailable } from '../lib/builders/fidelity.js';
+import { mountUnavailablePanel } from '../lib/panels.js';
 
 export function createConcurrencyView() {
     let chart = null;   // ECharts instance — owned here, nowhere else
@@ -34,10 +36,18 @@ export function createConcurrencyView() {
         },
 
         build(data) {
+            // EXACT-required (A3): a sampled-only window yields the structured
+            // "unavailable" marker — surfaced as an explicit escalate panel.
+            if (isUnavailable(data)) return { unavailable: data };
             return buildConcurrencyOption(data);
         },
 
         mount(el, model, ctx) {
+            if (model.unavailable) {
+                disposeChart();
+                mountUnavailablePanel(el, model.unavailable, ctx);
+                return;
+            }
             if (ctx.summaryEl) ctx.summaryEl.innerHTML = '';
             if (!model.hasData) {
                 disposeChart();

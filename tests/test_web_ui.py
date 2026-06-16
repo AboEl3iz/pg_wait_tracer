@@ -98,11 +98,20 @@ def assert_no_console_errors(page, guard, name, allow=()):
           f"(got {len(unexpected)}: {unexpected[:3]})")
 
 
-def start_mock_server():
-    """Start mock_server.py as a subprocess."""
+def start_mock_server(extra_env=None, port=None):
+    """Start mock_server.py as a subprocess.
+
+    extra_env: optional dict of env vars (e.g. PGWT_MOCK_FIDELITY,
+    PGWT_MOCK_DAEMON) so a test can launch the mock in a fidelity/daemon mode
+    without a new protocol surface.
+    port: override the HTTP port (WS = port+1) for a second concurrent mock.
+    """
+    env = dict(os.environ)
+    if extra_env:
+        env.update(extra_env)
     proc = subprocess.Popen(
-        [sys.executable, MOCK_SCRIPT, "--port", str(MOCK_PORT)],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        [sys.executable, MOCK_SCRIPT, "--port", str(port or MOCK_PORT)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
     )
     # Wait for server to be ready
     time.sleep(1.5)
@@ -1086,6 +1095,145 @@ def test_filter_persists_across_tabs(page):
         check(False, "(skipped)")
 
 
+# ── Phase B5: fidelity-aware UI ───────────────────────────────────────────────
+# These run against a SECOND mock launched in sampled fidelity with the daemon
+# control command enabled, so the escalate flow, the sampled shading, the
+# unavailable panels, and the metrics panel can be driven deterministically.
+
+B5_PORT = MOCK_PORT + 10
+B5_URL = f"http://127.0.0.1:{B5_PORT}"
+
+
+def test_b5_sampled_shading(page):
+    """B5.1: AAS chart shades the sampled window + shows the fidelity legend."""
+    print("--- Test B5.1: Sampled Fidelity Shading ---")
+
+    page.goto(B5_URL)
+    page.wait_for_selector("#status.connected", timeout=10000)
+    page.wait_for_timeout(1500)
+
+    # The AAS builder must attach a markArea band on the first series, and the
+    # fidelity legend chip must explain it.
+    shading = page.evaluate("""() => {
+        const el = document.getElementById('aas-chart-container');
+        const c = echarts.getInstanceByDom(el);
+        if (!c) return 'no instance';
+        const opt = c.getOption();
+        const s0 = opt.series && opt.series[0];
+        if (!s0) return 'no series';
+        const ma = s0.markArea;
+        if (!ma || !ma.data || !ma.data.length) return 'no markArea';
+        return 'ok:' + ma.data.length;
+    }""")
+    check(shading.startswith("ok"),
+          f"AAS chart has a fidelity markArea band ({shading})")
+
+    chip = page.query_selector("#aas-fidelity-chip")
+    check(chip is not None, "Fidelity legend chip rendered")
+    if chip:
+        txt = chip.text_content()
+        check("sampled" in txt.lower(),
+              f"Fidelity chip explains sampled shading: '{txt[:60]}'")
+
+
+def test_b5_unavailable_panel(page):
+    """B5.2: an EXACT-only view over a sampled window shows the escalate panel."""
+    print("--- Test B5.2: Exact-only Unavailable Panel ---")
+
+    page.goto(B5_URL)
+    page.wait_for_selector("#status.connected", timeout=10000)
+
+    # Stop auto-refresh so the panel is stable, then open Transitions (EXACT).
+    page.click("#live-btn")
+    page.wait_for_timeout(300)
+    page.click(".tab[data-tab='transitions']")
+    page.wait_for_timeout(1500)
+
+    panel = page.query_selector(".unavailable-panel")
+    check(panel is not None, "Transitions shows the unavailable panel")
+    if panel:
+        txt = panel.text_content()
+        check("full-fidelity" in txt.lower(),
+              f"Panel explains no full-fidelity data: '{txt[:60]}'")
+        btn = page.query_selector(".unavailable-panel .escalate-btn")
+        check(btn is not None, "Panel offers an Escalate button")
+
+    # Concurrency (also EXACT-required) shows the same panel.
+    page.click(".tab[data-tab='concurrency']")
+    page.wait_for_timeout(1500)
+    check(page.query_selector(".unavailable-panel") is not None,
+          "Concurrency shows the unavailable panel")
+
+    # Histogram (EXACT) shows it inside the heatmap container.
+    page.click(".tab[data-tab='histogram']")
+    page.wait_for_timeout(1500)
+    check(page.query_selector(".unavailable-panel") is not None,
+          "Histogram shows the unavailable panel")
+
+
+def test_b5_escalate_flow(page):
+    """B5.3: clicking Escalate transitions the daemon to escalated + budget drops."""
+    print("--- Test B5.3: Escalate Flow ---")
+
+    page.goto(B5_URL)
+    page.wait_for_selector("#status.connected", timeout=10000)
+    page.wait_for_timeout(1500)
+
+    # The header escalate control is visible (daemon supports tiered escalation).
+    ctrl = page.query_selector("#escalate-control")
+    check(ctrl is not None and ctrl.is_visible(),
+          "Escalate control visible (daemon supports escalation)")
+
+    btn = page.query_selector("#hdr-escalate")
+    check(btn is not None, "Escalate button present")
+    label_before = btn.text_content() if btn else ""
+    check("Escalate" in label_before, f"Button reads 'Escalate' (got '{label_before}')")
+
+    # Read the status before escalating.
+    tier_before = page.evaluate("window.__pgwt && window.__pgwt.daemonTier()")
+    check(tier_before == "sampled", f"Tier sampled before escalate (got {tier_before})")
+
+    # Click Escalate.
+    btn.click()
+    page.wait_for_timeout(1200)
+
+    tier_after = page.evaluate("window.__pgwt && window.__pgwt.daemonTier()")
+    check(tier_after == "escalated", f"Tier escalated after click (got {tier_after})")
+
+    # The control now shows seconds remaining + a Stop affordance.
+    btn2 = page.query_selector("#hdr-escalate")
+    label_after = btn2.text_content() if btn2 else ""
+    check("left" in label_after or "Escalated" in label_after,
+          f"Button shows escalated state: '{label_after}'")
+    check(page.query_selector("#hdr-deescalate") is not None,
+          "Stop (de-escalate) button appears while escalated")
+
+
+def test_b5_metrics_panel(page):
+    """B5.4: the daemon self-metrics panel renders events/s, drops, overhead."""
+    print("--- Test B5.4: Daemon Metrics Panel ---")
+
+    page.goto(B5_URL)
+    page.wait_for_selector("#status.connected", timeout=10000)
+    page.wait_for_timeout(1200)
+
+    mbtn = page.query_selector("#metrics-btn")
+    check(mbtn is not None and mbtn.is_visible(),
+          "Metrics button visible when daemon present")
+
+    mbtn.click()
+    page.wait_for_timeout(800)
+
+    panel = page.query_selector("#daemon-metrics")
+    check(panel is not None and panel.is_visible(), "Metrics panel opens")
+    if panel:
+        txt = panel.text_content()
+        check("Events/s" in txt, "Metrics panel shows Events/s")
+        check("drops" in txt.lower(), "Metrics panel shows ringbuf drops")
+        check("overhead" in txt.lower(), "Metrics panel shows overhead estimate")
+        check("Budget" in txt, "Metrics panel shows budget remaining")
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -1160,6 +1308,49 @@ def main():
             for fn in tests:
                 fn(page)
                 assert_no_console_errors(page, guard, fn.__name__)
+
+            # ── Phase B5: fidelity-aware UI ───────────────────────────────────
+            # A second mock in sampled fidelity with the daemon control command
+            # enabled, in its own browser context (own WS-port redirect), so the
+            # escalate flow / sampled shading / unavailable panels / metrics
+            # panel are driven without disturbing the primary suite.
+            b5_proc = start_mock_server(
+                extra_env={"PGWT_MOCK_FIDELITY": "sampled",
+                           "PGWT_MOCK_DAEMON": "1",
+                           "PGWT_MOCK_TIER": "sampled",
+                           "PGWT_MOCK_BUDGET_S": "300"},
+                port=B5_PORT)
+            try:
+                b5_ws = B5_PORT + 1
+                b5_ctx = browser.new_context(viewport={"width": 1280, "height": 900})
+                b5_ctx.add_init_script(f"""(function() {{
+                    const _WS = window.WebSocket;
+                    window.WebSocket = function(url, protocols) {{
+                        url = url.replace(':{B5_PORT}/', ':{b5_ws}/');
+                        if (protocols !== undefined) return new _WS(url, protocols);
+                        return new _WS(url);
+                    }};
+                    window.WebSocket.prototype = _WS.prototype;
+                    window.WebSocket.CONNECTING = _WS.CONNECTING;
+                    window.WebSocket.OPEN = _WS.OPEN;
+                    window.WebSocket.CLOSING = _WS.CLOSING;
+                    window.WebSocket.CLOSED = _WS.CLOSED;
+                }})();""")
+                b5_ctx.add_init_script(UNHANDLED_REJECTION_HOOK)
+                b5_page = b5_ctx.new_page()
+                b5_guard = ConsoleErrorGuard(b5_page)
+                b5_tests = [
+                    test_b5_sampled_shading,
+                    test_b5_unavailable_panel,
+                    test_b5_escalate_flow,
+                    test_b5_metrics_panel,
+                ]
+                for fn in b5_tests:
+                    fn(b5_page)
+                    assert_no_console_errors(b5_page, b5_guard, fn.__name__)
+                b5_ctx.close()
+            finally:
+                stop_mock_server(b5_proc)
 
             # Reconnection test (kills/restarts mock server) — connection
             # failures during the outage are expected, everything else fails.

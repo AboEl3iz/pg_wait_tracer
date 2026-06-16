@@ -19,6 +19,8 @@ import { Transport } from './lib/transport.js';
 import { ViewManager } from './lib/view-manager.js';
 import { mountTable } from './lib/table.js';
 import { classColor, fmtTime, fmtDuration, esc } from './lib/format.js';
+import { controlStatus, controlMetrics, ControlUnavailable } from './lib/control.js';
+import { mountEscalateControl, mountMetricsPanel } from './lib/panels.js';
 import { createActiveView } from './views/active.js';
 import { createOverviewView } from './views/overview.js';
 import { createEventsView } from './views/events.js';
@@ -38,6 +40,16 @@ const transport = new Transport();
 
 let activeView = null;       // persistent AAS chart view ("active")
 let vm = null;               // ViewManager for tab views
+
+// ── Daemon control plane (B5) ─────────────────────────────────────────────────
+// Latest daemon status/metrics from the control socket (proxied by pgwt-server
+// as the `control` command). null until first poll; `available` flips false the
+// first time the daemon is unreachable (static-trace replay) so we stop polling
+// and hide the escalation UI. Views read `daemon.status` synchronously via the
+// ctx hook to render the AAS escalation annotation + unavailable panels.
+const daemon = { status: null, metrics: null, available: true, polled: false };
+let metricsPanelOpen = false;
+let daemonPollId = 0;
 
 // Reconnect bookkeeping (lifecycle only — not request state).
 let reconnectDelay = 2000;
@@ -78,6 +90,12 @@ function makeCtx() {
         // header-sort click (re-runs requests/build/mount under a fresh epoch).
         getSort, toggleSort,
         refresh: () => vm.refresh(),
+        // Daemon control plane (B5): views read the latest escalation status to
+        // render the AAS annotation + the unavailable/escalate panels, and can
+        // re-poll it after an escalate/deescalate action.
+        getEscalationStatus: () => daemon.status,
+        refreshEscalationStatus: () => pollDaemon(),
+        onEscalationChanged: () => { renderEscalateControl(); refreshActive(); },
     };
 }
 
@@ -96,6 +114,7 @@ function connect() {
     ws.onclose = () => {
         transport.ws = null;
         transport.rejectAll('disconnected');
+        stopDaemonPoll();
         scheduleReconnect();
     };
     ws.onerror = () => { /* onclose follows */ };
@@ -124,7 +143,13 @@ async function init() {
         initTabs();
         initTimePicker();
         initLiveMode();
+        initMetricsButton();
         window.addEventListener('resize', onResize);
+
+        // Poll the daemon control plane BEFORE the first paint so the AAS
+        // escalation annotation + the escalate control are correct on load.
+        await pollDaemon();
+        startDaemonPoll();
 
         await refresh();
         startAutoRefresh(900);   // start in live mode (last 15 min)
@@ -467,6 +492,91 @@ function initLiveMode() {
     });
 }
 
+// ── Daemon control plane (B5) ─────────────────────────────────────────────────
+//
+// One poll fetches status (+ metrics if the panel is open) over the control
+// proxy. A daemon-not-running reply (static-trace replay) flips `available`
+// false: we hide the escalation UI and stop polling — no console noise, the UI
+// just degrades to "no escalation here". When a daemon IS present, the escalate
+// header control + (optionally) the metrics panel reflect live state, and the
+// AAS chart re-renders so its escalation annotation tracks the current window.
+
+async function pollDaemon() {
+    if (!daemon.available && daemon.polled) return;
+    try {
+        const status = await controlStatus(transport);
+        daemon.status = status;
+        daemon.available = true;
+        daemon.polled = true;
+        if (metricsPanelOpen) {
+            try { daemon.metrics = await controlMetrics(transport); }
+            catch (e) { /* metrics optional; keep last */ }
+        }
+        renderEscalateControl();
+        renderMetricsPanel();
+    } catch (e) {
+        // ControlUnavailable (no daemon) or transport error: degrade silently.
+        daemon.polled = true;
+        if (e instanceof ControlUnavailable) {
+            daemon.available = false;
+            daemon.status = null;
+            renderEscalateControl();
+            renderMetricsPanel();
+        }
+        // Transport errors (transient disconnect): keep last status, retry next tick.
+    }
+}
+
+function startDaemonPoll() {
+    stopDaemonPoll();
+    const myId = ++daemonPollId;
+    (async function loop() {
+        while (daemonPollId === myId) {
+            await new Promise(r => setTimeout(r, 5000));
+            if (daemonPollId !== myId) break;
+            if (!daemon.available) break;   // no daemon: stop the loop
+            await pollDaemon();
+        }
+    })();
+}
+
+function stopDaemonPoll() { daemonPollId++; }
+
+function renderEscalateControl() {
+    const el = document.getElementById('escalate-control');
+    const metricsBtn = document.getElementById('metrics-btn');
+    if (!el) return;
+    const supported = daemon.available && daemon.status &&
+                      daemon.status.escalation_supported;
+    if (metricsBtn) metricsBtn.style.display = supported ? '' : 'none';
+    mountEscalateControl(el, Object.assign(makeCtx(), { viewId: 'control' }));
+}
+
+function renderMetricsPanel() {
+    const el = document.getElementById('daemon-metrics');
+    if (!el) return;
+    if (metricsPanelOpen && daemon.available && daemon.metrics) {
+        mountMetricsPanel(el, daemon.metrics, daemon.status);
+        el.style.display = '';
+    } else {
+        el.style.display = 'none';
+    }
+}
+
+function initMetricsButton() {
+    const btn = document.getElementById('metrics-btn');
+    if (!btn) return;
+    btn.addEventListener('click', async () => {
+        metricsPanelOpen = !metricsPanelOpen;
+        btn.classList.toggle('active', metricsPanelOpen);
+        if (metricsPanelOpen) {
+            try { daemon.metrics = await controlMetrics(transport); }
+            catch (e) { /* keep last */ }
+        }
+        renderMetricsPanel();
+    });
+}
+
 // ── Start ─────────────────────────────────────────────────────────────────────
 
 function boot() {
@@ -478,7 +588,10 @@ function boot() {
     // Debug/test handle: the UI no longer has a single mutable global `state`,
     // so expose the explicit modules for Playwright assertions (read-only use).
     window.__pgwt = { server, timeRange, filters, transport,
-        get activeTab() { return vm ? vm.activeId() : null; } };
+        get activeTab() { return vm ? vm.activeId() : null; },
+        // B5: read-only accessors for Playwright assertions on the daemon state.
+        daemon,
+        daemonTier() { return daemon.status ? daemon.status.tier : null; } };
 
     connect();
 }

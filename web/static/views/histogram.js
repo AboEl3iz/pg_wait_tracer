@@ -16,6 +16,8 @@
  */
 
 import { buildHeatmapOption, buildSelectorModel } from '../lib/builders/histogram.js';
+import { isUnavailable } from '../lib/builders/fidelity.js';
+import { mountUnavailablePanel } from '../lib/panels.js';
 import { fmtCount } from '../lib/format.js';
 
 const BUCKETS = () =>
@@ -47,6 +49,12 @@ export function createHistogramView() {
     function renderHeatmap(data) {
         const host = document.getElementById('heatmap-container');
         if (!host) return;
+        // EXACT-required (A3): heatmap is unavailable over a sampled-only window.
+        if (isUnavailable(data)) {
+            if (chart) { chart.dispose(); chart = null; }
+            mountUnavailablePanel(host, data, ctxRef);
+            return;
+        }
         const model = buildHeatmapOption(data);
         if (!model.hasData) {
             if (chart) { chart.dispose(); chart = null; }

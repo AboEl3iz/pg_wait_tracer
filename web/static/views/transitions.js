@@ -20,6 +20,8 @@
 import {
     buildTransitionsOption, buildVariantsHtml,
 } from '../lib/builders/transitions.js';
+import { isUnavailable } from '../lib/builders/fidelity.js';
+import { mountUnavailablePanel } from '../lib/panels.js';
 import { esc } from '../lib/format.js';
 
 const DEFAULT_THRESHOLD = 20;
@@ -70,6 +72,9 @@ export function createTransitionsView() {
 
         build(data) {
             const t = data.transitions;
+            // EXACT-required (A3): a sampled-only window returns the structured
+            // "unavailable" marker for transitions — show the escalate panel.
+            if (isUnavailable(t)) return { unavailable: t };
             const hasLinks = !!(t && t.links && t.links.length > 0);
             return {
                 transitions: t,
@@ -80,6 +85,11 @@ export function createTransitionsView() {
         },
 
         mount(el, model, ctx) {
+            if (model.unavailable) {
+                disposeChart();
+                mountUnavailablePanel(el, model.unavailable, ctx);
+                return;
+            }
             if (ctx.summaryEl) ctx.summaryEl.innerHTML = '';
             disposeChart();
 
