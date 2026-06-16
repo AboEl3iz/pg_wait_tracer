@@ -187,7 +187,7 @@ def snapshot(page, name, selector):
     _mask_volatile(page)
     # Settle layout/fonts before capture.
     page.wait_for_timeout(300)
-    png = el.screenshot(animations="disabled", caret="hide")
+    png = el.screenshot(animations="disabled")
 
     baseline_path = os.path.join(SNAP_DIR, f"{name}.png")
 
