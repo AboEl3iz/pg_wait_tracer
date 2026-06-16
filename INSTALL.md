@@ -295,8 +295,14 @@ pgwt-server --dump /var/lib/pgwt/traces
 ## Quick Test
 
 ```bash
-# Must run as root (requires CAP_SYS_ADMIN for hardware watchpoints)
+# Must run as root. The default capture tier is "tiered" (low-overhead
+# always-on sampler with on-demand escalation).
 sudo ./pg_wait_tracer --pid $(pgrep -xo postgres) --interval 5 --duration 10 -v
+
+# To exercise the exact hardware-watchpoint tier (requires CAP_SYS_ADMIN),
+# force it with --mode full:
+sudo ./pg_wait_tracer --mode full --pid $(pgrep -xo postgres) \
+    --interval 5 --duration 10 -v
 ```
 
 ## Run Tests

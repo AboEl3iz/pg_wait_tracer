@@ -73,11 +73,16 @@ Events / Sessions / Queries → wait-event transition graph:
 # Build (see INSTALL.md for prerequisites)
 make
 
-# Run (auto-discovers single PG instance, must be root)
+# Run (auto-discovers single PG instance, must be root).
+# Default capture tier is "tiered": a low-overhead always-on sampler that
+# escalates to exact watchpoint tracing on demand (safe to leave running 24/7).
 sudo ./pg_wait_tracer
 
+# Force always-on exact watchpoint tracing (the original behavior, 6-30% overhead)
+sudo ./pg_wait_tracer --mode full
+
 # One-shot: collect one 10-second interval and exit
-sudo ./pg_wait_tracer --count 1 --interval 10
+sudo ./pg_wait_tracer --mode full --count 1 --interval 10
 
 # Multi-window: compare wait profiles across time horizons
 sudo ./pg_wait_tracer --window 5s,1m,5m
@@ -94,6 +99,35 @@ pgwt root@db-server
 # Quick summary from trace files (no root needed)
 pgwt-server --dump /var/lib/pgwt/traces
 ```
+
+## Capture Tiers (`--mode`)
+
+Orthogonal to the run modes below, `--mode` selects *how* wait events are
+captured. The default is **`tiered`**.
+
+| Mode | Fidelity | PG overhead | What it does |
+|------|----------|-------------|--------------|
+| `tiered` *(default)* | sampled, escalates to exact | ~0% baseline, bounded during escalation | Always-on userspace sampler; escalates to full watchpoint tracing for bounded, budgeted windows — on demand (control socket) or on anomaly. The "leave it running 24/7" posture. |
+| `sampled` | sampled | ~0% on PostgreSQL | Pure-userspace ASH-style sampling at a fixed rate. No watchpoints, never escalates. |
+| `full` | exact | 6-30% (workload-dependent) | Always-on hardware watchpoints — every `wait_event_info` transition captured exactly. The original behavior. |
+| `coop` | exact | — | Cooperative (PostgreSQL extension) tier — not available in this build; ships in the extension track. |
+
+```bash
+# Default — low-overhead always-on, escalate on demand
+sudo ./pg_wait_tracer --daemon -T /var/lib/pgwt/traces
+
+# Force exact watchpoint tracing for a focused investigation
+sudo ./pg_wait_tracer --mode full --count 1
+
+# Pure sampling at 50 Hz
+sudo ./pg_wait_tracer --mode sampled --sample-rate 50
+```
+
+In `tiered` mode, EXACT-required views (histogram, transitions, lock chains)
+report "requires full-fidelity data" over windows with no escalation, rather
+than returning silently empty results. Escalate via the control socket
+(`{"cmd":"escalate","duration_s":N}`) or the web UI's "Escalate" button;
+escalation is bounded by `--escalation-budget` (default 300s per rolling hour).
 
 ## Operating Modes
 
@@ -306,6 +340,14 @@ per interval, no screen clearing).
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
 | `--daemon` | — | off | Persistent mode with PostgreSQL restart detection |
+
+### Capture Tier
+
+| Flag | Short | Default | Description |
+|------|-------|---------|-------------|
+| `--mode <MODE>` | — | `tiered` | Capture tier: `tiered` (always-on sampler + on-demand escalation), `sampled`, `full` (exact watchpoints), `coop`. See [Capture Tiers](#capture-tiers---mode) |
+| `--sample-rate <HZ>` | — | `10` | Sampling rate for `sampled`/`tiered` (1-1000 Hz) |
+| `--escalation-budget <S>` | — | `300` | `tiered`: full-fidelity seconds allowed per rolling hour |
 
 ### Performance Tuning
 
