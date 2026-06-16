@@ -51,11 +51,14 @@ static void usage(const char *prog)
         "      --daemon               Run as daemon (reconnect on PG restart)\n"
         "\n"
         "Capture tier:\n"
-        "      --mode <MODE>          full (default) | sampled | tiered | coop\n"
-        "                             full: hardware watchpoints, exact transitions.\n"
+        "      --mode <MODE>          tiered (default) | sampled | full | coop\n"
+        "                             tiered: low-overhead always-on sampler; escalate\n"
+        "                                     to full fidelity for bounded, budgeted\n"
+        "                                     windows (on demand or on anomaly). The\n"
+        "                                     default — safe to leave running 24/7.\n"
         "                             sampled: userspace ASH-style sampling, ~zero PG cost.\n"
-        "                             tiered: sampler always-on; escalate to full\n"
-        "                                     fidelity for bounded, budgeted windows.\n"
+        "                             full: hardware watchpoints, exact transitions\n"
+        "                                   (always-on, 6-30%% overhead).\n"
         "                             coop: cooperative (PG extension) — not available in\n"
         "                                   this build; ships in the extension track.\n"
         "      --sample-rate <HZ>     Sampling rate for sampled/tiered (1-1000, default 10)\n"
@@ -259,7 +262,10 @@ int main(int argc, char **argv)
     d->signal_fd = -1;
     d->interval  = 5;
     d->view      = PGWT_VIEW_TIME_MODEL;
-    d->mode      = PGWT_MODE_FULL;   /* default: today's watchpoint behavior */
+    d->mode      = PGWT_MODE_TIERED; /* default: low-overhead always-on sampler
+                                        with on-demand/anomaly full-fidelity
+                                        escalation. Force exact watchpoints with
+                                        --mode full. */
     d->sample_rate_hz = 10;          /* default sampled rate (D1) */
     d->escalation_budget_s = 300;    /* tiered: full-fidelity s / rolling hour (D5) */
     /* Anomaly triggers (A5): negative sentinels = "use the built-in default"
@@ -431,11 +437,14 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* Tiered (A4): sampler always-on; full-fidelity escalation on demand via
-     * the control socket, bounded by --escalation-budget per rolling hour. */
+    /* Tiered (A4) is the default mode: sampler always-on; full-fidelity
+     * escalation on demand via the control socket, bounded by
+     * --escalation-budget per rolling hour. Use --mode full for always-on
+     * exact watchpoint tracing. */
     if (d->mode == PGWT_MODE_TIERED)
-        fprintf(stderr, "INFO: --mode tiered: sampler always-on; on-demand "
-                "full-fidelity escalation (budget %ds/hour)\n",
+        fprintf(stderr, "INFO: --mode tiered (default): sampler always-on; "
+                "on-demand full-fidelity escalation (budget %ds/hour). "
+                "Use --mode full for always-on exact tracing.\n",
                 d->escalation_budget_s);
 
     /* Check root */
