@@ -26,6 +26,7 @@ USER_SRCS  = $(SRC_DIR)/pg_wait_tracer.c \
              $(SRC_DIR)/daemon.c \
              $(SRC_DIR)/control.c \
              $(SRC_DIR)/provider_full.c \
+             $(SRC_DIR)/provider_coop.c \
              $(SRC_DIR)/sampler.c \
              $(SRC_DIR)/escalation.c \
              $(SRC_DIR)/anomaly.c \

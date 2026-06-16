@@ -51,11 +51,13 @@ static void usage(const char *prog)
         "      --daemon               Run as daemon (reconnect on PG restart)\n"
         "\n"
         "Capture tier:\n"
-        "      --mode <MODE>          full (default) | sampled | tiered\n"
+        "      --mode <MODE>          full (default) | sampled | tiered | coop\n"
         "                             full: hardware watchpoints, exact transitions.\n"
         "                             sampled: userspace ASH-style sampling, ~zero PG cost.\n"
         "                             tiered: sampler always-on; escalate to full\n"
         "                                     fidelity for bounded, budgeted windows.\n"
+        "                             coop: cooperative (PG extension) — not available in\n"
+        "                                   this build; ships in the extension track.\n"
         "      --sample-rate <HZ>     Sampling rate for sampled/tiered (1-1000, default 10)\n"
         "      --escalation-budget <S>  Tiered: full-fidelity seconds allowed per\n"
         "                             rolling hour (default 300). Escalate via the\n"
@@ -183,7 +185,8 @@ static enum pgwt_mode parse_mode(const char *s)
     if (strcmp(s, "full") == 0)     return PGWT_MODE_FULL;
     if (strcmp(s, "sampled") == 0)  return PGWT_MODE_SAMPLED;
     if (strcmp(s, "tiered") == 0)   return PGWT_MODE_TIERED;
-    fprintf(stderr, "ERROR: unknown mode '%s' (use: full, sampled, tiered)\n", s);
+    if (strcmp(s, "coop") == 0)     return PGWT_MODE_COOP;
+    fprintf(stderr, "ERROR: unknown mode '%s' (use: full, sampled, tiered, coop)\n", s);
     exit(1);
 }
 
@@ -416,11 +419,14 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* Validate: --mode sampled/tiered is incompatible with --lightweight
+    /* Validate: any non-full mode is incompatible with --lightweight
      * (lightweight is a watchpoint-only BPF-accumulator mode). */
     if (d->mode != PGWT_MODE_FULL && d->lightweight_mode) {
+        const char *mname = d->mode == PGWT_MODE_SAMPLED ? "sampled"
+                          : d->mode == PGWT_MODE_TIERED  ? "tiered"
+                          : "coop";
         fprintf(stderr, "ERROR: --mode %s is incompatible with --lightweight\n",
-                d->mode == PGWT_MODE_SAMPLED ? "sampled" : "tiered");
+                mname);
         free(d);
         return 1;
     }

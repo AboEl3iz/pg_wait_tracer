@@ -8,6 +8,7 @@
 #include "map_reader.h"
 #include "output.h"
 #include "perf_event.h"
+#include "provider_coop.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -191,6 +192,12 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
     case PGWT_MODE_SAMPLED:
     case PGWT_MODE_TIERED:
         d->provider = &pgwt_provider_sampled;
+        break;
+    case PGWT_MODE_COOP:
+        /* A6 interface freeze: the coop provider is recognized but its
+         * start() cleanly reports "not available in this build" (the
+         * cooperative tier ships in the separate extension track). */
+        d->provider = &pgwt_provider_coop;
         break;
     case PGWT_MODE_FULL:
     default:

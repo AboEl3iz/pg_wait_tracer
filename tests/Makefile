@@ -6,8 +6,9 @@ CFLAGS    = -g -O2 -Wall -I../src -I../include
 BUILD     = ../build
 
 TESTS     = test_wait_event test_cmdline test_event_writer test_event_reader \
-            test_trace_v2 test_sampler test_anomaly test_bucket gen_test_traces \
-            gen_bench_traces test_concurrent_rw cross_validate dump_markers
+            test_trace_v2 test_sampler test_anomaly test_coop test_bucket \
+            gen_test_traces gen_bench_traces test_concurrent_rw cross_validate \
+            dump_markers
 
 .PHONY: all clean
 
@@ -47,6 +48,13 @@ test_sampler: test_sampler.c ../src/sampler.c
 # anomaly.c with -DPGWT_SERVER so only the pure rule core is built — no
 # skeleton, no escalation engine, runnable in CI's server-only jobs.
 test_anomaly: test_anomaly.c ../src/anomaly.c
+	$(CC) $(CFLAGS) -DPGWT_SERVER -o $@ $^
+
+# test_coop: cooperative provider stub (A6 interface freeze) — registers,
+# advertises EXACT fidelity, start() returns the clean "not available" status.
+# Compiles provider_coop.c with -DPGWT_SERVER so it needs no BPF skeleton — no
+# bpftool, runnable in CI's server-only jobs.
+test_coop: test_coop.c ../src/provider_coop.c
 	$(CC) $(CFLAGS) -DPGWT_SERVER -o $@ $^
 
 # Server-build objects for gen_test_traces

@@ -177,6 +177,9 @@ static inline bool pgwt_mode_uses_watchpoints(const struct pgwt_daemon *d)
         return false;
     if (d->mode == PGWT_MODE_TIERED)
         return d->escalation.active;
+    if (d->mode == PGWT_MODE_COOP)
+        return false;   /* A6: capture comes from the extension, not watchpoints
+                           (and the stub refuses activation in this build) */
     return true;   /* PGWT_MODE_FULL */
 }
 
