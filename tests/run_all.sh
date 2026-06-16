@@ -202,6 +202,19 @@ else
     skip_test "test_web_ui_chaos" "playwright or websockets not installed"
 fi
 
+# Visual-regression snapshots (Phase B4). Needs playwright + Pillow + numpy AND
+# committed baselines (tests/web_snapshots/*.png). Baselines are environment-
+# specific (generated in CI's chromium) so this gates only where they match —
+# the authoritative run is the dedicated CI `snapshots` job. Here it's a skip
+# when deps or baselines are absent (never a spurious red on a dev box whose
+# fonts differ from CI).
+if python3 -c "import playwright, websockets, PIL, numpy" 2>/dev/null \
+   && ls "$SCRIPT_DIR"/web_snapshots/*.png >/dev/null 2>&1; then
+    run_test "test_web_ui_snapshots" python3 "$SCRIPT_DIR/test_web_ui_snapshots.py"
+else
+    skip_test "test_web_ui_snapshots" "snapshot deps or baselines not present (CI snapshots job is authoritative)"
+fi
+
 # Summary
 echo ""
 echo "════════════════════════════════════════"

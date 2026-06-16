@@ -27,6 +27,10 @@ tests/cross_validate
 tests/test_concurrent_rw
 tests/__pycache__/
 
+# Visual-snapshot diff/actual artifacts (transient — only baselines are tracked)
+tests/web_snapshots/*-actual.png
+tests/web_snapshots/*-diff.png
+
 # Go build artifacts
 poc/web/pgwt-poc
 poc/web/go.sum
