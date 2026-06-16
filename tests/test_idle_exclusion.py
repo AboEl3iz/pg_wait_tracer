@@ -117,7 +117,7 @@ def test_idle_exclusion(pm_pid):
 
     # Start tracer with time_model to see Activity line
     tracer = subprocess.Popen(
-        [TRACER, "--pid", str(pm_pid),
+        [TRACER, "--mode", "full", "--pid", str(pm_pid),
          "--interval", str(INTERVAL), "--duration", str(INTERVAL + 4),
          "--view", "time_model"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE
@@ -187,7 +187,7 @@ def test_idle_exclusion(pm_pid):
 
     # Also check system_event: Activity events should NOT appear
     tracer2 = subprocess.Popen(
-        [TRACER, "--pid", str(pm_pid),
+        [TRACER, "--mode", "full", "--pid", str(pm_pid),
          "--interval", str(INTERVAL), "--duration", str(INTERVAL + 4),
          "--view", "system_event"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE
@@ -204,7 +204,7 @@ def test_idle_exclusion(pm_pid):
     time.sleep(1)
 
     tracer2 = subprocess.Popen(
-        [TRACER, "--pid", str(pm_pid),
+        [TRACER, "--mode", "full", "--pid", str(pm_pid),
          "--interval", str(INTERVAL), "--duration", str(INTERVAL + 4),
          "--view", "system_event"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE

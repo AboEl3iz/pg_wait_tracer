@@ -85,6 +85,9 @@ PYEOF
 }
 
 # ── Start daemon ──────────────────────────────────────────────
+# Deliberately NO --mode: this also serves as the "default mode is tiered"
+# check. Started bare, the daemon must come up in tiered mode with the
+# always-on sampler and NO watchpoints (tier=sampled) until an escalation.
 "$TRACER" --daemon --pid "$PM_PID" -i 1 -T "$TRACE_DIR" -v \
     >/dev/null 2>"$DAEMON_LOG" &
 TRACER_PID=$!
@@ -117,13 +120,17 @@ echo "$STATUS" | python3 -c "
 import json, sys
 r = json.load(sys.stdin)
 assert r['ok'] is True, r
-assert r['mode'] == 'full', r
+# Default mode is now tiered (low-overhead always-on sampler).
+assert r['mode'] == 'tiered', r
+# Tiered starts de-escalated: the sampler is the active tier, no watchpoints.
+assert r['tier'] == 'sampled', r
+assert r['escalation_supported'] is True, r
 assert isinstance(r['uptime_s'], (int, float)) and r['uptime_s'] >= 0, r
 assert isinstance(r['backends'], int) and r['backends'] >= 0, r
 assert r['pg_pid'] == $PM_PID, r
 assert isinstance(r['version'], str) and r['version'], r
 "
-check $? "status: ok/mode/uptime_s/backends/pg_pid/version"
+check $? "default mode is tiered, tier=sampled (no watchpoints until escalation)"
 
 # ── metrics (initial) ─────────────────────────────────────────
 METRICS=$(ctl '{"cmd":"metrics"}')
@@ -141,8 +148,11 @@ for k in ('events_total', 'events_per_sec', 'lifecycle_events_total',
 "
 check $? "metrics: all counters present and numeric"
 
-EVENTS_BEFORE=$(echo "$METRICS" | python3 -c \
-    "import json,sys; print(json.load(sys.stdin)['events_total'])")
+# Tiered default: the always-on tier is the sampler, so it's samples_total
+# (not the watchpoint events_total) that moves. samples_total is part of the
+# sampled-tier metrics block.
+SAMPLES_BEFORE=$(echo "$METRICS" | python3 -c \
+    "import json,sys; print(json.load(sys.stdin).get('samples_total', 0))")
 
 # ── generate load, counters must move ─────────────────────────
 for i in 1 2 3; do
@@ -150,13 +160,13 @@ for i in 1 2 3; do
         "SELECT count(*) FROM generate_series(1,200000); SELECT pg_sleep(0.2);" \
         >/dev/null 2>&1
 done
-sleep 2   # let a timer tick refresh events_per_sec
+sleep 2   # let several sampler ticks accumulate
 
 METRICS2=$(ctl '{"cmd":"metrics"}')
-EVENTS_AFTER=$(echo "$METRICS2" | python3 -c \
-    "import json,sys; print(json.load(sys.stdin)['events_total'])")
-[[ "$EVENTS_AFTER" -gt "$EVENTS_BEFORE" ]]
-check $? "events_total increased under load ($EVENTS_BEFORE -> $EVENTS_AFTER)"
+SAMPLES_AFTER=$(echo "$METRICS2" | python3 -c \
+    "import json,sys; print(json.load(sys.stdin).get('samples_total', 0))")
+[[ "$SAMPLES_AFTER" -gt "$SAMPLES_BEFORE" ]]
+check $? "samples_total increased under load ($SAMPLES_BEFORE -> $SAMPLES_AFTER)"
 
 BYTES=$(echo "$METRICS2" | python3 -c \
     "import json,sys; print(json.load(sys.stdin)['trace_bytes_written_total'])")
@@ -235,7 +245,7 @@ import json, sys
 r = json.load(sys.stdin)
 assert r['id'] == 7, r
 assert r['response']['ok'] is True, r
-assert r['response']['mode'] == 'full', r
+assert r['response']['mode'] == 'tiered', r
 "
 check $? "pgwt-server control proxy forwards status"
 
@@ -249,7 +259,7 @@ check $? "control proxy rejects missing request object"
 
 # ── pgwt-server --dump status block ───────────────────────────
 DUMP=$("$SERVER" --dump "$TRACE_DIR" 2>/dev/null | head -3)
-echo "$DUMP" | grep -q "Daemon: running.*mode: full.*uptime"
+echo "$DUMP" | grep -q "Daemon: running.*mode: tiered.*uptime"
 check $? "--dump prints daemon status block"
 
 # ── clean shutdown ────────────────────────────────────────────

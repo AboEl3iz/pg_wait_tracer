@@ -217,8 +217,11 @@ for CLIENTS in "${CLIENT_COUNTS[@]}"; do
     echo "  With tracer:"
     tracer_results=""
     for i in $(seq 1 "$RUNS"); do
-        # Start tracer in background
-        "$TRACER" --pid "$PM_PID" --interval 5 --duration $((DURATION + WARMUP + 30)) \
+        # Start tracer in background. Pinned to --mode full: this benchmark
+        # measures the always-on watchpoint (exact) tier's overhead. The
+        # default is now tiered (sampled, ~zero PG cost) — to benchmark that,
+        # run without --mode.
+        "$TRACER" --mode full --pid "$PM_PID" --interval 5 --duration $((DURATION + WARMUP + 30)) \
             --view time_model > /dev/null 2>&1 &
         tracer_pid=$!
         sleep 2  # let tracer attach all backends

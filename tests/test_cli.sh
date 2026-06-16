@@ -94,7 +94,7 @@ check_exit 1 $? "--window invalid value exits non-zero"
 
 # Valid args with --duration 1 runs and exits cleanly
 if [[ -n "$PM_PID" ]]; then
-    timeout 10 "$TRACER" --pid "$PM_PID" --interval 1 --duration 2 \
+    timeout 10 "$TRACER" --mode full --pid "$PM_PID" --interval 1 --duration 2 \
         --view time_model > /dev/null 2>&1
     rc=$?
     if [[ $rc -eq 0 || $rc -eq 124 ]]; then
@@ -105,9 +105,11 @@ if [[ -n "$PM_PID" ]]; then
         failed=$((failed + 1))
     fi
 
-    # All views work
+    # All views work. Pinned to --mode full: these assert exact-tier CLI
+    # output shape (histogram buckets, view headers). The default is now
+    # tiered (sampled) where EXACT-required views report "unavailable".
     for view in time_model system_event session_event query_event active; do
-        timeout 10 "$TRACER" --pid "$PM_PID" --interval 1 --duration 2 \
+        timeout 10 "$TRACER" --mode full --pid "$PM_PID" --interval 1 --duration 2 \
             --view "$view" > /dev/null 2>&1
         rc=$?
         if [[ $rc -eq 0 || $rc -eq 124 ]]; then
@@ -124,7 +126,7 @@ if [[ -n "$PM_PID" ]]; then
     check_exit 1 $? "histogram without --event exits non-zero"
 
     # --window with valid args works
-    timeout 10 "$TRACER" --pid "$PM_PID" --window 1s,5s --interval 1 --count 2 \
+    timeout 10 "$TRACER" --mode full --pid "$PM_PID" --window 1s,5s --interval 1 --count 2 \
         > /dev/null 2>&1
     rc=$?
     if [[ $rc -eq 0 || $rc -eq 124 ]]; then
@@ -136,7 +138,7 @@ if [[ -n "$PM_PID" ]]; then
     fi
 
     # --window time_model output contains multi-window column headers
-    output=$(timeout 15 "$TRACER" --pid "$PM_PID" --window 1s,3s \
+    output=$(timeout 15 "$TRACER" --mode full --pid "$PM_PID" --window 1s,3s \
         --interval 1 --count 4 2>/dev/null || true)
     if echo "$output" | grep -q "Last 1s"; then
         echo "  PASS: --window time_model output contains window headers"
@@ -154,7 +156,7 @@ if [[ -n "$PM_PID" ]]; then
     fi
 
     # --window system_event output contains section headers
-    output=$(timeout 15 "$TRACER" --pid "$PM_PID" --view system_event \
+    output=$(timeout 15 "$TRACER" --mode full --pid "$PM_PID" --view system_event \
         --window 1s,3s --interval 1 --count 4 2>/dev/null || true)
     if echo "$output" | grep -q "Last 1s"; then
         echo "  PASS: --window system_event contains 'Last 1s' section"
@@ -179,7 +181,7 @@ if [[ -n "$PM_PID" ]]; then
     fi
 
     # --window histogram output contains side-by-side columns
-    output=$(timeout 15 "$TRACER" --pid "$PM_PID" --view histogram \
+    output=$(timeout 15 "$TRACER" --mode full --pid "$PM_PID" --view histogram \
         --event Client:ClientRead --window 1s,3s --interval 1 --count 4 \
         2>/dev/null || true)
     if echo "$output" | grep -q "Last 1s"; then
@@ -198,7 +200,7 @@ if [[ -n "$PM_PID" ]]; then
     fi
 
     # active view output contains correct header and column names
-    output=$(timeout 15 "$TRACER" --pid "$PM_PID" --view active \
+    output=$(timeout 15 "$TRACER" --mode full --pid "$PM_PID" --view active \
         --interval 1 --count 2 2>/dev/null || true)
     if echo "$output" | grep -q "Active Sessions"; then
         echo "  PASS: active view has 'Active Sessions' header"
@@ -223,7 +225,7 @@ if [[ -n "$PM_PID" ]]; then
     fi
 
     # active view with --sort db_time works
-    timeout 10 "$TRACER" --pid "$PM_PID" --view active --sort db_time \
+    timeout 10 "$TRACER" --mode full --pid "$PM_PID" --view active --sort db_time \
         --interval 1 --count 1 > /dev/null 2>&1
     rc=$?
     if [[ $rc -eq 0 || $rc -eq 124 ]]; then
@@ -235,7 +237,7 @@ if [[ -n "$PM_PID" ]]; then
     fi
 
     # query_event Mode B header (no workload — just verify header text)
-    output=$(timeout 15 "$TRACER" --pid "$PM_PID" --view query_event \
+    output=$(timeout 15 "$TRACER" --mode full --pid "$PM_PID" --view query_event \
         --event Client:ClientRead --interval 1 --count 2 2>/dev/null || true)
     if echo "$output" | grep -q "Top Queries for Client:ClientRead"; then
         echo "  PASS: query_event Mode B has correct header"
@@ -246,7 +248,7 @@ if [[ -n "$PM_PID" ]]; then
     fi
 
     # query_event Mode C header (no workload — just verify header text)
-    output=$(timeout 15 "$TRACER" --pid "$PM_PID" --view query_event \
+    output=$(timeout 15 "$TRACER" --mode full --pid "$PM_PID" --view query_event \
         --query-id 12345 --interval 1 --count 2 2>/dev/null || true)
     if echo "$output" | grep -q "Wait Profile for query_id 12345"; then
         echo "  PASS: query_event Mode C has correct header"

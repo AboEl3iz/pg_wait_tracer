@@ -125,7 +125,7 @@ def test_percentage_split(pm_pid):
     # Start tracer — initial scan finds both active
     INTERVAL = 8
     tracer = subprocess.Popen(
-        [TRACER, "--pid", str(pm_pid),
+        [TRACER, "--mode", "full", "--pid", str(pm_pid),
          "--interval", str(INTERVAL), "--duration", str(INTERVAL + 4),
          "--view", "time_model"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE
@@ -188,7 +188,7 @@ def test_percentage_split(pm_pid):
 
     # Also check system_event view
     tracer2 = subprocess.Popen(
-        [TRACER, "--pid", str(pm_pid),
+        [TRACER, "--mode", "full", "--pid", str(pm_pid),
          "--interval", "1", "--duration", "1",
          "--view", "system_event"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE
@@ -211,7 +211,7 @@ def test_percentage_split(pm_pid):
     time.sleep(1)
 
     tracer2 = subprocess.Popen(
-        [TRACER, "--pid", str(pm_pid),
+        [TRACER, "--mode", "full", "--pid", str(pm_pid),
          "--interval", str(INTERVAL), "--duration", str(INTERVAL + 4),
          "--view", "system_event"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE

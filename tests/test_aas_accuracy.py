@@ -128,13 +128,13 @@ def test_aas_accuracy(pm_pid):
 
     # Run time_model and session_event in parallel
     tracer_tm = subprocess.Popen(
-        [TRACER, "--pid", str(pm_pid),
+        [TRACER, "--mode", "full", "--pid", str(pm_pid),
          "--interval", str(INTERVAL), "--duration", str(INTERVAL + 4),
          "--view", "time_model"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE
     )
     tracer_se = subprocess.Popen(
-        [TRACER, "--pid", str(pm_pid),
+        [TRACER, "--mode", "full", "--pid", str(pm_pid),
          "--interval", str(INTERVAL), "--duration", str(INTERVAL + 4),
          "--view", "session_event"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE

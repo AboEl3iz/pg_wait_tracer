@@ -118,7 +118,7 @@ def test_query_accuracy(pm_pid):
 
     INTERVAL = 8
     tracer = subprocess.Popen(
-        [TRACER, "--pid", str(pm_pid),
+        [TRACER, "--mode", "full", "--pid", str(pm_pid),
          "--interval", str(INTERVAL), "--duration", str(INTERVAL + 4),
          "--view", "query_event"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE

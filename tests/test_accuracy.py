@@ -50,7 +50,7 @@ def psql(sql):
 
 def run_tracer(pm_pid, view, duration, interval, event=None):
     """Run tracer, return cleaned stdout."""
-    cmd = [TRACER, "--pid", str(pm_pid),
+    cmd = [TRACER, "--mode", "full", "--pid", str(pm_pid),
            "--interval", str(interval), "--duration", str(duration),
            "--view", view]
     if event:
@@ -157,7 +157,7 @@ def test_pg_sleep_duration(pm_pid):
 
     # Start tracer — initial scan will find backend already in PgSleep
     tracer = subprocess.Popen(
-        [TRACER, "--pid", str(pm_pid),
+        [TRACER, "--mode", "full", "--pid", str(pm_pid),
          "--interval", "8", "--duration", "12",
          "--view", "system_event"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE

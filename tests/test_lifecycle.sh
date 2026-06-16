@@ -29,8 +29,10 @@ echo "Postmaster PID: $PM_PID"
 LOGFILE=$(mktemp /tmp/tracer_lifecycle_XXXXXX.log)
 trap "rm -f $LOGFILE" EXIT
 
-# Start tracer in verbose mode with short duration — let it exit naturally
-"$TRACER" --pid "$PM_PID" --interval 5 --duration 15 -v \
+# Start tracer in verbose mode with short duration — let it exit naturally.
+# Pinned to --mode full: this asserts watchpoint attach/init log lines, which
+# only the full (exact) tier emits. The default is now tiered (sampled).
+"$TRACER" --mode full --pid "$PM_PID" --interval 5 --duration 15 -v \
     > /dev/null 2>"$LOGFILE" &
 TRACER_PID=$!
 

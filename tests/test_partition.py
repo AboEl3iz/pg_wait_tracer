@@ -88,7 +88,7 @@ def test_partition(pm_pid):
 
     # Start tracer
     tracer = subprocess.Popen(
-        [TRACER, "--pid", str(pm_pid),
+        [TRACER, "--mode", "full", "--pid", str(pm_pid),
          "--interval", str(INTERVAL), "--duration", str(INTERVAL + 4),
          "--view", "time_model"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE

@@ -103,7 +103,7 @@ def test_query_event_basic(pm_pid):
 
     # Start tracer
     tracer = subprocess.Popen(
-        [TRACER, "--pid", str(pm_pid),
+        [TRACER, "--mode", "full", "--pid", str(pm_pid),
          "--interval", "12", "--duration", "16",
          "--view", "query_event"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE
@@ -182,7 +182,7 @@ def test_specific_query_id(pm_pid):
 
     # Start tracer
     tracer = subprocess.Popen(
-        [TRACER, "--pid", str(pm_pid),
+        [TRACER, "--mode", "full", "--pid", str(pm_pid),
          "--interval", "8", "--duration", "12",
          "--view", "query_event"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE
@@ -304,7 +304,7 @@ def test_mode_b(pm_pid):
     time.sleep(3)
 
     tracer = subprocess.Popen(
-        [TRACER, "--pid", str(pm_pid),
+        [TRACER, "--mode", "full", "--pid", str(pm_pid),
          "--interval", "8", "--duration", "12",
          "--view", "query_event", "--event", "IO:DataFileRead"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE
@@ -382,7 +382,7 @@ def test_mode_c(pm_pid):
         return
 
     tracer = subprocess.Popen(
-        [TRACER, "--pid", str(pm_pid),
+        [TRACER, "--mode", "full", "--pid", str(pm_pid),
          "--interval", "8", "--duration", "12",
          "--view", "query_event", "--query-id", str(query_id)],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE

@@ -120,7 +120,7 @@ def test_cpu_system_event(pm_pid):
 
     # Start tracer — initial scan will see backend on CPU (wait_event_info=0)
     tracer = subprocess.Popen(
-        [TRACER, "--pid", str(pm_pid),
+        [TRACER, "--mode", "full", "--pid", str(pm_pid),
          "--interval", "8", "--duration", "12",
          "--view", "system_event"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE
@@ -178,7 +178,7 @@ def test_cpu_time_model(pm_pid):
     time.sleep(2)
 
     tracer = subprocess.Popen(
-        [TRACER, "--pid", str(pm_pid),
+        [TRACER, "--mode", "full", "--pid", str(pm_pid),
          "--interval", "8", "--duration", "12",
          "--view", "time_model"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE

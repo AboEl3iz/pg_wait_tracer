@@ -45,7 +45,7 @@ def check(cond, msg):
 def run_tracer(pm_pid, interval=1, count=2, view="active",
                extra_args=None, timeout_extra=15):
     """Run tracer with --view active, return cleaned stdout."""
-    cmd = [TRACER, "--pid", str(pm_pid),
+    cmd = [TRACER, "--mode", "full", "--pid", str(pm_pid),
            "--interval", str(interval),
            "--count", str(count),
            "--view", view]

@@ -114,13 +114,13 @@ def test_client_read_visible_but_idle(pm_pid):
 
     # Run both system_event and time_model in parallel
     tracer_se = subprocess.Popen(
-        [TRACER, "--pid", str(pm_pid),
+        [TRACER, "--mode", "full", "--pid", str(pm_pid),
          "--interval", str(INTERVAL), "--duration", str(INTERVAL + 4),
          "--view", "system_event"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE
     )
     tracer_tm = subprocess.Popen(
-        [TRACER, "--pid", str(pm_pid),
+        [TRACER, "--mode", "full", "--pid", str(pm_pid),
          "--interval", str(INTERVAL), "--duration", str(INTERVAL + 4),
          "--view", "time_model"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE
