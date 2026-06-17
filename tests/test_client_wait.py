@@ -175,15 +175,28 @@ def test_client_read_visible_but_idle(pm_pid):
     check(len(activity) == 0,
           f"Activity events hidden from system_event (found {len(activity)})")
 
-    # DB Time must NOT be inflated by the idle backend.  The idle backend
-    # contributes ~INTERVAL*1000ms of ClientRead; if that leaked into DB
-    # Time it would dominate.  DB Time should stay well below that.
-    if 'DB Time' in model:
-        db_time = model['DB Time']
-        idle_floor = INTERVAL * 1000 * 0.8
-        check(db_time < idle_floor,
-              f"DB Time = {db_time:.0f}ms < {idle_floor:.0f}ms "
-              f"(idle ClientRead NOT counted as DB Time)")
+    # Client-class wait time must NOT appear in the DB-Time breakdown.
+    # ClientRead is the only Client-class event the idle backend produces,
+    # and the tracer routes it to the Activity/idle bucket (see compute.c:
+    # the Client class_ns has cr_ns subtracted out, then added to idle).
+    # A correct build therefore emits NO "Client" class row and NO
+    # "Client:ClientRead" sub-row inside the DB-Time section; if ClientRead
+    # ever leaked into DB Time, one of those keys would appear in `model`.
+    #
+    # This is the load-INDEPENDENT correctness invariant.  The previous
+    # check compared total DB Time against an absolute idle-box threshold
+    # (INTERVAL*1000*0.8 ms), which broke under concurrent load: when the
+    # full suite runs other backends in parallel they add real DB Time that
+    # legitimately exceeds the bound, even though ClientRead is correctly
+    # excluded.  That made the test environment-sensitive without signalling
+    # any real bug.  The Client-class absence asserted below holds no matter
+    # how busy the box is, and still FAILS if ClientRead ever leaks into DB
+    # Time (a leak would add a "Client"/"Client:ClientRead" key here).
+    leaked = [k for k in model
+              if k == 'Client' or k.startswith('Client:')]
+    check(len(leaked) == 0,
+          f"No Client-class row in DB-Time breakdown "
+          f"(idle ClientRead excluded from DB Time; leaked keys: {leaked})")
 
     # The idle time is still accounted — routed to the Activity/idle bucket.
     if 'Idle' in model:
