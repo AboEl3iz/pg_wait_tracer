@@ -92,7 +92,7 @@ def test_lwlock_detection(pm_pid):
 
     # Start tracer
     tracer = subprocess.Popen(
-        [TRACER, "--pid", str(pm_pid),
+        [TRACER, "--mode", "full", "--pid", str(pm_pid),
          "--interval", "12", "--duration", "15",
          "--view", "system_event"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE

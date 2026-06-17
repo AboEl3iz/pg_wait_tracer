@@ -50,7 +50,7 @@ def check(cond, msg):
 def run_tracer(pm_pid, interval, count, windows, view="time_model",
                duration=None, timeout_extra=15, extra_args=None):
     """Run tracer with --window, return cleaned stdout."""
-    cmd = [TRACER, "--pid", str(pm_pid),
+    cmd = [TRACER, "--mode", "full", "--pid", str(pm_pid),
            "--interval", str(interval),
            "--window", windows,
            "--count", str(count),

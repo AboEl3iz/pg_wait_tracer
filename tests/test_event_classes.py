@@ -121,7 +121,7 @@ def test_activity(pm_pid):
     time.sleep(3)
 
     tracer = subprocess.Popen(
-        [TRACER, "--pid", str(pm_pid),
+        [TRACER, "--mode", "full", "--pid", str(pm_pid),
          "--interval", "8", "--duration", "12",
          "--view", "time_model"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE
@@ -193,7 +193,7 @@ def test_ipc(pm_pid):
     time.sleep(3)  # let parallel queries start
 
     tracer = subprocess.Popen(
-        [TRACER, "--pid", str(pm_pid),
+        [TRACER, "--mode", "full", "--pid", str(pm_pid),
          "--interval", "10", "--duration", "14",
          "--view", "system_event"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE
@@ -257,7 +257,7 @@ def test_extension(pm_pid):
     time.sleep(3)
 
     tracer = subprocess.Popen(
-        [TRACER, "--pid", str(pm_pid),
+        [TRACER, "--mode", "full", "--pid", str(pm_pid),
          "--interval", "8", "--duration", "12",
          "--view", "system_event"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE
@@ -287,7 +287,7 @@ def test_extension(pm_pid):
 
     # Also verify Extension appears in time_model
     tracer2 = subprocess.Popen(
-        [TRACER, "--pid", str(pm_pid),
+        [TRACER, "--mode", "full", "--pid", str(pm_pid),
          "--interval", "5", "--duration", "8",
          "--view", "time_model"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE
@@ -364,7 +364,7 @@ def test_bufferpin(pm_pid):
     time.sleep(2)
 
     tracer = subprocess.Popen(
-        [TRACER, "--pid", str(pm_pid),
+        [TRACER, "--mode", "full", "--pid", str(pm_pid),
          "--interval", "10", "--duration", "14",
          "--view", "system_event"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE

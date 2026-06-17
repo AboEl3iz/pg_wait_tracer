@@ -124,7 +124,7 @@ def test_daemon_server(pm_pid):
 
     # Run daemon with --trace-dir to capture trace files AND CLI output
     tracer = subprocess.Popen(
-        [TRACER, "--pid", str(pm_pid),
+        [TRACER, "--mode", "full", "--pid", str(pm_pid),
          "--interval", str(INTERVAL), "--duration", str(INTERVAL + 5),
          "--trace-dir", trace_dir,
          "--view", "time_model"],

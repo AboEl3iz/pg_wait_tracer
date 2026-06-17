@@ -71,6 +71,7 @@ def run_tracer_session_view(pm_pid, duration=6, interval=5):
     """Run tracer with session_event view and capture output."""
     cmd = [
         TRACER,
+        "--mode", "full",
         "--pid", str(pm_pid),
         "--interval", str(interval),
         "--duration", str(duration),
@@ -86,6 +87,7 @@ def run_tracer_system_view(pm_pid, duration=6, interval=5):
     """Run tracer with system_event view and capture output."""
     cmd = [
         TRACER,
+        "--mode", "full",
         "--pid", str(pm_pid),
         "--interval", str(interval),
         "--duration", str(duration),

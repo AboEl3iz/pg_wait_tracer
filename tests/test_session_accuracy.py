@@ -136,7 +136,7 @@ def test_session_accuracy(pm_pid):
     # Start tracer for session_event view
     INTERVAL = 8
     tracer = subprocess.Popen(
-        [TRACER, "--pid", str(pm_pid),
+        [TRACER, "--mode", "full", "--pid", str(pm_pid),
          "--interval", str(INTERVAL), "--duration", str(INTERVAL + 4),
          "--view", "session_event"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE
@@ -152,7 +152,7 @@ def test_session_accuracy(pm_pid):
 
     # Also get time_model for system-wide comparison
     tracer2 = subprocess.Popen(
-        [TRACER, "--pid", str(pm_pid),
+        [TRACER, "--mode", "full", "--pid", str(pm_pid),
          "--interval", "1", "--duration", "1",
          "--view", "time_model"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE

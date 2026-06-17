@@ -136,7 +136,7 @@ def test_pg_sleep_exact_count(pm_pid):
 
     # Start tracer — initial scan finds backend in PgSleep
     tracer = subprocess.Popen(
-        [TRACER, "--pid", str(pm_pid),
+        [TRACER, "--mode", "full", "--pid", str(pm_pid),
          "--interval", "14", "--duration", "18",
          "--view", "system_event"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE
@@ -261,7 +261,7 @@ def test_lock_wait_duration(pm_pid):
     # The scan pre-initializes state_map so Lock:relation is captured via
     # open interval accounting at timer tick time.
     tracer = subprocess.Popen(
-        [TRACER, "--pid", str(pm_pid),
+        [TRACER, "--mode", "full", "--pid", str(pm_pid),
          "--interval", "8", "--duration", "12",
          "--view", "system_event"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE

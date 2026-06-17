@@ -108,7 +108,7 @@ def test_cross_validate(pm_pid, profile_period_ms):
 
     # Start tracer
     tracer = subprocess.Popen(
-        [TRACER, "--pid", str(pm_pid),
+        [TRACER, "--mode", "full", "--pid", str(pm_pid),
          "--interval", "20", "--duration", "25",
          "--view", "system_event"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE
@@ -191,7 +191,7 @@ def test_time_estimate(pm_pid, profile_period_ms):
 
     # Start tracer
     tracer = subprocess.Popen(
-        [TRACER, "--pid", str(pm_pid),
+        [TRACER, "--mode", "full", "--pid", str(pm_pid),
          "--interval", "15", "--duration", "20",
          "--view", "system_event"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE
