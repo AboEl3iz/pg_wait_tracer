@@ -450,6 +450,24 @@ def test_histogram_tab(page):
     canvas = page.query_selector("#heatmap-container canvas")
     check(canvas is not None, "Heatmap canvas rendered")
 
+    # B4: read the ECharts option, not just canvas-exists — assert a heatmap
+    # series carrying data cells (catches "renders empty" that a canvas check
+    # cannot see).
+    hm_status = page.evaluate("""() => {
+        const el = document.getElementById('heatmap-container');
+        if (!el) return 'no container';
+        const c = echarts.getInstanceByDom(el);
+        if (!c) return 'no echarts instance';
+        const opt = c.getOption();
+        const s0 = opt.series && opt.series[0];
+        if (!s0) return 'no series';
+        if (s0.type !== 'heatmap') return 'not a heatmap: ' + s0.type;
+        if (!s0.data || s0.data.length === 0) return 'no data';
+        return 'ok:' + s0.data.length;
+    }""")
+    check(hm_status.startswith("ok"),
+          f"Heatmap series has data cells ({hm_status})")
+
 
 def test_timeline_tab(page):
     """12. Timeline tab requires PID filter, shows events."""
@@ -480,9 +498,27 @@ def test_timeline_tab(page):
 
         canvas = page.query_selector("#timeline-chart canvas")
         check(canvas is not None, "Timeline chart canvas rendered")
+
+        # B4: read the ECharts option — the timeline is a custom series whose
+        # data is one entry per wait span; assert it carries spans.
+        tl_status = page.evaluate("""() => {
+            const el = document.getElementById('timeline-chart');
+            if (!el) return 'no container';
+            const c = echarts.getInstanceByDom(el);
+            if (!c) return 'no echarts instance';
+            const opt = c.getOption();
+            const s0 = opt.series && opt.series[0];
+            if (!s0) return 'no series';
+            if (s0.type !== 'custom') return 'not custom: ' + s0.type;
+            if (!s0.data || s0.data.length === 0) return 'no data';
+            return 'ok:' + s0.data.length;
+        }""")
+        check(tl_status.startswith("ok"),
+              f"Timeline custom series has spans ({tl_status})")
     else:
         check(False, "No session row to drill into")
         check(False, "(skipped timeline chart)")
+        check(False, "(skipped timeline getOption)")
 
 
 def test_transitions_tab(page):
@@ -735,6 +771,22 @@ def test_concurrency_tab(page):
         }
     """)
     check(has_chart, "Peak concurrency ECharts instance rendered")
+
+    # B4: read the option — assert the peak line series carries per-bucket data.
+    cc_status = page.evaluate("""() => {
+        const el = document.getElementById('concurrency-chart');
+        if (!el) return 'no container';
+        const c = echarts.getInstanceByDom(el);
+        if (!c) return 'no echarts instance';
+        const opt = c.getOption();
+        const s0 = opt.series && opt.series[0];
+        if (!s0) return 'no series';
+        if (s0.type !== 'line') return 'not line: ' + s0.type;
+        if (!s0.data || s0.data.length === 0) return 'no data';
+        return 'ok:' + s0.data.length;
+    }""")
+    check(cc_status.startswith("ok"),
+          f"Concurrency peak line has data ({cc_status})")
 
     # Burst table should exist
     burst_el = page.query_selector("#burst-table")
