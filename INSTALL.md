@@ -2,10 +2,12 @@
 
 ## Supported Platforms
 
-- **Linux kernel** >= 5.8 (BPF ring buffer, CO-RE)
+- **Linux kernel** >= 5.8, **or** RHEL 8 / Rocky 8 (kernel 4.18 with Red Hat's
+  BPF ring buffer + BTF backports)
 - **Architecture**: x86_64, aarch64
 - **PostgreSQL**: 17, 18 (full support); 14–16 (limited — see Troubleshooting)
-- **Tested on**: Ubuntu 22.04/24.04, Rocky Linux 9, Oracle Linux 9, RHEL 9
+- **Tested on**: Ubuntu 22.04/24.04, Rocky Linux 9, Oracle Linux 9, RHEL 9,
+  Rocky Linux 8.10 / RHEL 8
 
 ## Prerequisites
 
@@ -30,6 +32,28 @@ sudo dnf install -y elfutils-libelf-devel zlib-devel lz4-devel
 # For DWARF-based st_query_id offset detection (optional, for query_event view)
 sudo dnf install -y elfutils    # provides readelf
 ```
+
+#### Rocky Linux 8 / RHEL 8 / AlmaLinux 8
+
+RHEL 8 ships `libbpf` 0.5.0 and an old `bpftool`, which predate the USDT
+support pg_wait_tracer needs. The Makefile detects this automatically and, on
+EL8 only, builds a pinned `libbpf` + `bpftool` from source into `build/`
+(requires network access at build time). EL9 and Ubuntu are unaffected.
+
+```bash
+# powertools is EL8's equivalent of EL9's CRB repo
+sudo dnf install -y dnf-plugins-core
+sudo dnf config-manager --set-enabled powertools
+
+# Core build tools + BPF toolchain + ELF/compression libs.
+# (git is required: the Makefile clones pinned libbpf/bpftool on EL8.)
+sudo dnf install -y gcc clang llvm make tar git \
+    elfutils-libelf-devel zlib-devel lz4-devel bpftool libbpf-devel
+```
+
+PGDG packages a **non-PIE** postgres binary on EL8 (PIE on EL9); pg_wait_tracer
+handles both. The kernel must still expose BTF (`/sys/kernel/btf/vmlinux`) —
+present by default on Rocky 8.10 / RHEL 8.
 
 #### Ubuntu 22.04 / 24.04 / Debian 12
 
