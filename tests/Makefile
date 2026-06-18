@@ -5,6 +5,11 @@ CC       ?= gcc
 CFLAGS    = -g -O2 -Wall -I../src -I../include
 BUILD     = ../build
 
+# libbpf link flags. Defaults to the system shared library; the top-level
+# Makefile overrides this (LIBBPF_LIB="path/to/libbpf.a -lelf -lz") on
+# Rocky 8 / RHEL 8 where the bundled static libbpf is used instead.
+LIBBPF_LIB ?= -lbpf
+
 TESTS     = test_wait_event test_cmdline test_event_writer test_event_reader \
             test_trace_v2 test_sampler test_anomaly test_coop test_bucket \
             gen_test_traces gen_bench_traces test_concurrent_rw cross_validate \
@@ -25,7 +30,7 @@ test_event_writer: test_event_writer.c $(BUILD)/event_writer.o
 
 test_event_reader: test_event_reader.c $(BUILD)/event_reader.o $(BUILD)/event_writer.o \
                    $(BUILD)/map_reader.o $(BUILD)/wait_event.o $(BUILD)/cJSON.o
-	$(CC) $(CFLAGS) -o $@ $^ -llz4 -lbpf -lelf -lz
+	$(CC) $(CFLAGS) -o $@ $^ -llz4 $(LIBBPF_LIB) -lelf -lz
 
 test_bucket: test_bucket.c
 	$(CC) $(CFLAGS) -o $@ $^
@@ -69,7 +74,7 @@ gen_bench_traces: gen_bench_traces.c $(SERVER_OBJS)
 
 test_concurrent_rw: test_concurrent_rw.c $(BUILD)/event_reader.o $(BUILD)/event_writer.o \
                     $(BUILD)/map_reader.o $(BUILD)/wait_event.o $(BUILD)/cJSON.o
-	$(CC) $(CFLAGS) -o $@ $^ -llz4 -lbpf -lelf -lz
+	$(CC) $(CFLAGS) -o $@ $^ -llz4 $(LIBBPF_LIB) -lelf -lz
 
 # cross_validate: A4 sampled-vs-exact comparison tool. Server build
 # (-DPGWT_SERVER) so it needs no BPF skeleton — runs anywhere the server

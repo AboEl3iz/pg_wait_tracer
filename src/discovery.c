@@ -169,11 +169,25 @@ uint64_t pgwt_find_load_base(pid_t pid, const char *binary_basename)
     uint64_t base = 0;
     char line[512];
     while (fgets(line, sizeof(line), f)) {
-        if (strstr(line, binary_basename) && strstr(line, "r--p")) {
-            /* First r--p mapping of the binary is the load base */
-            base = strtoull(line, NULL, 16);
-            break;
-        }
+        if (!strstr(line, binary_basename))
+            continue;
+        /* The load base is the LOWEST-address mapping of the binary.
+         * /proc/<pid>/maps is sorted by start address, so the first mapping
+         * that names the binary is the load base — regardless of its
+         * permissions. We must NOT require a specific permission bit here:
+         *
+         *   - PIE / ET_DYN (Rocky 9, Ubuntu, Debian PGDG): the first mapping
+         *     is the read-only ELF-header page (r--p), so the old "first r--p"
+         *     match happened to be correct.
+         *   - non-PIE / ET_EXEC (Rocky 8 / RHEL 8 PGDG postgres): the first
+         *     mapping is the text segment (r-xp) and the r--p mapping is
+         *     rodata, far above the load base. Matching "first r--p" there
+         *     returned the rodata address, producing a wildly wrong symbol VA
+         *     (every wait_event read came back 0 → no events captured).
+         *
+         * Taking the first matching mapping is correct for both. */
+        base = strtoull(line, NULL, 16);
+        break;
     }
     fclose(f);
 
