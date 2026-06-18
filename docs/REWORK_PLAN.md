@@ -1,7 +1,7 @@
 # Rework Plan: Tiered-Fidelity Capture + UI Restructure
 
-Status: IN PROGRESS (B1, A0 merged)
-Date: 2026-06-11 (last updated 2026-06-13)
+Status: ✅ COMPLETE (all phases merged — master c027d3c, 2026-06-18)
+Date: 2026-06-11 (completed 2026-06-18)
 
 Two tracks. Track A makes the daemon an always-on monitor with on-demand
 full-fidelity escalation. Track B makes the web UI testable, extensible,
@@ -10,10 +10,55 @@ UI grows fidelity-aware features on top of the restructured codebase.
 
 ---
 
+## Completion summary (2026-06-18)
+
+The **core rework is complete**: tiered-fidelity capture (A0–A6), the UI
+restructure + testability + fidelity UI (B1–B5), and the Track E
+live-suite cleanup are all merged to master and verified end-to-end —
+**CI green** (build-and-unit, web-ui incl. chaos+soak, snapshots,
+protocol-drift) **and a full live `run_all.sh`** on the test box =
+**46 passed / 0 failed / 1 skipped** (the skip is the web-UI snapshot
+job, which the CI snapshots job covers authoritatively).
+
+**Still open (in the plan, NOT done in this rework):** B6 (new analysis
+views — per-execution waterfall, latency scatter, transition matrix),
+Track C (Rocky 8 / RHEL 8 support), Track D (older PostgreSQL 14–16).
+These are future work; the sections below remain the design for them.
+
+**Default capture mode is now `tiered`** — always-on sampled tier with
+bounded/budgeted on-demand + anomaly-triggered escalation to full
+watchpoints. Proven results:
+- Sampled tier ≈ **0% impact on PostgreSQL** (daemon CPU 0.6% @10Hz;
+  pgbench TPS within noise) vs the full watchpoint tier's **29–30%**
+  (the documented range).
+- **Cross-validation: 0.9pp** worst-case event-share disagreement
+  between sampled and exact over the same window @10Hz, 5/5 top-5
+  overlap — so the cheap always-on default is genuinely accurate.
+
+**Merged PRs:** #6 B1 · #7 A0 · #8 Lock-naming fix · #9 Track E ·
+#10 ClientRead idle-but-visible · #11 B2 · #12 A1 · #13 A2 · #14 B3p1 ·
+#15 A3 · #16 B3p2 · #17 A4 · #18 B3p3 · #19 A5 · #20 A6 · #21 B5 ·
+#22 B4 · #23 default→tiered.
+
+**Bugs found & fixed along the way:** Lock-class subtype mislabel on
+PG17+ (relation→advisory, real product bug — #8); the ClientRead
+idle/visible semantics decision (#10); pre-existing flaky live-test
+thresholds (test_overhead 15%-gate vs documented 6–30%; test_client_wait
+load-dependent DB-Time threshold) corrected during #23 validation.
+
+**Deferred (not rework-blocking):** cooperative provider IMPLEMENTATION
+(extension track — A6 froze the interface); historical-escalation
+annotations + mixed-fidelity sub-range shading in the UI (small server
+additions); idle-ClientRead %DB cosmetic.
+
+---
+
 ## Progress log
 
 Workflow: branch + PR per phase, user merges. Two phases land at a time
-(one per track, in parallel). Subagents do the work in worktrees.
+(one per track, in parallel). Subagents do the work in worktrees (each
+isolated — a parallel pair without worktree isolation collided once,
+recovered with no lost work; isolation is mandatory thereafter).
 
 - **2026-06-13 — B1 (CI safety net) MERGED** (PR #6 → master 861c313).
   Delivered the console-error/pageerror guard, `.github/workflows/ci.yml`
@@ -773,15 +818,15 @@ Independent of all other tracks. E1+E2+E3 are one small PR's worth.
 # Sequencing
 
 ```
-Track A:  [A0✅] ─▶ A1 ──▶ A2 ──▶ A3 ──▶ A4 ──▶ A5    A6 (anytime after A2)
-Track B:  [B1✅] ─▶ B2 ──▶ B3 ──▶ B4 ──────────▶ B5 ──▶ B6
-                                            (B5 needs A3+A4; B6 needs B3+A3)
-Track C:        (A0✅+A2) ──▶ C1 ──▶ C2 ──▶ C3
-Track D:  D1 ──▶ D2  (independent; ideally with A2)      D3 if demanded
-Track E:  E1+E2+E3  (independent, do early — one small PR)
+Track A:  A0✅ ─▶ A1✅ ─▶ A2✅ ─▶ A3✅ ─▶ A4✅ ─▶ A5✅    A6✅
+Track B:  B1✅ ─▶ B2✅ ─▶ B3✅ ─▶ B4✅ ─────────▶ B5✅    B6 ⬜ (deferred)
+Track C:  C1 ⬜  C2 ⬜  C3 ⬜   (Rocky 8 — future)
+Track D:  D1 ⬜  D2 ⬜   D3 ⬜  (older PG 14–16 — future)
+Track E:  E1✅ E2✅ E3✅  (live-suite cleanup — done across #8/#9/#23)
 ```
 
-- ✅ = merged to master (2026-06-13). **Next pair: A1 + B2.**
+- ✅ = merged to master. ⬜ = not started (future). Core rework
+  (A0–A6, B1–B5, E) complete 2026-06-18 @ master c027d3c.
 - B1/B2 are small and should land **first** regardless of Track A —
   they protect everything else.
 - The tracks parallelize fully until B5.
