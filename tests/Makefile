@@ -12,6 +12,7 @@ LIBBPF_LIB ?= -lbpf
 
 TESTS     = test_wait_event test_cmdline test_event_writer test_event_reader \
             test_trace_v2 test_sampler test_anomaly test_coop test_bucket \
+            test_pg13_resolve \
             gen_test_traces gen_bench_traces test_concurrent_rw cross_validate \
             dump_markers
 
@@ -34,6 +35,14 @@ test_event_reader: test_event_reader.c $(BUILD)/event_reader.o $(BUILD)/event_wr
 
 test_bucket: test_bucket.c
 	$(CC) $(CFLAGS) -o $@ $^
+
+# test_pg13_resolve: PG13 MyProc-path offset table + the runtime "refuse on
+# garbage offset" validation guard. Compiles discovery.c directly (the helpers
+# under test are BPF-free; discovery.c only needs libelf). Runs anywhere — no
+# live PostgreSQL, no BPF skeleton.
+test_pg13_resolve: test_pg13_resolve.c ../src/discovery.c \
+                   $(BUILD)/wait_event.o $(BUILD)/cJSON.o
+	$(CC) $(CFLAGS) -o $@ $^ -lelf -lz
 
 # test_trace_v2: format round-trip (v2 typed blocks). Built against the
 # server objects (-DPGWT_SERVER) so it needs no BPF skeleton — buildable on
