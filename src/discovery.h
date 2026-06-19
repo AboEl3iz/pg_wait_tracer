@@ -37,6 +37,31 @@ int pgwt_detect_pg_version(const char *pg_binary);
  * Returns offset in bytes, or 0 if unavailable. */
 int pgwt_detect_query_id_offset(const char *pg_binary, int pg_major);
 
+/* PG13 query-attribution offsets (Route B1 via pg_stat_statements).
+ * PG13 has no in-core query_id; when pg_stat_statements is loaded its
+ * post_parse_analyze hook populates the core PlannedStmt.queryId field, which
+ * matches pg_stat_statements.queryid. We uprobe ExecutorStart(QueryDesc*) and
+ * walk QueryDesc->plannedstmt->queryId; QueryDesc->sourceText gives the text.
+ * Offsets are header-derived (postgresql13-devel, x86_64) since PG13 is EOL
+ * and has no debuginfo anywhere. All fields 0 => not available. */
+struct pgwt_pg13_query_offsets {
+    int querydesc_plannedstmt;  /* offsetof(QueryDesc, plannedstmt) */
+    int plannedstmt_queryid;    /* offsetof(PlannedStmt, queryId)   */
+    int querydesc_sourcetext;   /* offsetof(QueryDesc, sourceText)  */
+};
+
+/* Fill header-derived PG13 query-attribution offsets for the given major
+ * version on x86_64. Returns 1 if a known layout was filled, 0 otherwise
+ * (caller leaves query attribution disabled). */
+int pgwt_detect_pg13_query_offsets(int pg_major,
+                                   struct pgwt_pg13_query_offsets *out);
+
+/* Detect whether pg_stat_statements is loaded into the running postmaster.
+ * Scans /proc/<postmaster_pid>/maps for pg_stat_statements.so — no DB
+ * connection or auth needed, works regardless of port. Returns 1 if loaded,
+ * 0 if not, -1 if the maps file could not be read. */
+int pgwt_detect_pgss_loaded(pid_t postmaster_pid);
+
 /* offsetof(PGPROC, wait_event_info) for a given PG major version on x86_64.
  * Used on PG<17, where the daemon resolves the MyProc (PGPROC*) global and
  * adds this offset to reach each backend's wait_event_info. Header-derived

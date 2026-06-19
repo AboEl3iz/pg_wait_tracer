@@ -107,6 +107,18 @@ struct pgwt_daemon {
     int         pg_major_version;   /* 14, 15, 16, 17, or 18 */
     int         st_query_id_offset; /* 0 = not available */
     int         st_activity_offset; /* st_activity_raw in PgBackendStatus, 0 = N/A */
+
+    /* PG13 query attribution (Route B1 via pg_stat_statements). PG13 has no
+     * in-core query_id; when pgss is loaded its post_parse_analyze hook
+     * populates PlannedStmt.queryId (matching pg_stat_statements.queryid). We
+     * uprobe ExecutorStart(QueryDesc*) and walk QueryDesc->plannedstmt->queryId
+     * into the SAME state_map query_id slot the PG17+ path uses, so both tiers
+     * work unchanged. Active only when use_pg13_query_attr is true. */
+    bool        pgss_loaded;            /* pg_stat_statements in postmaster maps */
+    bool        use_pg13_query_attr;    /* PG13 + pgss: use ExecutorStart uprobe */
+    int         pg13_qd_plannedstmt_off; /* offsetof(QueryDesc, plannedstmt) */
+    int         pg13_ps_queryid_off;     /* offsetof(PlannedStmt, queryId) */
+    int         pg13_qd_sourcetext_off;  /* offsetof(QueryDesc, sourceText) */
     enum pgwt_format format;         /* output format (TUI/TEXT/JSON/CSV) */
     int         count;               /* max intervals, 0 = unlimited */
     int         tick;                /* current interval number */
