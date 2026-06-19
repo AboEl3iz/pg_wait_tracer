@@ -89,6 +89,24 @@ def main():
             t.check(len(client_rows) == 1,
                     "Client:ClientRead present in top_events (visible)")
 
+            # %DB = share of DB Time and applies ONLY to non-idle (DB-Time)
+            # events. Client:ClientRead is idle (excluded from DB Time), so it
+            # has time but no meaningful share — the server emits pct=null so
+            # the client renders "—" (a numeric %DB would overshoot 100%).
+            print("--- ClientRead %DB is null (idle, excluded from DB Time) ---")
+            if client_rows:
+                t.check(client_rows[0].get("pct", "missing") is None,
+                        "Client:ClientRead pct is null in top_events")
+                t.check(client_rows[0].get("total_ms", 0) > 0,
+                        "Client:ClientRead still reports its time")
+
+            # %DB over the NON-IDLE rows sums to ~100% (idle rows excluded).
+            non_idle = [r for r in resp_ev.get("rows", [])
+                        if r.get("pct") is not None]
+            pct_sum = sum(r["pct"] for r in non_idle)
+            t.check(abs(pct_sum - 100.0) < 0.5,
+                    f"Non-idle %DB sums to {pct_sum:.2f}% (expected ~100%)")
+
             # session_timeline must hide Activity bars but KEEP ClientRead
             print("--- timeline hides Activity, keeps ClientRead ---")
             resp_tl = srv.query("session_timeline")

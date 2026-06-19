@@ -386,7 +386,12 @@ def test_system_event_progressive(pm_pid):
 # ── Test 6: system_event Data Sanity ───────────────────────
 
 def parse_system_events_section(text):
-    """Parse events from a system_event section."""
+    """Parse events from a system_event section.
+
+    The % DB column is either a number ("12.3%") for non-idle (DB-Time)
+    events, or "—" (em-dash) for idle-but-visible events (Client:ClientRead),
+    which have time but no meaningful share of DB Time. We capture the raw
+    token and expose 'pct' (float or None) plus 'pct_is_dash'."""
     events = []
     for line in text.split('\n'):
         line = line.strip()
@@ -395,16 +400,19 @@ def parse_system_events_section(text):
             r'(\d+)\s+'
             r'([\d.]+)\s+'
             r'([\d.]+)\s+'
-            r'([\d.]+)%',
+            r'(\d[\d.]*%|—)',          # % DB: number+% OR em-dash
             line
         )
         if m:
+            pct_tok = m.group(5)
+            is_dash = (pct_tok == '—')
             events.append({
                 'name': m.group(1),
                 'count': int(m.group(2)),
                 'total_ms': float(m.group(3)),
                 'avg_us': float(m.group(4)),
-                'pct': float(m.group(5)),
+                'pct': None if is_dash else float(pct_tok.rstrip('%')),
+                'pct_is_dash': is_dash,
             })
     return events
 
@@ -463,10 +471,25 @@ def test_system_event_data(pm_pid):
     check(all_positive,
           "All events have count > 0")
 
-    # Percentages should sum to roughly 100% (allowing for rounding)
-    pct_sum = sum(e['pct'] for e in events)
+    # %DB = share of DB Time and applies ONLY to non-idle (DB-Time) events.
+    # Idle-but-visible events (Client:ClientRead) are listed (they have time)
+    # but render "—" for %DB, not a number — counting them would overshoot the
+    # column past 100%. Sum must be ~100% across the NON-IDLE rows.
+    non_idle = [e for e in events if not e['pct_is_dash']]
+    pct_sum = sum(e['pct'] for e in non_idle)
     check(80 < pct_sum < 120,
-          f"Percentages sum to {pct_sum:.1f}% (expected ~100%)")
+          f"Non-idle %DB sums to {pct_sum:.1f}% (expected ~100%)")
+
+    # Idle-but-visible events must render "—" (not a number) for %DB.
+    idle_rows = [e for e in events if e['name'] == 'Client:ClientRead']
+    if idle_rows:
+        all_dash = all(e['pct_is_dash'] for e in idle_rows)
+        check(all_dash,
+              "Client:ClientRead renders '—' for %DB (idle, excluded from DB Time)")
+        # ...while still showing its time (it is visible, not hidden).
+        has_time = all(e['total_ms'] > 0 for e in idle_rows)
+        check(has_time,
+              "Client:ClientRead still shows its time (visible row)")
 
 
 # ── Test 7: query_event Mode A multi-window ─────────────────
