@@ -572,7 +572,10 @@ void pgwt_compute_top_events(const struct pgwt_trace_event *events, int count,
             continue;
 
         /* Idle-but-visible events (Client:ClientRead) appear in the list
-         * but are excluded from DB Time, so their %DB stays meaningful. */
+         * but are excluded from DB Time. Their time is not part of the
+         * DB-Time denominator, so a numeric %DB is meaningless for them
+         * (it overshoots and makes the column sum past 100%). Their %DB is
+         * marked with a sentinel below and rendered as "—". */
         if (!pgwt_is_idle_event(ev->old_event))
             db_time_ns += ev->duration_ns;
 
@@ -613,7 +616,12 @@ void pgwt_compute_top_events(const struct pgwt_trace_event *events, int count,
         r->p50_us   = hist_percentile(ht[i].hist, ht[i].count, 0.50);
         r->p95_us   = hist_percentile(ht[i].hist, ht[i].count, 0.95);
         r->p99_us   = hist_percentile(ht[i].hist, ht[i].count, 0.99);
-        r->pct_db   = db_time_ms > 0 ? r->total_ms / db_time_ms * 100.0 : 0;
+        /* Idle-but-visible events have time but no meaningful share of DB
+         * Time; flag their %DB with a sentinel so it renders as "—". */
+        if (pgwt_is_idle_event(ht[i].event_id))
+            r->pct_db = PGWT_PCT_DB_IDLE;
+        else
+            r->pct_db = db_time_ms > 0 ? r->total_ms / db_time_ms * 100.0 : 0;
         r->aas      = wall_ms > 0 ? r->total_ms / wall_ms : 0;
 
         if (ht[i].event_id == 0)
@@ -1432,7 +1440,12 @@ void pgwt_compute_top_events_from_summaries(
         row->p50_us   = hist_percentile(ctx.ht[i].hist, ctx.ht[i].count, 0.50);
         row->p95_us   = hist_percentile(ctx.ht[i].hist, ctx.ht[i].count, 0.95);
         row->p99_us   = hist_percentile(ctx.ht[i].hist, ctx.ht[i].count, 0.99);
-        row->pct_db   = db_time_ms > 0 ? row->total_ms / db_time_ms * 100.0 : 0;
+        /* Idle-but-visible events have time but no meaningful share of DB
+         * Time; flag their %DB with a sentinel so it renders as "—". */
+        if (pgwt_is_idle_event(ctx.ht[i].event_id))
+            row->pct_db = PGWT_PCT_DB_IDLE;
+        else
+            row->pct_db = db_time_ms > 0 ? row->total_ms / db_time_ms * 100.0 : 0;
         row->aas      = wall_ms > 0 ? row->total_ms / wall_ms : 0;
 
         if (ctx.ht[i].event_id == 0)
