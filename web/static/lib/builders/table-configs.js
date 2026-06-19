@@ -57,6 +57,10 @@ export const eventsConfig = {
         { key: 'p99_us', label: 'P99', cls: 'num', format: (r) => fmtUs(r.p99_us) },
         { key: 'max_us', label: 'Max', cls: 'num', format: (r) => fmtUs(r.max_us) },
         { key: 'pct', label: '%DB', cls: 'num', format: (r) => {
+            /* Idle-but-visible events (e.g. Client:ClientRead) have time but
+             * no meaningful share of DB Time; the server sends pct=null so we
+             * render "—" instead of a bogus bar. */
+            if (r.pct == null) return '<span style="color:#555">—</span>';
             const color = classColor(r.name) || '#4fc3f7';
             return pctBar(r.pct, color);
         }},
