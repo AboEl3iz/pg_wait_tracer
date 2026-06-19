@@ -907,3 +907,35 @@ Track E:  E1✅ E2✅ E3✅  (live-suite cleanup — done across #8/#9/#23)
    workloads. Ship conservative defaults, make every threshold
    configurable, and log every near-trigger to the trace so tuning is
    data-driven.
+6. **PG18 async I/O — io_worker semantics + I/O data correctness (OPEN
+   DECISION + validation gap).** Under `io_method=worker` (the PG18
+   default), a single logical read is split across processes: the
+   requesting backend shows the generic `IO:AioIoCompletion` (or no wait
+   if it completed in the background), while the actual
+   `IO:DataFileRead/Write` happens on an **io_worker** that has no
+   requesting-query context. Consequences we must decide on and verify:
+   - **Decision needed: how to treat io_workers.** They're background
+     workers doing foreground work. Counting their busy I/O time as
+     active load means the SAME logical I/O can be represented twice in
+     AAS (backend waiting on AioIoCompletion + io_worker doing the read)
+     → AAS can read higher under AIO-worker than the pre-AIO model, and
+     cross-version AAS isn't apples-to-apples. Options: count as today,
+     exclude io_workers from AAS, or surface them as a distinct
+     "I/O on behalf of sessions" class. This is a semantic call like the
+     Client:ClientRead idle decision ([[project_clientread_idle_decision]]).
+   - **Query attribution to I/O degrades**: io_worker reads can't be
+     tied to the originating query (no query_id on the worker); the
+     backend's AioIoCompletion has the query_id but not the read detail.
+     Document this limitation; per-query I/O is partial under `worker`.
+   - **Validate data correctness better**: the existing `pg_stat_io`
+     cross-check (~0.80 ratio, accepted as "async overlap") is too loose
+     to *prove* correctness under AIO. Add a focused validation that
+     accounts for the backend/io_worker split — e.g. sum backend
+     `AioIoCompletion` + io_worker `DataFileRead/Write` and reconcile
+     against `pg_stat_io`, and confirm no unintended double-counting in
+     DB Time/AAS. `io_uring` mode (rare on RHEL8) loses even the
+     io_worker detail — note as a separate, lower-priority case.
+   Status: flagged from analysis (AioIoCompletion + 0.80 ratio observed);
+   the AAS double-representation and the backend/worker split are NOT yet
+   measured head-on — needs an empirical run on a PG18 box before any
+   io_worker semantic change.
