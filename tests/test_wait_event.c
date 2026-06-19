@@ -260,7 +260,7 @@ static void test_pg13_names(void)
     printf("--- PG13 tables ---\n");
     pgwt_init_event_names(13);
 
-    /* IO: PG13 enum starts at BufFileRead (no Aio*/Basebackup* of PG17/18). */
+    /* IO: PG13 enum starts at BufFileRead (no Aio/Basebackup events of 17/18). */
     CHECK_NAME(WEI(PG_WAIT_IO, 0),  "IO:BufFileRead");
     CHECK_NAME(WEI(PG_WAIT_IO, 13), "IO:DataFileRead");
     CHECK_NAME(WEI(PG_WAIT_IO, 32), "IO:RelationMapSync");  /* PG17 renamed -> Replace */
