@@ -713,7 +713,7 @@ Dependencies: C1 needs A0 (control socket) and A2 (provider split).
 C2/C3 are independent of Tracks A3+ and B. Testing requires a Rocky 8
 VM added to the test matrix (deps installed on the remote box only).
 
-# Track D — Older PostgreSQL support (14–16 full; 12–13 optional)
+# Track D — Older PostgreSQL support (13–16; PG13 feasibility VERIFIED)
 
 Current state: PG 17/18 full; on 14–16 the tracer starts but does not
 capture correctly (INSTALL.md Troubleshooting). Root cause is **address
@@ -758,27 +758,75 @@ commit generated tables + the generator. `pg_wait_events` runtime
 discovery stays the preferred path on 17+.
 Acceptance: no hex-code event names on 14–16 traces in the live suite.
 
-### Phase D3 (optional, demand-driven) — PG 12/13
-Scope: same D1 resolution path (no `my_wait_event_info` at all pre-14)
-+ name tables for 12/13. **No query attribution**: in-core query_id
-(`compute_query_id`, `pgstat_report_query_id`) is PG 14+ — query views
-report explicit "unavailable on PG < 14" (same pattern as fidelity
-unavailability in A3), never silently empty. Query *text* via
-`debug_query_string` could be added later if demand justifies it.
-Note EOL: PG 13 EOL 2025-11, PG 12 EOL 2024-11 — implement only if
-users ask.
+### Phase D3 — PG 13 (FEASIBILITY VERIFIED — GO, 2026-06-19)
+Validated on a real **PostgreSQL 13.23** (Rocky 8.10 box, port 5433) by
+direct probe — see [[project_pg13_feasibility]]. PG13 gets the full
+wait-event analysis (both tiers) **plus query attribution** via
+pg_stat_statements. Three pieces:
 
-### Not supported: PG ≤ 11
+**(a) Wait capture — the prerequisite (= Phase D1).** PG13 has no
+`my_wait_event_info` global and writes `MyProc->wait_event_info`
+directly, so it needs the D1 MyProc-resolution path. Proven live: with
+`offsetof(PGPROC, wait_event_info)=684` on 13.23, reading
+`*(MyProc)+684` from `/proc/<pid>/mem` matched `pg_stat_activity`
+(Lock=0x03000000, Timeout:PgSleep=0x09000001). PG13 postgres is
+**non-PIE** on EL8, so the #24 non-PIE load-base fix applies. `MyProc`
+resolves from `.dynsym`.
+
+**(b) PG13 wait-event name tables (= Phase D2, extended to 13).**
+`pg_wait_events` is PG17+ only; generate PG13's table from its headers.
+
+**(c) Query attribution — Route B1 (pg_stat_statements-based).** PG13
+has no in-core query_id, BUT when `pg_stat_statements` is loaded its
+`post_parse_analyze` hook populates the core `PlannedStmt.queryId`
+field (which exists in PG13). Proven: that field is populated and
+**matches `pg_stat_statements.queryid`** — confirmed both via an
+`ActivePortal` outside-read and via gdb at `ExecutorStart` entry (queryId
+already set when ExecutorStart fires).
+- Design: uprobe **`ExecutorStart`** (arg0 = `QueryDesc*`) →
+  `+8` (plannedstmt) → `+8` (queryId, uint64) → store in `state_map`
+  (the EXISTING attribution pipeline). One uprobe per query (NOT per
+  event). Serves BOTH tiers: the A2 sampler reads the cached id at
+  10 Hz; the full-tier watchpoint reads it per event. (Offsets on
+  13.23: `QueryDesc.plannedstmt=8`, `PlannedStmt.queryId=8`,
+  `PortalData.queryDesc=136`.)
+- **pgss is required for PG13 query attribution.** If pgss is not
+  loaded, query views report "unavailable (requires pg_stat_statements)"
+  — the A3 unavailable pattern. (Decision: the text-fingerprint
+  alternative, "Route A", is NOT pursued.)
+- Coverage gap: utility statements (CHECKPOINT/VACUUM/DDL) go through
+  `ProcessUtility`, not `ExecutorStart`, so the ExecutorStart uprobe
+  won't attribute them — same gap as other PG versions; an optional
+  `ProcessUtility` uprobe can close it later.
+
+**Offset-resolution constraint (important):** **no PG13 debuginfo exists
+anywhere** (purged after PG13's Nov-2025 EOL; the binary is stripped).
+So PG13 (and any EOL version) offsets MUST be derived from the
+`postgresql*-devel` **headers** at build time (compile an `offsetof()`
+probe) or hardcoded from header-derived values — never from a debuginfo
+package. Symbols (`MyProc`, `ExecutorStart`, `ActivePortal`) come from
+`.dynsym`, which survives stripping. Symbol VAs are build-specific →
+resolve at runtime from the target binary, don't hardcode.
+
+Note: PG13 is EOL (2025-11); the D1 prerequisite also unlocks PG14–16,
+which get **native** query_id (no pgss needed) via the existing
+st_query_id path — so PG14–16 are higher-value for the same core work.
+
+### Not supported: PG ≤ 12
 Technically possible (wait_event_info exists since 9.6) but PG itself
-instruments far fewer wait points before 12 (IO/IPC classes and
+instruments far fewer wait points before 13 (IO/IPC classes and
 coverage grew release by release), so captured data would be
-misleadingly sparse; combined with deep EOL and test-matrix cost, the
-cut line is 12.
+misleadingly sparse; combined with deep EOL (PG12 EOL 2024-11) and
+test-matrix cost, the cut line is 13.
 
 Dependencies: D1/D2 are independent of Tracks A–C and can land anytime;
 doing D1 before/with A2 is ideal since the sampler shares the registry.
-Test matrix: PGDG 14–16 installed alongside 17/18 on the remote test
-VM (deps on remote only).
+D3 needs pgss for query attribution. Test matrix: PGDG 13 (archive
+repo — dropped from the live EL8 mirror at EOL) + 14–16 installed
+alongside 17/18 on the test box (PG13.23 already installed on the box,
+port 5433). Validation: full + sampled capture correct + (with pgss)
+query attribution matching pg_stat_statements, cross-checked vs
+pg_stat_activity.
 
 # Track E — Live-suite cleanup (pre-existing debt)
 
