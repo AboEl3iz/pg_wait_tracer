@@ -213,6 +213,77 @@ uint64_t pgwt_read_pointer(pid_t pid, uint64_t addr)
     return val;
 }
 
+/* ── PG<17 MyProc-based wait_event_info resolution ────────────
+ *
+ * PG17 added the `my_wait_event_info` global (a uint32* that points directly
+ * at the backend's wait_event_info). Before PG17 there is no such global;
+ * backends write `MyProc->wait_event_info` directly. So on PG<17 we resolve
+ * the `MyProc` PGPROC* global instead, read it per backend to get that
+ * backend's PGPROC, and add offsetof(PGPROC, wait_event_info).
+ *
+ * The watched FIELD (wait_event_info) has existed in PGPROC since PG 9.6, and
+ * a watchpoint on its address catches writes regardless of which pointer the
+ * code wrote through — so the full + sampled pipelines are identical once the
+ * address is resolved; only this resolution differs by version. */
+
+int pgwt_detect_pgproc_wait_offset(int pg_major)
+{
+    struct utsname un;
+    if (uname(&un) != 0)
+        return 0;
+    if (strcmp(un.machine, "x86_64") != 0)
+        return 0;   /* offsets are layout-/ABI-specific; only x86_64 known */
+
+    switch (pg_major) {
+    /* Header-derived (offsetof(PGPROC, wait_event_info), postgresql<v>-devel):
+     *   PG13.23 → 684  (compiled probe, confirmed live vs pg_stat_activity).
+     * PG14/15/16 deliberately omitted here until their offset is header-derived
+     * and validated; the runtime guard (pgwt_validate_wait_addr) refuses to
+     * attach if an offset is wrong, so a missing entry fails safe rather than
+     * tracing garbage. */
+    case 13: return 684;
+    default: return 0;
+    }
+}
+
+uint64_t pgwt_resolve_wait_addr_via_myproc(pid_t pid, uint64_t my_proc_global_addr,
+                                           int pgproc_wait_offset)
+{
+    if (my_proc_global_addr == 0 || pgproc_wait_offset <= 0)
+        return 0;
+    /* *MyProc → this backend's PGPROC; + offset → wait_event_info field. */
+    uint64_t pgproc = pgwt_read_pointer(pid, my_proc_global_addr);
+    if (pgproc == 0)
+        return 0;   /* MyProc not yet assigned (backend still in early init) */
+    return pgproc + (uint64_t)pgproc_wait_offset;
+}
+
+int pgwt_validate_wait_addr(pid_t pid, uint64_t wait_addr)
+{
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/mem", pid);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return -1;
+
+    uint32_t wei = 0;
+    ssize_t r = pread(fd, &wei, sizeof(wei), (off_t)wait_addr);
+    close(fd);
+    if (r != (ssize_t)sizeof(wei))
+        return -1;
+
+    /* Class byte is the high byte. CPU (0x00000000) is valid (not waiting);
+     * otherwise the class must be a known wait-event class. PG wait classes
+     * occupy 0x01..0x0B (LWLock..InjectionPoint); anything else means the
+     * offset is wrong (custom build / mis-detected layout). */
+    if (wei == 0)
+        return 1;
+    unsigned cls = (wei >> 24) & 0xFF;
+    if (cls >= 0x01 && cls <= 0x0B)
+        return 1;
+    return 0;
+}
+
 /* ── PG Version Detection ─────────────────────────────────── */
 
 int pgwt_detect_pg_version(const char *pg_binary)
@@ -660,23 +731,53 @@ int pgwt_discover(struct pgwt_daemon *d)
     const char *base = strrchr(binary, '/');
     base = base ? base + 1 : binary;
 
-    /* Resolve symbols */
-    d->my_wait_ptr_addr = pgwt_resolve_symbol(binary, "my_wait_event_info",
-                                               pm_pid, base);
-    if (d->my_wait_ptr_addr == 0) {
-        fprintf(stderr, "FATAL: cannot resolve 'my_wait_event_info' in %s (PID %d)\n",
-                binary, pm_pid);
-        return -1;
-    }
-    if (d->verbose)
-        fprintf(stderr, "INFO: my_wait_event_info VA: 0x%lx\n",
-                (unsigned long)d->my_wait_ptr_addr);
+    /* Resolve the wait_event_info access path. Per-version strategy:
+     *   PG17+  → the `my_wait_event_info` global (a uint32* pointing AT the
+     *            field). UNCHANGED — must not regress.
+     *   PG<17  → no such global; resolve the `MyProc` PGPROC* global and add
+     *            offsetof(PGPROC, wait_event_info) per backend (use_myproc). */
+    d->use_myproc = (d->pg_major_version > 0 && d->pg_major_version < 17);
 
-    /* Verify pointer is readable */
-    uint64_t ptr_val = pgwt_read_pointer(pm_pid, d->my_wait_ptr_addr);
-    if (d->verbose)
-        fprintf(stderr, "INFO: my_wait_event_info value (postmaster): 0x%lx\n",
-                (unsigned long)ptr_val);
+    if (d->use_myproc) {
+        d->pgproc_wait_offset = pgwt_detect_pgproc_wait_offset(d->pg_major_version);
+        if (d->pgproc_wait_offset <= 0) {
+            fprintf(stderr,
+                    "FATAL: no known offsetof(PGPROC, wait_event_info) for PG%d "
+                    "on this architecture.\n"
+                    "  PG<17 needs a header-derived offset (see "
+                    "tools/gen_pg13_wait_events.py / discovery.c).\n",
+                    d->pg_major_version);
+            return -1;
+        }
+        d->my_wait_ptr_addr = pgwt_resolve_symbol(binary, "MyProc", pm_pid, base);
+        if (d->my_wait_ptr_addr == 0) {
+            fprintf(stderr, "FATAL: cannot resolve 'MyProc' in %s (PID %d)\n",
+                    binary, pm_pid);
+            return -1;
+        }
+        if (d->verbose)
+            fprintf(stderr,
+                    "INFO: PG%d MyProc VA: 0x%lx, offsetof(PGPROC,wait_event_info)=%d\n",
+                    d->pg_major_version, (unsigned long)d->my_wait_ptr_addr,
+                    d->pgproc_wait_offset);
+    } else {
+        d->my_wait_ptr_addr = pgwt_resolve_symbol(binary, "my_wait_event_info",
+                                                   pm_pid, base);
+        if (d->my_wait_ptr_addr == 0) {
+            fprintf(stderr, "FATAL: cannot resolve 'my_wait_event_info' in %s (PID %d)\n",
+                    binary, pm_pid);
+            return -1;
+        }
+        if (d->verbose)
+            fprintf(stderr, "INFO: my_wait_event_info VA: 0x%lx\n",
+                    (unsigned long)d->my_wait_ptr_addr);
+
+        /* Verify pointer is readable */
+        uint64_t ptr_val = pgwt_read_pointer(pm_pid, d->my_wait_ptr_addr);
+        if (d->verbose)
+            fprintf(stderr, "INFO: my_wait_event_info value (postmaster): 0x%lx\n",
+                    (unsigned long)ptr_val);
+    }
 
     /* Discover MyBEEntry address (for query_id attribution) */
     d->my_be_entry_addr = pgwt_resolve_symbol(binary, "MyBEEntry",

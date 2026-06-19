@@ -71,6 +71,19 @@ static uint64_t now_ns(void)
     return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 }
 
+/* Resolve a backend's wait_event_info address using the version-appropriate
+ * path. PG17+: my_wait_ptr_addr is the my_wait_event_info global (a uint32*
+ * that already points at the field). PG<17 (use_myproc): my_wait_ptr_addr is
+ * the MyProc PGPROC* global — deref it and add pgproc_wait_offset. Returns 0
+ * if the backend has not set MyProc / the pointer yet. */
+uint64_t pgwt_resolve_backend_wait_addr(struct pgwt_daemon *d, pid_t pid)
+{
+    if (d->use_myproc)
+        return pgwt_resolve_wait_addr_via_myproc(pid, d->my_wait_ptr_addr,
+                                                 d->pgproc_wait_offset);
+    return pgwt_read_pointer(pid, d->my_wait_ptr_addr);
+}
+
 /* Pre-seed the BPF state_map for a backend whose wait_event_info address is
  * already resolved (be->wp_addr). Reads the backend's CURRENT wait_event_info
  * and query_id and writes them as the initial state, so the first watchpoint
@@ -176,14 +189,38 @@ int pgwt_scan_existing_backends(struct pgwt_daemon *d)
         if (ppid != d->postmaster_pid)
             continue;
 
-        /* This is a postgres child. Read its my_wait_event_info pointer. */
-        uint64_t ptr = pgwt_read_pointer(pid, d->my_wait_ptr_addr);
+        /* This is a postgres child. Resolve its wait_event_info address
+         * (PG17+ my_wait_event_info global; PG<17 MyProc + offset). */
+        uint64_t ptr = pgwt_resolve_backend_wait_addr(d, pid);
         if (ptr == 0) {
             /* Not yet initialized — treat as fresh fork */
             if (d->verbose)
                 fprintf(stderr, "INFO: PID %d not yet initialized, attaching bootstrap\n", pid);
             pgwt_handle_fork(d, pid);
             continue;
+        }
+
+        /* Runtime validation (PG<17 MyProc path): the offset is global, so a
+         * single sane reading proves it. Check the first backend we resolve;
+         * if its wait_event_info value's class byte is garbage, the offset is
+         * wrong (custom build / mis-detected layout) — refuse to attach rather
+         * than trace nonsense. PG17+ skips this (my_wait_event_info already
+         * points exactly at the field). */
+        if (d->use_myproc && !d->wait_offset_validated) {
+            int v = pgwt_validate_wait_addr(pid, ptr);
+            if (v == 0) {
+                fprintf(stderr,
+                        "FATAL: resolved wait_event_info for PID %d holds a value "
+                        "with an invalid wait-event class byte.\n"
+                        "  offsetof(PGPROC, wait_event_info)=%d is likely wrong for "
+                        "this PG%d build — refusing to attach.\n",
+                        pid, d->pgproc_wait_offset, d->pg_major_version);
+                closedir(proc);
+                return -1;
+            }
+            if (v == 1)
+                d->wait_offset_validated = true;
+            /* v < 0: transient read error — try the next backend. */
         }
 
         /* Already initialized — record the address. */
@@ -268,8 +305,8 @@ int pgwt_handle_fork(struct pgwt_daemon *d, pid_t child_pid)
                                              bootstrap_prog_fd);
     if (be->bootstrap_fd < 0) {
         /* Race: child may have already exited or initialized.
-         * Try direct init path. */
-        uint64_t ptr = pgwt_read_pointer(child_pid, d->my_wait_ptr_addr);
+         * Try direct init path (version-aware address resolution). */
+        uint64_t ptr = pgwt_resolve_backend_wait_addr(d, child_pid);
         if (ptr != 0) {
             return pgwt_handle_init(d, child_pid, ptr);
         }
@@ -305,6 +342,25 @@ int pgwt_handle_init(struct pgwt_daemon *d, pid_t pid, uint64_t addr)
     if (be->wp_fd >= 0) {
         pgwt_close_watchpoint(be->wp_fd);
         be->wp_fd = -1;
+    }
+
+    /* Runtime offset validation (PG<17 MyProc path), once. Covers the case
+     * where PG was idle at daemon start (scan validated nothing) and the
+     * first backend arrives via bootstrap→init. A garbage class byte means
+     * the offset is wrong — refuse rather than trace nonsense. */
+    if (d->use_myproc && !d->wait_offset_validated) {
+        int v = pgwt_validate_wait_addr(pid, addr);
+        if (v == 0) {
+            fprintf(stderr,
+                    "FATAL: resolved wait_event_info for PID %d holds a value "
+                    "with an invalid wait-event class byte.\n"
+                    "  offsetof(PGPROC, wait_event_info)=%d is likely wrong for "
+                    "this PG%d build — refusing to attach.\n",
+                    pid, d->pgproc_wait_offset, d->pg_major_version);
+            return -1;
+        }
+        if (v == 1)
+            d->wait_offset_validated = true;
     }
 
     /* Attach real watchpoint on PGPROC->wait_event_info */

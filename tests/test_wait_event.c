@@ -251,6 +251,49 @@ static void test_dynamic_name_mapping(void)
     CHECK_NAME(WEI(PG_WAIT_LOCK, 12), "Lock:zzznewlock");
 }
 
+/* PG13 has different wait-event enum orderings than 17/18; pgwt_init_event_names(13)
+ * swaps in the generated PG13 tables (src/wait_event_pg13.inc). Spot-check the
+ * classes that differ most (IO, LWLock, IPC, Activity, Client, Timeout) plus
+ * the Lock class which is shared. Offsets verified against PG13.23 headers. */
+static void test_pg13_names(void)
+{
+    printf("--- PG13 tables ---\n");
+    pgwt_init_event_names(13);
+
+    /* IO: PG13 enum starts at BufFileRead (no Aio/Basebackup events of 17/18). */
+    CHECK_NAME(WEI(PG_WAIT_IO, 0),  "IO:BufFileRead");
+    CHECK_NAME(WEI(PG_WAIT_IO, 13), "IO:DataFileRead");
+    CHECK_NAME(WEI(PG_WAIT_IO, 32), "IO:RelationMapSync");  /* PG17 renamed -> Replace */
+    CHECK_NAME(WEI(PG_WAIT_IO, 67), "IO:WalWrite");
+
+    /* Timeout: PG13 ordering (PgSleep at id 1, not 2 as in PG17/18). */
+    CHECK_NAME(WEI(PG_WAIT_TIMEOUT, 1), "Timeout:PgSleep");
+
+    /* Activity: PG13 includes PgStatMain (removed in PG15). */
+    CHECK_NAME(WEI(PG_WAIT_ACTIVITY, 0), "Activity:ArchiverMain");
+    CHECK_NAME(WEI(PG_WAIT_ACTIVITY, 7), "Activity:PgStatMain");
+
+    /* Client: PG13 spells WalSenderWaitWal (PG17 -> WaitForWal). */
+    CHECK_NAME(WEI(PG_WAIT_CLIENT, 0), "Client:ClientRead");
+    CHECK_NAME(WEI(PG_WAIT_CLIENT, 7), "Client:WalSenderWaitWal");
+
+    /* IPC: PG13 ordering, BgWorkerShutdown casing. */
+    CHECK_NAME(WEI(PG_WAIT_IPC, 1), "IPC:BgWorkerShutdown");
+
+    /* LWLock: PG13 individual locks + tranches (NUM_INDIVIDUAL_LWLOCKS=48). */
+    CHECK_NAME(WEI(PG_WAIT_LWLOCK, 4),  "LWLock:ProcArray");
+    CHECK_NAME(WEI(PG_WAIT_LWLOCK, 11), "LWLock:XactSLRU");   /* SLRU was individual in PG13 */
+    CHECK_NAME(WEI(PG_WAIT_LWLOCK, 55), "LWLock:WALInsert");  /* first tranche after 48 base + ... */
+    CHECK_NAME(WEI(PG_WAIT_LWLOCK, 62), "LWLock:LockManager");
+
+    /* Lock class is identical to 17/18 (LockTagType 0..10). */
+    CHECK_NAME(WEI(PG_WAIT_LOCK, 0),  "Lock:relation");
+    CHECK_NAME(WEI(PG_WAIT_LOCK, 10), "Lock:advisory");
+
+    /* Restore PG18 tables for subsequent tests. */
+    pgwt_init_event_names(18);
+}
+
 int main(void)
 {
     printf("=== test_wait_event ===\n");
@@ -265,6 +308,7 @@ int main(void)
     test_ipc_events();
     test_bufferpin();
     test_extension();
+    test_pg13_names();
     test_unknown_fallbacks();
     test_dynamic_name_mapping();  /* must run last: sets dyn_loaded */
 

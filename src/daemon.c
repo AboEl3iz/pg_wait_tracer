@@ -231,6 +231,10 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
     /* Set rodata constants before loading */
     d->skel->rodata->target_postmaster_pid = d->postmaster_pid;
     d->skel->rodata->my_wait_ptr_addr = d->my_wait_ptr_addr;
+    /* PG<17: my_wait_ptr_addr is MyProc (PGPROC*); on_bootstrap adds this
+     * offset to *MyProc to reach wait_event_info. 0 on PG17+. */
+    d->skel->rodata->pgproc_wait_offset =
+        d->use_myproc ? (uint32_t)d->pgproc_wait_offset : 0;
     d->skel->rodata->my_be_entry_addr = d->my_be_entry_addr;
     d->skel->rodata->st_query_id_offset = d->st_query_id_offset;
     d->skel->rodata->lightweight_mode = d->lightweight_mode;
