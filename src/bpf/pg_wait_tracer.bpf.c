@@ -38,6 +38,15 @@ volatile const u32 lightweight_mode = 0;   /* 0=full trace, 1=lightweight (no ri
 volatile const u32 skip_query_id = 0;      /* 1=skip query_id reads (saves 1 probe_read) */
 volatile const u64 debug_query_string_addr = 0; /* VA of debug_query_string global */
 
+/* PG13 query attribution (Route B1): ExecutorStart(QueryDesc*) uprobe walks
+ * QueryDesc->plannedstmt->queryId (populated by pg_stat_statements' hook) into
+ * the state_map query_id slot. 0 => disabled (the PG17+ pgstat_report_query_id
+ * uprobe is used instead). Offsets are header-derived (postgresql13-devel). */
+volatile const u32 pg13_query_attr = 0;          /* 1 = ExecutorStart path active */
+volatile const u32 pg13_qd_plannedstmt_off = 0;  /* offsetof(QueryDesc, plannedstmt) */
+volatile const u32 pg13_ps_queryid_off = 0;      /* offsetof(PlannedStmt, queryId) */
+volatile const u32 pg13_qd_sourcetext_off = 0;   /* offsetof(QueryDesc, sourceText) */
+
 /* ── Maps ─────────────────────────────────────────────────── */
 
 /* Per-PID state: last event + timestamp for duration computation.
@@ -463,6 +472,80 @@ int on_report_query_id(struct pt_regs *ctx)
     }
 
     /* Mark as seen */
+    u8 one = 1;
+    bpf_map_update_elem(&seen_query_ids, &query_id, &one, BPF_ANY);
+
+    return 0;
+}
+
+/* ── Program 10: uprobe on ExecutorStart (PG13 query attribution) ──
+ * PG13 has no in-core query_id and no pgstat_report_query_id. When
+ * pg_stat_statements is loaded its post_parse_analyze hook populates
+ * PlannedStmt.queryId (matching pg_stat_statements.queryid) before
+ * ExecutorStart fires. arg0 = QueryDesc *queryDesc; walk
+ *   queryDesc->plannedstmt (+pg13_qd_plannedstmt_off)
+ *           ->queryId       (+pg13_ps_queryid_off, uint64)
+ * and store it in the SAME state_map slot the PG17+ uprobe uses, so the
+ * watchpoint (full tier) and sampler (sampled tier) pick it up unchanged.
+ * One uprobe per query, not per event. Query text comes from
+ * queryDesc->sourceText (a const char*), captured once per query_id. */
+
+SEC("uprobe")
+int on_executor_start(struct pt_regs *ctx)
+{
+    if (!pg13_query_attr)
+        return 0;
+
+    u64 query_desc = PT_REGS_PARM1(ctx);
+    if (!query_desc)
+        return 0;
+
+    /* queryDesc->plannedstmt */
+    u64 planned = 0;
+    bpf_probe_read_user(&planned, sizeof(planned),
+                        (void *)(query_desc + pg13_qd_plannedstmt_off));
+    if (!planned)
+        return 0;
+
+    /* plannedstmt->queryId (uint64). With pgss loaded this is set; without it
+     * the field is 0, so we leave the slot untouched (query attribution stays
+     * "unavailable" rather than reporting a bogus 0 id). */
+    u64 query_id = 0;
+    bpf_probe_read_user(&query_id, sizeof(query_id),
+                        (void *)(planned + pg13_ps_queryid_off));
+    if (!query_id)
+        return 0;
+
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    struct pgwt_pid_state *st = bpf_map_lookup_elem(&state_map, &pid);
+    if (st)
+        st->last_query_id = query_id;
+
+    /* Capture query text on first occurrence of this query_id, from
+     * queryDesc->sourceText. Emitted via lifecycle_rb (metadata, not trace
+     * data) — same consumer as the PG17+ debug_query_string path. */
+    if (lightweight_mode || skip_query_id || !pg13_qd_sourcetext_off)
+        return 0;
+
+    if (bpf_map_lookup_elem(&seen_query_ids, &query_id))
+        return 0;  /* already captured text for this query_id */
+
+    u64 src_ptr = 0;
+    bpf_probe_read_user(&src_ptr, sizeof(src_ptr),
+                        (void *)(query_desc + pg13_qd_sourcetext_off));
+    if (!src_ptr)
+        return 0;
+
+    struct pgwt_query_text_event *evt;
+    evt = bpf_ringbuf_reserve(&lifecycle_rb, sizeof(*evt), 0);
+    if (evt) {
+        evt->type = PGWT_LIFECYCLE_QUERY_TEXT;
+        evt->pid = pid;
+        evt->query_id = query_id;
+        bpf_probe_read_user_str(evt->text, sizeof(evt->text), (void *)src_ptr);
+        bpf_ringbuf_submit(evt, 0);
+    }
+
     u8 one = 1;
     bpf_map_update_elem(&seen_query_ids, &query_id, &one, BPF_ANY);
 
