@@ -207,6 +207,26 @@ static const char *io_events_pg17[] = {
 static const char **io_events = io_events_pg18;
 static int io_events_max = IO_EVENTS_PG18_MAX;
 
+#include "wait_event_pg13.inc"   /* GENERATED PG13 tables (see tools/) */
+
+/* Active per-class table pointers + maxima (set by pgwt_init_event_names).
+ * Default to the PG17/18-shared tables defined below this point; PG13 swaps
+ * in the generated PG13 tables. Forward declarations of the default tables
+ * appear further down — these are assigned in pgwt_init_event_names(), which
+ * runs after all tables are defined, so no forward-reference issue. The Lock
+ * class is identical on PG13 (LockTagType 0..10), so it always uses
+ * lock_events. */
+static const char **lwlock_events_active;
+static int          lwlock_events_active_max;
+static const char **timeout_events_active;
+static int          timeout_events_active_max;
+static const char **activity_events_active;
+static int          activity_events_active_max;
+static const char **client_events_active;
+static int          client_events_active_max;
+static const char **ipc_events_active;
+static int          ipc_events_active_max;
+
 /* ── Lock Events (class 0x03) ────────────────────────────── */
 /* Lock types match LockTagType enum, 0-indexed */
 static const char *lock_events[] = {
@@ -448,7 +468,40 @@ static const char *lwlock_tranches[] = {
 void pgwt_init_event_names(int pg_major)
 {
     pg_version = pg_major;
+
+    /* Default the non-IO classes to the PG17/18-shared tables. PG13 overrides
+     * below; for PG14/15/16 these shared tables are a best-effort fallback
+     * (their enum orderings mostly match 17 for the stable classes — a later
+     * PR adds exact 14/15/16 tables, see D2). */
+    lwlock_events_active     = lwlock_tranches;
+    lwlock_events_active_max = LWLOCK_TRANCHES_MAX;
+    timeout_events_active    = timeout_events;
+    timeout_events_active_max = TIMEOUT_EVENTS_MAX;
+    activity_events_active   = activity_events;
+    activity_events_active_max = ACTIVITY_EVENTS_MAX;
+    client_events_active     = client_events;
+    client_events_active_max = CLIENT_EVENTS_MAX;
+    ipc_events_active        = ipc_events;
+    ipc_events_active_max    = IPC_EVENTS_MAX;
+
     switch (pg_major) {
+    case 13:
+        /* PG13 enum orderings differ from 17/18 across IO, LWLock, IPC,
+         * Activity, Client and Timeout. Use the generated PG13 tables. The
+         * Lock class (LockTagType 0..10) is identical, so lock_events stays. */
+        io_events                  = io_events_pg13;
+        io_events_max              = IO_EVENTS_PG13_MAX;
+        lwlock_events_active       = lwlock_tranches_pg13;
+        lwlock_events_active_max   = LWLOCK_TRANCHES_PG13_MAX;
+        timeout_events_active      = timeout_events_pg13;
+        timeout_events_active_max  = TIMEOUT_EVENTS_PG13_MAX;
+        activity_events_active     = activity_events_pg13;
+        activity_events_active_max = ACTIVITY_EVENTS_PG13_MAX;
+        client_events_active       = client_events_pg13;
+        client_events_active_max   = CLIENT_EVENTS_PG13_MAX;
+        ipc_events_active          = ipc_events_pg13;
+        ipc_events_active_max      = IPC_EVENTS_PG13_MAX;
+        break;
     case 17:
         io_events = io_events_pg17;
         io_events_max = IO_EVENTS_PG17_MAX;
@@ -510,19 +563,24 @@ const char *pgwt_event_name(uint32_t wei)
         name = lookup0(lock_events, LOCK_EVENTS_MAX, id);
         return name ? name : NULL;
     case PG_WAIT_TIMEOUT:
-        name = lookup0(timeout_events, TIMEOUT_EVENTS_MAX, id);
+        name = lookup0(timeout_events_active ? timeout_events_active : timeout_events,
+                       timeout_events_active ? timeout_events_active_max : TIMEOUT_EVENTS_MAX, id);
         return name ? name : NULL;
     case PG_WAIT_ACTIVITY:
-        name = lookup0(activity_events, ACTIVITY_EVENTS_MAX, id);
+        name = lookup0(activity_events_active ? activity_events_active : activity_events,
+                       activity_events_active ? activity_events_active_max : ACTIVITY_EVENTS_MAX, id);
         return name ? name : NULL;
     case PG_WAIT_CLIENT:
-        name = lookup0(client_events, CLIENT_EVENTS_MAX, id);
+        name = lookup0(client_events_active ? client_events_active : client_events,
+                       client_events_active ? client_events_active_max : CLIENT_EVENTS_MAX, id);
         return name ? name : NULL;
     case PG_WAIT_IPC:
-        name = lookup0(ipc_events, IPC_EVENTS_MAX, id);
+        name = lookup0(ipc_events_active ? ipc_events_active : ipc_events,
+                       ipc_events_active ? ipc_events_active_max : IPC_EVENTS_MAX, id);
         return name ? name : NULL;
     case PG_WAIT_LWLOCK:
-        name = lookup0(lwlock_tranches, LWLOCK_TRANCHES_MAX, id);
+        name = lookup0(lwlock_events_active ? lwlock_events_active : lwlock_tranches,
+                       lwlock_events_active ? lwlock_events_active_max : LWLOCK_TRANCHES_MAX, id);
         return name ? name : NULL;
     case PG_WAIT_BUFFERPIN:
         return "BufferPin";
