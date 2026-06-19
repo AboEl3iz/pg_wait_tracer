@@ -87,7 +87,15 @@ struct pgwt_daemon {
 
     /* Configuration */
     pid_t       postmaster_pid;
+    /* Address of the global the daemon dereferences to reach each backend's
+     * wait_event_info. On PG17+ this is `my_wait_event_info` (a uint32* that
+     * already points AT the field). On PG<17 (use_myproc=true) it is the
+     * `MyProc` PGPROC* global; dereferencing it yields the backend's PGPROC,
+     * to which pgproc_wait_offset is added to reach wait_event_info. */
     uint64_t    my_wait_ptr_addr;
+    bool        use_myproc;          /* PG<17: my_wait_ptr_addr is MyProc (PGPROC*) */
+    int         pgproc_wait_offset;  /* offsetof(PGPROC, wait_event_info); 0 if N/A */
+    bool        wait_offset_validated; /* PG<17: a resolved addr held a sane value */
     uint64_t    my_be_entry_addr; /* address of MyBEEntry (for query_id) */
     int         interval;         /* seconds */
     int         duration;         /* seconds, 0 = unlimited */

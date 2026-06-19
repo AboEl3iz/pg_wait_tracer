@@ -237,11 +237,12 @@ int pgwt_sampler_poll(struct pgwt_daemon *d)
             continue;
         /* In sampled mode no bootstrap watchpoint resolves wp_addr, so a
          * freshly-forked backend arrives with wp_addr == 0. Lazily resolve
-         * it by dereferencing the my_wait_event_info global in that backend
-         * (same VA in every backend; the deref gives its own PGPROC slot).
-         * Skip this tick if the backend hasn't set the pointer yet. */
+         * it via the version-appropriate path (PG17+ my_wait_event_info
+         * global; PG<17 MyProc + offset — same global VA in every backend,
+         * the deref gives that backend's own PGPROC slot). Skip this tick if
+         * the backend hasn't set the pointer yet. */
         if (be->wp_addr == 0) {
-            be->wp_addr = pgwt_read_pointer(be->pid, d->my_wait_ptr_addr);
+            be->wp_addr = pgwt_resolve_backend_wait_addr(d, be->pid);
             if (be->wp_addr == 0)
                 continue;
             /* First time we resolved this backend — seed its state_map entry

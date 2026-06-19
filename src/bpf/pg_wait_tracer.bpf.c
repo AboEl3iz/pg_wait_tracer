@@ -27,6 +27,11 @@
 /* ── Constants from userspace (set before load via .rodata) ── */
 volatile const u32 target_postmaster_pid = 0;
 volatile const u64 my_wait_ptr_addr = 0;
+/* PG<17 (MyProc path): my_wait_ptr_addr is the MyProc PGPROC* global, not a
+ * uint32* pointing at the field. on_bootstrap reads *MyProc (the backend's
+ * PGPROC) and adds this offset to reach wait_event_info. 0 on PG17+ (the
+ * global already points at the field). */
+volatile const u32 pgproc_wait_offset = 0;
 volatile const u64 my_be_entry_addr = 0;  /* address of MyBEEntry global */
 volatile const u32 st_query_id_offset = 0; /* offsetof(PgBackendStatus, st_query_id) */
 volatile const u32 lightweight_mode = 0;   /* 0=full trace, 1=lightweight (no ringbuf) */
@@ -256,12 +261,15 @@ int on_bootstrap(struct bpf_perf_event_data *ctx)
     bpf_probe_read_user(&ptr, sizeof(ptr), (void *)my_wait_ptr_addr);
 
     if (ptr != 0) {
+        /* PG17+: ptr already points at wait_event_info (offset 0).
+         * PG<17: ptr is the backend's PGPROC; add the field offset. */
+        u64 wait_addr = ptr + pgproc_wait_offset;
         struct pgwt_lifecycle_event *ev;
         ev = bpf_ringbuf_reserve(&lifecycle_rb, sizeof(*ev), 0);
         if (ev) {
             ev->type = PGWT_LIFECYCLE_INIT;
             ev->pid = pid;
-            ev->addr = ptr;
+            ev->addr = wait_addr;
             ev->timestamp = bpf_ktime_get_ns();
             bpf_ringbuf_submit(ev, 0);
         }

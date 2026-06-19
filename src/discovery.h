@@ -37,6 +37,26 @@ int pgwt_detect_pg_version(const char *pg_binary);
  * Returns offset in bytes, or 0 if unavailable. */
 int pgwt_detect_query_id_offset(const char *pg_binary, int pg_major);
 
+/* offsetof(PGPROC, wait_event_info) for a given PG major version on x86_64.
+ * Used on PG<17, where the daemon resolves the MyProc (PGPROC*) global and
+ * adds this offset to reach each backend's wait_event_info. Header-derived
+ * (postgresql<major>-devel), since PG13 has no debuginfo anywhere. Returns 0
+ * if the version is unknown (caller refuses to attach). */
+int pgwt_detect_pgproc_wait_offset(int pg_major);
+
+/* Resolve a backend's wait_event_info address from the MyProc PGPROC* global.
+ * Reads *my_proc_global_addr from /proc/<pid>/mem to get the backend's PGPROC,
+ * then adds pgproc_wait_offset. Returns 0 if MyProc is not yet set (backend
+ * still in early init) or on read error. */
+uint64_t pgwt_resolve_wait_addr_via_myproc(pid_t pid, uint64_t my_proc_global_addr,
+                                           int pgproc_wait_offset);
+
+/* Validate that a resolved wait_event_info address holds a plausible value:
+ * the class byte must be CPU (0) or a known wait-event class (0x01..0x0B).
+ * Guards against a wrong offset (custom build) producing garbage. Returns 1
+ * if valid, 0 if the value looks like garbage, -1 on read error. */
+int pgwt_validate_wait_addr(pid_t pid, uint64_t wait_addr);
+
 /* Detect st_activity_raw offset in PgBackendStatus.
  * Tries: 1) DWARF debug info, 2) known offset table.
  * Returns offset in bytes, or 0 if unavailable.

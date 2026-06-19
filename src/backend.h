@@ -51,6 +51,11 @@ int pgwt_handle_exit(struct pgwt_daemon *d, pid_t pid);
 int pgwt_attach_backend_watchpoint(struct pgwt_daemon *d,
                                    struct pgwt_backend *be);
 
+/* Resolve a backend's wait_event_info address using the version-appropriate
+ * path (PG17+ my_wait_event_info global vs PG<17 MyProc+offset). Returns 0 if
+ * the backend has not yet set the pointer (still in early init). */
+uint64_t pgwt_resolve_backend_wait_addr(struct pgwt_daemon *d, pid_t pid);
+
 /* Find backend by PID. Returns NULL if not found. */
 struct pgwt_backend *pgwt_find_backend(struct pgwt_backend_table *bt, pid_t pid);
 
