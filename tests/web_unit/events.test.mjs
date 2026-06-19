@@ -71,3 +71,30 @@ test('single row -> stable', () => {
     assert.equal(m.table.rows.length, 1);
     assert.equal(m.table.rows[0].row.name, 'Solo');
 });
+
+// %DB column is index 8 (name,count,total_ms,avg_us,p50,p95,p99,max,pct,aas).
+const PCT_COL = 8;
+
+test('idle event with pct=null renders "—" for %DB, not a bar', () => {
+    // Client:ClientRead is idle (excluded from DB Time): server sends
+    // pct=null, the cell must show an em-dash rather than a bogus pct-bar.
+    const m = buildEventsModel({ rows: [
+        ev({ name: 'Client:ClientRead', event_id: 0x06000000,
+             count: 100, total_ms: 5000, pct: null }),
+    ] }, null);
+    const cell = m.table.rows[0].cells[PCT_COL].html;
+    assert.ok(cell.includes('—'), `expected em-dash, got: ${cell}`);
+    assert.ok(!cell.includes('pct-bar'), `should not render a bar, got: ${cell}`);
+    // The row is still visible with its time intact.
+    assert.equal(m.table.rows[0].row.total_ms, 5000);
+});
+
+test('non-idle event with numeric pct still renders a pct-bar', () => {
+    const m = buildEventsModel({ rows: [
+        ev({ name: 'IO:DataFileRead', event_id: 0x01000015,
+             count: 100, total_ms: 2100, pct: 16.8 }),
+    ] }, null);
+    const cell = m.table.rows[0].cells[PCT_COL].html;
+    assert.ok(cell.includes('pct-bar'), `expected pct-bar, got: ${cell}`);
+    assert.ok(cell.includes('16.8%'), `expected 16.8%, got: ${cell}`);
+});

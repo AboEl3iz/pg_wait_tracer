@@ -5,6 +5,13 @@
 #include "pg_wait_tracer.h"
 #include <stdint.h>
 
+/* Sentinel for %DB of idle-but-visible events (e.g. Client:ClientRead).
+ * %DB = "share of DB Time" and applies only to non-idle (DB-Time) events;
+ * idle events have time but no meaningful share, so their pct_db is set to
+ * this sentinel and rendered as "—" (em-dash) / null (JSON). */
+#define PGWT_PCT_DB_IDLE (-1.0)
+#define PGWT_PCT_DB_IS_IDLE(p) ((p) < 0.0)
+
 /* ── Wait classes (same order as Rust WaitClass enum) ──────── */
 
 #define PGWT_NUM_CLASSES 11

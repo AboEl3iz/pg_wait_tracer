@@ -181,6 +181,18 @@ _CANNED["top_events"] = {
          "p95_us": 80, "p99_us": 200, "max_us": 5000, "pct": 2.4, "aas": 0.08},
     ],
 }
+# NOTE on the idle-but-visible %DB shape:
+# The real server emits pct=null for idle-but-visible events (Client:ClientRead)
+# in top_events — %DB is "share of DB Time" and idle time is not part of DB
+# Time, so a numeric %DB is meaningless (see src/server.c handle_top_events).
+# We deliberately do NOT add such a row to this canned top_events dataset:
+# the visual-snapshot baselines (tests/web_snapshots/*.png, GATING in CI and
+# regenerated only via workflow_dispatch) are keyed to this exact layout, and
+# adding a row would change the rendered table height. The null-pct -> "—"
+# rendering is covered deterministically by the Node builder unit test
+# (tests/web_unit/events.test.mjs) and end-to-end against the real server by
+# tests/test_data_idle.py. protocol-drift stays consistent because a null
+# field merges optionally into the same numeric schema (test_protocol_drift.py).
 
 _CANNED["top_sessions"] = {
     "rows": [

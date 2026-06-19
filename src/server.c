@@ -1180,7 +1180,12 @@ static void handle_top_events(struct pgwt_server *srv, struct pgwt_request *req)
         cJSON_AddNumberToObject(r, "p95_us", res.rows[i].p95_us);
         cJSON_AddNumberToObject(r, "p99_us", res.rows[i].p99_us);
         cJSON_AddNumberToObject(r, "max_us", res.rows[i].max_us);
-        cJSON_AddNumberToObject(r, "pct", res.rows[i].pct_db);
+        /* Idle-but-visible events (Client:ClientRead) have no meaningful
+         * share of DB Time; emit null so the client renders "—". */
+        if (PGWT_PCT_DB_IS_IDLE(res.rows[i].pct_db))
+            cJSON_AddNullToObject(r, "pct");
+        else
+            cJSON_AddNumberToObject(r, "pct", res.rows[i].pct_db);
         cJSON_AddNumberToObject(r, "aas", res.rows[i].aas);
         cJSON_AddItemToArray(rows, r);
     }
@@ -2421,8 +2426,14 @@ static void dump_summary(struct pgwt_server *srv)
     int n = ev.num_rows < 15 ? ev.num_rows : 15;
     for (int i = 0; i < n; i++) {
         struct pgwt_event_row *r = &ev.rows[i];
-        printf("  %-28s %10llu %12.1f %10.1f %7.1f%%\n",
-               r->name, (unsigned long long)r->count, r->total_ms, r->avg_us, r->pct_db);
+        char pctbuf[16];
+        /* Idle-but-visible events: time but no meaningful %DB share. */
+        if (PGWT_PCT_DB_IS_IDLE(r->pct_db))
+            snprintf(pctbuf, sizeof(pctbuf), "%8s", "—");
+        else
+            snprintf(pctbuf, sizeof(pctbuf), "%7.1f%%", r->pct_db);
+        printf("  %-28s %10llu %12.1f %10.1f %s\n",
+               r->name, (unsigned long long)r->count, r->total_ms, r->avg_us, pctbuf);
     }
     free(ev.rows);
 

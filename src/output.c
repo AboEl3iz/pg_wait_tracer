@@ -16,6 +16,20 @@
 static double ns_to_ms(uint64_t ns) { return (double)ns / 1e6; }
 static double ns_to_us(uint64_t ns) { return (double)ns / 1e3; }
 
+/* Format a "% DB" cell into buf. %DB = share of DB Time and applies only to
+ * non-idle (DB-Time) events; idle-but-visible events (e.g. Client:ClientRead)
+ * have time but no meaningful share, so they render as "—" (matching the
+ * "(Activity/Idle — excluded from DB Time)" bucket). pct is the precomputed
+ * percentage for non-idle rows. width is the field width (right-aligned). */
+static void fmt_pct_db(char *buf, size_t bufsz, int width,
+                       uint32_t wait_event, double pct)
+{
+    if (pgwt_is_idle_event(wait_event))
+        snprintf(buf, bufsz, "%*s", width, "—");
+    else
+        snprintf(buf, bufsz, "%*.1f%%", width - 1, pct);
+}
+
 /* ── Multi-window helpers ───────────────────────────────── */
 
 static void format_window_label(int secs, char *buf, size_t bufsz)
@@ -220,8 +234,10 @@ static void print_time_model_multi(struct pgwt_daemon *d)
                 if (!valid[w]) { printf(" %9s %7s", "-", "-"); continue; }
                 uint64_t db = deltas[w].tm.db_time_ns;
                 uint64_t ev_ns = find_snap_event_ns(&deltas[w], top[t].we);
-                printf(" %9.1f %6.1f%%", ns_to_ms(ev_ns),
-                       db ? 100.0 * ev_ns / db : 0);
+                char pctcell[16];
+                fmt_pct_db(pctcell, sizeof(pctcell), 7, top[t].we,
+                           db ? 100.0 * ev_ns / db : 0);
+                printf(" %9.1f %s", ns_to_ms(ev_ns), pctcell);
             }
             printf("\n");
         }
@@ -334,8 +350,11 @@ void pgwt_print_time_model(struct pgwt_daemon *d)
         for (int t = 0; t < ntop; t++) {
             char name[64];
             pgwt_event_full_name(top[t].we, name, sizeof(name));
-            printf("      %-32s %12.1f %9.1f%%\n", name,
-                   ns_to_ms(top[t].total_ns), 100.0 * top[t].total_ns / db);
+            char pctcell[16];
+            fmt_pct_db(pctcell, sizeof(pctcell), 9, top[t].we,
+                       100.0 * top[t].total_ns / db);
+            printf("      %-32s %12.1f %s\n", name,
+                   ns_to_ms(top[t].total_ns), pctcell);
         }
     }
 
@@ -432,12 +451,15 @@ static void print_system_event_multi(struct pgwt_daemon *d)
             double avg_us = ev->count ?
                 ns_to_us(ev->total_ns) / ev->count : 0;
 
-            printf("  %-26s %12lu %14.1f %10.1f %8.1f%%\n",
+            char pctcell[16];
+            fmt_pct_db(pctcell, sizeof(pctcell), 9, ev->wait_event,
+                       db ? 100.0 * ev->total_ns / db : 0);
+            printf("  %-26s %12lu %14.1f %10.1f %s\n",
                    name,
                    (unsigned long)ev->count,
                    ns_to_ms(ev->total_ns),
                    avg_us,
-                   db ? 100.0 * ev->total_ns / db : 0);
+                   pctcell);
             shown++;
         }
         printf("\n");
@@ -490,13 +512,16 @@ void pgwt_print_system_event(struct pgwt_daemon *d)
         double avg_us = sorted[i].count ?
             ns_to_us(sorted[i].total_ns) / sorted[i].count : 0;
 
-        printf("  %-26s %12lu %14.1f %10.1f %12.1f %8.1f%%\n",
+        char pctcell[16];
+        fmt_pct_db(pctcell, sizeof(pctcell), 9, sorted[i].wait_event,
+                   db ? 100.0 * sorted[i].total_ns / db : 0);
+        printf("  %-26s %12lu %14.1f %10.1f %12.1f %s\n",
                name,
                (unsigned long)sorted[i].count,
                ns_to_ms(sorted[i].total_ns),
                avg_us,
                ns_to_us(sorted[i].max_ns),
-               db ? 100.0 * sorted[i].total_ns / db : 0);
+               pctcell);
         shown++;
     }
     free(sorted);
@@ -587,13 +612,16 @@ void pgwt_print_session_event(struct pgwt_daemon *d)
             pgwt_event_full_name(sorted[j].wait_event, name, sizeof(name));
             double avg_us = sorted[j].count ?
                 ns_to_us(sorted[j].total_ns) / sorted[j].count : 0;
-            printf("  %-26s %12lu %14.1f %10.1f %12.1f %8.1f%%\n",
+            char pctcell[16];
+            fmt_pct_db(pctcell, sizeof(pctcell), 9, sorted[j].wait_event,
+                       pa->db_time_ns ? 100.0 * sorted[j].total_ns / pa->db_time_ns : 0);
+            printf("  %-26s %12lu %14.1f %10.1f %12.1f %s\n",
                    name,
                    (unsigned long)sorted[j].count,
                    ns_to_ms(sorted[j].total_ns),
                    avg_us,
                    ns_to_us(sorted[j].max_ns),
-                   pa->db_time_ns ? 100.0 * sorted[j].total_ns / pa->db_time_ns : 0);
+                   pctcell);
         }
         printf("\n");
     }
