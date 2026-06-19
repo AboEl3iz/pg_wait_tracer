@@ -32,6 +32,7 @@ STRIP_ANSI = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
 tests_run = 0
 tests_passed = 0
 tests_failed = 0
+tests_skipped = 0
 
 
 def check(cond, msg):
@@ -45,6 +46,12 @@ def check(cond, msg):
         print(f"  FAIL: {msg}")
 
 
+def skip(msg):
+    global tests_skipped
+    tests_skipped += 1
+    print(f"  SKIP: {msg}")
+
+
 def psql(sql):
     result = subprocess.run(
         ["psql", "-U", "postgres", "-d", "postgres", "-tAc", sql],
@@ -53,27 +60,60 @@ def psql(sql):
     return result.stdout.strip()
 
 
+def wait_for_idle_in_tx(exclude_pids, timeout=30):
+    """Poll pg_stat_activity until a client backend (not in exclude_pids) is
+    'idle in transaction' parked in Client:ClientRead.  Returns its pid, or
+    None on timeout.  This is the test's precondition: never measure before
+    the backend we want to observe is actually established and parked, so the
+    result can't depend on a fixed sleep racing a loaded box."""
+    deadline = time.time() + timeout
+    excl = ",".join(str(p) for p in exclude_pids if p) or "-1"
+    sql = (
+        "SELECT pid FROM pg_stat_activity "
+        "WHERE backend_type = 'client backend' "
+        "AND state = 'idle in transaction' "
+        "AND wait_event_type = 'Client' AND wait_event = 'ClientRead' "
+        f"AND pid NOT IN ({excl}) "
+        "ORDER BY backend_start DESC LIMIT 1"
+    )
+    while time.time() < deadline:
+        out = psql(sql)
+        if out:
+            try:
+                return int(out.splitlines()[0])
+            except (ValueError, IndexError):
+                pass
+        time.sleep(0.25)
+    return None
+
+
 def parse_system_events(output):
     events = []
     for line in output.split('\n'):
         line = line.strip()
+        # Last column "% DB" is either a number ("99.5%") for DB-Time events
+        # or the em-dash sentinel ("—") for idle-but-visible events such as
+        # Client:ClientRead (see src/output.c fmt_pct_db()).  Both forms must
+        # parse, otherwise the ClientRead row — the whole point of this test —
+        # is silently dropped.
         m = re.match(
             r'^(\S+(?::\S+)?)\s+'
             r'(\d+)\s+'
             r'([\d.]+)\s+'
             r'([\d.]+)\s+'
             r'([\d.]+)\s+'
-            r'([\d.]+)%',
+            r'([\d.]+%|—)',
             line
         )
         if m:
+            pct_raw = m.group(6)
             events.append({
                 'name': m.group(1),
                 'count': int(m.group(2)),
                 'total_ms': float(m.group(3)),
                 'avg_us': float(m.group(4)),
                 'max_us': float(m.group(5)),
-                'pct': float(m.group(6)),
+                'pct': None if pct_raw == '—' else float(pct_raw.rstrip('%')),
             })
     return events
 
@@ -99,7 +139,20 @@ def test_client_read_visible_but_idle(pm_pid):
     but does NOT inflate DB Time (idle for load accounting)."""
     print("--- Test 1: Client:ClientRead visible but excluded from DB Time ---")
 
-    # Start psql idle-in-transaction FIRST — before tracer
+    # Record any pre-existing idle-in-tx backends (e.g. leftovers from a prior
+    # benchmark in a full-suite run) so we can identify OUR backend specifically
+    # and not be fooled by — or attribute load to — someone else's.
+    pre_existing = set()
+    try:
+        out = psql("SELECT pid FROM pg_stat_activity "
+                   "WHERE state = 'idle in transaction'")
+        pre_existing = {int(p) for p in out.split() if p.strip().isdigit()}
+    except (subprocess.TimeoutExpired, Exception):
+        pass
+
+    # Start psql idle-in-transaction FIRST — before tracer.  Keep its
+    # connection open (do NOT close stdin) for the whole capture window so the
+    # backend stays parked in Client:ClientRead the entire time.
     psql_proc = subprocess.Popen(
         ["psql", "-U", "postgres", "-d", "postgres"],
         stdin=subprocess.PIPE,
@@ -108,7 +161,30 @@ def test_client_read_visible_but_idle(pm_pid):
     )
     psql_proc.stdin.write(b"BEGIN;\n")
     psql_proc.stdin.flush()
-    time.sleep(2)  # let backend enter Client:ClientRead
+
+    # Precondition: do not start measuring until our backend is actually
+    # established and parked idle-in-transaction in Client:ClientRead.  A fixed
+    # sleep raced a loaded box (backend not yet connected/parked), which made
+    # the ClientRead row absent through no fault of the tracer.
+    idle_pid = wait_for_idle_in_tx(pre_existing, timeout=30)
+    if idle_pid is None:
+        # Genuinely could not set up the precondition — skip, don't fail.
+        skip("could not establish idle-in-transaction backend parked in "
+             "Client:ClientRead within 30s (box too loaded to set up); "
+             "not a tracer failure")
+        try:
+            psql_proc.stdin.write(b"END;\n")
+            psql_proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+        psql_proc.terminate()
+        try:
+            psql_proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            psql_proc.kill()
+        return
+    print(f"  (idle-in-transaction backend pid={idle_pid} parked in "
+          f"Client:ClientRead)")
 
     INTERVAL = 8
 
@@ -150,10 +226,11 @@ def test_client_read_visible_but_idle(pm_pid):
     except subprocess.TimeoutExpired:
         psql_proc.kill()
 
-    # Kill any lingering idle-in-transaction backends
+    # Terminate only OUR idle-in-transaction backend if it lingers; never
+    # touch other backends (a concurrent suite/benchmark may own theirs).
     try:
-        psql("SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-             "WHERE pid != pg_backend_pid() AND state = 'idle in transaction'")
+        psql(f"SELECT pg_terminate_backend({idle_pid}) FROM pg_stat_activity "
+             f"WHERE pid = {idle_pid} AND state = 'idle in transaction'")
     except (subprocess.TimeoutExpired, Exception):
         pass
     time.sleep(1)
@@ -231,7 +308,10 @@ def main():
 
     test_client_read_visible_but_idle(pm_pid)
 
-    print(f"\n{tests_passed}/{tests_run} tests passed")
+    summary = f"\n{tests_passed}/{tests_run} tests passed"
+    if tests_skipped:
+        summary += f" ({tests_skipped} skipped)"
+    print(summary)
     sys.exit(0 if tests_failed == 0 else 1)
 
 

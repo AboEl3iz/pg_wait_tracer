@@ -131,20 +131,45 @@ def test_backend_coverage(pm_pid):
     """Test that tracer sees all backends that pg_stat_activity reports."""
     print("--- Backend Coverage ---")
 
-    pg_backends = get_pg_backends()
-    check(len(pg_backends) > 0, "pg_stat_activity should return backends")
+    # Transient-PID race guard:
+    #   The tracer takes its session snapshot at one instant, while
+    #   pg_stat_activity is read separately. A short-lived client backend can
+    #   appear in one source and vanish from the other purely because it
+    #   connected or disconnected between the two reads — that is not a tracer
+    #   bug, just timing.
+    #
+    #   To stay robust without weakening the real cross-check, we read
+    #   pg_stat_activity BOTH before and after the tracer window and only
+    #   require PIDs that are STABLY present (in both reads, i.e. alive for the
+    #   whole tracer window) to show up in the tracer. PIDs present in only one
+    #   read are in-flight/transient and are tolerated. The substantive
+    #   assertion — that the tracer sees the backends pg_stat_activity reports —
+    #   is still enforced for every stable backend.
+    pg_backends_before = get_pg_backends()
+    check(len(pg_backends_before) > 0, "pg_stat_activity should return backends")
 
     tracer_output = run_tracer_session_view(pm_pid)
     tracer_sessions = parse_session_pids(tracer_output)
     tracer_pids = {s['pid'] for s in tracer_sessions}
 
+    pg_backends_after = get_pg_backends()
+
     check(len(tracer_sessions) > 0, "tracer should report at least one session")
 
-    # All client backends in pg_stat_activity should appear in tracer
-    client_pids_pg = {b['pid'] for b in pg_backends if b['backend_type'] == 'client backend'}
-    for pid in client_pids_pg:
+    # Stable client backends = present in BOTH the before and after reads, so
+    # they existed across the entire tracer window and must have been observed.
+    client_pids_before = {b['pid'] for b in pg_backends_before
+                          if b['backend_type'] == 'client backend'}
+    client_pids_after = {b['pid'] for b in pg_backends_after
+                         if b['backend_type'] == 'client backend'}
+    stable_client_pids = client_pids_before & client_pids_after
+
+    check(len(stable_client_pids) > 0,
+          "at least one client backend should be stably present across the tracer window")
+
+    for pid in stable_client_pids:
         check(pid in tracer_pids,
-              f"client PID {pid} from pg_stat_activity missing in tracer")
+              f"stable client PID {pid} from pg_stat_activity missing in tracer")
 
 
 def test_backend_types(pm_pid):

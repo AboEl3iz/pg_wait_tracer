@@ -245,8 +245,9 @@ for CLIENTS in "${CLIENT_COUNTS[@]}"; do
     printf "    Mean: %s TPS (stddev: %s)\n\n" "$t_mean" "$t_stddev"
 
     # ── Overhead calculation ──
-    overhead=$(echo "scale=4; ($b_mean - $t_mean) * 100 / $b_mean" | bc)
-    overhead_display=$(echo "scale=2; $overhead / 1" | bc)
+    # Use awk (always present) for the float math so the test needs no `bc`.
+    overhead=$(awk -v bm="$b_mean" -v tm="$t_mean" 'BEGIN{printf "%.4f", (bm - tm) * 100 / bm}')
+    overhead_display=$(awk -v o="$overhead" 'BEGIN{printf "%.2f", o}')
 
     # 95% confidence interval for overhead (propagated error)
     # SE = sqrt((b_se/b_mean)^2 + (t_se/t_mean)^2) * overhead
@@ -278,7 +279,7 @@ for CLIENTS in "${CLIENT_COUNTS[@]}"; do
     OVERHEAD_PCT[$CLIENTS]=$overhead_display
 
     # Track max overhead
-    is_higher=$(echo "$overhead > $MAX_OVERHEAD" | bc)
+    is_higher=$(awk -v o="$overhead" -v m="$MAX_OVERHEAD" 'BEGIN{print (o > m) ? 1 : 0}')
     if [[ "$is_higher" -eq 1 ]]; then
         MAX_OVERHEAD=$overhead
     fi
@@ -323,23 +324,23 @@ echo ""
 
 GROSS_REGRESSION_PCT=50   # documented max is ~30%; only fail well above it
 
-MAX_OH_DISPLAY=$(echo "scale=2; $MAX_OVERHEAD / 1" | bc)
+MAX_OH_DISPLAY=$(awk -v m="$MAX_OVERHEAD" 'BEGIN{printf "%.2f", m}')
 echo "  Peak overhead: ${MAX_OH_DISPLAY}%"
 echo "  (Overhead is hardware/workload-dependent; README documents ~6% write-heavy"
 echo "   up to ~30% read-heavy. This gate only catches gross regressions"
 echo "   > ${GROSS_REGRESSION_PCT}%, not documented-normal overhead.)"
 
-result=$(echo "$MAX_OVERHEAD < 10" | bc)
+result=$(awk -v m="$MAX_OVERHEAD" 'BEGIN{print (m < 10) ? 1 : 0}')
 if [[ "$result" -eq 1 ]]; then
     echo "  PASS (< 10% — low overhead)"
     exit 0
 fi
-result=$(echo "$MAX_OVERHEAD < 30" | bc)
+result=$(awk -v m="$MAX_OVERHEAD" 'BEGIN{print (m < 30) ? 1 : 0}')
 if [[ "$result" -eq 1 ]]; then
     echo "  PASS (10-30% — within documented full-tier range)"
     exit 0
 fi
-result=$(echo "$MAX_OVERHEAD < $GROSS_REGRESSION_PCT" | bc)
+result=$(awk -v m="$MAX_OVERHEAD" -v g="$GROSS_REGRESSION_PCT" 'BEGIN{print (m < g) ? 1 : 0}')
 if [[ "$result" -eq 1 ]]; then
     echo "  PASS (30-${GROSS_REGRESSION_PCT}% — above documented max but plausible on a"
     echo "        small/loaded box; informational, review BPF program if unexpected)"
