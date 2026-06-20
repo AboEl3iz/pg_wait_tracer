@@ -240,6 +240,14 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
     d->skel->rodata->lightweight_mode = d->lightweight_mode;
     d->skel->rodata->skip_query_id = d->skip_query_id;
 
+    /* PG13 query attribution (Route B1): the ExecutorStart uprobe walks
+     * QueryDesc->plannedstmt->queryId into the state_map. Enabled only when
+     * pg_stat_statements is loaded (use_pg13_query_attr). */
+    d->skel->rodata->pg13_query_attr = d->use_pg13_query_attr ? 1 : 0;
+    d->skel->rodata->pg13_qd_plannedstmt_off = (uint32_t)d->pg13_qd_plannedstmt_off;
+    d->skel->rodata->pg13_ps_queryid_off = (uint32_t)d->pg13_ps_queryid_off;
+    d->skel->rodata->pg13_qd_sourcetext_off = (uint32_t)d->pg13_qd_sourcetext_off;
+
     /* Resolve debug_query_string address for BPF query text capture */
     if (d->pg_binary_saved) {
         uint64_t dqs_addr = pgwt_find_symbol_offset(d->pg_binary_saved,
@@ -278,19 +286,45 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
     if (!d->lightweight_mode && !d->skip_usdt && d->pg_binary_saved) {
         const char *bin = d->pg_binary_saved;
 
-        /* Uprobe on pgstat_report_query_id FIRST — must be active before
-         * USDT probes fire, so EXEC_START always has a correct query_id.
-         * Captures query_id from function argument, bypassing shared memory. */
-        uint64_t qid_func_va = pgwt_find_symbol_offset(bin, "pgstat_report_query_id");
-        uint64_t qid_func_off = qid_func_va > 0x400000 ? qid_func_va - 0x400000 : qid_func_va;
-        if (qid_func_off) {
-            LIBBPF_OPTS(bpf_uprobe_opts, uprobe_opts, .retprobe = false);
-            d->skel->links.on_report_query_id =
-                bpf_program__attach_uprobe_opts(d->skel->progs.on_report_query_id,
-                                                -1, bin, qid_func_off, &uprobe_opts);
-            if (d->verbose)
-                fprintf(stderr, "INFO: pgstat_report_query_id at offset 0x%lx\n",
-                        (unsigned long)qid_func_off);
+        /* Query-id capture uprobe. Must be active before USDT probes fire so
+         * EXEC_START always has a correct query_id. Two variants:
+         *   PG14+ : pgstat_report_query_id (arg = query_id), bypassing shmem.
+         *   PG13  : no in-core query_id / no pgstat_report_query_id. Instead,
+         *           with pg_stat_statements loaded (use_pg13_query_attr),
+         *           uprobe ExecutorStart(QueryDesc*) and walk
+         *           queryDesc->plannedstmt->queryId. Feeds the SAME state_map
+         *           slot, so the sampler + watchpoint pipelines are unchanged. */
+        if (d->use_pg13_query_attr) {
+            uint64_t es_va = pgwt_find_symbol_offset(bin, "ExecutorStart");
+            uint64_t es_off = es_va > 0x400000 ? es_va - 0x400000 : es_va;
+            if (es_off) {
+                LIBBPF_OPTS(bpf_uprobe_opts, uprobe_opts, .retprobe = false);
+                d->skel->links.on_executor_start =
+                    bpf_program__attach_uprobe_opts(d->skel->progs.on_executor_start,
+                                                    -1, bin, es_off, &uprobe_opts);
+                if (d->verbose)
+                    fprintf(stderr, "INFO: ExecutorStart at offset 0x%lx "
+                            "(PG13 query attribution via pg_stat_statements)\n",
+                            (unsigned long)es_off);
+                if (!d->skel->links.on_executor_start)
+                    fprintf(stderr, "WARN: could not attach ExecutorStart uprobe "
+                            "(PG13 query attribution disabled)\n");
+            } else {
+                fprintf(stderr, "WARN: symbol 'ExecutorStart' not found "
+                        "(PG13 query attribution disabled)\n");
+            }
+        } else {
+            uint64_t qid_func_va = pgwt_find_symbol_offset(bin, "pgstat_report_query_id");
+            uint64_t qid_func_off = qid_func_va > 0x400000 ? qid_func_va - 0x400000 : qid_func_va;
+            if (qid_func_off) {
+                LIBBPF_OPTS(bpf_uprobe_opts, uprobe_opts, .retprobe = false);
+                d->skel->links.on_report_query_id =
+                    bpf_program__attach_uprobe_opts(d->skel->progs.on_report_query_id,
+                                                    -1, bin, qid_func_off, &uprobe_opts);
+                if (d->verbose)
+                    fprintf(stderr, "INFO: pgstat_report_query_id at offset 0x%lx\n",
+                            (unsigned long)qid_func_off);
+            }
         }
 
         /* USDT marker probes write into event_ringbuf, which only the FULL
@@ -316,12 +350,15 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
                                          -1, bin,
                                          "postgresql", "query__plan__done", NULL);
 
+            bool qid_attached = d->use_pg13_query_attr
+                ? (d->skel->links.on_executor_start != NULL)
+                : (d->skel->links.on_report_query_id != NULL);
             if (d->skel->links.on_exec_start && d->skel->links.on_exec_done
-                && d->skel->links.on_report_query_id)
+                && qid_attached)
                 fprintf(stderr, "INFO: attached USDT + query_id uprobe\n");
             else
                 fprintf(stderr, "WARN: could not attach query probes (lifecycle tracking disabled)\n");
-        } else if (d->skel->links.on_report_query_id) {
+        } else if (d->skel->links.on_report_query_id || d->skel->links.on_executor_start) {
             fprintf(stderr, "INFO: attached query_id uprobe (sampled mode)\n");
         }
     }

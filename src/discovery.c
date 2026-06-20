@@ -246,6 +246,60 @@ int pgwt_detect_pgproc_wait_offset(int pg_major)
     }
 }
 
+int pgwt_detect_pg13_query_offsets(int pg_major,
+                                   struct pgwt_pg13_query_offsets *out)
+{
+    if (!out)
+        return 0;
+    out->querydesc_plannedstmt = 0;
+    out->plannedstmt_queryid   = 0;
+    out->querydesc_sourcetext  = 0;
+
+    struct utsname un;
+    if (uname(&un) != 0)
+        return 0;
+    if (strcmp(un.machine, "x86_64") != 0)
+        return 0;   /* offsets are layout-/ABI-specific; only x86_64 known */
+
+    switch (pg_major) {
+    /* Header-derived via an offsetof() probe against postgresql13-devel
+     * (13.23, x86_64), confirmed against the running binary:
+     *   offsetof(QueryDesc, plannedstmt) = 8
+     *   offsetof(PlannedStmt, queryId)   = 8   (uint64)
+     *   offsetof(QueryDesc, sourceText)  = 16  (const char *)
+     * The BPF uprobe validates the walked queryId against pgss at runtime,
+     * so a wrong offset shows up as zero/garbage ids rather than a crash. */
+    case 13:
+        out->querydesc_plannedstmt = 8;
+        out->plannedstmt_queryid   = 8;
+        out->querydesc_sourcetext  = 16;
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+int pgwt_detect_pgss_loaded(pid_t postmaster_pid)
+{
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/maps", postmaster_pid);
+
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return -1;
+
+    int found = 0;
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        if (strstr(line, "pg_stat_statements")) {
+            found = 1;
+            break;
+        }
+    }
+    fclose(f);
+    return found;
+}
+
 uint64_t pgwt_resolve_wait_addr_via_myproc(pid_t pid, uint64_t my_proc_global_addr,
                                            int pgproc_wait_offset)
 {
@@ -779,36 +833,85 @@ int pgwt_discover(struct pgwt_daemon *d)
                     (unsigned long)ptr_val);
     }
 
-    /* Discover MyBEEntry address (for query_id attribution) */
+    /* Discover MyBEEntry address (for query_id attribution via PgBackendStatus,
+     * the PG14+ path). On PG13 the query_id comes from QueryDesc->plannedstmt
+     * (Route B1, resolved below), NOT from MyBEEntry — and PG13 does not export
+     * MyBEEntry in .dynsym anyway — so a missing MyBEEntry is not fatal there. */
     d->my_be_entry_addr = pgwt_resolve_symbol(binary, "MyBEEntry",
                                                pm_pid, base);
     if (d->my_be_entry_addr == 0) {
-        if (d->view == PGWT_VIEW_QUERY_EVENT) {
+        if (d->view == PGWT_VIEW_QUERY_EVENT && d->pg_major_version != 13) {
             fprintf(stderr, "FATAL: symbol 'MyBEEntry' not found — query_event view unavailable\n");
             return -1;
         }
         if (d->verbose)
-            fprintf(stderr, "WARN: symbol 'MyBEEntry' not found — query_event view disabled\n");
+            fprintf(stderr, "WARN: symbol 'MyBEEntry' not found — "
+                    "PgBackendStatus query-id path disabled\n");
     } else if (d->verbose) {
         fprintf(stderr, "INFO: MyBEEntry VA: 0x%lx\n",
                 (unsigned long)d->my_be_entry_addr);
     }
 
-    /* Detect st_query_id offset */
+    /* Detect st_query_id offset (PG14+ in-core query_id path) */
     d->st_query_id_offset = pgwt_detect_query_id_offset(binary, d->pg_major_version);
+
+    /* PG13 query attribution — Route B1 (pg_stat_statements-based).
+     * PG13 has no in-core query_id (st_query_id was added in PG14), so the
+     * detection above returns 0. Instead, if pg_stat_statements is loaded its
+     * post_parse_analyze hook populates PlannedStmt.queryId; we uprobe
+     * ExecutorStart and walk QueryDesc->plannedstmt->queryId into the same
+     * state_map slot. This is gated on pgss being loaded. */
+    if (d->use_myproc && d->pg_major_version == 13) {
+        struct pgwt_pg13_query_offsets qo;
+        int have_off = pgwt_detect_pg13_query_offsets(d->pg_major_version, &qo);
+        int pgss = pgwt_detect_pgss_loaded(pm_pid);
+        d->pgss_loaded = (pgss == 1);
+
+        if (have_off && d->pgss_loaded) {
+            d->use_pg13_query_attr      = true;
+            d->pg13_qd_plannedstmt_off  = qo.querydesc_plannedstmt;
+            d->pg13_ps_queryid_off      = qo.plannedstmt_queryid;
+            d->pg13_qd_sourcetext_off   = qo.querydesc_sourcetext;
+            if (d->verbose)
+                fprintf(stderr,
+                        "INFO: PG13 query attribution via pg_stat_statements "
+                        "(ExecutorStart uprobe; QueryDesc.plannedstmt=%d, "
+                        "PlannedStmt.queryId=%d, QueryDesc.sourceText=%d)\n",
+                        d->pg13_qd_plannedstmt_off, d->pg13_ps_queryid_off,
+                        d->pg13_qd_sourcetext_off);
+        } else if (d->view == PGWT_VIEW_QUERY_EVENT) {
+            if (!have_off)
+                fprintf(stderr,
+                        "FATAL: query_event unavailable on PG13 — no known "
+                        "query-attribution offsets for this architecture\n");
+            else
+                fprintf(stderr,
+                        "FATAL: query_event unavailable on PG13 — requires "
+                        "pg_stat_statements (not loaded in this instance).\n"
+                        "  Add pg_stat_statements to shared_preload_libraries "
+                        "and restart PostgreSQL.\n");
+            return -1;
+        } else if (d->verbose) {
+            fprintf(stderr,
+                    "INFO: PG13 query attribution unavailable (requires "
+                    "pg_stat_statements%s) — query views disabled\n",
+                    have_off ? "; not loaded" : "; unknown offsets");
+        }
+    }
+
     if (d->st_query_id_offset > 0) {
         if (d->verbose)
             fprintf(stderr, "INFO: st_query_id offset: %d (PG%d)\n",
                     d->st_query_id_offset, d->pg_major_version);
-    } else {
-        if (d->view == PGWT_VIEW_QUERY_EVENT) {
+    } else if (!d->use_pg13_query_attr) {
+        if (d->view == PGWT_VIEW_QUERY_EVENT && d->pg_major_version != 13) {
             fprintf(stderr, "FATAL: st_query_id offset not found for PG%d — "
                     "query_event view unavailable\n"
                     "  Hint: install postgresql-%d-dbgsym for DWARF-based detection\n",
                     d->pg_major_version, d->pg_major_version);
             return -1;
         }
-        if (d->verbose)
+        if (d->verbose && d->pg_major_version != 13)
             fprintf(stderr, "INFO: st_query_id offset not available — "
                     "query_event view disabled\n");
     }
