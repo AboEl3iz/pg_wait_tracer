@@ -859,8 +859,8 @@ int pgwt_discover(struct pgwt_daemon *d)
      * PG13 has no in-core query_id (st_query_id was added in PG14), so the
      * detection above returns 0. Instead, if pg_stat_statements is loaded its
      * post_parse_analyze hook populates PlannedStmt.queryId; we uprobe
-     * ExecutorStart and walk QueryDesc->plannedstmt->queryId into the same
-     * state_map slot. This is gated on pgss being loaded. */
+     * standard_ExecutorStart and walk QueryDesc->plannedstmt->queryId into the
+     * same state_map slot. This is gated on pgss being loaded. */
     if (d->use_myproc && d->pg_major_version == 13) {
         struct pgwt_pg13_query_offsets qo;
         int have_off = pgwt_detect_pg13_query_offsets(d->pg_major_version, &qo);
@@ -875,7 +875,7 @@ int pgwt_discover(struct pgwt_daemon *d)
             if (d->verbose)
                 fprintf(stderr,
                         "INFO: PG13 query attribution via pg_stat_statements "
-                        "(ExecutorStart uprobe; QueryDesc.plannedstmt=%d, "
+                        "(standard_ExecutorStart uprobe; QueryDesc.plannedstmt=%d, "
                         "PlannedStmt.queryId=%d, QueryDesc.sourceText=%d)\n",
                         d->pg13_qd_plannedstmt_off, d->pg13_ps_queryid_off,
                         d->pg13_qd_sourcetext_off);

@@ -38,11 +38,12 @@ volatile const u32 lightweight_mode = 0;   /* 0=full trace, 1=lightweight (no ri
 volatile const u32 skip_query_id = 0;      /* 1=skip query_id reads (saves 1 probe_read) */
 volatile const u64 debug_query_string_addr = 0; /* VA of debug_query_string global */
 
-/* PG13 query attribution (Route B1): ExecutorStart(QueryDesc*) uprobe walks
- * QueryDesc->plannedstmt->queryId (populated by pg_stat_statements' hook) into
- * the state_map query_id slot. 0 => disabled (the PG17+ pgstat_report_query_id
- * uprobe is used instead). Offsets are header-derived (postgresql13-devel). */
-volatile const u32 pg13_query_attr = 0;          /* 1 = ExecutorStart path active */
+/* PG13 query attribution (Route B1): standard_ExecutorStart(QueryDesc*) uprobe
+ * walks QueryDesc->plannedstmt->queryId (populated by pg_stat_statements' hook)
+ * into the state_map query_id slot. 0 => disabled (the PG17+
+ * pgstat_report_query_id uprobe is used instead). Offsets are header-derived
+ * (postgresql13-devel). */
+volatile const u32 pg13_query_attr = 0;          /* 1 = std_ExecutorStart path active */
 volatile const u32 pg13_qd_plannedstmt_off = 0;  /* offsetof(QueryDesc, plannedstmt) */
 volatile const u32 pg13_ps_queryid_off = 0;      /* offsetof(PlannedStmt, queryId) */
 volatile const u32 pg13_qd_sourcetext_off = 0;   /* offsetof(QueryDesc, sourceText) */
@@ -478,11 +479,16 @@ int on_report_query_id(struct pt_regs *ctx)
     return 0;
 }
 
-/* ── Program 10: uprobe on ExecutorStart (PG13 query attribution) ──
+/* ── Program 10: uprobe on standard_ExecutorStart (PG13 query attribution) ──
  * PG13 has no in-core query_id and no pgstat_report_query_id. When
  * pg_stat_statements is loaded its post_parse_analyze hook populates
  * PlannedStmt.queryId (matching pg_stat_statements.queryid) before
- * ExecutorStart fires. arg0 = QueryDesc *queryDesc; walk
+ * the executor starts. We probe standard_ExecutorStart rather than the
+ * public ExecutorStart wrapper: with pgss loaded ExecutorStart_hook is set,
+ * so ExecutorStart is a trampoline that tail-jumps into the hook chain and an
+ * entry uprobe on it does not fire; standard_ExecutorStart is the real
+ * function, always reached at the bottom of the hook chain.
+ * arg0 = QueryDesc *queryDesc; walk
  *   queryDesc->plannedstmt (+pg13_qd_plannedstmt_off)
  *           ->queryId       (+pg13_ps_queryid_off, uint64)
  * and store it in the SAME state_map slot the PG17+ uprobe uses, so the
