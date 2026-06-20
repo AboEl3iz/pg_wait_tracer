@@ -128,6 +128,8 @@ int pgwt_sampler_build_batch(const struct pgwt_sample_target *targets,
 #include "backend.h"
 #include "event_writer.h"
 #include "discovery.h"
+#include "map_reader.h"
+#include "wait_event.h"
 
 #include <time.h>
 #include <bpf/libbpf.h>
@@ -219,6 +221,84 @@ int pgwt_sampler_stop(struct pgwt_daemon *d)
     return 0;
 }
 
+/* Fold one sample batch into the live in-process accumulator so the running
+ * --view output reflects sampled-mode data in real time.
+ *
+ * In full/lightweight mode the event_ringbuf consumer (pgwt_handle_trace_event)
+ * is what populates d->event_accum, which the timer copies into d->accum for
+ * display. Sampled mode has no ringbuf consumer — the sampler is the data
+ * source — so without this step the live view stays empty ("(no data yet)")
+ * even though samples are correctly captured and written to the trace file.
+ *
+ * Each sample is an ASH point observation worth one sample period of wall time;
+ * we weight it by sample_period_ns exactly as the offline reader/server do
+ * (event_reader.c sets FLAG_SAMPLE; server.c normalizes old_event/duration_ns).
+ * The build_batch records keep their on-disk shape (new_event set, old/duration
+ * zero) so the trace-file format is unchanged; we read new_event here and apply
+ * the per-sample weight locally. */
+static void pgwt_sampler_accumulate(struct pgwt_daemon *d,
+                                    const struct pgwt_trace_event *samples,
+                                    int count, uint64_t period_ns)
+{
+    struct pgwt_accumulator *acc = d->event_accum;
+    if (!acc)
+        return;
+
+    for (int i = 0; i < count; i++) {
+        uint32_t we  = samples[i].new_event;   /* sampled wait event */
+        uint64_t dur = period_ns;              /* ASH weight per sample */
+
+        if (PGWT_IS_MARKER(we))
+            continue;
+
+        /* Per-PID accumulation */
+        struct pgwt_pid_accum *pa = pgwt_get_or_create_pid(acc, samples[i].pid);
+        if (pa) {
+            struct pgwt_event_stats *es = pgwt_get_or_create_event(pa, we);
+            if (es) {
+                es->count++;
+                es->total_ns += dur;
+                if (dur < es->min_ns) es->min_ns = dur;
+                if (dur > es->max_ns) es->max_ns = dur;
+                uint32_t bucket = pgwt_duration_to_bucket(dur);
+                if (bucket < HISTOGRAM_BUCKETS)
+                    es->histogram[bucket]++;
+            }
+            if (!pgwt_is_idle_event(we)) {
+                pa->wait_time_ns += dur;
+                pa->db_time_ns   += dur;
+            }
+        }
+
+        /* System-wide accumulation */
+        struct pgwt_event_stats *se = pgwt_get_or_create_system_event(acc, we);
+        if (se) {
+            se->count++;
+            se->total_ns += dur;
+            if (dur < se->min_ns) se->min_ns = dur;
+            if (dur > se->max_ns) se->max_ns = dur;
+            uint32_t bucket = pgwt_duration_to_bucket(dur);
+            if (bucket < HISTOGRAM_BUCKETS)
+                se->histogram[bucket]++;
+        }
+
+        /* Time model by class */
+        pgwt_update_time_model(&acc->tm, we, dur);
+
+        /* Query attribution */
+        if (samples[i].query_id != 0) {
+            struct pgwt_query_event_stats *qe =
+                pgwt_get_or_create_query_event(acc, samples[i].query_id, we);
+            if (qe) {
+                qe->count++;
+                qe->total_ns += dur;
+                if (dur < qe->min_ns) qe->min_ns = dur;
+                if (dur > qe->max_ns) qe->max_ns = dur;
+            }
+        }
+    }
+}
+
 /* One sampling tick. Build the target list from the live registry, read all
  * wait_event_info in one syscall (+ per-pid fallback), encode non-CPU
  * readings, and push a SAMPLES block. Called from the daemon timer. */
@@ -264,6 +344,10 @@ int pgwt_sampler_poll(struct pgwt_daemon *d)
 
     int count = pgwt_sampler_build_batch(targets, s->read_vals, n, tick_ts,
                                          s->samples);
+
+    /* Fold the batch into the live accumulator so the running --view reflects
+     * sampled data in real time (there is no ringbuf consumer in this tier). */
+    pgwt_sampler_accumulate(d, s->samples, count, s->sample_period_ns);
 
     /* Anomaly-trigger rules (A5) run on the live sample batch every tick — in
      * tiered mode they may AUTO-escalate to full fidelity. Evaluated even when
