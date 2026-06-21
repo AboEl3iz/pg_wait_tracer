@@ -291,11 +291,22 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
          *   PG14+ : pgstat_report_query_id (arg = query_id), bypassing shmem.
          *   PG13  : no in-core query_id / no pgstat_report_query_id. Instead,
          *           with pg_stat_statements loaded (use_pg13_query_attr),
-         *           uprobe ExecutorStart(QueryDesc*) and walk
+         *           uprobe standard_ExecutorStart(QueryDesc*) and walk
          *           queryDesc->plannedstmt->queryId. Feeds the SAME state_map
-         *           slot, so the sampler + watchpoint pipelines are unchanged. */
+         *           slot, so the sampler + watchpoint pipelines are unchanged.
+         *
+         *           We probe standard_ExecutorStart, NOT the public
+         *           ExecutorStart wrapper. With pg_stat_statements loaded,
+         *           ExecutorStart_hook is set, so the ExecutorStart wrapper is
+         *           a tiny trampoline that tail-jumps (jmp *hook) into the
+         *           hook chain; an entry uprobe placed on that trampoline does
+         *           not fire reliably (the tail-jump never returns through the
+         *           wrapper body). standard_ExecutorStart is the real function
+         *           and is always reached at the bottom of the hook chain
+         *           (pgss's hook calls it), by which point pgss has already
+         *           populated PlannedStmt.queryId. Same arg0 (QueryDesc*). */
         if (d->use_pg13_query_attr) {
-            uint64_t es_va = pgwt_find_symbol_offset(bin, "ExecutorStart");
+            uint64_t es_va = pgwt_find_symbol_offset(bin, "standard_ExecutorStart");
             uint64_t es_off = es_va > 0x400000 ? es_va - 0x400000 : es_va;
             if (es_off) {
                 LIBBPF_OPTS(bpf_uprobe_opts, uprobe_opts, .retprobe = false);
@@ -303,14 +314,14 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
                     bpf_program__attach_uprobe_opts(d->skel->progs.on_executor_start,
                                                     -1, bin, es_off, &uprobe_opts);
                 if (d->verbose)
-                    fprintf(stderr, "INFO: ExecutorStart at offset 0x%lx "
+                    fprintf(stderr, "INFO: standard_ExecutorStart at offset 0x%lx "
                             "(PG13 query attribution via pg_stat_statements)\n",
                             (unsigned long)es_off);
                 if (!d->skel->links.on_executor_start)
-                    fprintf(stderr, "WARN: could not attach ExecutorStart uprobe "
-                            "(PG13 query attribution disabled)\n");
+                    fprintf(stderr, "WARN: could not attach standard_ExecutorStart "
+                            "uprobe (PG13 query attribution disabled)\n");
             } else {
-                fprintf(stderr, "WARN: symbol 'ExecutorStart' not found "
+                fprintf(stderr, "WARN: symbol 'standard_ExecutorStart' not found "
                         "(PG13 query attribution disabled)\n");
             }
         } else {
