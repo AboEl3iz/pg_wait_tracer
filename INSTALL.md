@@ -105,6 +105,38 @@ sudo systemctl enable --now postgresql-17
 sudo dnf install -y postgresql17-debuginfo
 ```
 
+##### PostgreSQL 13 (EOL — use the PGDG archive repo)
+
+PostgreSQL 13 is end-of-life and has been removed from the live PGDG repo,
+so `postgresql13-server` will not install from `pgdg-redhat-repo-latest`.
+Add the PGDG **archive** repo instead (adjust `rhel-9` → `rhel-8` for EL8):
+
+```bash
+sudo tee /etc/yum.repos.d/pgdg13-archive.repo >/dev/null <<'EOF'
+[pgdg13-archive]
+name=PostgreSQL 13 (PGDG archive)
+baseurl=https://yum-archive.postgresql.org/13/redhat/rhel-9-x86_64/
+enabled=1
+gpgcheck=0
+EOF
+
+sudo dnf install -y postgresql13-server postgresql13-contrib
+sudo /usr/pgsql-13/bin/postgresql-13-setup initdb
+sudo systemctl enable --now postgresql-13
+```
+
+PG13 has no in-core query id, so the **query_event view requires
+`pg_stat_statements`** — add it to `shared_preload_libraries` and restart:
+
+```bash
+sudo -u postgres psql -c "ALTER SYSTEM SET shared_preload_libraries='pg_stat_statements'"
+sudo systemctl restart postgresql-13
+sudo -u postgres psql -c "CREATE EXTENSION pg_stat_statements"
+```
+
+Wait capture itself works without it. (No PG13 debuginfo exists anymore;
+the tracer uses header-derived offsets, so debuginfo is not required.)
+
 #### Ubuntu / Debian
 
 ```bash
