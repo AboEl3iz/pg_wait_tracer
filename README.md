@@ -1,15 +1,39 @@
 # pg_wait_tracer
 
-Real-time PostgreSQL wait event tracer using BPF hardware watchpoints.
+Real-time, **tiered** PostgreSQL wait event tracer.
 
-pg_wait_tracer attaches to a running PostgreSQL cluster and captures every
-wait event transition across all backends with nanosecond precision. It
-requires no PostgreSQL patches, no extensions, and no restarts.
+pg_wait_tracer attaches to a running PostgreSQL cluster and observes wait
+events across all backends. It requires no PostgreSQL patches, no extensions,
+and no restarts.
+
+It runs in **two tiers** (default `--mode tiered`):
+
+- An always-on, low-overhead **sampled** tier (ASH-style, pure userspace via
+  `process_vm_readv` — ~0% impact on PostgreSQL) that you leave running 24/7.
+- On-demand or anomaly-triggered **escalation** to the exact
+  **hardware-watchpoint** tier, which captures every `wait_event_info`
+  transition with nanosecond precision during bounded, budgeted windows.
+
+This gives you Active Session History continuously, plus exact, every-transition
+detail exactly when you need it — without paying the watchpoint overhead all the
+time. The 10 Hz sampler agrees with the exact tier to within ~1 percentage point
+(top-5 events match) on the same window, so tiered-by-default is trustworthy.
 
 Key capabilities:
 
+- **Tiered capture** (`--mode tiered`, default): always-on userspace sampler
+  + on-demand/anomaly escalation to exact hardware-watchpoint tracing; also
+  available as pure `--mode sampled` or always-on exact `--mode full`
+- **Escalation**: bounded, budgeted full-fidelity windows, triggered manually
+  (web UI "Escalate" button / control socket) or automatically by anomaly rules
+  (AAS-vs-baseline and lock-class-fraction, with cooldown/hysteresis)
+- **Control socket**: `{trace_dir}/pgwt.sock` JSON-line `status`/`metrics`/
+  `escalate`/`deescalate`, proxied by `pgwt-server` for the web client, with
+  Prometheus-ready self-observability metrics
 - **7 diagnostic views**: time_model, system_event, session_event, histogram,
-  query_event, active, transitions (Sankey diagram)
+  query_event, active, transitions (Sankey diagram) — each tagged with its data
+  fidelity (sampled / exact / mixed); exact-only views prompt to escalate over
+  sampled-only windows instead of silently showing nothing
 - **Web investigation client** (`pgwt`): browser UI with ECharts AAS chart,
   color-coded drill-down tables, percentage bars, summary metrics, concurrency
   peak overlay, burst detection markers — connects to DB server over SSH
@@ -30,19 +54,28 @@ Key capabilities:
 - **Dynamic event names**: auto-discovers wait event names from PostgreSQL
   (PG17+) via `pg_wait_events`, forward-compatible with PG19+
 
-Overhead scales with wait event transition rate: ~6% on write-heavy OLTP,
-up to ~30% on read-heavy workloads with high buffer miss rates. See
-[Performance](#performance) for details.
+In the default tiered mode the always-on sampler has **~0% impact on
+PostgreSQL** (the daemon itself uses ~0.6% of one core at 10 Hz). The exact
+watchpoint tier — used only during bounded escalation windows — costs ~6% on
+write-heavy OLTP, up to ~30% on read-heavy workloads with high buffer miss
+rates. See [Performance](#performance) for details.
 
 > **Requirements — Linux only.** pg_wait_tracer relies on Linux-specific
-> facilities (eBPF, `perf_event_open`, CPU hardware watchpoints) and cannot
-> run on macOS, Windows, or \*BSD. Minimum environment:
+> facilities (eBPF, `process_vm_readv`, `perf_event_open`, CPU hardware
+> watchpoints) and cannot run on macOS, Windows, or \*BSD. Minimum environment:
 >
-> - **Linux kernel >= 5.8** with BTF enabled (`/sys/kernel/btf/vmlinux` present)
+> - **Linux kernel >= 5.8** with BTF enabled (`/sys/kernel/btf/vmlinux`
+>   present), **or** EL8 (RHEL/Rocky/Alma/Oracle Linux 8.10, kernel 4.18 with
+>   backported BTF + BPF ring buffer). EL9 (kernel 5.14) and Ubuntu are also
+>   supported. The build auto-bundles a pinned libbpf/bpftool when the system
+>   ones are too old (e.g. EL8's libbpf 0.5.0), so older distros build cleanly.
+>   BTF is always required; on kernels without the BPF ring buffer the tool
+>   degrades to sampled-only (the full tier needs ringbuf).
 > - **Architecture**: x86_64 or aarch64
 > - **Privileges**: root, or `CAP_BPF` + `CAP_PERFMON` + `CAP_SYS_PTRACE`
 >   (older kernels: `CAP_SYS_ADMIN` + `CAP_SYS_PTRACE`)
-> - **PostgreSQL**: 17 or 18 (full support); 14-16 (limited — see
+> - **PostgreSQL**: 17 or 18 (full); 13 (supported — query attribution
+>   requires `pg_stat_statements`); 14-16 not yet (see
 >   [INSTALL.md](INSTALL.md))
 >
 > The web client (`pgwt`) and offline replay (`pg_wait_tracer --replay`,
@@ -107,10 +140,10 @@ captured. The default is **`tiered`**.
 
 | Mode | Fidelity | PG overhead | What it does |
 |------|----------|-------------|--------------|
-| `tiered` *(default)* | sampled, escalates to exact | ~0% baseline, bounded during escalation | Always-on userspace sampler; escalates to full watchpoint tracing for bounded, budgeted windows — on demand (control socket) or on anomaly. The "leave it running 24/7" posture. |
+| `tiered` *(default)* | sampled, escalates to exact | ~0% baseline, bounded during escalation | Always-on userspace sampler (`process_vm_readv`); escalates to full watchpoint tracing for bounded, budgeted windows — on demand (control socket / web UI) or on anomaly. The "leave it running 24/7" posture. |
 | `sampled` | sampled | ~0% on PostgreSQL | Pure-userspace ASH-style sampling at a fixed rate. No watchpoints, never escalates. |
-| `full` | exact | 6-30% (workload-dependent) | Always-on hardware watchpoints — every `wait_event_info` transition captured exactly. The original behavior. |
-| `coop` | exact | — | Cooperative (PostgreSQL extension) tier — not available in this build; ships in the extension track. |
+| `full` | exact | 6-30% (workload-dependent) | Always-on hardware watchpoints — every `wait_event_info` transition captured exactly. The original behavior, now opt-in. |
+| `coop` | exact | — | Cooperative (PostgreSQL extension) tier — **stub only**: the interface is frozen but the provider advertises itself and then returns "not available in this build". The real implementation ships in the separate PG-extension track. |
 
 ```bash
 # Default — low-overhead always-on, escalate on demand
@@ -123,11 +156,66 @@ sudo ./pg_wait_tracer --mode full --count 1
 sudo ./pg_wait_tracer --mode sampled --sample-rate 50
 ```
 
-In `tiered` mode, EXACT-required views (histogram, transitions, lock chains)
-report "requires full-fidelity data" over windows with no escalation, rather
-than returning silently empty results. Escalate via the control socket
-(`{"cmd":"escalate","duration_s":N}`) or the web UI's "Escalate" button;
-escalation is bounded by `--escalation-budget` (default 300s per rolling hour).
+In `tiered` mode, EXACT-required views (histogram, transitions, fingerprints,
+lock chains, interference, concurrency) report `requires full-fidelity data`
+over windows with no escalation, rather than returning silently empty results
+— the web client renders an explicit "escalate to capture" state.
+
+### Escalation
+
+A full-fidelity window can be opened two ways:
+
+- **Manually** — the web UI's "Escalate" button, or the control socket
+  (`{"cmd":"escalate","duration_s":N}`). `{"cmd":"deescalate"}` closes it early.
+- **Automatically** — anomaly rules evaluated on the sampled stream:
+  AAS exceeding a multiple of its rolling baseline (`--anomaly-aas-factor`,
+  default 3.0× sustained `--anomaly-aas-ticks` ticks, default 3), or the
+  Lock-class share of active samples exceeding `--anomaly-lock-fraction`
+  (default 0.30). A cooldown (`--anomaly-cooldown-s`, default 120) prevents
+  flapping.
+
+Every window is bounded: per-window length is set by the request (or
+`--anomaly-window-s`, default 60, for auto-triggers), and total escalation time
+is capped by `--escalation-budget` (default 300s per rolling hour). When the
+budget is exhausted, further escalations are denied (and counted in the
+self-metrics).
+
+```bash
+# Open a 120s full-fidelity window on a running daemon via the control socket
+echo '{"cmd":"escalate","duration_s":120}' | nc -U /var/lib/pgwt/traces/pgwt.sock
+
+# Inspect current tier / budget
+echo '{"cmd":"status"}'  | nc -U /var/lib/pgwt/traces/pgwt.sock
+echo '{"cmd":"metrics"}' | nc -U /var/lib/pgwt/traces/pgwt.sock
+```
+
+## Control Socket
+
+When recording is enabled (`--trace-dir`), the daemon listens on a unix-domain
+socket at `{trace_dir}/pgwt.sock` (mode 0600). It speaks a newline-delimited
+JSON protocol — one request object per line, one response object per line.
+`pgwt-server` proxies it through to the web client as a single `control`
+command, so the browser UI drives escalation and reads self-metrics without a
+direct connection.
+
+| Command | Request | Response (summary) |
+|---------|---------|--------------------|
+| `status` | `{"cmd":"status"}` | `mode`, `tier` (`sampled`/`escalated`), `escalation_supported`, `escalation_seconds_remaining`, `escalation_budget_remaining_s`, `escalation_reason`, `uptime_s`, `backends`, `pg_pid`, `version` |
+| `metrics` | `{"cmd":"metrics"}` | self-observability counters (below) |
+| `escalate` | `{"cmd":"escalate","duration_s":N}` | `escalated`, `granted_s`, `seconds_remaining`, `budget_remaining_s` — or `ok:false` + `error` + `budget_remaining_s` when over budget / not tiered |
+| `deescalate` | `{"cmd":"deescalate"}` | closes the window now (idempotent); errors if not `--mode tiered` |
+
+**Self-observability metrics** (`metrics` command — Prometheus-ready names):
+
+- `events_total`, `events_per_sec`, `lifecycle_events_total`
+- `samples_total`, `samples_per_sec`, `sample_read_faults_total`
+- `wp_attach_failures_total`, `ringbuf_drops_total`, `backends_tracked`
+- `trace_events_written_total`, `trace_bytes_written_total`
+- `tier`, `escalation_active`, `escalation_seconds_remaining`,
+  `escalation_budget_remaining_s`, `escalation_windows_total`,
+  `escalation_denied_total`
+- `anomaly_fires_total`, `anomaly_near_total`, `anomaly_dropped_budget_total`,
+  `anomaly_dropped_cooldown_total`, `anomaly_baseline_aas`
 
 ## Operating Modes
 
@@ -228,7 +316,16 @@ pgwt (Go binary)                     pgwt-server (C binary)
 **Features:**
 
 - **AAS stacked area chart** (ECharts) — 11 wait class colors, interactive
-  zoom with drag-to-select, tooltip with per-class AAS breakdown and percentages
+  zoom with drag-to-select, tooltip with per-class AAS breakdown and percentages.
+  **Fidelity shading**: sampled-only spans are washed amber and mixed spans
+  indigo, so you can see at a glance which parts of the window are estimated vs
+  exact; escalation windows are annotated (cyan for manual, red for anomaly).
+- **Escalate control** — an "Escalate" button in the header opens a
+  full-fidelity window (and shows the seconds left / a "Stop" button while one
+  is open), plus a budget readout of full-fidelity seconds remaining this hour.
+- **Daemon self-metrics panel** — live tier, events/s, samples/s, ringbuf
+  drops, sample faults, estimated overhead, anomaly counters, baseline AAS, and
+  remaining escalation budget (read over the control socket).
 - **4 table views**: Overview (time model), Events, Sessions, Queries
 - **Drill-down navigation**: click a wait class → see its events → click an
   event → see sessions → click a session → see queries. Breadcrumb trail
@@ -345,9 +442,22 @@ per interval, no screen clearing).
 
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
-| `--mode <MODE>` | — | `tiered` | Capture tier: `tiered` (always-on sampler + on-demand escalation), `sampled`, `full` (exact watchpoints), `coop`. See [Capture Tiers](#capture-tiers---mode) |
+| `--mode <MODE>` | — | `tiered` | Capture tier: `tiered` (always-on sampler + on-demand escalation), `sampled`, `full` (exact watchpoints), `coop` (stub). See [Capture Tiers](#capture-tiers---mode) |
 | `--sample-rate <HZ>` | — | `10` | Sampling rate for `sampled`/`tiered` (1-1000 Hz) |
-| `--escalation-budget <S>` | — | `300` | `tiered`: full-fidelity seconds allowed per rolling hour |
+| `--escalation-budget <S>` | — | `300` | `tiered`: full-fidelity seconds allowed per rolling hour (0 disables the limit) |
+
+### Anomaly Triggers (tiered mode)
+
+Auto-escalation rules evaluated on the sampled stream. Ignored outside
+`--mode tiered`.
+
+| Flag | Short | Default | Description |
+|------|-------|---------|-------------|
+| `--anomaly-aas-factor <K>` | — | `3.0` | Fire when AAS > K × rolling baseline |
+| `--anomaly-aas-ticks <N>` | — | `3` | ...sustained for N consecutive ticks |
+| `--anomaly-lock-fraction <F>` | — | `0.30` | Fire when Lock-class share of active samples > F (sustained N ticks) |
+| `--anomaly-cooldown-s <S>` | — | `120` | Minimum seconds between auto-escalations |
+| `--anomaly-window-s <S>` | — | `60` | Full-fidelity window length per auto-trigger |
 
 ### Performance Tuning
 
@@ -403,12 +513,15 @@ pg_wait_tracer — Time Model    Backends: 12    Interval: 5s
     LWLock                            1823.2       7.3%
       LWLock:WALInsert                1312.3       5.2%
       LWLock:BufferContent             410.8       1.6%
-    Client                             882.1       3.5%
-      Client:ClientRead                882.1       3.5%
     Timeout                            450.0       1.8%
 
-  (Activity/Idle — excluded from DB Time)    12560.4       —
+  (Activity/Idle — excluded from DB Time)    13442.5       —
 ```
+
+`Client:ClientRead` (a backend waiting for the next query from the client) is
+treated as **idle** — like Oracle's "SQL\*Net message from client" — so it is
+excluded from DB Time. It still shows up in event lists, but with `—` in the
+`% DB` column; only the Activity class is hidden entirely.
 
 **Reading this output:**
 
@@ -495,7 +608,7 @@ pg_wait_tracer — System Events (cumulative)    Backends: 12
   IO:DataFileRead                8234        3262.8      396.2     45623.1   13.0%
   Lock:Transaction                567        2104.3     3712.2    892100.5    8.4%
   LWLock:WALInsert               4812        1823.2      378.9      8934.2    7.3%
-  Client:ClientRead              1203         882.1      733.1     25410.3    3.5%
+  Client:ClientRead              1203         882.1      733.1     25410.3      —
   Timeout:PgSleep                   3         450.0   150000.0    200012.1    1.8%
   IO:DataFileWrite               1056         312.4      295.8      5612.0    1.2%
   LWLock:BufferContent            892         198.7      222.8      3451.0    0.8%
@@ -734,6 +847,11 @@ and cumulative columns.
 Wait events grouped by PostgreSQL query ID. Shows which queries cause which
 waits. Requires `compute_query_id = on` (or `auto`) in `postgresql.conf`.
 
+> **PG13:** there is no in-core query_id, so query attribution requires
+> **`pg_stat_statements`** in `shared_preload_libraries` (its hook populates the
+> query id pg_wait_tracer reads). Without it, query views report unavailable —
+> wait capture itself is unaffected. PG17/18 use the native query_id directly.
+
 Three modes are available depending on flags:
 
 #### Mode A (default) — Top query-event combinations
@@ -773,7 +891,11 @@ All three modes support `--window` with vertically stacked sections per window.
 
 ## Advanced Analysis (Web Client)
 
-The web client (`pgwt`) provides additional analysis views beyond the CLI:
+The web client (`pgwt`) provides additional analysis views beyond the CLI.
+These all need exact transition data (old→new ordering, real overlap
+intervals), so they are **full-fidelity only**: over a sampled-only window they
+show a "requires full-fidelity data — escalate to capture" state rather than an
+empty or misleading result.
 
 ### Transitions (Sankey Diagram)
 
@@ -857,11 +979,17 @@ events to disk in a columnar, LZ4-compressed format.
 | **LWLock** | Lightweight locks: WAL, buffers, proc array, etc. | Yes |
 | **Lock** | Heavy locks: row, table, transaction, advisory | Yes |
 | **BufferPin** | Waiting to pin a shared buffer | Yes |
-| **Client** | Waiting for client: reading query, sending results | Yes |
+| **Client** | Waiting for client: reading query, sending results | Partial† |
 | **IPC** | Inter-process communication: parallel workers, replication | Yes |
 | **Timeout** | Timed waits: `pg_sleep()`, statement timeouts | Yes |
 | **Extension** | Extension-generated events (e.g. pg_wait_sampling) | Yes |
-| **Activity** | Idle states: waiting for next query | **No** |
+| **Activity** | Idle states: waiting for next query | **No** (hidden) |
+
+† **Client is included except `Client:ClientRead`**, which is treated as idle
+(a backend waiting for the next query — Oracle's "SQL\*Net message from client")
+and excluded from DB Time / AAS. Unlike the Activity class, `Client:ClientRead`
+stays **visible** in event lists and graphs — only its `% DB` shows `—`. Only
+the Activity class is hidden entirely.
 
 ## Understanding DB Time
 
@@ -873,14 +1001,15 @@ DB Time = CPU*
         + LWLock
         + Lock
         + BufferPin
-        + Client
+        + Client (except Client:ClientRead)
         + IPC
         + Timeout
         + Extension
 ```
 
-Activity (idle) events are explicitly excluded. A backend sitting idle between
-queries does not contribute to DB Time.
+Idle events are explicitly excluded: the entire **Activity** class and
+**`Client:ClientRead`** (a backend waiting for the next query). A backend
+sitting idle between queries does not contribute to DB Time.
 
 With N backends over an interval of T seconds, the theoretical maximum DB Time
 is `N x T x 1000` ms. For example, 12 backends over 5 seconds = 60,000 ms max.
@@ -913,6 +1042,15 @@ Storage is the bottleneck. Check which IO events dominate:
   cache settings.
 - **WALWrite/WALSync** — WAL is the bottleneck. Consider faster WAL storage
   or tuning `wal_buffers`.
+
+> **PG18 asynchronous I/O caveat.** Under PG18's default `io_method=worker`, a
+> single logical read is split across processes: the requesting backend shows
+> `IO:AioIoCompletion` (or no wait at all if the read completed in the
+> background), while the actual `IO:DataFileRead` happens on an **io_worker**
+> that carries no requesting-query context. As a result, **per-query I/O
+> attribution is partial** under `worker` — the read latency is captured, but
+> it cannot always be tied back to the originating query. This is a known
+> limitation; system-wide IO totals remain correct.
 
 ### High Lock%
 
@@ -1077,10 +1215,25 @@ runs all 18 tests, then shuts down. No cleanup needed.
 
 ## How It Works
 
-pg_wait_tracer uses a **CPU hardware debug register** (watchpoint) to trap
-every write to `PGPROC->wait_event_info` in each PostgreSQL backend. PostgreSQL
+pg_wait_tracer captures the same field — each backend's `wait_event_info` —
+two ways, and the default `tiered` mode uses both:
+
+**Sampled tier (always-on, default).** A userspace sampler reads each backend's
+`wait_event_info` directly with `process_vm_readv` at a fixed rate
+(`--sample-rate`, default 10 Hz). There is no watchpoint, no debug exception,
+and nothing injected into PostgreSQL — the cost falls entirely on the daemon
+(~0.6% of one core at 10 Hz), so PostgreSQL sees ~0% impact. This produces
+ASH-style estimates of where time is spent. The estimates are accurate: at
+10 Hz the per-event time share agrees with the exact tier to within ~1
+percentage point and the top-5 events match (see Cross-validation below).
+
+**Full tier (exact, during escalation).** A **CPU hardware debug register**
+(watchpoint) traps every write to `wait_event_info` in each backend. PostgreSQL
 updates this field on every wait event transition (entering a wait, leaving a
-wait, changing wait type).
+wait, changing wait type), so this captures every transition exactly — at the
+cost of a CPU debug exception per write (see [Performance](#performance)). In
+`tiered` mode this runs only during bounded escalation windows; `--mode full`
+runs it always-on.
 
 When the watchpoint fires, a BPF program runs in kernel context:
 
@@ -1101,8 +1254,9 @@ written by the daemon) is read with a streaming block reader for live mode.
 
 This design means:
 - **No PostgreSQL patches or extensions required** — works with stock binaries
-- **No sampling** — every event transition is captured exactly
-- **Low overhead** — ~6% on write-heavy OLTP (see [Performance](#performance))
+- **~0% impact by default** — the always-on sampled tier never touches a backend
+- **Exact when you need it** — escalate to the full tier to capture every
+  transition (histograms, transitions, lock chains) during a bounded window
 - **No lock contention** — ring buffer is lock-free
 - **Historical analysis** — trace files enable offline replay of past events
 - **Live analysis** — `current.trace` readable while daemon writes it
@@ -1112,11 +1266,18 @@ This design means:
 
 ### Overhead
 
-pg_wait_tracer uses CPU hardware debug registers (watchpoints) to trap every
-write to `PGPROC->wait_event_info`. The overhead is proportional to the **wait
-event transition rate** — how many times per second backends change wait state.
-The cost is almost entirely in the CPU's hardware debug exception handler, not
-in BPF or userspace processing.
+**The default sampled tier has ~0% impact on PostgreSQL.** It reads each
+backend's `wait_event_info` from userspace (`process_vm_readv`) at 10 Hz; the
+cost (~0.6% of one core at 10 Hz) falls entirely on the daemon, never on a
+backend. The numbers in this section apply to the **full hardware-watchpoint
+tier** — used always-on with `--mode full`, or only during bounded escalation
+windows in the default `tiered` mode.
+
+The full tier uses CPU hardware debug registers (watchpoints) to trap every
+write to `wait_event_info`. Its overhead is proportional to the **wait event
+transition rate** — how many times per second backends change wait state. The
+cost is almost entirely in the CPU's hardware debug exception handler, not in
+BPF or userspace processing.
 
 **Benchmark environment:** Hetzner cx43 (8 vCPU, 16 GB RAM), Rocky 9.7,
 PostgreSQL 18, pgbench scale 100, 8 clients, 60-second runs, 5 repetitions.
@@ -1127,9 +1288,10 @@ Baseline: ~5,000 TPS, ~40K transitions/sec.
 
 | Mode | TPS Overhead |
 |------|:---:|
-| **Full trace** (default) | **6%** |
+| **Full trace** (`--mode full`) | **6%** |
 | Full trace + `--skip-query-id` | 5% |
 | `--lightweight` | 4% |
+| **Sampled** (default tier) | **~0%** |
 
 #### Read-heavy with high buffer miss rate (pgbench SELECT-only, shared_buffers = 128 MB)
 
@@ -1139,13 +1301,27 @@ transition rate.
 
 | Mode | TPS Overhead |
 |------|:---:|
-| **Full trace** (default) | **29%** |
+| **Full trace** (`--mode full`) | **29%** |
 | Full trace + `--skip-query-id` | 26% |
 | `--lightweight` | 28% |
+| **Sampled** (default tier) | **~0%** |
 
 The `--lightweight` and `--skip-query-id` flags save only 1-3 percentage points
 because the bottleneck is the hardware debug exception itself (~200-300 ns per
-fire), not the BPF work done inside it.
+fire), not the BPF work done inside it. This worst case is exactly why the full
+tier is gated behind escalation by default — you only pay it during the bounded
+window you asked for.
+
+#### Cross-validation: sampling vs exact
+
+Because the default tier is sampled, its accuracy is verified against the exact
+tier over the same window. The `cross_validate` tool compares per-event time
+shares both ways and the top-N event overlap. At 10 Hz the worst-case event-
+share disagreement is **~0.9 percentage points** with **5/5 top-5** events
+matching — well inside the test's ±10pp / top-5-≥4 pass gate. This is why
+tiered-by-default is trustworthy: the always-on sampler reproduces the exact
+profile closely enough to drive investigation, and you escalate only when you
+need per-transition detail.
 
 #### What drives overhead
 
@@ -1184,13 +1360,17 @@ most useful for write-heavy OLTP where transitions/sec is moderate.
 
 **Recommendations:**
 
-- **Default (full trace)** is appropriate for most production use. Write-heavy
-  OLTP workloads see ~6% overhead, and you get all 6 views plus trace recording.
-- Use `--lightweight` for always-on monitoring where you only need time_model
-  and system_event views.
-- Use `--skip-query-id` if you don't need per-query wait attribution.
-- Monitor overhead on your workload — if baseline TPS is very high (>50K) with
-  high buffer miss rates, overhead may be significant.
+- **Default `tiered` mode** is appropriate for almost all production use: the
+  always-on sampler costs PostgreSQL ~0%, and you escalate to the full tier on
+  demand (or let anomaly rules do it) when you need exact, per-transition detail.
+- Use **`--mode full`** for a focused investigation where you want every
+  transition captured for the whole run and the overhead is acceptable.
+- The performance-tuning flags below apply to the full tier. Use
+  `--lightweight` when you only need time_model and system_event views, or
+  `--skip-query-id` if you don't need per-query wait attribution.
+- Monitor full-tier overhead on your workload — if baseline TPS is very high
+  (>50K) with high buffer miss rates, escalation windows can be costly; keep
+  `--escalation-budget` conservative.
 
 ### BPF optimizations
 
@@ -1302,8 +1482,12 @@ for full per-event trace recording.
 
 ## Requirements
 
-- Linux kernel >= 5.8
-- PostgreSQL 17 or 18 (PG14-16: limited, see [INSTALL.md](INSTALL.md))
+- Linux kernel >= 5.8 with BTF, **or** EL8 (RHEL/Rocky/Alma/Oracle Linux 8.10,
+  kernel 4.18 with backported BTF + BPF ring buffer). EL9 (kernel 5.14) and
+  Ubuntu also supported. The build auto-bundles a pinned libbpf/bpftool when the
+  system ones are too old (e.g. EL8's libbpf 0.5.0).
+- PostgreSQL 17 or 18 (full); 13 (supported — query attribution needs
+  `pg_stat_statements`); 14-16 not yet (see [INSTALL.md](INSTALL.md))
 - Root privileges (or CAP_SYS_ADMIN + CAP_SYS_PTRACE)
 - x86_64 or aarch64
 

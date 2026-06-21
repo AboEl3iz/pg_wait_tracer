@@ -2,12 +2,14 @@
 
 ## Supported Platforms
 
-- **Linux kernel** >= 5.8, **or** RHEL 8 / Rocky 8 (kernel 4.18 with Red Hat's
-  BPF ring buffer + BTF backports)
+- **Linux kernel** >= 5.8, **or** EL8 (RHEL/Rocky/Alma/Oracle Linux 8.10,
+  kernel 4.18 with backported BPF ring buffer + BTF). BTF is always required;
+  on kernels without the BPF ring buffer the tool degrades to sampled-only.
 - **Architecture**: x86_64, aarch64
-- **PostgreSQL**: 17, 18 (full support); 14–16 (limited — see Troubleshooting)
-- **Tested on**: Ubuntu 22.04/24.04, Rocky Linux 9, Oracle Linux 9, RHEL 9,
-  Rocky Linux 8.10 / RHEL 8
+- **PostgreSQL**: 17, 18 (full); 13 (supported — query attribution requires
+  `pg_stat_statements`); 14–16 not yet (see Troubleshooting)
+- **Tested on**: Ubuntu 22.04/24.04, Rocky Linux 9, AlmaLinux 9,
+  Oracle Linux 9, RHEL 9, Rocky Linux 8.10 / AlmaLinux 8 / Oracle Linux 8 / RHEL 8
 
 ## Prerequisites
 
@@ -423,10 +425,21 @@ kernels may need an upgrade.
 
 ### PostgreSQL version compatibility
 
-pg_wait_tracer uses a hardware watchpoint on the `my_wait_event_info` global
-variable to trace wait events. PostgreSQL 17+ writes wait events through
-`*my_wait_event_info` (global pointer dereference), which the watchpoint captures.
-PostgreSQL 14–16 writes directly to `MyProc->wait_event_info` (PGPROC struct field),
-bypassing the global pointer. As a result, **full wait event tracing requires
-PostgreSQL 17 or later**. On PG14–16 the tracer will start but will not capture
-wait events correctly.
+pg_wait_tracer observes each backend's `wait_event_info` field. How it reaches
+that field depends on the PostgreSQL major version:
+
+- **PG17, PG18 — full.** PostgreSQL writes wait events through the
+  `my_wait_event_info` global pointer; the tracer resolves it directly. Wait
+  event names are also discovered dynamically from `pg_wait_events` (PG17+).
+- **PG13 — supported.** PostgreSQL 13 writes directly to
+  `MyProc->wait_event_info`; the tracer resolves `MyProc` and adds the known
+  PGPROC offset (684, verified live on 13.23), with a runtime validation guard
+  that refuses to attach if the offset looks wrong. Both tiers (sampled and
+  full) use this path. PG13 has no in-core query id, so the **query_event view
+  requires `pg_stat_statements`** in `shared_preload_libraries` — without it,
+  query views report unavailable (or the daemon exits if `--view query_event`
+  was explicitly requested), but wait capture is unaffected.
+- **PG14, PG15, PG16 — not yet.** These also write to
+  `MyProc->wait_event_info`, but their verified PGPROC offsets and per-version
+  name tables are not yet added, so the daemon fails fast at startup rather than
+  capturing incorrect data. Support is planned.
