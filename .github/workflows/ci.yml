@@ -95,6 +95,13 @@ jobs:
     # if present, --mode full is asserted as hard as tiered; if absent, the
     # full-mode section is skipped LOUDLY in the job summary while the
     # tiered/sampled assertions (the shipped default) remain the hard gate.
+    # Matrix: PG 13 / 17 / 18 are the SUPPORTED versions (README+INSTALL)
+    # and get the full capture assertions. PG 16 is NOT yet supported
+    # (PG<17 needs a header-derived offsetof(PGPROC, wait_event_info) and
+    # only PG13's is validated — Track D owns 14-16): its cell asserts the
+    # fail-safe contract instead — the tracer must REFUSE loudly, never
+    # trace garbage (verified empirically: it exits with a FATAL). When
+    # Track D lands, flip the cell to the full assertions.
     name: capture-smoke (PG ${{ matrix.pg }})
     runs-on: ubuntu-latest
     strategy:
@@ -175,8 +182,14 @@ jobs:
       - name: Run capture smoke (tiered hard; full if watchpoints available)
         run: |
           V=${{ matrix.pg }}
+          # PG16 = unsupported version: assert the loud-refusal contract.
+          FLAGS=""
+          [ "$V" = "16" ] && FLAGS="--expect-unsupported"
+          # sudo strips the environment: pass PATH (psql/pgbench) and
+          # GITHUB_STEP_SUMMARY (the loud watchpoint-skip note) through.
           sudo env "PATH=/usr/lib/postgresql/$V/bin:$PATH" \
-            tests/ci_smoke.sh --pg-version "$V"
+            "GITHUB_STEP_SUMMARY=$GITHUB_STEP_SUMMARY" \
+            tests/ci_smoke.sh --pg-version "$V" $FLAGS
 
   web-ui:
     name: web-ui

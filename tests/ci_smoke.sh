@@ -25,11 +25,13 @@ source "$SCRIPT_DIR/testutil.sh"
 
 PM_PID=""
 PG_VERSION=""
+EXPECT_UNSUPPORTED=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --pid) PM_PID="$2"; shift 2 ;;
         --pg-version) PG_VERSION="$2"; shift 2 ;;
-        *) echo "Usage: $0 [--pid POSTMASTER_PID] [--pg-version N]"; exit 1 ;;
+        --expect-unsupported) EXPECT_UNSUPPORTED=1; shift ;;
+        *) echo "Usage: $0 [--pid POSTMASTER_PID] [--pg-version N] [--expect-unsupported]"; exit 1 ;;
     esac
 done
 
@@ -51,6 +53,30 @@ if [[ -z "$PM_PID" ]]; then
     echo "ERROR: cannot find postmaster PID"; exit 1
 fi
 echo "=== ci_smoke (postmaster PID $PM_PID, pg-version ${PG_VERSION:-auto}) ==="
+
+summary_early() {
+    echo "$1"
+    [[ -n "${GITHUB_STEP_SUMMARY:-}" ]] && echo "$1" >> "$GITHUB_STEP_SUMMARY" || true
+}
+
+# ── Unsupported-version cell (e.g. PG16 until Track D lands) ───────
+# The contract under test is fail-safe refusal: no known
+# offsetof(PGPROC, wait_event_info) for this version => the tracer must
+# exit non-zero with a loud FATAL, never attach and trace garbage (the
+# CAP-2/CAP-3 "refuse on unknown layout" guarantee).
+if [[ $EXPECT_UNSUPPORTED -eq 1 ]]; then
+    echo "=== unsupported-version cell: tracer must refuse loudly ==="
+    OUT=$("$PROJECT_DIR/pg_wait_tracer" --mode tiered --pid "$PM_PID" \
+          --duration 5 --quiet 2>&1)
+    RC=$?
+    echo "$OUT" | tail -5
+    if [[ $RC -ne 0 ]] && grep -q "no known offsetof(PGPROC, wait_event_info)" <<<"$OUT"; then
+        summary_early "- PASS: unsupported PG version refused loudly (rc=$RC, fail-safe contract)"
+        exit 0
+    fi
+    summary_early "- **FAIL**: expected a loud refusal on an unsupported PG version (rc=$RC)"
+    exit 1
+fi
 
 summary() {
     echo "$1"

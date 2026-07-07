@@ -782,13 +782,19 @@ int pgwt_discover(struct pgwt_daemon *d)
             if (d->verbose)
                 fprintf(stderr, "INFO: loaded dynamic event names from PG%d\n",
                         d->pg_major_version);
-            /* Write sidecar for pgwt-server to use later */
-            if (d->trace_dir)
-                pgwt_write_names_json(d->trace_dir);
         } else if (d->verbose) {
             fprintf(stderr, "INFO: dynamic event name query failed, using hardcoded tables\n");
         }
     }
+
+    /* Write the name sidecar for pgwt-server whenever we record a trace —
+     * ALWAYS, not only when dynamic names loaded. The sidecar must carry
+     * the mapping the trace is written with (dynamic on PG17+, the
+     * version-selected hardcoded tables otherwise); without it a PG13
+     * trace was silently decoded with PG18 tables by pgwt-server (the #8
+     * mislabeling class — caught by the CI capture-smoke PG13 cell). */
+    if (d->trace_dir)
+        pgwt_write_names_json(d->trace_dir);
 
     /* Extract basename for /proc/pid/maps matching */
     const char *base = strrchr(binary, '/');
