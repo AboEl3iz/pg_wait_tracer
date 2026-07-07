@@ -1,0 +1,21 @@
+55d4c1000000-55d4c1052000 r--p 00000000 fd:00 51126382                   /usr/pgsql-18/bin/postgres
+55d4c1052000-55d4c17f0000 r-xp 00052000 fd:00 51126382                   /usr/pgsql-18/bin/postgres
+55d4c17f0000-55d4c1a4f000 r--p 007f0000 fd:00 51126382                   /usr/pgsql-18/bin/postgres
+55d4c1a4f000-55d4c1a63000 r--p 00a4e000 fd:00 51126382                   /usr/pgsql-18/bin/postgres
+55d4c1a63000-55d4c1a72000 rw-p 00a62000 fd:00 51126382                   /usr/pgsql-18/bin/postgres
+55d4c1a72000-55d4c1ac0000 rw-p 00000000 00:00 0
+55d4c2f31000-55d4c2f93000 rw-p 00000000 00:00 0                          [heap]
+7f10a4000000-7f10a4021000 rw-p 00000000 00:00 0
+7f10aa5f2000-7f10aa603000 r-xp 00001000 fd:00 51126417                   /usr/pgsql-18/lib/pg_stat_statements.so
+7f10aa603000-7f10aa604000 r--p 00012000 fd:00 51126417                   /usr/pgsql-18/lib/pg_stat_statements.so
+7f10aa604000-7f10aa605000 rw-p 00013000 fd:00 51126417                   /usr/pgsql-18/lib/pg_stat_statements.so
+7f10aa605000-7f10aa62d000 r--p 00000000 fd:00 33555532                   /usr/lib64/libc.so.6
+7f10aa62d000-7f10aa79c000 r-xp 00028000 fd:00 33555532                   /usr/lib64/libc.so.6
+7f10aa79c000-7f10aa7f4000 r--p 00197000 fd:00 33555532                   /usr/lib64/libc.so.6
+7f10aa7f4000-7f10aa7f8000 rw-p 001ee000 fd:00 33555532                   /usr/lib64/libc.so.6
+7f10aa858000-7f10aa85a000 r--p 00000000 fd:00 33555525                   /usr/lib64/ld-linux-x86-64.so.2
+7f10aa85a000-7f10aa881000 r-xp 00002000 fd:00 33555525                   /usr/lib64/ld-linux-x86-64.so.2
+7ffc1f6de000-7ffc1f6ff000 rw-p 00000000 00:00 0                          [stack]
+7ffc1f77d000-7ffc1f781000 r--p 00000000 00:00 0                          [vvar]
+7ffc1f781000-7ffc1f783000 r-xp 00000000 00:00 0                          [vdso]
+ffffffffff600000-ffffffffff601000 --xp 00000000 00:00 0                  [vsyscall]

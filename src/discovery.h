@@ -19,6 +19,13 @@ uint64_t pgwt_find_symbol_offset(const char *binary, const char *symbol);
 /* Find the load base address of the binary in the target process. */
 uint64_t pgwt_find_load_base(pid_t pid, const char *binary_basename);
 
+/* Same, but against an explicit maps file (the /proc/<pid>/maps format).
+ * pgwt_find_load_base() is a thin wrapper over this; the split exists so
+ * unit tests can drive the parser with committed fixture files
+ * (tests/test_discovery.c — the #24 load-base regression class). */
+uint64_t pgwt_find_load_base_in_maps(const char *maps_path,
+                                     const char *binary_basename);
+
 /* Resolve a symbol to its runtime virtual address in the target process.
  * Handles both PIE (ET_DYN) and non-PIE (ET_EXEC) binaries correctly. */
 uint64_t pgwt_resolve_symbol(const char *binary, const char *symbol,

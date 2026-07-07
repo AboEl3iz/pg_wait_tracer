@@ -155,14 +155,16 @@ uint64_t pgwt_resolve_symbol(const char *binary, const char *symbol,
     return sym_val - elf_base + load_base;
 }
 
-uint64_t pgwt_find_load_base(pid_t pid, const char *binary_basename)
+/* Parse a maps file (the /proc/<pid>/maps format) and return the load base
+ * for the given binary basename. Split out from pgwt_find_load_base so unit
+ * tests can drive it with committed fixture files (tests/test_discovery.c —
+ * the #24 regression class: EL8 non-PIE vs EL9/Ubuntu PIE layouts). */
+uint64_t pgwt_find_load_base_in_maps(const char *maps_path,
+                                     const char *binary_basename)
 {
-    char path[64];
-    snprintf(path, sizeof(path), "/proc/%d/maps", pid);
-
-    FILE *f = fopen(path, "r");
+    FILE *f = fopen(maps_path, "r");
     if (!f) {
-        fprintf(stderr, "Cannot open %s: %s\n", path, strerror(errno));
+        fprintf(stderr, "Cannot open %s: %s\n", maps_path, strerror(errno));
         return 0;
     }
 
@@ -192,9 +194,16 @@ uint64_t pgwt_find_load_base(pid_t pid, const char *binary_basename)
     fclose(f);
 
     if (base == 0)
-        fprintf(stderr, "Load base for '%s' not found in /proc/%d/maps\n",
-                binary_basename, pid);
+        fprintf(stderr, "Load base for '%s' not found in %s\n",
+                binary_basename, maps_path);
     return base;
+}
+
+uint64_t pgwt_find_load_base(pid_t pid, const char *binary_basename)
+{
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/maps", pid);
+    return pgwt_find_load_base_in_maps(path, binary_basename);
 }
 
 uint64_t pgwt_read_pointer(pid_t pid, uint64_t addr)

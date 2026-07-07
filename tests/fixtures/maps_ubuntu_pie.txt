@@ -1,0 +1,22 @@
+5560d1a00000-5560d1a53000 r--p 00000000 fc:01 4718723                    /usr/lib/postgresql/17/bin/postgres
+5560d1a53000-5560d21c9000 r-xp 00053000 fc:01 4718723                    /usr/lib/postgresql/17/bin/postgres
+5560d21c9000-5560d2429000 r--p 007c9000 fc:01 4718723                    /usr/lib/postgresql/17/bin/postgres
+5560d2429000-5560d243c000 r--p 00a28000 fc:01 4718723                    /usr/lib/postgresql/17/bin/postgres
+5560d243c000-5560d244b000 rw-p 00a3b000 fc:01 4718723                    /usr/lib/postgresql/17/bin/postgres
+5560d244b000-5560d2499000 rw-p 00000000 00:00 0
+5560d3b17000-5560d3b79000 rw-p 00000000 00:00 0                          [heap]
+7f8e34000000-7f8e34021000 rw-p 00000000 00:00 0
+7f8e3a1e4000-7f8e3a1e6000 r--p 00000000 fc:01 4719102                    /usr/lib/postgresql/17/lib/pg_stat_statements.so
+7f8e3a1e6000-7f8e3a1f6000 r-xp 00002000 fc:01 4719102                    /usr/lib/postgresql/17/lib/pg_stat_statements.so
+7f8e3a1f6000-7f8e3a1f8000 r--p 00012000 fc:01 4719102                    /usr/lib/postgresql/17/lib/pg_stat_statements.so
+7f8e3a1f8000-7f8e3a1f9000 rw-p 00013000 fc:01 4719102                    /usr/lib/postgresql/17/lib/pg_stat_statements.so
+7f8e3a1f9000-7f8e3a221000 r--p 00000000 fc:01 3151553                    /usr/lib/x86_64-linux-gnu/libc.so.6
+7f8e3a221000-7f8e3a3b6000 r-xp 00028000 fc:01 3151553                    /usr/lib/x86_64-linux-gnu/libc.so.6
+7f8e3a3b6000-7f8e3a40e000 r--p 001bd000 fc:01 3151553                    /usr/lib/x86_64-linux-gnu/libc.so.6
+7f8e3a40e000-7f8e3a412000 rw-p 00215000 fc:01 3151553                    /usr/lib/x86_64-linux-gnu/libc.so.6
+7f8e3a5cf000-7f8e3a5d1000 r--p 00000000 fc:01 3151550                    /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+7f8e3a5d1000-7f8e3a5fb000 r-xp 00002000 fc:01 3151550                    /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+7ffce92c1000-7ffce92e2000 rw-p 00000000 00:00 0                          [stack]
+7ffce930a000-7ffce930e000 r--p 00000000 00:00 0                          [vvar]
+7ffce930e000-7ffce9310000 r-xp 00000000 00:00 0                          [vdso]
+ffffffffff600000-ffffffffff601000 --xp 00000000 00:00 0                  [vsyscall]
