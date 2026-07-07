@@ -1,6 +1,11 @@
 #!/bin/bash
 # run_all.sh — Master test runner for pg_wait_tracer
-# Usage: sudo tests/run_all.sh [--pid POSTMASTER_PID] [--pg-version N]
+# Usage: sudo tests/run_all.sh [--pid POSTMASTER_PID] [--pg-version N] [--require-live]
+#
+# --require-live: any skip in the root+PG live section is a FAILURE. This is
+# the gate for capture-behavior phases (Trust Milestone standing rule): an
+# all-skip run used to exit 0 (TST-4), which is how "green" runs happened on
+# boxes where nothing live actually executed. Use it on the real test box.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -9,11 +14,13 @@ source "$SCRIPT_DIR/testutil.sh"
 
 PM_PID=""
 PG_VERSION=""
+REQUIRE_LIVE=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --pid) PM_PID="$2"; shift 2 ;;
         --pg-version) PG_VERSION="$2"; shift 2 ;;
-        *) echo "Usage: $0 [--pid POSTMASTER_PID] [--pg-version N]"; exit 1 ;;
+        --require-live) REQUIRE_LIVE=1; shift ;;
+        *) echo "Usage: $0 [--pid POSTMASTER_PID] [--pg-version N] [--require-live]"; exit 1 ;;
     esac
 done
 
@@ -63,6 +70,23 @@ skip_test() {
     skipped=$((skipped + 1))
 }
 
+# Skip in the root+PG LIVE section. Under --require-live a live skip is a
+# FAILURE, not a skip — the live suite silently not running is exactly how
+# all four field escapes (#8/#24/#30/#31) shipped (TST-4).
+skip_live_test() {
+    local name="$1"
+    local reason="$2"
+    if [[ $REQUIRE_LIVE -eq 1 ]]; then
+        echo ""
+        echo "════════════════════════════════════════"
+        echo "  $name — FAILED (--require-live set, but: $reason)"
+        echo "════════════════════════════════════════"
+        failed=$((failed + 1))
+    else
+        skip_test "$name" "$reason"
+    fi
+}
+
 # Step 0: Build main project if needed
 echo "Building main project..."
 make -C "$PROJECT_DIR" -q 2>/dev/null || make -C "$PROJECT_DIR"
@@ -71,15 +95,14 @@ make -C "$PROJECT_DIR" -q 2>/dev/null || make -C "$PROJECT_DIR"
 echo "Building C unit tests..."
 make -C "$SCRIPT_DIR"
 
-# Step 2: C unit tests (no root needed)
-run_test "test_wait_event" "$SCRIPT_DIR/test_wait_event"
-run_test "test_cmdline" "$SCRIPT_DIR/test_cmdline"
-run_test "test_bucket" "$SCRIPT_DIR/test_bucket"
-run_test "test_trace_v2" "$SCRIPT_DIR/test_trace_v2"
-run_test "test_sampler" "$SCRIPT_DIR/test_sampler"
-run_test "test_anomaly" "$SCRIPT_DIR/test_anomaly"
-run_test "test_coop" "$SCRIPT_DIR/test_coop"
-run_test "test_pg13_resolve" "$SCRIPT_DIR/test_pg13_resolve"
+# Step 2: C unit tests (no root needed).
+# The list lives in unit_tests.list — the SINGLE source of truth shared with
+# CI (`make -C tests check`). Never add unit tests here directly (TST-3).
+# (read via fd 3 so the tests' stdin stays the terminal, not the list file)
+while read -r t <&3; do
+    case "$t" in ''|\#*) continue ;; esac
+    run_test "$t" "$SCRIPT_DIR/$t"
+done 3< "$SCRIPT_DIR/unit_tests.list"
 
 # Step 2.5: Synthetic data correctness tests (no root needed, needs pgwt-server)
 if [[ -x "$PROJECT_DIR/pgwt-server" ]] && [[ -x "$SCRIPT_DIR/gen_test_traces" ]]; then
@@ -101,87 +124,95 @@ else
     skip_test "test_data_*" "pgwt-server or gen_test_traces not built"
 fi
 
-# Step 3: CLI tests (needs root)
+# Live test inventory (root + running PG). One list, used both to run and to
+# report skips — keep names and runners in sync here only.
+# test_overhead runs in --quick mode (~10 min instead of ~70) and appends a
+# CSV trend row set to tests/results/overhead_trend.csv; a full sweep is
+# still available via `sudo tests/test_overhead.sh` directly.
+run_overhead_quick() {
+    local results_dir="$SCRIPT_DIR/results"
+    local trend="$results_dir/overhead_trend.csv"
+    local tmp_csv
+    tmp_csv=$(mktemp /tmp/pgwt_overhead_XXXXXX.csv)
+    mkdir -p "$results_dir"
+    if bash "$SCRIPT_DIR/test_overhead.sh" --quick --output "$tmp_csv" $PID_ARG; then
+        local status=0
+    else
+        local status=1
+    fi
+    # Append per-run rows to the tracked trend file (date + commit prefixed)
+    if [[ -s "$tmp_csv" ]]; then
+        if [[ ! -f "$trend" ]]; then
+            echo "date,commit,clients,mode,run,tps" > "$trend"
+        fi
+        local when commit
+        when=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        commit=$(git -C "$PROJECT_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)
+        tail -n +2 "$tmp_csv" | sed "s|^|$when,$commit,|" >> "$trend"
+        echo "Overhead trend appended to $trend"
+    fi
+    rm -f "$tmp_csv"
+    return $status
+}
+
+# Step 3: CLI tests (needs root; PG optional for the arg-validation checks)
 if [[ $(id -u) -eq 0 ]]; then
     run_test "test_cli" bash "$SCRIPT_DIR/test_cli.sh" $PID_ARG
 else
-    skip_test "test_cli" "requires root"
+    skip_live_test "test_cli" "requires root"
 fi
 
-# Step 4: Integration tests (need root + running PG)
-if [[ $(id -u) -eq 0 ]] && pgrep -x postgres > /dev/null 2>&1; then
-    run_test "test_lifecycle" bash "$SCRIPT_DIR/test_lifecycle.sh" $PID_ARG
-    run_test "test_cross_validate" python3 "$SCRIPT_DIR/test_cross_validate.py" $PID_ARG
-    run_test "test_accuracy" python3 "$SCRIPT_DIR/test_accuracy.py" $PID_ARG
-    run_test "test_deterministic" python3 "$SCRIPT_DIR/test_deterministic.py" $PID_ARG
-    run_test "test_overhead" bash "$SCRIPT_DIR/test_overhead.sh" $PID_ARG
-    run_test "test_client_wait" python3 "$SCRIPT_DIR/test_client_wait.py" $PID_ARG
-    run_test "test_cpu_time" python3 "$SCRIPT_DIR/test_cpu_time.py" $PID_ARG
-    run_test "test_lwlock" python3 "$SCRIPT_DIR/test_lwlock.py" $PID_ARG
-    run_test "test_query_event" python3 "$SCRIPT_DIR/test_query_event.py" $PID_ARG
-    run_test "test_cross_pg_wait_sampling" python3 "$SCRIPT_DIR/test_cross_pg_wait_sampling.py" $PID_ARG
-    run_test "test_event_classes" python3 "$SCRIPT_DIR/test_event_classes.py" $PID_ARG
-    run_test "test_multi_window" python3 "$SCRIPT_DIR/test_multi_window.py" $PID_ARG
-    run_test "test_active" python3 "$SCRIPT_DIR/test_active.py" $PID_ARG
+LIVE_TESTS=(
+    "test_lifecycle|bash|test_lifecycle.sh"
+    "test_cross_validate|python3|test_cross_validate.py"
+    "test_accuracy|python3|test_accuracy.py"
+    "test_deterministic|python3|test_deterministic.py"
+    "test_overhead|overhead_quick|"
+    "test_client_wait|python3|test_client_wait.py"
+    "test_cpu_time|python3|test_cpu_time.py"
+    "test_lwlock|python3|test_lwlock.py"
+    "test_query_event|python3|test_query_event.py"
+    "test_cross_pg_wait_sampling|python3|test_cross_pg_wait_sampling.py"
+    "test_event_classes|python3|test_event_classes.py"
+    "test_multi_window|python3|test_multi_window.py"
+    "test_active|python3|test_active.py"
+    # Live data correctness tests (Sprint 4)
+    "test_percentage|python3|test_percentage.py"
+    "test_aas_accuracy|python3|test_aas_accuracy.py"
+    "test_session_accuracy|python3|test_session_accuracy.py"
+    "test_query_accuracy|python3|test_query_accuracy.py"
+    "test_partition|python3|test_partition.py"
+    "test_idle_exclusion|python3|test_idle_exclusion.py"
+    "test_daemon_server|python3|test_daemon_server.py"
+    "test_control|bash|test_control.sh"
+    "test_escalation|bash|test_escalation.sh"
+    # Tiered-capture live tests (were built for A4/A5 but wired into
+    # nothing — TST-7). test_cross_validate_tiered is the test that
+    # justified tiered as the default mode.
+    "test_cross_validate_tiered|bash|test_cross_validate_tiered.sh"
+    "test_anomaly_live|bash|test_anomaly_live.sh"
+)
 
-    # Step 4.5: Live data correctness tests (Sprint 4)
-    run_test "test_percentage" python3 "$SCRIPT_DIR/test_percentage.py" $PID_ARG
-    run_test "test_aas_accuracy" python3 "$SCRIPT_DIR/test_aas_accuracy.py" $PID_ARG
-    run_test "test_session_accuracy" python3 "$SCRIPT_DIR/test_session_accuracy.py" $PID_ARG
-    run_test "test_query_accuracy" python3 "$SCRIPT_DIR/test_query_accuracy.py" $PID_ARG
-    run_test "test_partition" python3 "$SCRIPT_DIR/test_partition.py" $PID_ARG
-    run_test "test_idle_exclusion" python3 "$SCRIPT_DIR/test_idle_exclusion.py" $PID_ARG
-    run_test "test_daemon_server" python3 "$SCRIPT_DIR/test_daemon_server.py" $PID_ARG
-    run_test "test_control" bash "$SCRIPT_DIR/test_control.sh" $PID_ARG
-    run_test "test_escalation" bash "$SCRIPT_DIR/test_escalation.sh" $PID_ARG
+# Step 4: integration + live-correctness tests (root + running PG)
+if [[ $(id -u) -eq 0 ]] && pgrep -x postgres > /dev/null 2>&1; then
+    for entry in "${LIVE_TESTS[@]}"; do
+        IFS='|' read -r name runner file <<< "$entry"
+        case "$runner" in
+            bash)           run_test "$name" bash "$SCRIPT_DIR/$file" $PID_ARG ;;
+            python3)        run_test "$name" python3 "$SCRIPT_DIR/$file" $PID_ARG ;;
+            overhead_quick) run_test "$name (--quick)" run_overhead_quick ;;
+        esac
+    done
 else
     if [[ $(id -u) -ne 0 ]]; then
-        skip_test "test_lifecycle" "requires root"
-        skip_test "test_cross_validate" "requires root"
-        skip_test "test_accuracy" "requires root"
-        skip_test "test_deterministic" "requires root"
-        skip_test "test_overhead" "requires root"
-        skip_test "test_client_wait" "requires root"
-        skip_test "test_cpu_time" "requires root"
-        skip_test "test_lwlock" "requires root"
-        skip_test "test_query_event" "requires root"
-        skip_test "test_cross_pg_wait_sampling" "requires root"
-        skip_test "test_event_classes" "requires root"
-        skip_test "test_multi_window" "requires root"
-        skip_test "test_active" "requires root"
-        skip_test "test_percentage" "requires root"
-        skip_test "test_aas_accuracy" "requires root"
-        skip_test "test_session_accuracy" "requires root"
-        skip_test "test_query_accuracy" "requires root"
-        skip_test "test_partition" "requires root"
-        skip_test "test_idle_exclusion" "requires root"
-        skip_test "test_daemon_server" "requires root"
-        skip_test "test_control" "requires root"
-        skip_test "test_escalation" "requires root"
+        live_skip_reason="requires root"
     else
-        skip_test "test_lifecycle" "PostgreSQL not running"
-        skip_test "test_cross_validate" "PostgreSQL not running"
-        skip_test "test_accuracy" "PostgreSQL not running"
-        skip_test "test_deterministic" "PostgreSQL not running"
-        skip_test "test_overhead" "PostgreSQL not running"
-        skip_test "test_client_wait" "PostgreSQL not running"
-        skip_test "test_cpu_time" "PostgreSQL not running"
-        skip_test "test_lwlock" "PostgreSQL not running"
-        skip_test "test_query_event" "PostgreSQL not running"
-        skip_test "test_cross_pg_wait_sampling" "PostgreSQL not running"
-        skip_test "test_event_classes" "PostgreSQL not running"
-        skip_test "test_multi_window" "PostgreSQL not running"
-        skip_test "test_active" "PostgreSQL not running"
-        skip_test "test_percentage" "PostgreSQL not running"
-        skip_test "test_aas_accuracy" "PostgreSQL not running"
-        skip_test "test_session_accuracy" "PostgreSQL not running"
-        skip_test "test_query_accuracy" "PostgreSQL not running"
-        skip_test "test_partition" "PostgreSQL not running"
-        skip_test "test_idle_exclusion" "PostgreSQL not running"
-        skip_test "test_daemon_server" "PostgreSQL not running"
-        skip_test "test_control" "PostgreSQL not running"
-        skip_test "test_escalation" "PostgreSQL not running"
+        live_skip_reason="PostgreSQL not running"
     fi
+    for entry in "${LIVE_TESTS[@]}"; do
+        IFS='|' read -r name _ _ <<< "$entry"
+        skip_live_test "$name" "$live_skip_reason"
+    done
 fi
 
 # Step 5: Web UI tests (needs playwright + websockets, no root needed)
@@ -222,10 +253,18 @@ echo "════════════════════════�
 echo "  SUMMARY"
 echo "════════════════════════════════════════"
 total=$((passed + failed + skipped))
-echo "  Passed:  $passed"
-echo "  Failed:  $failed"
-echo "  Skipped: $skipped"
-echo "  Total:   $total"
+executed=$((passed + failed))
+echo "  Executed: $executed (passed $passed, failed $failed), skipped $skipped, total $total"
+if [[ $REQUIRE_LIVE -eq 1 ]]; then
+    echo "  Mode:     --require-live (live-section skips counted as failures)"
+fi
 echo ""
+
+# An all-skip run must never be green: something is wrong with the
+# environment or the runner itself if nothing executed (TST-4).
+if [[ $executed -eq 0 ]]; then
+    echo "ERROR: no test was executed — refusing to report success"
+    exit 1
+fi
 
 [[ $failed -eq 0 ]]
