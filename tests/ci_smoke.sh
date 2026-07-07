@@ -1,0 +1,151 @@
+#!/bin/bash
+# ci_smoke.sh — real-PostgreSQL capture smoke test wrapper (Phase T0: TST-1/2).
+#
+# The CI capture-smoke job calls this against a freshly-installed PGDG
+# PostgreSQL; it also runs unchanged on any root box with a running PG.
+# It drives tests/test_capture_smoke.py in BOTH capture modes plus the
+# existing full-mode deterministic-accuracy test, and fails if capture
+# records nothing (that is its entire purpose).
+#
+#   tiered (the shipped default) — HARD requirement, always asserted:
+#     sampler capture, live-view feed (PR #30), query attribution (PR #31),
+#     trace-file write + pgwt-server read-back.
+#   full (hardware watchpoints) — depends on the environment: perf hw
+#     breakpoints may be unavailable on some hypervisors. The probe below
+#     DISCOVERS this empirically. If watchpoints work, the full-mode
+#     assertions are just as hard; if they don't, the full-mode section is
+#     skipped LOUDLY (stdout + $GITHUB_STEP_SUMMARY) — never silently.
+#
+# Usage: sudo tests/ci_smoke.sh [--pid POSTMASTER_PID] [--pg-version N]
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+source "$SCRIPT_DIR/testutil.sh"
+
+PM_PID=""
+PG_VERSION=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --pid) PM_PID="$2"; shift 2 ;;
+        --pg-version) PG_VERSION="$2"; shift 2 ;;
+        *) echo "Usage: $0 [--pid POSTMASTER_PID] [--pg-version N]"; exit 1 ;;
+    esac
+done
+
+if [[ $(id -u) -ne 0 ]]; then
+    echo "ERROR: must run as root (sudo)"; exit 1
+fi
+if [[ ! -x "$PROJECT_DIR/pg_wait_tracer" || ! -x "$PROJECT_DIR/pgwt-server" ]]; then
+    echo "ERROR: build first (make)"; exit 1
+fi
+
+if [[ -z "$PM_PID" ]]; then
+    if [[ -n "$PG_VERSION" ]]; then
+        PM_PID=$(find_postmaster --pg-version "$PG_VERSION")
+    else
+        PM_PID=$(find_postmaster)
+    fi
+fi
+if [[ -z "$PM_PID" ]]; then
+    echo "ERROR: cannot find postmaster PID"; exit 1
+fi
+echo "=== ci_smoke (postmaster PID $PM_PID, pg-version ${PG_VERSION:-auto}) ==="
+
+summary() {
+    echo "$1"
+    if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+        echo "$1" >> "$GITHUB_STEP_SUMMARY"
+    fi
+}
+
+# ── Watchpoint availability probe ──────────────────────────────────
+# perf hardware breakpoints (PERF_TYPE_BREAKPOINT) need debug-register
+# support from the hypervisor; discover rather than assume.
+probe_watchpoints() {
+    local src bin
+    src=$(mktemp /tmp/pgwt_wp_probe_XXXXXX.c)
+    bin="${src%.c}"
+    cat > "$src" <<'EOF'
+#include <linux/perf_event.h>
+#include <linux/hw_breakpoint.h>
+#include <sys/syscall.h>
+#include <string.h>
+#include <unistd.h>
+#include <stdio.h>
+#include <errno.h>
+static volatile int target;
+int main(void) {
+    struct perf_event_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.type = PERF_TYPE_BREAKPOINT;
+    attr.size = sizeof(attr);
+    attr.bp_type = HW_BREAKPOINT_W;
+    attr.bp_addr = (unsigned long)&target;
+    attr.bp_len = HW_BREAKPOINT_LEN_4;
+    attr.sample_period = 1;
+    attr.wakeup_events = 1;
+    int fd = syscall(SYS_perf_event_open, &attr, 0, -1, -1, 0);
+    if (fd < 0) { fprintf(stderr, "perf_event_open: %s\n", strerror(errno)); return 1; }
+    close(fd);
+    return 0;
+}
+EOF
+    if ! cc -o "$bin" "$src" 2>/dev/null; then
+        rm -f "$src" "$bin"
+        echo "unknown"; return
+    fi
+    if "$bin" 2>/tmp/pgwt_wp_probe.err; then
+        echo "yes"
+    else
+        echo "no"
+    fi
+    rm -f "$src" "$bin"
+}
+
+WP=$(probe_watchpoints)
+echo "Watchpoint probe: $WP"
+[[ "$WP" == "no" ]] && cat /tmp/pgwt_wp_probe.err 2>/dev/null
+
+overall=0
+
+run_section() {
+    local name="$1"; shift
+    echo ""
+    echo "════════════════════════════════════════"
+    echo "  $name"
+    echo "════════════════════════════════════════"
+    if "$@"; then
+        summary "- PASS: $name"
+    else
+        summary "- **FAIL**: $name"
+        overall=1
+    fi
+}
+
+# ── Tiered mode: the shipped default — always a hard requirement ───
+run_section "capture smoke: --mode tiered (live view + trace file)" \
+    python3 "$SCRIPT_DIR/test_capture_smoke.py" --mode tiered --pid "$PM_PID"
+
+# ── Full mode: hard when watchpoints exist; loud skip when they don't ──
+if [[ "$WP" == "yes" ]]; then
+    run_section "capture smoke: --mode full (live view + trace file)" \
+        python3 "$SCRIPT_DIR/test_capture_smoke.py" --mode full --pid "$PM_PID"
+    run_section "deterministic accuracy: exact counts/durations (--mode full)" \
+        python3 "$SCRIPT_DIR/test_deterministic.py" --pid "$PM_PID"
+else
+    summary "### WARNING: full-mode watchpoint assertions SKIPPED"
+    summary "perf hardware breakpoints are unavailable in this environment"
+    summary "(probe: perf_event_open(PERF_TYPE_BREAKPOINT) failed — see log)."
+    summary "Tiered/sampled assertions above remain the hard gate; full-mode"
+    summary "exactness is validated on real hardware via tests/run_all.sh"
+    summary "--require-live (Trust Milestone standing rule)."
+fi
+
+echo ""
+if [[ $overall -eq 0 ]]; then
+    echo "ci_smoke: ALL SECTIONS PASSED (watchpoints: $WP)"
+else
+    echo "ci_smoke: FAILURES (watchpoints: $WP)"
+fi
+exit $overall

@@ -62,17 +62,11 @@ jobs:
         run: make -C tests
 
       - name: Run C unit tests
-        run: |
-          tests/test_wait_event
-          tests/test_cmdline
-          tests/test_bucket
-          tests/test_event_writer
-          tests/test_event_reader
-          tests/test_trace_v2
-          tests/test_sampler
-          tests/test_anomaly
-          tests/test_coop
-          tests/test_pg13_resolve
+        # The test list lives in tests/unit_tests.list — the single source of
+        # truth shared with tests/run_all.sh (TST-3: the two hand-maintained
+        # lists had drifted; test_event_writer/test_event_reader were missing
+        # from run_all and test_concurrent_rw ran nowhere).
+        run: make -C tests check
 
       - name: Run synthetic data tests
         run: |
@@ -88,6 +82,101 @@ jobs:
         # transport / selection modules are Node-testable without a browser.
         # A builder off-by-one fails here in milliseconds, no Playwright needed.
         run: node --test 'tests/web_unit/*.test.mjs'
+
+  capture-smoke:
+    # Phase T0 (Trust Milestone, TST-1/2): run the REAL capture path against
+    # a real PostgreSQL on the runner. Every field escape to date (#8, #24,
+    # #30, #31) lived in the capture/discovery slice that the other jobs
+    # never execute; this job's entire purpose is to go red when capture
+    # silently records nothing.
+    #
+    # Watchpoints (perf hardware breakpoints) may be unavailable on hosted
+    # runners' hypervisor — tests/ci_smoke.sh probes for them empirically:
+    # if present, --mode full is asserted as hard as tiered; if absent, the
+    # full-mode section is skipped LOUDLY in the job summary while the
+    # tiered/sampled assertions (the shipped default) remain the hard gate.
+    name: capture-smoke (PG ${{ matrix.pg }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [13, 16, 17, 18]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libbpf-dev libelf-dev \
+            zlib1g-dev liblz4-dev linux-tools-common
+          # Same bpftool fallback as build-and-unit: the runner's HWE azure
+          # kernel may ship linux-tools without a bpftool binary.
+          if bpftool version >/dev/null 2>&1; then
+            BPFTOOL=$(command -v bpftool)
+          else
+            git clone --depth 1 --branch v7.5.0 --recurse-submodules \
+              https://github.com/libbpf/bpftool.git /tmp/bpftool
+            make -C /tmp/bpftool/src -j"$(nproc)"
+            BPFTOOL=/tmp/bpftool/src/bpftool
+          fi
+          "$BPFTOOL" version
+          echo "BPFTOOL=$BPFTOOL" >> "$GITHUB_ENV"
+          test -r /sys/kernel/btf/vmlinux
+
+      - name: Install PostgreSQL ${{ matrix.pg }} (PGDG apt)
+        run: |
+          set -x
+          V=${{ matrix.pg }}
+          # Stop and drop any preinstalled clusters so ours owns port 5432.
+          sudo systemctl stop postgresql || true
+          sudo apt-get install -y postgresql-common
+          pg_lsclusters -h | awk '{print $1, $2}' | while read -r ver name; do
+            sudo pg_dropcluster --stop "$ver" "$name" || true
+          done
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          # PG13 is EOL: when the live PGDG repo no longer carries it, fall
+          # back to the PGDG apt archive (same signing key).
+          if ! apt-cache show "postgresql-$V" >/dev/null 2>&1; then
+            echo "postgresql-$V not in the live PGDG repo — adding apt-archive"
+            echo "deb https://apt-archive.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+              | sudo tee /etc/apt/sources.list.d/pgdg-archive.list
+            sudo apt-get update
+          fi
+          sudo apt-get install -y "postgresql-$V" "postgresql-contrib-$V"
+
+      - name: Configure + start PostgreSQL ${{ matrix.pg }}
+        run: |
+          set -ex
+          V=${{ matrix.pg }}
+          # The postgresql-$V package auto-creates cluster "main" unless one
+          # already existed (e.g. the preinstalled PG16 we dropped above).
+          if ! pg_lsclusters -h | awk -v v="$V" '$1 == v && $2 == "main"' | grep -q .; then
+            sudo pg_createcluster "$V" main
+          fi
+          sudo pg_conftool "$V" main set port 5432
+          # pg_stat_statements everywhere:
+          #  - PG13: REQUIRED for query attribution (no in-core query_id;
+          #    the tracer walks PlannedStmt.queryId that pgss populates).
+          #  - PG14+: compute_query_id=on so st_query_id is populated.
+          sudo pg_conftool "$V" main set shared_preload_libraries pg_stat_statements
+          if [ "$V" -ge 14 ]; then
+            sudo pg_conftool "$V" main set compute_query_id on
+          fi
+          # Tests connect as "psql -U postgres" from root: trust local auth.
+          sudo sed -i -E 's/(peer|scram-sha-256|md5)$/trust/' \
+            "/etc/postgresql/$V/main/pg_hba.conf"
+          sudo pg_ctlcluster "$V" main start
+          psql -U postgres -d postgres -c "CREATE EXTENSION IF NOT EXISTS pg_stat_statements"
+          psql -U postgres -d postgres -tAc "SELECT version()"
+
+      - name: Build (BPF tracer + pgwt-server)
+        run: make
+
+      - name: Run capture smoke (tiered hard; full if watchpoints available)
+        run: |
+          V=${{ matrix.pg }}
+          sudo env "PATH=/usr/lib/postgresql/$V/bin:$PATH" \
+            tests/ci_smoke.sh --pg-version "$V"
 
   web-ui:
     name: web-ui
