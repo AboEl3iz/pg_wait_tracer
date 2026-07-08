@@ -155,14 +155,16 @@ uint64_t pgwt_resolve_symbol(const char *binary, const char *symbol,
     return sym_val - elf_base + load_base;
 }
 
-uint64_t pgwt_find_load_base(pid_t pid, const char *binary_basename)
+/* Parse a maps file (the /proc/<pid>/maps format) and return the load base
+ * for the given binary basename. Split out from pgwt_find_load_base so unit
+ * tests can drive it with committed fixture files (tests/test_discovery.c —
+ * the #24 regression class: EL8 non-PIE vs EL9/Ubuntu PIE layouts). */
+uint64_t pgwt_find_load_base_in_maps(const char *maps_path,
+                                     const char *binary_basename)
 {
-    char path[64];
-    snprintf(path, sizeof(path), "/proc/%d/maps", pid);
-
-    FILE *f = fopen(path, "r");
+    FILE *f = fopen(maps_path, "r");
     if (!f) {
-        fprintf(stderr, "Cannot open %s: %s\n", path, strerror(errno));
+        fprintf(stderr, "Cannot open %s: %s\n", maps_path, strerror(errno));
         return 0;
     }
 
@@ -192,9 +194,16 @@ uint64_t pgwt_find_load_base(pid_t pid, const char *binary_basename)
     fclose(f);
 
     if (base == 0)
-        fprintf(stderr, "Load base for '%s' not found in /proc/%d/maps\n",
-                binary_basename, pid);
+        fprintf(stderr, "Load base for '%s' not found in %s\n",
+                binary_basename, maps_path);
     return base;
+}
+
+uint64_t pgwt_find_load_base(pid_t pid, const char *binary_basename)
+{
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/maps", pid);
+    return pgwt_find_load_base_in_maps(path, binary_basename);
 }
 
 uint64_t pgwt_read_pointer(pid_t pid, uint64_t addr)
@@ -773,13 +782,19 @@ int pgwt_discover(struct pgwt_daemon *d)
             if (d->verbose)
                 fprintf(stderr, "INFO: loaded dynamic event names from PG%d\n",
                         d->pg_major_version);
-            /* Write sidecar for pgwt-server to use later */
-            if (d->trace_dir)
-                pgwt_write_names_json(d->trace_dir);
         } else if (d->verbose) {
             fprintf(stderr, "INFO: dynamic event name query failed, using hardcoded tables\n");
         }
     }
+
+    /* Write the name sidecar for pgwt-server whenever we record a trace —
+     * ALWAYS, not only when dynamic names loaded. The sidecar must carry
+     * the mapping the trace is written with (dynamic on PG17+, the
+     * version-selected hardcoded tables otherwise); without it a PG13
+     * trace was silently decoded with PG18 tables by pgwt-server (the #8
+     * mislabeling class — caught by the CI capture-smoke PG13 cell). */
+    if (d->trace_dir)
+        pgwt_write_names_json(d->trace_dir);
 
     /* Extract basename for /proc/pid/maps matching */
     const char *base = strrchr(binary, '/');

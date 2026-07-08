@@ -815,6 +815,24 @@ int pgwt_load_event_names_from_buffer(const char *data)
     return 0;
 }
 
+/* Return the ACTIVE (version-selected) id→name table + max index for a
+ * class byte — what the daemon is actually decoding with right now (the
+ * PG13 tables on PG13, etc.), unlike hardcoded_class_table() which always
+ * returns the PG17/18-shared tables for reverse lookup. */
+static int active_class_table(int cb, const char ***tbl, int *max)
+{
+    switch (cb) {
+    case PG_WAIT_IO:       *tbl = io_events;              *max = io_events_max;              return 1;
+    case PG_WAIT_LOCK:     *tbl = lock_events;            *max = LOCK_EVENTS_MAX;            return 1;
+    case PG_WAIT_TIMEOUT:  *tbl = timeout_events_active;  *max = timeout_events_active_max;  return 1;
+    case PG_WAIT_ACTIVITY: *tbl = activity_events_active; *max = activity_events_active_max; return 1;
+    case PG_WAIT_CLIENT:   *tbl = client_events_active;   *max = client_events_active_max;   return 1;
+    case PG_WAIT_IPC:      *tbl = ipc_events_active;      *max = ipc_events_active_max;      return 1;
+    case PG_WAIT_LWLOCK:   *tbl = lwlock_events_active;   *max = lwlock_events_active_max;   return 1;
+    default:               return 0;
+    }
+}
+
 int pgwt_write_names_json(const char *trace_dir)
 {
     char path[512];
@@ -829,16 +847,39 @@ int pgwt_write_names_json(const char *trace_dir)
         NULL, NULL, NULL, NULL
     };
 
+    /* The sidecar records the mapping the trace was WRITTEN with, so the
+     * reader (pgwt-server) never decodes with mismatched tables. Prefer
+     * the dynamically-loaded names (PG17+, exact for this build); fall
+     * back to the active version-selected hardcoded tables otherwise —
+     * without this, a PG13 trace had no sidecar at all and pgwt-server
+     * silently decoded PG13 ids with PG18 tables (the #8 mislabeling
+     * class; caught by the CI capture-smoke PG13 cell). */
     for (int c = 0; c < 16; c++) {
-        if (dyn_max[c] < 0) continue;
-
         const char *cname = class_names[c];
         if (!cname) continue;
 
+        /* Gate on dyn_loaded, NOT on dyn_max alone: dyn_max[] is
+         * zero-initialized in a fresh process (dyn_clear() sets it to -1
+         * but only ever runs on a dynamic load), so a raw dyn_max check
+         * made a no-dynamic-names daemon dump a bogus one-empty-entry
+         * table per class instead of the hardcoded fallback. */
+        int use_dyn = (dyn_loaded && dyn_max[c] >= 0);
+        const char **htbl = NULL;
+        int hmax = -1;
+        if (!use_dyn && !active_class_table(c, &htbl, &hmax))
+            continue;
+
         cJSON *arr = cJSON_CreateArray();
-        for (int i = 0; i <= dyn_max[c]; i++) {
-            const char *n = dyn_names[c][i];
-            cJSON_AddItemToArray(arr, cJSON_CreateString(n ? n : ""));
+        if (use_dyn) {
+            for (int i = 0; i <= dyn_max[c]; i++) {
+                const char *n = dyn_names[c][i];
+                cJSON_AddItemToArray(arr, cJSON_CreateString(n ? n : ""));
+            }
+        } else {
+            for (int i = 0; i <= hmax; i++) {
+                const char *n = htbl[i];
+                cJSON_AddItemToArray(arr, cJSON_CreateString(n ? n : ""));
+            }
         }
         cJSON_AddItemToObject(root, cname, arr);
     }

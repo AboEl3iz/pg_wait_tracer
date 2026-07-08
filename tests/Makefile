@@ -12,13 +12,25 @@ LIBBPF_LIB ?= -lbpf
 
 TESTS     = test_wait_event test_cmdline test_event_writer test_event_reader \
             test_trace_v2 test_sampler test_anomaly test_coop test_bucket \
-            test_pg13_resolve \
+            test_pg13_resolve test_discovery_pie test_discovery_nopie \
             gen_test_traces gen_bench_traces test_concurrent_rw cross_validate \
             dump_markers
 
-.PHONY: all clean
+.PHONY: all clean check
 
 all: $(TESTS)
+
+# Run the full C unit suite. The list of tests lives in unit_tests.list —
+# the SINGLE source of truth shared by CI (ci.yml) and tests/run_all.sh
+# (TST-3: two hand-maintained lists had drifted; never maintain a third).
+check: all
+	@fail=0; \
+	while read -r t; do \
+	    case "$$t" in ''|\#*) continue ;; esac; \
+	    echo "=== $$t ==="; \
+	    ./$$t || { echo "FAILED: $$t"; fail=1; }; \
+	done < unit_tests.list; \
+	exit $$fail
 
 test_wait_event: test_wait_event.c $(BUILD)/wait_event.o $(BUILD)/cJSON.o
 	$(CC) $(CFLAGS) -o $@ $^
@@ -43,6 +55,22 @@ test_bucket: test_bucket.c
 test_pg13_resolve: test_pg13_resolve.c ../src/discovery.c \
                    $(BUILD)/wait_event.o $(BUILD)/cJSON.o
 	$(CC) $(CFLAGS) -o $@ $^ -lelf -lz
+
+# test_discovery: load-base + ELF symbol resolution — the #24 regression
+# class (pgwt_find_load_base_in_maps against committed maps fixtures, plus
+# self-resolution of a known global via /proc/self/{exe,maps}). Built TWICE,
+# -pie and -no-pie, because PIE vs non-PIE is exactly the axis #24 broke on;
+# each build asserts (via the ELF header) that the flag actually took effect.
+# Compiles discovery.c directly (BPF-free, needs libelf) — same pattern as
+# test_pg13_resolve.
+DISCOVERY_TEST_DEPS = test_discovery.c ../src/discovery.c \
+                      $(BUILD)/wait_event.o $(BUILD)/cJSON.o
+
+test_discovery_pie: $(DISCOVERY_TEST_DEPS)
+	$(CC) $(CFLAGS) -DPGWT_TEST_EXPECT_PIE=1 -fPIE -pie -o $@ $^ -lelf -lz
+
+test_discovery_nopie: $(DISCOVERY_TEST_DEPS)
+	$(CC) $(CFLAGS) -DPGWT_TEST_EXPECT_PIE=0 -fno-pie -no-pie -o $@ $^ -lelf -lz
 
 # test_trace_v2: format round-trip (v2 typed blocks). Built against the
 # server objects (-DPGWT_SERVER) so it needs no BPF skeleton — buildable on

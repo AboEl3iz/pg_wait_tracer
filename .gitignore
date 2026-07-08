@@ -20,6 +20,9 @@ tests/test_trace_v2
 tests/test_sampler
 tests/test_anomaly
 tests/test_coop
+tests/test_pg13_resolve
+tests/test_discovery_pie
+tests/test_discovery_nopie
 tests/dump_markers
 tests/gen_test_traces
 tests/gen_bench_traces

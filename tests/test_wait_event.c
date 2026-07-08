@@ -294,9 +294,57 @@ static void test_pg13_names(void)
     pgwt_init_event_names(18);
 }
 
+/* Regression (#8 mislabeling class; caught live by the CI capture-smoke
+ * PG13 cell): a trace recorded on PG13 must ship a name sidecar carrying
+ * the mapping it was WRITTEN with. pgwt_write_names_json() must dump the
+ * active version-selected hardcoded tables even when no dynamic names
+ * were loaded (PG13 has no pg_wait_events view) — before the fix, PG13
+ * traces had no sidecar at all and pgwt-server silently decoded PG13 ids
+ * with PG18 tables (PgSleep rendered as CheckpointWriteDelay).
+ *
+ * MUST RUN FIRST (fresh-process dyn state): dyn_max[] is 0-initialized at
+ * process start and only becomes -1 after a dyn_clear(). The daemon
+ * writes the sidecar in exactly that fresh state, and the first version
+ * of the fix passed this test only because an earlier test had already
+ * clear()ed — while a fresh daemon still wrote a bogus one-empty-entry
+ * sidecar. Running first reproduces the daemon's real initial state. */
+static void test_pg13_sidecar_roundtrip(void)
+{
+    printf("--- PG13 name sidecar round-trip ---\n");
+
+    char dir[] = "/tmp/pgwt_names_XXXXXX";
+    CHECK(mkdtemp(dir) != NULL, "mkdtemp failed");
+
+    /* Daemon side: PG13 tables active, no dynamic names available. */
+    pgwt_init_event_names(13);
+    CHECK(pgwt_write_names_json(dir) == 0,
+          "write sidecar without dynamic names");
+
+    /* Reader side: fresh pgwt-server defaults to PG18 tables, then loads
+     * the sidecar — PG13 ids must decode with PG13 names afterwards. */
+    pgwt_init_event_names(18);
+    CHECK(pgwt_load_names_json(dir) == 0, "load sidecar");
+
+    CHECK_NAME(WEI(PG_WAIT_TIMEOUT, 1), "Timeout:PgSleep");      /* PG18 id1 = CheckpointWriteDelay */
+    CHECK_NAME(WEI(PG_WAIT_TIMEOUT, 4), "Timeout:VacuumDelay");  /* PG18 id4 = RecoveryRetrieve... */
+    CHECK_NAME(WEI(PG_WAIT_LWLOCK, 11), "LWLock:XactSLRU");      /* individual lock in PG13 */
+    CHECK_NAME(WEI(PG_WAIT_LOCK, 0),   "Lock:relation");
+
+    char path[600];
+    snprintf(path, sizeof(path), "%s/wait_event_names.json", dir);
+    remove(path);
+    remove(dir);
+
+    /* Reset dynamic-name state for the remaining tests: an unparseable
+     * buffer makes the loader clear the dyn tables and return -1. */
+    CHECK(pgwt_load_event_names_from_buffer("no separators here") == -1,
+          "dyn reset via invalid buffer");
+}
+
 int main(void)
 {
     printf("=== test_wait_event ===\n");
+    test_pg13_sidecar_roundtrip();   /* FIRST: needs fresh-process dyn state */
     pgwt_init_event_names(18);
     test_cpu();
     test_io_events();
