@@ -476,6 +476,23 @@ class DaemonState:
 _DAEMON = DaemonState()
 
 
+class UpstreamState:
+    """Simulates the bridge's dead-upstream behavior (Trust Milestone UI-1/UI-3).
+
+    In production the browser's WS goes to the local Go bridge; when the
+    SSH/pgwt-server pipe behind it dies the WS STAYS OPEN and every request is
+    answered with {"id":N,"error":"...","transport":true}. Tests flip this
+    state via the test-only `test_upstream_down` / `test_upstream_up` commands
+    to drive the UI's degraded-transport state deterministically.
+    """
+
+    def __init__(self):
+        self.up = True
+
+
+_UPSTREAM = UpstreamState()
+
+
 def _handle_control(req_id, msg):
     """Proxy a control command (mirrors src/server.c handle_control)."""
     request = msg.get("request")
@@ -500,6 +517,16 @@ def handle_request(msg):
     """Dispatch a WebSocket JSON request and return canned response."""
     cmd = msg.get("cmd", "")
     req_id = msg.get("id", 0)
+
+    # Test-only upstream-death simulation (mirrors web/bridge.go envelopes).
+    if cmd == "test_upstream_down":
+        _UPSTREAM.up = False
+        return {"id": req_id, "ok": True}
+    if cmd == "test_upstream_up":
+        _UPSTREAM.up = True
+        return {"id": req_id, "ok": True}
+    if not _UPSTREAM.up:
+        return {"id": req_id, "error": "server disconnected", "transport": True}
 
     if cmd == "control":
         return _handle_control(req_id, msg)
@@ -526,6 +553,15 @@ def _handle_request_inner(cmd, req_id, msg):
         return {"id": req_id, **_CANNED["info"]}
 
     if cmd == "aas":
+        # Protocol-faithful: a window that does not intersect the canned data
+        # returns EMPTY buckets (like the real server for an out-of-range
+        # window). Lets Playwright drive the AAS empty-state (UI-5). Requests
+        # without from/to (e.g. protocol-drift) keep the canned data.
+        req_from, req_to = msg.get("from"), msg.get("to")
+        if (req_from is not None and req_to is not None and
+                (req_from > _TO_NS or req_to < _FROM_NS)):
+            return {"id": req_id, "bucket_ns": _BUCKET_NS, "max_aas": 0,
+                    "buckets": []}
         resp = {"id": req_id, "bucket_ns": _BUCKET_NS, "max_aas": 4.5}
         if msg.get("detail") == "events":
             series, buckets = _aas_event_series()
@@ -753,6 +789,21 @@ async def ws_handler(websocket, chaos=None):
 class StaticHandler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=STATIC_DIR, **kwargs)
+
+    def do_GET(self):
+        # The real Go server serves a per-session WS token at /session
+        # (UI-12). The mock has no token requirement; answer with a null
+        # token (rather than a 404, which would log a console error in every
+        # browser test) so the client connects token-less.
+        if self.path == "/session":
+            body = b'{"token": null}\n'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        super().do_GET()
 
     def log_message(self, format, *args):
         pass  # suppress logs

@@ -11,7 +11,7 @@
  * the old ApexCharts "N CPUs" annotation.
  */
 
-import { WAIT_CLASSES, EVENT_PALETTE, fmtTime } from '../format.js';
+import { WAIT_CLASSES, EVENT_PALETTE, fmtTime, esc } from '../format.js';
 import {
     buildFidelityShading, buildEscalationAnnotation, fidelityOf, fidelityLabel,
 } from './fidelity.js';
@@ -192,7 +192,7 @@ export function aasTooltip(params, bns) {
                total.toFixed(2) + '</b><br>';
     for (const it of items) {
         const pct = total > 0 ? (it.value / total * 100).toFixed(0) : '0';
-        html += '<span style="color:' + it.color + '">●</span> ' + it.name +
+        html += '<span style="color:' + it.color + '">●</span> ' + esc(it.name) +
                 ': <b>' + it.value.toFixed(2) + '</b> (' + pct + '%)<br>';
     }
     html += '</div>';

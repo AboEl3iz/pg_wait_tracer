@@ -14,24 +14,30 @@
  * unavailable" rather than erroring.
  */
 
+import { TransportError } from './transport.js';
+
 export class ControlUnavailable extends Error {
     constructor(msg) { super(msg || 'daemon not running'); this.name = 'ControlUnavailable'; }
 }
 
 /* Send one control request; resolve to the inner daemon reply object.
- * Throws ControlUnavailable when no daemon is reachable, or a plain Error on
- * transport failure. `transport` is the shared Transport instance. */
+ * Throws ControlUnavailable when the SERVER answered "no daemon here" (static
+ * replay) — that is a stable fact about the deployment. A transport-level
+ * failure (disconnect / bridge lost the pipe / timeout) rethrows as-is: the
+ * daemon may be fine, we just can't reach anything right now, so callers must
+ * NOT latch "no daemon" off it (UI-1/UI-9). */
 export async function control(transport, request) {
     let env;
     try {
         env = await transport.send('control', { request });
     } catch (e) {
-        // Transport-level failure (disconnect/timeout): surface as unavailable
-        // so the UI shows the degraded panel rather than a console error.
-        throw new ControlUnavailable(e && e.message);
+        if (e instanceof TransportError && !e.transport) {
+            // Command-level error from a live server: no daemon control socket.
+            throw new ControlUnavailable(e.message);
+        }
+        throw e;   // transport degraded — caller keeps last-known daemon state
     }
     if (!env) throw new ControlUnavailable('empty response');
-    if (env.error) throw new ControlUnavailable(env.error);
     return env.response || {};
 }
 

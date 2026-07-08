@@ -13,7 +13,7 @@
  *   - bursts table: every burst (4+ sessions within 10ms)
  */
 
-import { fmtTime, fmtTimeMs } from '../format.js';
+import { fmtTime, fmtTimeMs, esc } from '../format.js';
 
 /* data: concurrency response { peaks[], bursts[], bucket_ns }
  * Returns { option, hasData, topPeaks, bursts, bucketNs }. The HTML tables are
@@ -54,7 +54,7 @@ export function buildConcurrencyOption(data) {
                 const idx = params[0].dataIndex;
                 const ev = peakEvents[idx] || 'none';
                 return fmtTime(params[0].axisValue, bns) + '<br/>' +
-                    'Peak: <b>' + params[0].value + ' sessions</b><br/>Event: ' + ev;
+                    'Peak: <b>' + params[0].value + ' sessions</b><br/>Event: ' + esc(ev);
             },
         },
         grid: { left: 50, right: 20, top: 50, bottom: 40 },
@@ -90,7 +90,7 @@ export function buildConcurrencyTables(model) {
         '<table class="data-table"><thead><tr>' +
         '<th>Time</th><th>Wait Event</th><th>Simultaneous Sessions</th></tr></thead><tbody>';
     model.topPeaks.forEach(p => {
-        html += '<tr><td>' + fmtTimeMs(p.t_ms) + '</td><td>' + (p.event || 'CPU*') +
+        html += '<tr><td>' + fmtTimeMs(p.t_ms) + '</td><td>' + esc(p.event || 'CPU*') +
             '</td><td><b>' + p.max + '</b></td></tr>';
     });
     html += '</tbody></table>';
@@ -104,7 +104,7 @@ export function buildConcurrencyTables(model) {
             const time = fmtTimeMs(b.timestamp_ms);
             const pids = (b.pids || []).slice(0, 8).join(', ') +
                 (b.pids && b.pids.length > 8 ? '...' : '');
-            html += '<tr><td>' + time + '</td><td>' + b.event + '</td><td><b>' +
+            html += '<tr><td>' + time + '</td><td>' + esc(b.event) + '</td><td><b>' +
                 b.sessions + '</b></td><td>' + pids + '</td></tr>';
         });
         html += '</tbody></table>';

@@ -41,10 +41,12 @@
         </div>
       </div>
       <div class="tp-section">
-        <div class="tp-label">Custom range</div>
+        <div class="tp-label">Custom range (UTC)</div>
+        <!-- These inputs are UTC (like every displayed time in pgwt) and are
+             parsed as UTC — see datetimeLocalUTCToNs in lib/format.js. -->
         <div class="tp-custom">
-          <label>From <input type="datetime-local" id="tp-from" step="1"></label>
-          <label>To <input type="datetime-local" id="tp-to" step="1"></label>
+          <label>From (UTC) <input type="datetime-local" id="tp-from" step="1"></label>
+          <label>To (UTC) <input type="datetime-local" id="tp-to" step="1"></label>
           <button id="tp-apply" class="tp-apply">Apply</button>
         </div>
       </div>
@@ -73,6 +75,19 @@
 <div id="summary-bar"></div>
 <div id="table-container"></div>
 <div id="query-tooltip" class="query-tooltip"></div>
+
+<!-- Degraded-transport overlay (Trust Milestone UI-1): shown when the server
+     behind the bridge is unreachable (SSH death, server crash). Distinct from
+     any "No data" state — the data panes are covered, not blanked, and the
+     header stays interactive (pointer-events:none on the overlay). -->
+<div id="degraded-overlay" class="degraded-overlay" style="display:none">
+  <div class="degraded-card">
+    <div class="degraded-title">⚠ Connection to the server lost</div>
+    <div class="degraded-hint">Charts and tables show the last data received —
+      they are NOT live. Retrying automatically…</div>
+    <div id="degraded-reason" class="degraded-detail"></div>
+  </div>
+</div>
 
 <script type="module" src="app.js"></script>
 </body>

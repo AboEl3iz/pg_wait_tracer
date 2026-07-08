@@ -13,7 +13,7 @@
  *   - visualMap min 0 / max = max_count, with the original 6-stop color ramp
  */
 
-import { fmtTime } from '../format.js';
+import { fmtTime, esc } from '../format.js';
 
 const HEATMAP_COLORS =
     ['#1a5276', '#2196F3', '#4CAF50', '#FFEB3B', '#FF9800', '#F44336'];
@@ -35,8 +35,8 @@ export function buildHeatmapOption(data) {
         tooltip: {
             position: 'top', backgroundColor: '#1e1e3a', borderColor: '#333',
             textStyle: { color: '#e0e0e0', fontSize: 12 },
-            formatter: (p) => '<b>' + timeLabels[p.data[0]] + '</b><br>' +
-                'Latency: ' + latLabels[p.data[1]] + '<br>' +
+            formatter: (p) => '<b>' + esc(timeLabels[p.data[0]]) + '</b><br>' +
+                'Latency: ' + esc(latLabels[p.data[1]]) + '<br>' +
                 'Count: <b>' + p.data[2].toLocaleString() + '</b>',
         },
         grid: { left: 90, right: 40, top: 10, bottom: 60 },

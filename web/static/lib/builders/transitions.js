@@ -16,7 +16,7 @@
  *   - layout 'none', roam + draggable, arrow edge symbol
  */
 
-import { classColor } from '../format.js';
+import { classColor, esc as escHtml } from '../format.js';
 
 /* Build the layout-independent pieces: the maximum edge count and a name->node
  * lookup. Cheap, exported so the slider re-render can reuse it. */
@@ -81,7 +81,9 @@ export function buildTransitionsOption(data, threshold, dims) {
                     '\n' + timeStr,
                 lineHeight: 14,
             },
-            tooltip: { formatter: '<b>' + nd.name + '</b><br/>Total time: ' + timeStr },
+            // Tooltips render as HTML — escape the (server-derived) name too,
+            // same bug class as the timeline query-text injection (UI-6).
+            tooltip: { formatter: '<b>' + escHtml(nd.name) + '</b><br/>Total time: ' + timeStr },
             value: ms,
         };
     });
@@ -98,7 +100,8 @@ export function buildTransitionsOption(data, threshold, dims) {
                 opacity: 0.4 + (l.value / maxLinkVal) * 0.5,
             },
             tooltip: {
-                formatter: '<b>' + l.source + '</b> → <b>' + l.target + '</b><br/>' +
+                formatter: '<b>' + escHtml(l.source) + '</b> → <b>' + escHtml(l.target) +
+                    '</b><br/>' +
                     'Count: ' + l.value.toLocaleString() + ' (' + pct + '%)<br/>Avg dwell: ' +
                     avg + ' ms',
             },
@@ -153,16 +156,16 @@ export function buildVariantSectionHtml(vdata, title, esc) {
             flowHtml += '<div style="width:' + w.toFixed(1) + '%;background:' + color + ';opacity:0.8;' +
                 'display:flex;align-items:center;justify-content:center;overflow:hidden;' +
                 'font-size:9px;color:#fff;white-space:nowrap;padding:0 3px;min-width:2px" ' +
-                'title="' + st.name + ' ' + durStr + loopMark + '">' +
-                (w > 8 ? label + (loopMark ? loopMark : '') : '') +
+                'title="' + esc(st.name) + ' ' + durStr + loopMark + '">' +
+                (w > 8 ? esc(label) + (loopMark ? loopMark : '') : '') +
                 (w > 15 ? ' ' + durStr : '') + '</div>';
         });
         flowHtml += '</div>';
         const stepsText = v.steps.map(st => {
             const label = st.name.indexOf(':') > 0 ? st.name.substring(st.name.indexOf(':') + 1) : st.name;
             const dur = st.avg_ms >= 1 ? st.avg_ms.toFixed(1) + 'ms' : (st.avg_ms * 1000).toFixed(0) + 'μs';
-            if (st.loop) return '[' + label + '(' + dur + ')…]×N';
-            return label + '(' + dur + ')';
+            if (st.loop) return '[' + esc(label) + '(' + dur + ')…]×N';
+            return esc(label) + '(' + dur + ')';
         }).join(' → ');
         let queryHtml = '';
         if (v.top_query_id) {

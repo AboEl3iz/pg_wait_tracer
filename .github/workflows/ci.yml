@@ -83,6 +83,17 @@ jobs:
         # A builder off-by-one fails here in milliseconds, no Playwright needed.
         run: node --test 'tests/web_unit/*.test.mjs'
 
+      - name: Bridge integration test (Go client ↔ real pgwt-server — T6)
+        # Spawns the REAL pgwt-server (built above) over a local pipe (no SSH)
+        # behind the Go bridge and drives it through actual WebSockets:
+        # request/response id rewriting, two-connection id-collision isolation
+        # (UI-2), upstream death → transport error envelope + respawn (UI-1/3),
+        # session-token gating (UI-12), and the server's id-first envelope
+        # invariant (UI-8). Uses ../pgwt-server and ../tests/gen_test_traces.
+        env:
+          PGWT_BRIDGE_TEST_REQUIRE: "1"
+        run: cd web && go test -race ./...
+
   capture-smoke:
     # Phase T0 (Trust Milestone, TST-1/2): run the REAL capture path against
     # a real PostgreSQL on the runner. Every field escape to date (#8, #24,

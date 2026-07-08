@@ -101,3 +101,30 @@ export function fmtUs(us) {
 export function esc(s) {
     return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
+
+// -- datetime-local <-> ns, pinned to UTC (UI-11) ------------------------------
+//
+// Every time pgwt displays (chart axes, tooltips, the window readout) is UTC,
+// and the window readout is labeled "UTC". The custom-range picker's
+// <input type="datetime-local"> fields are therefore ALSO defined as UTC and
+// labeled "(UTC)" in the markup: the user types the times they read off the
+// screen. Browsers give datetime-local values no timezone, so both directions
+// must be explicit — a naive `new Date(str)` would parse the string in the
+// browser's LOCAL zone and hand a UTC+3 user a window three hours off.
+
+/* ns since epoch -> "YYYY-MM-DDTHH:MM:SS" rendered in UTC. */
+export function nsToDatetimeLocalUTC(ns) {
+    const d = new Date(ns / 1e6);
+    const pad = (n) => String(n).padStart(2, '0');
+    return d.getUTCFullYear() + '-' + pad(d.getUTCMonth() + 1) + '-' + pad(d.getUTCDate()) +
+        'T' + pad(d.getUTCHours()) + ':' + pad(d.getUTCMinutes()) + ':' + pad(d.getUTCSeconds());
+}
+
+/* "YYYY-MM-DDTHH:MM[:SS]" (a datetime-local value, defined as UTC) -> ns since
+ * epoch, or null if unparsable. */
+export function datetimeLocalUTCToNs(str) {
+    if (!str) return null;
+    const ms = Date.parse(str + 'Z');   // the Z suffix forces UTC parsing
+    if (isNaN(ms)) return null;
+    return ms * 1e6;
+}

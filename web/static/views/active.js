@@ -58,7 +58,32 @@ export function createActiveView() {
         },
 
         mount(_el, model, ctx) {
-            if (!chart || !model.hasData) return;   // disposed / no data
+            if (!chart) return;                     // disposed
+            if (!model.hasData) {
+                // UI-5: an empty window must not leave the PREVIOUS window's
+                // paint on screen while the tables say "No data" — clear the
+                // chart and say so explicitly.
+                chart.clear();
+                chart.setOption({
+                    backgroundColor: 'transparent',
+                    graphic: [{
+                        type: 'text', left: 'center', top: 'middle',
+                        style: { text: 'No data in selected range',
+                                 fill: '#666', fontSize: 13 },
+                    }],
+                }, true);
+                const legDiv = document.getElementById('aas-legend');
+                if (legDiv) legDiv.innerHTML = '';
+                const chip = document.getElementById('aas-fidelity-chip');
+                if (chip) chip.remove();
+                selected = null;
+                if (ctx.setStatus) {
+                    ctx.setStatus(ctx.server.numCpus + ' CPUs · ' +
+                        fmtDuration(ctx.timeRange.span()) + ' window · no data',
+                        'connected');
+                }
+                return;
+            }
             chart.setOption(model.option, true);
             renderLegend(model, chart, ctx, () => selected, (s) => { selected = s; });
             renderFidelityChip(model, ctx);

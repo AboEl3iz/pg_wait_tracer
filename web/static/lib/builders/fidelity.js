@@ -136,25 +136,24 @@ export function bandsToMarkArea(bands) {
  *
  * buildEscalationAnnotation(status, win) → null | {
  *   reason,          // "manual" | "anomaly" | other
- *   from, to,        // window bounds in ns (clamped to the view window)
- *   markArea,        // ECharts markArea spec for the escalation window
- *   markLine,        // a labeled vertical line at the window start
+ *   from, to,        // band bounds in ns (clamped to the view window), or null
+ *   markArea,        // ECharts markArea spec for the OBSERVED escalation span
+ *                    //   (null when the span start is unknown — never fabricate)
+ *   markLine,        // a labeled vertical line at the live edge
  *   label,           // human label ("Escalated (manual)")
  * }
  *
  * The control-socket `status` reports the CURRENTLY-open escalation window:
- * tier="escalated", escalation_seconds_remaining, and escalation_reason. We
- * render that as a band on the AAS timeline starting at (now - elapsed). Since
- * status doesn't carry elapsed, we anchor the band at the window's *visible*
- * portion: from = win.to - remaining (i.e. the live edge back by the seconds
- * left) is wrong — instead we start the band at "now minus remaining is the
- * end"; the open window's start is unknown, so we anchor the band to begin at
- * the live edge minus the time already shaded and extend to the live edge.
- * Concretely: the window END is "now + remaining"; its visible span within the
- * view is [max(win.from, now - elapsed), win.to]. We don't know elapsed, so we
- * shade from the live edge (win.to) back by a small, bounded marker and place a
- * labeled markLine at the live edge — making the active escalation unambiguous
- * without inventing a duration the server didn't give.
+ * tier="escalated", escalation_seconds_remaining, and escalation_reason. The
+ * daemon does not report when the window OPENED, so the client stamps
+ * `observed_start_ns` onto the status the first time a poll sees the tier flip
+ * to "escalated" (app.js pollDaemon). The band then covers exactly the span we
+ * know is escalated: [max(win.from, observed_start_ns), win.to] — never the
+ * whole view window (UI-10: shading 15 minutes for a 5-second escalation
+ * implied full-fidelity capture where there is none). If the page loaded
+ * mid-escalation the start is unknown; then we draw NO band — only the labeled
+ * markLine at the live edge — rather than invent a duration the server didn't
+ * give.
  */
 export function buildEscalationAnnotation(status, win) {
     if (!status || status.tier !== 'escalated') return null;
@@ -166,24 +165,26 @@ export function buildEscalationAnnotation(status, win) {
     const border = isAnomaly ? ESC_ANOMALY_BORDER : ESC_MANUAL_BORDER;
     const label  = 'Escalated (' + reason + ')';
 
-    // Anchor the band to the live edge: the active window ends in the future
-    // (remaining seconds) and is open now, so its captured portion runs up to
-    // the live edge (win.to). We shade from the window open time when known,
-    // else from win.from, up to win.to.
     const remainingS = +status.escalation_seconds_remaining || 0;
-    const from = win.from != null ? win.from : null;
-    const to   = win.to != null ? win.to : null;
+    const startNs = (typeof status.observed_start_ns === 'number')
+        ? status.observed_start_ns : null;
+    const to = win.to != null ? win.to : null;
+    // Band start: the observed escalation start, clamped into the window.
+    let from = null;
+    if (startNs != null) {
+        from = (win.from != null) ? Math.max(win.from, startNs) : startNs;
+        if (to != null && from > to) from = to;
+    }
 
-    const markArea = {
+    const markArea = (from != null && to != null) ? {
         silent: true,
         data: [[
-            (from != null ? { xAxis: from } : {}),
-            Object.assign(to != null ? { xAxis: to } : {}, {
-                itemStyle: { color: fill, borderColor: border,
-                             borderWidth: 1, borderType: 'solid' },
-            }),
+            { xAxis: from },
+            { xAxis: to,
+              itemStyle: { color: fill, borderColor: border,
+                           borderWidth: 1, borderType: 'solid' } },
         ]],
-    };
+    } : null;
 
     const markLine = to != null ? {
         silent: true,

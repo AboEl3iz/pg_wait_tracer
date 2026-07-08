@@ -8,7 +8,9 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildTimelineOption, timelineRenderItem } from '../../web/static/lib/builders/timeline.js';
+import {
+    buildTimelineOption, timelineRenderItem, timelineTooltipFormatter,
+} from '../../web/static/lib/builders/timeline.js';
 
 function data() {
     return {
@@ -86,4 +88,23 @@ test('renderItem: unknown classIdx falls back to grey, width >= 1', () => {
     const r = timelineRenderItem({}, api);
     assert.equal(r.style.fill, '#888');
     assert.equal(r.shape.width, 1);             // clamped to >= 1px
+});
+
+// ── Tooltip formatter (UI-6: query text is UNTRUSTED — any DB user's SQL) ────
+
+test('tooltip escapes query text (HTML injection from SQL)', () => {
+    const evil = 'SELECT 1 /* <img src=x onerror=alert(1)> */ <script>x</script>';
+    const bar = [100, 150, 0, 'CPU*', 0, evil, 50_000];
+    const html = timelineTooltipFormatter({ data: bar });
+    assert.ok(!html.includes('<img'), 'no raw <img injected');
+    assert.ok(!html.includes('<script'), 'no raw <script injected');
+    assert.ok(html.includes('&lt;script&gt;'), 'query text is escaped');
+});
+
+test('tooltip escapes the event name too, and omits empty/zero query', () => {
+    const bar = [100, 150, 0, '<b>evil</b>', 0, '0', 50_000];
+    const html = timelineTooltipFormatter({ data: bar });
+    assert.ok(!html.includes('<b>evil</b>'), 'name is escaped');
+    assert.ok(html.includes('&lt;b&gt;evil&lt;/b&gt;'));
+    assert.ok(!html.includes('Query:'), 'q="0" means no query line');
 });
