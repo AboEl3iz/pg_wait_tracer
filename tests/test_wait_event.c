@@ -300,7 +300,14 @@ static void test_pg13_names(void)
  * active version-selected hardcoded tables even when no dynamic names
  * were loaded (PG13 has no pg_wait_events view) — before the fix, PG13
  * traces had no sidecar at all and pgwt-server silently decoded PG13 ids
- * with PG18 tables (PgSleep rendered as CheckpointWriteDelay). */
+ * with PG18 tables (PgSleep rendered as CheckpointWriteDelay).
+ *
+ * MUST RUN FIRST (fresh-process dyn state): dyn_max[] is 0-initialized at
+ * process start and only becomes -1 after a dyn_clear(). The daemon
+ * writes the sidecar in exactly that fresh state, and the first version
+ * of the fix passed this test only because an earlier test had already
+ * clear()ed — while a fresh daemon still wrote a bogus one-empty-entry
+ * sidecar. Running first reproduces the daemon's real initial state. */
 static void test_pg13_sidecar_roundtrip(void)
 {
     printf("--- PG13 name sidecar round-trip ---\n");
@@ -327,11 +334,17 @@ static void test_pg13_sidecar_roundtrip(void)
     snprintf(path, sizeof(path), "%s/wait_event_names.json", dir);
     remove(path);
     remove(dir);
+
+    /* Reset dynamic-name state for the remaining tests: an unparseable
+     * buffer makes the loader clear the dyn tables and return -1. */
+    CHECK(pgwt_load_event_names_from_buffer("no separators here") == -1,
+          "dyn reset via invalid buffer");
 }
 
 int main(void)
 {
     printf("=== test_wait_event ===\n");
+    test_pg13_sidecar_roundtrip();   /* FIRST: needs fresh-process dyn state */
     pgwt_init_event_names(18);
     test_cpu();
     test_io_events();
@@ -345,8 +358,7 @@ int main(void)
     test_extension();
     test_pg13_names();
     test_unknown_fallbacks();
-    test_dynamic_name_mapping();     /* near-last: sets dyn_loaded */
-    test_pg13_sidecar_roundtrip();   /* last: overwrites dyn tables from sidecar */
+    test_dynamic_name_mapping();  /* must run last: sets dyn_loaded */
 
     printf("\n%d/%d tests passed\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;

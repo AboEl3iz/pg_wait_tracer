@@ -858,13 +858,19 @@ int pgwt_write_names_json(const char *trace_dir)
         const char *cname = class_names[c];
         if (!cname) continue;
 
+        /* Gate on dyn_loaded, NOT on dyn_max alone: dyn_max[] is
+         * zero-initialized in a fresh process (dyn_clear() sets it to -1
+         * but only ever runs on a dynamic load), so a raw dyn_max check
+         * made a no-dynamic-names daemon dump a bogus one-empty-entry
+         * table per class instead of the hardcoded fallback. */
+        int use_dyn = (dyn_loaded && dyn_max[c] >= 0);
         const char **htbl = NULL;
         int hmax = -1;
-        if (dyn_max[c] < 0 && !active_class_table(c, &htbl, &hmax))
+        if (!use_dyn && !active_class_table(c, &htbl, &hmax))
             continue;
 
         cJSON *arr = cJSON_CreateArray();
-        if (dyn_max[c] >= 0) {
+        if (use_dyn) {
             for (int i = 0; i <= dyn_max[c]; i++) {
                 const char *n = dyn_names[c][i];
                 cJSON_AddItemToArray(arr, cJSON_CreateString(n ? n : ""));
