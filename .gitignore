@@ -38,7 +38,9 @@ tests/web_snapshots/*-diff.png
 poc/web/pgwt-poc
 poc/web/go.sum
 web/pgwt
-web/go.sum
+web/web
+# NOTE: web/go.sum is TRACKED (required for reproducible `go test ./web/...`
+# in CI — the bridge integration test). Do not re-ignore it.
 
 # Cross-compiled Go binaries
 pgwt-darwin-amd64

@@ -29,6 +29,40 @@ h1 { font-size: 18px; font-weight: 600; color: #fff; }
 .status.connecting { background: #3d3200; color: #ffd700; }
 .status.connected  { background: #1a3d1a; color: #4caf50; }
 .status.error      { background: #3d1a1a; color: #f44336; }
+/* Degraded transport (UI-1): the WS may be open but the server behind the
+   bridge is unreachable — visually distinct from both connected and error. */
+.status.degraded   { background: #4a1515; color: #ff8a80; animation: pgwt-degraded-pulse 1.6s ease-in-out infinite; }
+@keyframes pgwt-degraded-pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.55; }
+}
+
+/* Degraded-transport overlay (UI-1): covers the data panes (below the header)
+   so stale paint can never read as live data; pointer-events:none keeps the
+   header (Live toggle, time picker) usable. */
+.degraded-overlay {
+  position: fixed;
+  top: 48px; left: 0; right: 0; bottom: 0;
+  background: rgba(20, 8, 8, 0.55);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: 60px;
+  pointer-events: none;
+  z-index: 900;
+}
+.degraded-card {
+  background: #3d1a1a;
+  border: 1px solid #f44336;
+  border-radius: 8px;
+  padding: 16px 24px;
+  max-width: 480px;
+  text-align: center;
+  box-shadow: 0 4px 24px rgba(0,0,0,0.6);
+}
+.degraded-title  { color: #ff8a80; font-size: 15px; font-weight: 600; margin-bottom: 6px; }
+.degraded-hint   { color: #ccc; font-size: 12px; }
+.degraded-detail { color: #888; font-size: 11px; margin-top: 6px; font-family: monospace; }
 
 /* Time range button + picker */
 .time-range-btn {

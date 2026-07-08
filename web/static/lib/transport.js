@@ -28,6 +28,22 @@ export class CancelledError extends Error {
     constructor(msg) { super(msg || 'cancelled'); this.name = 'CancelledError'; }
 }
 
+/* A request that failed instead of returning data (Trust Milestone UI-1).
+ * Raised for error envelopes ({"id":N,"error":"..."}), local timeouts, and
+ * disconnects. `transport` is true when the failure is connection-level (the
+ * bridge lost the SSH/server pipe, the socket closed, we are not connected)
+ * as opposed to a command-level error from a healthy server (e.g. the control
+ * proxy's "daemon not running"). Consumers use this flag to distinguish
+ * "transport degraded" (show the connection-lost state) from "this particular
+ * command failed" (degrade just that feature). */
+export class TransportError extends Error {
+    constructor(msg, opts) {
+        super(msg || 'request failed');
+        this.name = 'TransportError';
+        this.transport = !!(opts && opts.transport);
+    }
+}
+
 export class Transport {
     constructor() {
         this.ws = null;
@@ -53,6 +69,13 @@ export class Transport {
         delete this.pending[data.id];
         if (p.channel && this.channelId[p.channel] === data.id) {
             delete this.channelId[p.channel];
+        }
+        /* UI-1: an error envelope is a FAILED request, never data. The bridge
+         * tags its own (connection-level) envelopes with "transport":true;
+         * everything else is a command-level error from a live server. */
+        if (typeof data.error === 'string' && data.error !== '') {
+            p.reject(new TransportError(data.error, { transport: !!data.transport }));
+            return;
         }
         p.resolve(data);
     }
@@ -89,7 +112,7 @@ export class Transport {
 
     _issue(cmd, params, channel) {
         if (!this.isOpen()) {
-            return Promise.reject(new Error('not connected'));
+            return Promise.reject(new TransportError('not connected', { transport: true }));
         }
         const id = this.nextId++;
         const msg = JSON.stringify({ id, cmd, ...params });
@@ -99,7 +122,7 @@ export class Transport {
                 if (channel && this.channelId[channel] === id) {
                     delete this.channelId[channel];
                 }
-                reject(new Error('timeout'));
+                reject(new TransportError('timeout', { transport: true }));
             }, this.timeoutMs);
             this.pending[id] = { resolve, reject, timer, channel };
             if (channel) this.channelId[channel] = id;
@@ -112,7 +135,7 @@ export class Transport {
         for (const id of Object.keys(this.pending)) {
             const p = this.pending[id];
             clearTimeout(p.timer);
-            p.reject(new Error(reason));
+            p.reject(new TransportError(reason, { transport: true }));
         }
         this.pending = {};
         this.channelId = {};

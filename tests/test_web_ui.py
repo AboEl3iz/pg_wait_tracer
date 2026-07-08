@@ -1147,6 +1147,219 @@ def test_filter_persists_across_tabs(page):
         check(False, "(skipped)")
 
 
+# ── Trust Milestone T6: transport trust ───────────────────────────────────────
+
+def test_degraded_transport(page):
+    """T6/UI-1: a dead upstream (SSH/pgwt-server behind a live bridge) shows a
+    DEGRADED state — red pulsing pill + connection-lost overlay — never
+    "No data" under a green pill; live mode freezes; recovery needs no reload."""
+    print("--- Test T6.1: Degraded Transport ---")
+
+    page.goto(MOCK_URL)
+    page.wait_for_selector("#status.connected", timeout=10000)
+    page.wait_for_timeout(1000)
+
+    # Sanity: data on screen, live mode on, overlay hidden.
+    check(page.query_selector("#table-container table tbody tr") is not None,
+          "table has data before the outage")
+    overlay_visible = page.evaluate(
+        "document.getElementById('degraded-overlay').style.display !== 'none'")
+    check(not overlay_visible, "degraded overlay hidden while healthy")
+
+    # Kill the upstream: the WS STAYS OPEN (mirrors the Go bridge whose SSH
+    # pipe died) and every request now gets a transport error envelope.
+    page.evaluate(
+        "window.__pgwt.transport.send('test_upstream_down', {}).catch(() => {})")
+    page.wait_for_timeout(300)
+
+    # A user action fails immediately → degraded state, within one action.
+    page.click(".tab[data-tab='events']")
+    page.wait_for_timeout(1000)
+
+    status_cls = page.get_attribute("#status", "class") or ""
+    check("degraded" in status_cls,
+          f"status pill shows degraded (class='{status_cls}')")
+    status_txt = page.text_content("#status") or ""
+    check("lost" in status_txt.lower() or "retry" in status_txt.lower(),
+          f"status text explains the outage: '{status_txt}'")
+    overlay_visible = page.evaluate(
+        "document.getElementById('degraded-overlay').style.display !== 'none'")
+    check(overlay_visible, "connection-lost overlay is visible")
+    container = page.text_content("#table-container") or ""
+    check("No data" not in container,
+          "tables do NOT claim 'No data' during a transport outage")
+    check(page.evaluate("window.__pgwt.degraded.active") is True,
+          "degraded state exposed to tests")
+
+    # Live mode must stop pretending to tick: the window stays frozen across
+    # a live tick (5 s cadence) while degraded.
+    t0 = page.evaluate(
+        "() => [window.__pgwt.timeRange.from, window.__pgwt.timeRange.to]")
+    page.wait_for_timeout(6000)
+    t1 = page.evaluate(
+        "() => [window.__pgwt.timeRange.from, window.__pgwt.timeRange.to]")
+    check(t0 == t1, f"window frozen while degraded (was {t0}, now {t1})")
+    check(page.evaluate("window.__pgwt.degraded.active") is True,
+          "still degraded while upstream stays dead")
+
+    # Revive the upstream: the recovery probe (2.5 s cadence) must resync —
+    # connected pill, overlay gone, data repainted — WITHOUT a page reload.
+    page.evaluate(
+        "window.__pgwt.transport.send('test_upstream_up', {}).catch(() => {})")
+    page.wait_for_selector("#status.connected", timeout=15000)
+    page.wait_for_timeout(500)
+    check(page.evaluate("window.__pgwt.degraded.active") is False,
+          "degraded state cleared after recovery")
+    overlay_visible = page.evaluate(
+        "document.getElementById('degraded-overlay').style.display !== 'none'")
+    check(not overlay_visible, "overlay hidden after recovery")
+    check(page.query_selector("#table-container table tbody tr") is not None,
+          "table repainted with data after recovery")
+
+
+def test_custom_range_utc_and_aas_empty_state(page):
+    """T6/UI-11 + UI-5: the custom-range inputs are UTC even in a UTC+3
+    browser, and an out-of-range (empty) window CLEARS the AAS chart instead
+    of leaving the previous window's paint under 'No data' tables."""
+    print("--- Test T6.2: UTC Custom Range + AAS Empty State ---")
+
+    # A dedicated UTC+3 context (Europe/Moscow) — the UI-11 repro condition.
+    browser = page.context.browser
+    ws_port = MOCK_PORT + 1
+    ctx = browser.new_context(viewport={"width": 1280, "height": 900},
+                              timezone_id="Europe/Moscow")
+    ctx.add_init_script(f"""(function() {{
+        const _WS = window.WebSocket;
+        window.WebSocket = function(url, protocols) {{
+            url = url.replace(':{MOCK_PORT}/', ':{ws_port}/');
+            if (protocols !== undefined) return new _WS(url, protocols);
+            return new _WS(url);
+        }};
+        window.WebSocket.prototype = _WS.prototype;
+        window.WebSocket.CONNECTING = _WS.CONNECTING;
+        window.WebSocket.OPEN = _WS.OPEN;
+        window.WebSocket.CLOSING = _WS.CLOSING;
+        window.WebSocket.CLOSED = _WS.CLOSED;
+    }})();""")
+    ctx.add_init_script(UNHANDLED_REJECTION_HOOK)
+    p = ctx.new_page()
+    guard = ConsoleErrorGuard(p)
+    try:
+        p.goto(MOCK_URL)
+        p.wait_for_selector("#status.connected", timeout=10000)
+        p.wait_for_timeout(1200)
+
+        # The window readout is labeled UTC (UI-11).
+        check(" UTC" in (p.text_content("#time-range") or ""),
+              "time-range readout labeled UTC")
+
+        # AAS chart has series data initially.
+        has_series = p.evaluate("""() => {
+            const c = echarts.getInstanceByDom(
+                document.getElementById('aas-chart-container'));
+            if (!c) return false;
+            const opt = c.getOption();
+            return !!(opt.series && opt.series.some(s => s.data && s.data.length));
+        }""")
+        check(has_series, "AAS chart painted for the live window")
+
+        # Apply a custom range far outside the data. Typed values are UTC:
+        # 2039-01-01 00:00-01:00 UTC, regardless of the browser's UTC+3 zone.
+        p.click("#live-btn")            # stop live mode
+        p.wait_for_timeout(200)
+        p.click("#time-range")
+        p.wait_for_timeout(300)
+        # Set the values directly (Chromium's fill() rejects seconds in
+        # datetime-local); the Apply handler reads .value, no events needed.
+        p.eval_on_selector("#tp-from", "el => el.value = '2039-01-01T00:00:00'")
+        p.eval_on_selector("#tp-to", "el => el.value = '2039-01-01T01:00:00'")
+        p.click("#tp-apply")
+        p.wait_for_timeout(1200)
+
+        # UI-11: parsed as UTC — no 3-hour shift in a Moscow browser.
+        import calendar
+        want_from = calendar.timegm((2039, 1, 1, 0, 0, 0)) * 1_000_000_000
+        got_from = p.evaluate("window.__pgwt.timeRange.from")
+        check(int(got_from) == want_from,
+              f"custom From parsed as UTC (want {want_from}, got {int(got_from)})")
+
+        # UI-5: the empty window CLEARED the chart (no stale series paint).
+        state = p.evaluate("""() => {
+            const c = echarts.getInstanceByDom(
+                document.getElementById('aas-chart-container'));
+            if (!c) return { instance: false };
+            const opt = c.getOption();
+            const hasSeries = !!(opt.series &&
+                opt.series.some(s => s.data && s.data.length));
+            const hasGraphic = !!(opt.graphic && opt.graphic.length &&
+                JSON.stringify(opt.graphic).includes('No data'));
+            return { instance: true, hasSeries, hasGraphic };
+        }""")
+        check(state.get("instance") and not state.get("hasSeries"),
+              f"AAS chart cleared on empty window ({state})")
+        check(state.get("hasGraphic"),
+              "AAS chart shows an explicit 'No data' placeholder")
+
+        p.wait_for_timeout(250)
+        errors = guard.drain()
+        check(len(errors) == 0,
+              f"[utc/empty-state] no console errors (got {errors[:3]})")
+    finally:
+        ctx.close()
+
+
+def test_reconnect_idempotent_no_leak(page):
+    """T6/UI-4: N WS reconnects run the RESYNC path, not a fresh init — no
+    duplicated chart instances and no duplicated tab/resize listeners."""
+    print("--- Test T6.3: Reconnect Idempotence ---")
+
+    page.goto(MOCK_URL)
+    page.wait_for_selector("#status.connected", timeout=10000)
+    page.wait_for_timeout(1000)
+    page.click("#live-btn")   # stop live so ticks don't muddy request counts
+    page.wait_for_timeout(300)
+
+    # Force three full WS reconnect cycles (close → 2s backoff → reconnect).
+    for i in range(3):
+        page.evaluate("window.__pgwt.transport.ws.close()")
+        page.wait_for_selector("#status.connected", timeout=15000)
+        page.wait_for_timeout(400)
+
+    # Chart instances bounded: the persistent AAS chart only (overview tab has
+    # no chart of its own). A leaking init() would add one per reconnect.
+    charts = page.evaluate("""() => {
+        let n = 0;
+        for (const el of document.querySelectorAll('*')) {
+            try { if (echarts.getInstanceByDom(el)) n++; } catch (e) {}
+        }
+        return n;
+    }""")
+    check(charts <= 2,
+          f"no ECharts instance leak after 3 reconnects (live instances={charts})")
+
+    # Tab listeners not duplicated: one tab click must produce exactly one
+    # table request + one aas request (N+1 listeners would send N+1 each).
+    page.evaluate("""() => {
+        window.__wsMsgLog = [];
+        const ws = window.__pgwt.transport.ws;
+        const origSend = ws.send.bind(ws);
+        ws.send = function(data) {
+            window.__wsMsgLog.push(JSON.parse(data));
+            return origSend(data);
+        };
+    }""")
+    page.click(".tab[data-tab='events']")
+    page.wait_for_timeout(1500)
+    cmds = [m.get("cmd") for m in page.evaluate("window.__wsMsgLog")]
+    check(cmds.count("top_events") == 1,
+          f"one tab click sends exactly 1 top_events after reconnects (got {cmds})")
+    check(cmds.count("aas") == 1,
+          f"one tab click sends exactly 1 aas after reconnects (got {cmds})")
+
+    page.click(".tab[data-tab='overview']")
+    page.wait_for_timeout(500)
+
+
 # ── Phase B5: fidelity-aware UI ───────────────────────────────────────────────
 # These run against a SECOND mock launched in sampled fidelity with the daemon
 # control command enabled, so the escalate flow, the sampled shading, the
@@ -1356,6 +1569,10 @@ def main():
                 # Sprint 5.4: Regression tests
                 test_no_double_refresh,
                 test_filter_persists_across_tabs,
+                # Trust Milestone T6: transport trust
+                test_degraded_transport,
+                test_custom_range_utc_and_aas_empty_state,
+                test_reconnect_idempotent_no_leak,
             ]
             for fn in tests:
                 fn(page)

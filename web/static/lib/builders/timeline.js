@@ -33,12 +33,15 @@ export function timelineRenderItem(params, api) {
     };
 }
 
-function tooltipFormatter(params) {
+/* Pure tooltip renderer (exported for testing). The query text (d[5]) comes
+ * from arbitrary user SQL and MUST be escaped — it is injected into the DBA's
+ * browser otherwise (UI-6). */
+export function timelineTooltipFormatter(params) {
     const d = params.data;
     let s = '<b>' + esc(d[3]) + '</b><br>';
     s += 'Duration: <b>' + fmtUs(d[6] / 1000) + '</b><br>';
     s += 'Start: ' + fmtTime(d[0]) + '<br>';
-    if (d[5] && d[5] !== '0') s += 'Query: ' + d[5];
+    if (d[5] && d[5] !== '0') s += 'Query: ' + esc(d[5]);
     return s;
 }
 
@@ -66,7 +69,7 @@ export function buildTimelineOption(data, opts) {
         tooltip: {
             trigger: 'item', backgroundColor: '#1e1e3a', borderColor: '#333',
             textStyle: { color: '#e0e0e0', fontSize: 12 },
-            formatter: tooltipFormatter,
+            formatter: timelineTooltipFormatter,
         },
         grid: { left: 100, right: 20, top: 20, bottom: 40 },
         xAxis: {

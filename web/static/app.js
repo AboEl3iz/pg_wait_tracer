@@ -15,10 +15,13 @@
  */
 
 import { ServerInfo, TimeRange, FilterStack } from './lib/state.js';
-import { Transport } from './lib/transport.js';
+import { Transport, TransportError, CancelledError } from './lib/transport.js';
 import { ViewManager } from './lib/view-manager.js';
 import { mountTable } from './lib/table.js';
-import { classColor, fmtTime, fmtDuration, esc } from './lib/format.js';
+import {
+    classColor, fmtTime, fmtDuration, esc,
+    nsToDatetimeLocalUTC, datetimeLocalUTCToNs,
+} from './lib/format.js';
 import { controlStatus, controlMetrics, ControlUnavailable } from './lib/control.js';
 import { mountEscalateControl, mountMetricsPanel } from './lib/panels.js';
 import { createActiveView } from './views/active.js';
@@ -47,13 +50,30 @@ let vm = null;               // ViewManager for tab views
 // first time the daemon is unreachable (static-trace replay) so we stop polling
 // and hide the escalation UI. Views read `daemon.status` synchronously via the
 // ctx hook to render the AAS escalation annotation + unavailable panels.
-const daemon = { status: null, metrics: null, available: true, polled: false };
+const daemon = { status: null, metrics: null, available: true, polled: false,
+                 escalationStartNs: null };
 let metricsPanelOpen = false;
 let daemonPollId = 0;
 
 // Reconnect bookkeeping (lifecycle only — not request state).
 let reconnectDelay = 2000;
 let reconnectTimer = null;
+
+// One-time UI wiring guard (UI-4): chart instances, tab routing, and DOM
+// listeners are created exactly once; every later WS (re)connect goes through
+// the resync path instead of re-running init.
+let uiInitialized = false;
+
+// ── Degraded-transport state (UI-1) ───────────────────────────────────────────
+// The bridge stays connected while the SSH/pgwt-server pipe behind it dies: the
+// only signal is error envelopes on requests. This state makes that failure
+// VISIBLE (red status pill + connection-lost overlay over the data panes) and
+// distinct from "no data in range". While degraded, live mode stops pretending
+// to tick (the window freezes); a background probe re-tries `info` and, on
+// success, resyncs — server info refreshed and any live window re-anchored to
+// NOW (never to stale data).
+const degraded = { active: false, reason: null };
+let recoverId = 0;
 
 // Auto-refresh (live mode) bookkeeping.
 let autoRefreshId = 0;
@@ -96,25 +116,46 @@ function makeCtx() {
         getEscalationStatus: () => daemon.status,
         refreshEscalationStatus: () => pollDaemon(),
         onEscalationChanged: () => { renderEscalateControl(); refreshActive(); },
+        // UI-1: request failures bubble here (view-manager chokepoint + the
+        // active view) so a dead transport becomes visible, not "No data".
+        onRequestError: onRequestError,
     };
 }
 
 // ── WebSocket lifecycle ───────────────────────────────────────────────────────
 
-function connect() {
+/* UI-12: fetch the per-session WS token from the Go server. Same-origin
+ * policy is what protects it — a foreign page cannot read this response. The
+ * mock server has no /session endpoint; connect without a token then. */
+async function fetchSessionToken() {
+    try {
+        const r = await fetch('/session');
+        if (!r.ok) return null;
+        const j = await r.json();
+        return (j && j.token) || null;
+    } catch (e) {
+        return null;
+    }
+}
+
+async function connect() {
     if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
     setStatus('Connecting...', 'connecting');
-    const ws = new WebSocket('ws://' + location.host + '/ws');
+    const token = await fetchSessionToken();
+    const url = 'ws://' + location.host + '/ws' +
+        (token ? '?token=' + encodeURIComponent(token) : '');
+    const ws = new WebSocket(url);
 
     ws.onopen = () => {
         transport.attach(ws);
         reconnectDelay = 2000;
-        init();
+        onConnected();
     };
     ws.onclose = () => {
         transport.ws = null;
         transport.rejectAll('disconnected');
         stopDaemonPoll();
+        if (uiInitialized) setDegraded('disconnected');
         scheduleReconnect();
     };
     ws.onerror = () => { /* onclose follows */ };
@@ -127,35 +168,126 @@ function scheduleReconnect() {
     reconnectTimer = setTimeout(connect, delay);
 }
 
-// ── Init ──────────────────────────────────────────────────────────────────────
+// ── Init / reconnect resync (UI-4) ────────────────────────────────────────────
+//
+// One-time setup (chart instances, tab routing, DOM listeners) runs exactly
+// once. Every subsequent WS connection goes through the RESYNC path: refresh
+// server info, re-anchor a live window to NOW, repaint — creating nothing, so
+// N reconnects leak zero chart instances and zero listeners.
 
-async function init() {
+async function onConnected() {
     setStatus('Loading...', 'connecting');
     try {
         const info = await transport.send('info');
         server.update(info);
-        timeRange.initDefault();
+
+        if (!uiInitialized) {
+            timeRange.initDefault();
+            initOnce();
+            uiInitialized = true;
+            setStatus(server.numCpus + ' CPUs', 'connected');
+            updateTimeRange();
+
+            // Poll the daemon control plane BEFORE the first paint so the AAS
+            // escalation annotation + the escalate control are correct on load.
+            await pollDaemon();
+            startDaemonPoll();
+
+            await refresh();
+            startAutoRefresh(900);   // start in live mode (last 15 min)
+            return;
+        }
+
+        // Reconnect resync: the transport is healthy again.
+        clearDegraded();
         setStatus(server.numCpus + ' CPUs', 'connected');
-
+        if (autoRefreshOn) {
+            // "Last N min" must mean NOW, never the pre-disconnect window.
+            timeRange.anchorLive(timeRange.liveRangeSecs);
+        }
         updateTimeRange();
-        initChartView();
-        initChartResize();
-        initTabs();
-        initTimePicker();
-        initLiveMode();
-        initMetricsButton();
-        window.addEventListener('resize', onResize);
-
-        // Poll the daemon control plane BEFORE the first paint so the AAS
-        // escalation annotation + the escalate control are correct on load.
         await pollDaemon();
         startDaemonPoll();
-
         await refresh();
-        startAutoRefresh(900);   // start in live mode (last 15 min)
     } catch (e) {
         setStatus('Error: ' + e.message, 'error');
     }
+}
+
+function initOnce() {
+    initChartView();
+    initChartResize();
+    initTabs();
+    initTimePicker();
+    initLiveMode();
+    initMetricsButton();
+    window.addEventListener('resize', onResize);
+}
+
+// ── Degraded-transport handling (UI-1) ────────────────────────────────────────
+
+function onRequestError(e) {
+    if (e instanceof CancelledError) return;
+    if (e instanceof TransportError && e.transport) setDegraded(e.message);
+}
+
+function setDegraded(reason) {
+    if (degraded.active) { degraded.reason = reason; renderDegraded(); return; }
+    degraded.active = true;
+    degraded.reason = reason;
+    renderDegraded();
+    startRecoveryProbe();
+}
+
+function clearDegraded() {
+    recoverId++;   // stop any running probe
+    if (!degraded.active) return;
+    degraded.active = false;
+    degraded.reason = null;
+    renderDegraded();
+}
+
+function renderDegraded() {
+    const overlay = document.getElementById('degraded-overlay');
+    if (overlay) {
+        overlay.style.display = degraded.active ? 'flex' : 'none';
+        const reasonEl = document.getElementById('degraded-reason');
+        if (reasonEl) reasonEl.textContent = degraded.reason || '';
+    }
+    if (degraded.active) setStatus('Connection lost — retrying', 'degraded');
+}
+
+/* While degraded with the WS still open (dead SSH behind a live bridge), probe
+ * `info` until the server answers again, then resync. If the WS itself is
+ * closed, the reconnect loop owns recovery (its resync clears the state). */
+function startRecoveryProbe() {
+    const myId = ++recoverId;
+    (async function loop() {
+        while (recoverId === myId && degraded.active) {
+            await new Promise(r => setTimeout(r, 2500));
+            if (recoverId !== myId || !degraded.active) break;
+            if (!transport.isOpen()) continue;   // WS reconnect path owns this
+            try {
+                const info = await transport.send('info');
+                if (recoverId !== myId) break;
+                server.update(info);
+                await onTransportRecovered();
+                break;
+            } catch (e) { /* still down; retry */ }
+        }
+    })();
+}
+
+async function onTransportRecovered() {
+    clearDegraded();
+    setStatus(server.numCpus + ' CPUs', 'connected');
+    if (autoRefreshOn) {
+        // Re-anchor the live window to NOW — never resume a stale window.
+        timeRange.anchorLive(timeRange.liveRangeSecs);
+    }
+    updateTimeRange();
+    await pollDaemon();
+    await refresh();
 }
 
 // ── Refresh orchestration ─────────────────────────────────────────────────────
@@ -177,7 +309,11 @@ async function refreshActive() {
     try {
         data = await activeView.requests(ctx);
     } catch (e) {
-        return;  // superseded / disconnected: keep current paint
+        // Superseded: silent. Transport failure: surface the degraded state
+        // (UI-1) — the current paint stays but under the connection-lost
+        // overlay, never pretending to be fresh.
+        onRequestError(e);
+        return;
     }
     let model;
     try { model = activeView.build(data, ctx); } catch (e) { return; }
@@ -331,7 +467,8 @@ function updateTimeRange() {
     const from = fmtTime(timeRange.from);
     const to = fmtTime(timeRange.to);
     const dur = fmtDuration(timeRange.span());
-    el.textContent = from + ' – ' + to + ' (' + dur + ')';
+    // All pgwt times are UTC — say so (UI-11).
+    el.textContent = from + ' – ' + to + ' UTC (' + dur + ')';
 }
 
 async function zoomTo(from, to) {
@@ -385,8 +522,8 @@ function initTimePicker() {
         const visible = picker.style.display !== 'none';
         picker.style.display = visible ? 'none' : 'block';
         if (!visible) {
-            document.getElementById('tp-from').value = nsToDatetimeLocal(timeRange.from);
-            document.getElementById('tp-to').value = nsToDatetimeLocal(timeRange.to);
+            document.getElementById('tp-from').value = nsToDatetimeLocalUTC(timeRange.from);
+            document.getElementById('tp-to').value = nsToDatetimeLocalUTC(timeRange.to);
         }
     });
 
@@ -415,12 +552,11 @@ function initTimePicker() {
     });
 
     document.getElementById('tp-apply').addEventListener('click', () => {
-        const fromStr = document.getElementById('tp-from').value;
-        const toStr = document.getElementById('tp-to').value;
-        if (!fromStr || !toStr) return;
-        const fromNs = new Date(fromStr + 'Z').getTime() * 1e6;
-        const toNs = new Date(toStr + 'Z').getTime() * 1e6;
-        if (fromNs >= toNs) return;
+        // The inputs are defined (and labeled) as UTC; parse them as UTC so a
+        // UTC+3 browser gets exactly the window it typed (UI-11).
+        const fromNs = datetimeLocalUTCToNs(document.getElementById('tp-from').value);
+        const toNs = datetimeLocalUTCToNs(document.getElementById('tp-to').value);
+        if (fromNs == null || toNs == null || fromNs >= toNs) return;
         picker.style.display = 'none';
         picker.querySelectorAll('.tp-quick button').forEach(b => b.classList.remove('active'));
         stopAutoRefresh();
@@ -428,13 +564,6 @@ function initTimePicker() {
     });
 
     zoomOutBtn.addEventListener('click', () => { stopAutoRefresh(); zoomOut(); });
-}
-
-function nsToDatetimeLocal(ns) {
-    const d = new Date(ns / 1e6);
-    const pad = (n) => String(n).padStart(2, '0');
-    return d.getUTCFullYear() + '-' + pad(d.getUTCMonth() + 1) + '-' + pad(d.getUTCDate()) +
-        'T' + pad(d.getUTCHours()) + ':' + pad(d.getUTCMinutes()) + ':' + pad(d.getUTCSeconds());
 }
 
 // ── Live mode / auto-refresh ──────────────────────────────────────────────────
@@ -447,17 +576,24 @@ function startAutoRefresh(rangeSecs) {
     (async function loop() {
         await new Promise(r => setTimeout(r, 5000));
         while (autoRefreshId === myId) {
-            try {
-                const info = await transport.send('info', {});
-                if (autoRefreshId !== myId) break;
-                if (info) {
-                    server.update(info);
-                    timeRange.anchorLive(rangeSecs);
-                    updateTimeRange();
+            // UI-1: while the transport is degraded, live mode must not
+            // pretend to tick — the window stays frozen and nothing repaints
+            // as fresh. The recovery probe re-anchors to NOW on success.
+            if (!degraded.active) {
+                try {
+                    const info = await transport.send('info', {});
+                    if (autoRefreshId !== myId) break;
+                    if (info) {
+                        server.update(info);
+                        timeRange.anchorLive(rangeSecs);
+                        updateTimeRange();
+                    }
+                    if (autoRefreshId !== myId) break;
+                    await refresh();
+                } catch (e) {
+                    if (autoRefreshId === myId) onRequestError(e);
                 }
-                if (autoRefreshId !== myId) break;
-                await refresh();
-            } catch (e) { /* ignore */ }
+            }
             if (autoRefreshId !== myId) break;
             await new Promise(r => setTimeout(r, 5000));
         }
@@ -496,15 +632,31 @@ function initLiveMode() {
 //
 // One poll fetches status (+ metrics if the panel is open) over the control
 // proxy. A daemon-not-running reply (static-trace replay) flips `available`
-// false: we hide the escalation UI and stop polling — no console noise, the UI
-// just degrades to "no escalation here". When a daemon IS present, the escalate
-// header control + (optionally) the metrics panel reflect live state, and the
-// AAS chart re-renders so its escalation annotation tracks the current window.
+// false: we hide the escalation UI and drop to a slow re-probe cadence — the
+// control plane is RE-PROBED periodically (UI-9), so a daemon (re)started
+// mid-session restores the escalate UI without a page reload. When a daemon IS
+// present, the escalate header control + (optionally) the metrics panel reflect
+// live state, and the AAS chart re-renders so its escalation annotation tracks
+// the current window.
 
 async function pollDaemon() {
-    if (!daemon.available && daemon.polled) return;
     try {
         const status = await controlStatus(transport);
+        // UI-10: the daemon doesn't report when the current escalation window
+        // opened, so record the moment a poll OBSERVES the sampled->escalated
+        // flip. The AAS annotation shades only [observed start, live edge]; a
+        // page loaded mid-escalation has no start and gets the markLine only.
+        if (status && status.tier === 'escalated') {
+            const prevEscalated = daemon.status && daemon.status.tier === 'escalated';
+            if (!prevEscalated && daemon.status) {
+                daemon.escalationStartNs = server.nowNs;
+            }
+            if (daemon.escalationStartNs != null) {
+                status.observed_start_ns = daemon.escalationStartNs;
+            }
+        } else {
+            daemon.escalationStartNs = null;
+        }
         daemon.status = status;
         daemon.available = true;
         daemon.polled = true;
@@ -515,26 +667,34 @@ async function pollDaemon() {
         renderEscalateControl();
         renderMetricsPanel();
     } catch (e) {
-        // ControlUnavailable (no daemon) or transport error: degrade silently.
         daemon.polled = true;
         if (e instanceof ControlUnavailable) {
+            // The server answered "no daemon here" — a real fact.
             daemon.available = false;
             daemon.status = null;
+            daemon.escalationStartNs = null;
             renderEscalateControl();
             renderMetricsPanel();
         }
-        // Transport errors (transient disconnect): keep last status, retry next tick.
+        // Transport errors (disconnect / dead bridge pipe): keep the last
+        // status — the daemon may be fine; the degraded state covers the UI.
     }
 }
 
 function startDaemonPoll() {
     stopDaemonPoll();
     const myId = ++daemonPollId;
+    let tick = 0;
     (async function loop() {
         while (daemonPollId === myId) {
             await new Promise(r => setTimeout(r, 5000));
             if (daemonPollId !== myId) break;
-            if (!daemon.available) break;   // no daemon: stop the loop
+            tick++;
+            if (degraded.active) continue;   // transport down: nothing to ask
+            // No daemon last time we asked: keep re-probing, but slowly
+            // (every 30 s), so a daemon started mid-session is picked up
+            // without hammering a static-replay server (UI-9).
+            if (!daemon.available && tick % 6 !== 0) continue;
             await pollDaemon();
         }
     })();
@@ -591,7 +751,9 @@ function boot() {
         get activeTab() { return vm ? vm.activeId() : null; },
         // B5: read-only accessors for Playwright assertions on the daemon state.
         daemon,
-        daemonTier() { return daemon.status ? daemon.status.tier : null; } };
+        daemonTier() { return daemon.status ? daemon.status.tier : null; },
+        // T6/UI-1: read-only degraded-transport state for Playwright assertions.
+        degraded };
 
     connect();
 }

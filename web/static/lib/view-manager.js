@@ -93,7 +93,14 @@ export class ViewManager {
             data = await view.requests(ctx);
         } catch (e) {
             if (e instanceof CancelledError) return;   // superseded: drop
-            // Disconnect/timeout: leave the current paint in place.
+            // Request failure (error envelope / disconnect / timeout, UI-1):
+            // surface it to the app so it can show the degraded-transport
+            // state — but only if this refresh is still the current one (a
+            // stale epoch's failure is nobody's business, same rule as data).
+            if (this.active === view && myEpoch === this.epoch &&
+                this.ctx.onRequestError) {
+                try { this.ctx.onRequestError(e); } catch (e2) { /* best-effort */ }
+            }
             return;
         }
 

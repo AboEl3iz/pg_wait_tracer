@@ -102,7 +102,7 @@ test('escalation annotation: null when not escalated', () => {
 test('escalation annotation: manual vs anomaly use distinct colors + labels', () => {
     const manual = buildEscalationAnnotation(
         { tier: 'escalated', escalation_reason: 'manual',
-          escalation_seconds_remaining: 42 }, WIN);
+          escalation_seconds_remaining: 42, observed_start_ns: 1500 }, WIN);
     assert.equal(manual.reason, 'manual');
     assert.equal(manual.isAnomaly, false);
     assert.match(manual.label, /manual/);
@@ -110,12 +110,42 @@ test('escalation annotation: manual vs anomaly use distinct colors + labels', ()
 
     const anomaly = buildEscalationAnnotation(
         { tier: 'escalated', escalation_reason: 'anomaly',
-          escalation_seconds_remaining: 30 }, WIN);
+          escalation_seconds_remaining: 30, observed_start_ns: 1500 }, WIN);
     assert.equal(anomaly.isAnomaly, true);
     assert.match(anomaly.label, /anomaly/);
     assert.equal(anomaly.markArea.data[0][1].itemStyle.color, ESC_ANOMALY_COLOR);
     // The markLine sits at the live edge of the window.
     assert.equal(anomaly.markLine.data[0].xAxis, 2000);
+});
+
+/* UI-10: the band must cover only the escalation window actually observed —
+ * never the whole view window (a 15-min window with a 5 s escalation used to
+ * shade all 15 min, implying full-fidelity capture where there is none). */
+test('escalation annotation: band spans [observed start, live edge], not the window', () => {
+    const a = buildEscalationAnnotation(
+        { tier: 'escalated', escalation_reason: 'manual',
+          escalation_seconds_remaining: 42, observed_start_ns: 1600 }, WIN);
+    assert.equal(a.from, 1600, 'band starts where escalation was observed to start');
+    assert.equal(a.to, 2000, 'band ends at the live edge');
+    assert.equal(a.markArea.data[0][0].xAxis, 1600);
+    assert.equal(a.markArea.data[0][1].xAxis, 2000);
+});
+
+test('escalation annotation: observed start clamps to the view window', () => {
+    const a = buildEscalationAnnotation(
+        { tier: 'escalated', escalation_reason: 'manual',
+          escalation_seconds_remaining: 42, observed_start_ns: 5 }, WIN);
+    assert.equal(a.from, WIN.from, 'start clamped to the visible window');
+});
+
+test('escalation annotation: unknown start -> markLine only, NO fabricated band', () => {
+    const a = buildEscalationAnnotation(
+        { tier: 'escalated', escalation_reason: 'manual',
+          escalation_seconds_remaining: 42 }, WIN);
+    assert.notEqual(a, null, 'annotation still present');
+    assert.equal(a.markArea, null, 'no band when the start is unknown');
+    assert.equal(a.markLine.data[0].xAxis, 2000, 'live-edge markLine remains');
+    assert.match(a.label, /manual/);
 });
 
 // ── unavailable panel ────────────────────────────────────────────────────────
