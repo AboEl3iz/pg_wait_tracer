@@ -261,7 +261,16 @@ int pgwt_scan_existing_backends(struct pgwt_daemon *d)
             continue;
 
         /* This is a postgres child. Resolve its wait_event_info address
-         * (PG17+ my_wait_event_info global; PG<17 MyProc + offset). */
+         * (PG17+ my_wait_event_info global; PG<17 MyProc + offset).
+         *
+         * Note: on PG17+ a long-lived process whose pointer still targets
+         * the process-local dummy (aux processes without a PGPROC, e.g.
+         * syslogger) is deliberately accepted here — the dummy IS that
+         * process's wait_event_info, so watchpointing it is correct. The
+         * one residual edge is a backend caught in its few-ms init window
+         * DURING this one-time scan (dummy now, PGPROC in a moment); the
+         * fork path (pgwt_handle_fork) closes the same race properly via
+         * the shared-memory check + bootstrap watchpoint. */
         uint64_t ptr = pgwt_resolve_backend_wait_addr(d, pid);
         if (ptr == 0) {
             /* Not yet initialized — treat as fresh fork */
@@ -492,9 +501,19 @@ int pgwt_handle_fork(struct pgwt_daemon *d, pid_t child_pid)
      * records nothing, silently, for its whole life. Close the race by
      * checking the pointer NOW that the watchpoint is armed: either the
      * write comes later (watchpoint catches it) or it already happened
-     * (visible right here) — no gap between the two. */
+     * (visible right here) — no gap between the two.
+     *
+     * "Already happened" must mean the pointer targets SHARED memory: on
+     * PG17+ my_wait_event_info is non-zero from the very first instruction
+     * (its static initializer points at the process-LOCAL dummy
+     * local_my_wait_event_info), so non-zero alone proves nothing —
+     * InitProcess is done only once the pointer targets the backend's
+     * PGPROC, which lives in shm. A local (non-shared) target here means
+     * init has not switched the pointer yet — the armed bootstrap
+     * watchpoint will catch that write. (PG<17: MyProc starts NULL, and a
+     * non-NULL PGPROC is in shm, so the same predicate holds.) */
     uint64_t ptr = pgwt_resolve_backend_wait_addr(d, child_pid);
-    if (ptr != 0) {
+    if (ptr != 0 && pgwt_addr_is_shared(child_pid, ptr) == 1) {
         if (d->verbose)
             fprintf(stderr, "INFO: fork PID %d already initialized "
                     "(fork->attach race) — attaching directly\n", child_pid);

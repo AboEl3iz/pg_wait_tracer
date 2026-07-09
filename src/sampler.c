@@ -534,18 +534,32 @@ int pgwt_sampler_poll(struct pgwt_daemon *d)
          * it via the version-appropriate path (PG17+ my_wait_event_info
          * global; PG<17 MyProc + offset — same global VA in every backend,
          * the deref gives that backend's own PGPROC slot). Skip this tick if
-         * the backend hasn't set the pointer yet. */
-        if (be->wp_addr == 0) {
-            be->wp_addr = pgwt_resolve_backend_wait_addr(d, be->pid);
-            if (be->wp_addr == 0)
+         * the backend hasn't set the pointer yet.
+         *
+         * While the resolved address is NOT in shared memory, keep
+         * re-resolving every tick: on PG17+ the pointer is non-zero from the
+         * first instruction (static initializer → the process-local dummy
+         * local_my_wait_event_info) — a tick landing in the fork→InitProcess
+         * window would otherwise cache the dummy FOREVER and that backend's
+         * waits would never be sampled (the fork→attach race's sampled-tier
+         * sibling). Genuinely-local addresses (aux processes without a
+         * PGPROC, e.g. syslogger) stay non-shared and are simply re-resolved
+         * to the same value — a cheap /proc read per tick for a handful of
+         * processes. Once the address lands in shm it is cached for good. */
+        if (be->wp_addr == 0 || be->wp_addr_shared == 0) {
+            uint64_t addr = pgwt_resolve_backend_wait_addr(d, be->pid);
+            if (addr == 0 && be->wp_addr == 0)
                 continue;
-            be->wp_addr_shared = -1;
-            /* First time we resolved this backend — seed its state_map entry
-             * so the query_id uprobe can populate it. */
-            seed_state_entry(d, be->pid, be->wp_addr);
+            if (addr != 0 && addr != be->wp_addr) {
+                be->wp_addr = addr;
+                be->wp_addr_shared = -1;
+                /* Seed its state_map entry so the query_id uprobe can
+                 * populate it (idempotent — BPF_NOEXIST). */
+                seed_state_entry(d, be->pid, be->wp_addr);
+            }
         }
-        /* SMP-2: classify the address once — only verified-shared addresses
-         * may be batched through a foreign pid. */
+        /* SMP-2: classify the address — only verified-shared addresses may
+         * be batched through a foreign pid. */
         if (be->wp_addr_shared < 0)
             be->wp_addr_shared =
                 (pgwt_addr_is_shared(be->pid, be->wp_addr) == 1) ? 1 : 0;
