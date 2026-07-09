@@ -20,6 +20,7 @@
 #include <sys/epoll.h>
 #include <sys/timerfd.h>
 #include <sys/signalfd.h>
+#include <sys/resource.h>
 
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
@@ -146,6 +147,19 @@ static void handle_timer(struct pgwt_daemon *d)
             pgwt_summary_cleanup_old_files(d->summary_writer);
     }
 
+    /* CAP-6: the BPF seen_query_ids dedup map (4096 entries) never ages;
+     * once full, query TEXT for new query_ids is silently never captured
+     * again. Log it once; seen_query_ids_full_total keeps counting. */
+    if (!d->seen_qids_full_logged
+        && pgwt_read_bpf_fail_counter(d, PGWT_BPF_FAIL_SEEN_QIDS) > 0) {
+        d->seen_qids_full_logged = true;
+        fprintf(stderr,
+                "WARN: BPF seen_query_ids map is FULL (4096 unique query_ids)"
+                " — query TEXT for new query_ids will no longer be captured "
+                "(ids and waits are unaffected). Restart the daemon to reset;"
+                " seen_query_ids_full_total counts the misses.\n");
+    }
+
     /* Refresh recent event/sample rates for control-socket metrics */
     if (d->interval > 0) {
         d->counters.events_per_sec =
@@ -166,11 +180,56 @@ static void handle_timer(struct pgwt_daemon *d)
 
 static void handle_sample_timer(struct pgwt_daemon *d)
 {
-    uint64_t expirations;
+    uint64_t expirations = 0;
     ssize_t r = read(d->sample_timer_fd, &expirations, sizeof(expirations));
-    (void)r;
+    /* SMP-3: expirations > 1 means the daemon stalled and ticks coalesced —
+     * those samples are gone. The sampler compensates by weighting each tick
+     * with the MEASURED inter-tick elapsed time (see pgwt_sampler_poll), so
+     * the loss is in resolution, not in total weight. Count it so a chronic
+     * stall is visible on the control socket. */
+    if (r == (ssize_t)sizeof(expirations) && expirations > 1)
+        d->counters.sampler_ticks_missed_total += expirations - 1;
     if (d->provider && d->provider->poll)
         d->provider->poll(d);
+}
+
+/* CAP-12: raise RLIMIT_NOFILE to what MAX_BACKENDS needs. Full/tiered mode
+ * holds up to two perf fds per backend (watchpoint + bootstrap) plus BPF
+ * maps/ringbufs, trace files and the control socket; the common default of
+ * 1024 is below that, and hitting it turns every further attach into a
+ * quiet EMFILE failure (now also loudly reported in perf_event.c). */
+static void bump_rlimit_nofile(struct pgwt_daemon *d)
+{
+    const rlim_t need = MAX_BACKENDS * 2 + 512;
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) != 0)
+        return;
+    if (rl.rlim_cur >= need)
+        return;
+
+    struct rlimit want = rl;
+    want.rlim_cur = need;
+    if (want.rlim_max != RLIM_INFINITY && want.rlim_max < need)
+        want.rlim_max = need;   /* root may raise the hard limit */
+    if (setrlimit(RLIMIT_NOFILE, &want) == 0) {
+        if (d->verbose)
+            fprintf(stderr, "INFO: RLIMIT_NOFILE raised %llu -> %llu\n",
+                    (unsigned long long)rl.rlim_cur,
+                    (unsigned long long)need);
+        return;
+    }
+    /* Could not raise the hard limit (not root?) — take what we can get. */
+    want.rlim_max = rl.rlim_max;
+    want.rlim_cur = (rl.rlim_max == RLIM_INFINITY || rl.rlim_max > need)
+                  ? need : rl.rlim_max;
+    if (setrlimit(RLIMIT_NOFILE, &want) == 0 && want.rlim_cur >= need)
+        return;
+    fprintf(stderr,
+            "WARN: RLIMIT_NOFILE is %llu (< %llu needed for %d backends). "
+            "Watchpoint attach will fail with EMFILE beyond the limit — "
+            "raise the hard limit (ulimit -Hn / LimitNOFILE=).\n",
+            (unsigned long long)want.rlim_cur, (unsigned long long)need,
+            MAX_BACKENDS);
 }
 
 static void handle_signal(struct pgwt_daemon *d)
@@ -184,6 +243,10 @@ static void handle_signal(struct pgwt_daemon *d)
 int pgwt_daemon_init(struct pgwt_daemon *d)
 {
     int err;
+
+    /* CAP-12: enough fds for a full-size backend registry, before anything
+     * starts opening watchpoints. */
+    bump_rlimit_nofile(d);
 
     /* Select the capture provider for this mode. FULL (default) is the
      * original watchpoint path; SAMPLED is the userspace tier; TIERED runs
@@ -247,6 +310,21 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
     d->skel->rodata->pg13_qd_plannedstmt_off = (uint32_t)d->pg13_qd_plannedstmt_off;
     d->skel->rodata->pg13_ps_queryid_off = (uint32_t)d->pg13_ps_queryid_off;
     d->skel->rodata->pg13_qd_sourcetext_off = (uint32_t)d->pg13_qd_sourcetext_off;
+
+    /* CAP-1: state_map is compiled at MAX_BACKENDS entries (the registry
+     * capacity). PGWT_STATE_MAP_ENTRIES shrinks it before load — a TEST hook
+     * so CI can prove the map-full loud path with a handful of connections
+     * instead of >1024 real ones. Never set it in production. */
+    {
+        const char *sme = getenv("PGWT_STATE_MAP_ENTRIES");
+        if (sme && atoi(sme) > 0) {
+            uint32_t entries = (uint32_t)atoi(sme);
+            bpf_map__set_max_entries(d->skel->maps.state_map, entries);
+            fprintf(stderr, "WARN: PGWT_STATE_MAP_ENTRIES=%u — state_map "
+                    "shrunk below MAX_BACKENDS (test hook; backends beyond "
+                    "this record nothing, loudly)\n", entries);
+        }
+    }
 
     /* Resolve debug_query_string address for BPF query text capture */
     if (d->pg_binary_saved) {
@@ -478,11 +556,24 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
     /* Scan existing backends (tracepoints are already attached,
      * so any new forks during scan will be caught) */
     int n = pgwt_scan_existing_backends(d);
-    if (n < 0) {
+    if (n == -2) {
+        /* Runtime offset validation refused (garbage class byte). The old
+         * code path degraded this to a WARN and kept running — the exact
+         * silent-garbage failure CAP-2 exists to prevent. Abort. */
+        goto fail;
+    } else if (n < 0) {
         fprintf(stderr, "WARN: scan_existing_backends failed\n");
     } else if (d->verbose) {
         fprintf(stderr, "INFO: attached to %d existing backends\n", n);
     }
+
+    /* CAP-2/3: if the scan resolved backends but none produced a NON-ZERO
+     * class-valid reading, re-poll briefly and refuse to run on the
+     * hardcoded-offset path (PG<17) if the offset still cannot be confirmed
+     * — a wrong offset into zeroed memory reads zero forever, and blessing
+     * it would trace garbage (or nothing) labeled as real. */
+    if (pgwt_confirm_wait_offset(d) != 0)
+        goto fail;
 
     /* Create timer fd */
     d->timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC);

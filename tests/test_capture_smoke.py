@@ -119,16 +119,20 @@ class Workload:
          waiter  — SELECT on the table when fire()d -> blocks on
                    Lock:relation until the phase ends
 
-    Sessions are opened BEFORE the tracer starts (the initial backend scan
-    finds them — same technique as test_deterministic.py: backends forked
-    after attach are subject to the fork->attach race, observed live on
-    Ubuntu 24.04/kernel 6.8 — a T4 hardening item, not smoke-test scope),
-    but the waits are fired AFTER the tracer attaches so their durations
-    are fully observed. release() commits the holder so the lock wait ENDS
-    inside the observation window — in full mode a transition is only
-    written to the trace when the wait ends, so a never-ending lock wait
-    would be absent from the trace file (the ESC-2/FID-class open-interval
-    gap, owned by T1/T3)."""
+    In phases 1-3, sessions are opened BEFORE the tracer starts (the
+    initial backend scan finds them — same technique as
+    test_deterministic.py). Phase 4 (fork-after-attach) opens them AFTER
+    the tracer attaches: backends forked post-attach used to be subject to
+    the fork->attach race (bootstrap watchpoint armed after the child had
+    already written its pointer -> never fires -> zero events, silently;
+    observed live on Ubuntu 24.04/kernel 6.8 by the T0 CI run, fixed in T4
+    by re-checking the pointer right after arming). The waits are fired
+    AFTER the tracer attaches so their durations are fully observed.
+    release() commits the holder so the lock wait ENDS inside the
+    observation window — in full mode a transition is only written to the
+    trace when the wait ends, so a never-ending lock wait would be absent
+    from the trace file (the ESC-2/FID-class open-interval gap, owned by
+    T1/T3)."""
 
     LOCK_TABLE = "_smoke_lock_wait"
 
@@ -346,9 +350,9 @@ def phase_live_query_event(pm_pid, mode):
           f"pgbench -i succeeded: {pgb_init.stderr[-200:]}")
     psql("SELECT pg_stat_statements_reset()")
 
-    # pgbench starts FIRST: its backends must exist when the tracer's
-    # initial scan runs (backends forked after attach are subject to the
-    # fork->attach race — see Workload docstring).
+    # pgbench starts FIRST so its backends are found by the initial scan
+    # (keeps this phase deterministic; the fork-after-attach path has its
+    # own dedicated phase 4).
     pgbench = subprocess.Popen(
         ["pgbench", "-U", "postgres", "-d", "postgres", "-c", "4", "-T", "14"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -386,8 +390,8 @@ def phase_trace_file(pm_pid, mode):
     wl = Workload()
     wl.open_sessions()
     psql("SELECT pg_stat_statements_reset()")
-    # pgbench backends must exist before the tracer attaches (fork->attach
-    # race, see Workload docstring).
+    # pgbench starts first so its backends are found by the initial scan
+    # (the fork-after-attach path is covered by phase 4).
     pgbench = subprocess.Popen(
         ["pgbench", "-U", "postgres", "-d", "postgres", "-c", "2", "-T", "16"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -437,6 +441,63 @@ def phase_trace_file(pm_pid, mode):
         subprocess.run(["rm", "-rf", trace_dir])
 
 
+def phase_fork_after_attach(pm_pid, mode):
+    """T4/CAP-8 regression: backends forked AFTER the tracer attached must
+    record events. The fork->attach race (bootstrap watchpoint armed after
+    the child already wrote its my_wait_event_info/MyProc pointer -> the
+    watchpoint never fires -> the backend records nothing for its whole
+    life, silently) was observed live in --mode full by the T0 CI run; the
+    T4 fix re-checks the pointer immediately after arming the bootstrap
+    watchpoint, closing the gap. In tiered mode the same phase guards the
+    sampler's lazy-resolve path for post-attach forks."""
+    print(f"--- Phase 4: fork-after-attach (--mode {mode}) ---")
+
+    tracer = subprocess.Popen(
+        [TRACER, "--mode", mode, "--pid", str(pm_pid),
+         "--interval", "14", "--duration", "17",
+         "--view", "system_event"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    time.sleep(2.5)   # BPF load + initial scan complete — NOW fork backends
+
+    wl = Workload()
+    try:
+        wl.open_sessions()     # all three backends fork post-attach
+        wl.fire(sleep_s=3)
+        time.sleep(5)
+        wl.release()
+        stdout, stderr = tracer.communicate(timeout=40)
+    except subprocess.TimeoutExpired:
+        tracer.kill()
+        stdout, stderr = tracer.communicate()
+    finally:
+        wl.stop()
+
+    out = STRIP_ANSI.sub('', stdout.decode('utf-8', errors='replace'))
+    err = stderr.decode('utf-8', errors='replace')
+    events = parse_system_events(out)
+    names = [e['name'] for e in events]
+    check(len(events) > 0,
+          "fork-after-attach: events captured from post-attach backends"
+          if events else
+          f"fork-after-attach: events captured from post-attach backends "
+          f"(stderr tail: {err[-300:]!r})")
+
+    sleep_ev = [e for e in events if e['name'] == 'Timeout:PgSleep']
+    check(len(sleep_ev) > 0,
+          f"fork-after-attach: Timeout:PgSleep from a post-attach backend "
+          f"(saw: {names}) [fork->attach race regression]")
+    if sleep_ev:
+        total = sleep_ev[0]['total_ms']
+        check(1200 <= total <= 7000,
+              f"fork-after-attach: PgSleep total = {total:.0f}ms "
+              f"(expect ~3000 ±tol)")
+
+    lock_ev = [e for e in events if e['name'] == 'Lock:relation']
+    check(len(lock_ev) > 0,
+          f"fork-after-attach: Lock:relation from a post-attach backend "
+          f"(saw: {names})")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--pid', type=int, help='Postmaster PID')
@@ -476,6 +537,7 @@ def main():
     phase_live_system_event(pm_pid, args.mode)
     phase_live_query_event(pm_pid, args.mode)
     phase_trace_file(pm_pid, args.mode)
+    phase_fork_after_attach(pm_pid, args.mode)
 
     print(f"\n{tests_passed}/{tests_run} checks passed")
     sys.exit(0 if tests_failed == 0 else 1)

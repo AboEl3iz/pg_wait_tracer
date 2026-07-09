@@ -98,32 +98,38 @@ int main(void)
     CHECK(load_base_fixture("maps_ubuntu_pie.txt", "no_such_binary") == 0,
           "missing basename should return 0");
 
-    /* ── CAP-4 adversarial case (fix owned by Phase T4) ───────────────
+    /* ── CAP-4 adversarial case (fixed in Phase T4) ───────────────────
      * pg_stat_statements.so mapped BELOW the binary; its path
-     * "/usr/lib/postgresql/17/lib/..." contains the substring "postgres",
-     * so the current whole-line strstr() match picks the .so's base.
-     * Correct answer: 0x5560d1a00000 (the binary). Current answer:
-     * 0x4f2a80000000 (the .so). This test PINS the current wrong behavior
-     * as an expected failure so the hazard stays visible; when T4 lands
-     * the exact-pathname match, flip this to assert the correct base.
-     * TODO(T4/CAP-4): assert == 0x5560d1a00000 and drop the xfail. */
-    {
-        uint64_t got = load_base_fixture("maps_ext_below_binary.txt", "postgres");
-        if (got == 0x5560d1a00000ULL) {
-            printf("  XPASS(CAP-4): extension-.so-below-binary now resolves the\n"
-                   "  BINARY's base — T4 fix landed? Promote this to a hard assert.\n");
-            run++; ok++;
-        } else {
-            CHECK(got == 0x4f2a80000000ULL,
-                  "CAP-4 fixture: got 0x%llx, expected the known-wrong .so base "
-                  "0x4f2a80000000 (current strstr behavior) — behavior changed "
-                  "without updating this test", (unsigned long long)got);
-            printf("  XFAIL(CAP-4/T4): substring match returns the extension .so's "
-                   "base below the binary\n"
-                   "  (documented hazard — the #24 class; exact-path match is "
-                   "owned by Phase T4)\n");
-        }
-    }
+     * "/usr/lib/postgresql/17/lib/..." contains the substring "postgres".
+     * The old whole-line strstr() match picked the .so's base
+     * (0x4f2a80000000) → every symbol VA garbage → zero events, silently
+     * (the #24 class). The exact pathname-field match must resolve the
+     * BINARY's base. Hard assert — this was T0's pinned expected-failure. */
+    CHECK(load_base_fixture("maps_ext_below_binary.txt", "postgres")
+              == 0x5560d1a00000ULL,
+          "CAP-4: extension .so below binary must not win (exact-basename "
+          "match)");
+
+    /* Same fixture through the FULL-path match — the path the daemon
+     * actually uses (pgwt_resolve_symbol passes /proc/<pid>/exe). */
+    CHECK(load_base_fixture("maps_ext_below_binary.txt",
+                            "/usr/lib/postgresql/17/bin/postgres")
+              == 0x5560d1a00000ULL,
+          "CAP-4: full-path match resolves the binary's base");
+
+    /* A full path that names the EXTENSION resolves the extension —
+     * proving the comparison is exact-pathname, not basename-of-path. */
+    CHECK(load_base_fixture("maps_ext_below_binary.txt",
+                            "/usr/lib/postgresql/17/lib/pg_stat_statements.so")
+              == 0x4f2a80000000ULL,
+          "full-path match of the .so itself resolves the .so");
+
+    /* Substring of a basename must NOT match: "postgres" is a substring of
+     * "pg_stat_statements.so"'s path but of no basename in the EL9 fixture
+     * except the binary's own. A name that is a strict substring of the
+     * binary basename must find nothing. */
+    CHECK(load_base_fixture("maps_el9_pie.txt", "postgre") == 0,
+          "strict-substring basename must not match");
 
     /* ── 2. self-resolution: the #24 regression test proper ───────────
      * Resolve a known global in THIS binary through the real code path
@@ -151,11 +157,15 @@ int main(void)
         uint64_t sym_val = pgwt_find_symbol_offset(exe, "pgwt_test_fixture_symbol");
         CHECK(sym_val != 0, "pgwt_find_symbol_offset found nothing");
 
+        /* Both match forms must find the load base: exact basename (fixture
+         * form) and the full /proc/self/exe path (the daemon's form). */
         uint64_t load_base = pgwt_find_load_base(getpid(), base);
-        CHECK(load_base != 0, "pgwt_find_load_base(self) returned 0");
+        CHECK(load_base != 0, "pgwt_find_load_base(self, basename) returned 0");
+        CHECK(pgwt_find_load_base(getpid(), exe) == load_base,
+              "full-path and basename load base disagree");
 
         uint64_t va = pgwt_resolve_symbol(exe, "pgwt_test_fixture_symbol",
-                                          getpid(), base);
+                                          getpid());
         uint64_t actual = (uint64_t)(uintptr_t)&pgwt_test_fixture_symbol;
         CHECK(va == actual,
               "resolved VA 0x%llx != actual &symbol 0x%llx (load_base=0x%llx, "

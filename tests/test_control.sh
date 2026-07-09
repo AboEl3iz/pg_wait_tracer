@@ -129,6 +129,9 @@ assert isinstance(r['uptime_s'], (int, float)) and r['uptime_s'] >= 0, r
 assert isinstance(r['backends'], int) and r['backends'] >= 0, r
 assert r['pg_pid'] == $PM_PID, r
 assert isinstance(r['version'], str) and r['version'], r
+# T4/SMP-1: sampler health must be present and healthy on a working box
+assert r['sampler_healthy'] is True, r
+assert r['sampler_unhealthy_reason'] == '', r
 "
 check $? "default mode is tiered, tier=sampled (no watchpoints until escalation)"
 
@@ -142,7 +145,10 @@ assert r['ok'] is True, r
 for k in ('events_total', 'events_per_sec', 'lifecycle_events_total',
           'wp_attach_failures_total', 'backends_tracked',
           'trace_events_written_total', 'trace_bytes_written_total',
-          'uptime_s'):
+          'uptime_s',
+          # T4 capture-hardening counters (CAP-1/2/5/6, SMP-1/3)
+          'state_map_full_total', 'seen_query_ids_full_total',
+          'invalid_wait_reads_total', 'sampler_ticks_missed_total'):
     assert k in r, 'missing ' + k
     assert isinstance(r[k], (int, float)), k
 "

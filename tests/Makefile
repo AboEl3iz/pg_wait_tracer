@@ -32,7 +32,7 @@ check: all
 	done < unit_tests.list; \
 	exit $$fail
 
-test_wait_event: test_wait_event.c $(BUILD)/wait_event.o $(BUILD)/cJSON.o
+test_wait_event: test_wait_event.c $(BUILD)/wait_event.o $(BUILD)/spawn.o $(BUILD)/cJSON.o
 	$(CC) $(CFLAGS) -o $@ $^
 
 test_cmdline: test_cmdline.c $(BUILD)/cmdline.o
@@ -42,7 +42,7 @@ test_event_writer: test_event_writer.c $(BUILD)/event_writer.o
 	$(CC) $(CFLAGS) -o $@ $^ -llz4
 
 test_event_reader: test_event_reader.c $(BUILD)/event_reader.o $(BUILD)/event_writer.o \
-                   $(BUILD)/map_reader.o $(BUILD)/wait_event.o $(BUILD)/cJSON.o
+                   $(BUILD)/map_reader.o $(BUILD)/wait_event.o $(BUILD)/spawn.o $(BUILD)/cJSON.o
 	$(CC) $(CFLAGS) -o $@ $^ -llz4 $(LIBBPF_LIB) -lelf -lz
 
 test_bucket: test_bucket.c
@@ -52,7 +52,7 @@ test_bucket: test_bucket.c
 # garbage offset" validation guard. Compiles discovery.c directly (the helpers
 # under test are BPF-free; discovery.c only needs libelf). Runs anywhere — no
 # live PostgreSQL, no BPF skeleton.
-test_pg13_resolve: test_pg13_resolve.c ../src/discovery.c \
+test_pg13_resolve: test_pg13_resolve.c ../src/discovery.c ../src/spawn.c \
                    $(BUILD)/wait_event.o $(BUILD)/cJSON.o
 	$(CC) $(CFLAGS) -o $@ $^ -lelf -lz
 
@@ -63,7 +63,7 @@ test_pg13_resolve: test_pg13_resolve.c ../src/discovery.c \
 # each build asserts (via the ELF header) that the flag actually took effect.
 # Compiles discovery.c directly (BPF-free, needs libelf) — same pattern as
 # test_pg13_resolve.
-DISCOVERY_TEST_DEPS = test_discovery.c ../src/discovery.c \
+DISCOVERY_TEST_DEPS = test_discovery.c ../src/discovery.c ../src/spawn.c \
                       $(BUILD)/wait_event.o $(BUILD)/cJSON.o
 
 test_discovery_pie: $(DISCOVERY_TEST_DEPS)
@@ -101,7 +101,7 @@ test_coop: test_coop.c ../src/provider_coop.c
 
 # Server-build objects for gen_test_traces
 SERVER_OBJS = $(BUILD)/server_event_writer.o $(BUILD)/server_summary_writer.o \
-              $(BUILD)/server_wait_event.o $(BUILD)/server_cJSON.o
+              $(BUILD)/server_wait_event.o $(BUILD)/server_spawn.o $(BUILD)/server_cJSON.o
 
 gen_test_traces: gen_test_traces.c $(SERVER_OBJS)
 	$(CC) $(CFLAGS) -DPGWT_SERVER -o $@ $^ -llz4
@@ -110,7 +110,7 @@ gen_bench_traces: gen_bench_traces.c $(SERVER_OBJS)
 	$(CC) $(CFLAGS) -DPGWT_SERVER -o $@ $^ -llz4
 
 test_concurrent_rw: test_concurrent_rw.c $(BUILD)/event_reader.o $(BUILD)/event_writer.o \
-                    $(BUILD)/map_reader.o $(BUILD)/wait_event.o $(BUILD)/cJSON.o
+                    $(BUILD)/map_reader.o $(BUILD)/wait_event.o $(BUILD)/spawn.o $(BUILD)/cJSON.o
 	$(CC) $(CFLAGS) -o $@ $^ -llz4 $(LIBBPF_LIB) -lelf -lz
 
 # cross_validate: A4 sampled-vs-exact comparison tool. Server build
@@ -118,7 +118,7 @@ test_concurrent_rw: test_concurrent_rw.c $(BUILD)/event_reader.o $(BUILD)/event_
 # builds. Reads a tiered trace dir and reports estimator agreement.
 cross_validate: cross_validate.c $(BUILD)/server_event_reader.o \
                 $(BUILD)/server_event_writer.o $(BUILD)/server_wait_event.o \
-                $(BUILD)/server_cJSON.o
+                $(BUILD)/server_spawn.o $(BUILD)/server_cJSON.o
 	$(CC) $(CFLAGS) -DPGWT_SERVER -o $@ $^ -llz4 -lz
 
 # dump_markers: A5 helper — decode escalation-window markers (reason + length)
@@ -126,7 +126,7 @@ cross_validate: cross_validate.c $(BUILD)/server_event_reader.o \
 # window was recorded. Server build (no BPF skeleton).
 dump_markers: dump_markers.c $(BUILD)/server_event_reader.o \
               $(BUILD)/server_event_writer.o $(BUILD)/server_wait_event.o \
-              $(BUILD)/server_cJSON.o
+              $(BUILD)/server_spawn.o $(BUILD)/server_cJSON.o
 	$(CC) $(CFLAGS) -DPGWT_SERVER -o $@ $^ -llz4 -lz
 
 clean:

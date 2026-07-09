@@ -16,10 +16,12 @@ captures — modeled on the layouts documented in the #24 fix history
   ELF-header page. Expected load base 0x55d4c1000000.
 - `maps_ubuntu_pie.txt` — Ubuntu PGDG deb (`/usr/lib/postgresql/17/bin/
   postgres`), PIE. Expected load base 0x5560d1a00000.
-- `maps_ext_below_binary.txt` — ADVERSARIAL (CAP-4, owned by Phase T4):
+- `maps_ext_below_binary.txt` — ADVERSARIAL (CAP-4, fixed in Phase T4):
   same Ubuntu layout, but `pg_stat_statements.so` is mapped BELOW the main
   binary. Its path `/usr/lib/postgresql/17/lib/...` contains the substring
-  "postgres", so the current whole-line `strstr()` match returns the .so's
+  "postgres", so the pre-T4 whole-line `strstr()` match returned the .so's
   base (0x4f2a80000000) instead of the binary's (0x5560d1a00000) — the #24
-  class one directory layout away from recurring. test_discovery.c pins the
-  current (wrong) behavior as an expected failure until T4 fixes it.
+  class one directory layout away from recurring. T4 replaced the substring
+  match with an EXACT pathname-field comparison (full path, or exact
+  basename); test_discovery.c hard-asserts the binary's base 0x5560d1a00000
+  on this fixture, in both match forms.
