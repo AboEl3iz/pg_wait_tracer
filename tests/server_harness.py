@@ -106,12 +106,17 @@ class ServerHarness:
         return json.loads(resp_line)
 
 
-def generate_traces(scenario, output_dir=None):
+def generate_traces(scenario, output_dir=None, wall_offset_ns=None, rotate=None):
     """Generate trace files from a scenario dict.
 
     Args:
         scenario: Dict with 'backends', 'queries', 'events' keys.
         output_dir: Directory to write to (created if None, using tempdir).
+        wall_offset_ns: mono→wall offset patched into this run's file headers
+            (default 0 — wall == mono). Simulates an NTP step between files.
+        rotate: if set (e.g. "2025-01-01_10"), rename this run's current.*
+            to <rotate>.trace.lz4 / <rotate>.summary.lz4 so another run can
+            add a second file to the same dir.
 
     Returns:
         Path to the trace directory.
@@ -125,10 +130,12 @@ def generate_traces(scenario, output_dir=None):
         )
 
     scenario_json = json.dumps(scenario)
-    result = subprocess.run(
-        [GEN_BIN, "-o", output_dir, "--inline", scenario_json],
-        capture_output=True, text=True,
-    )
+    cmd = [GEN_BIN, "-o", output_dir, "--inline", scenario_json]
+    if wall_offset_ns is not None:
+        cmd += ["--wall-offset", str(wall_offset_ns)]
+    if rotate is not None:
+        cmd += ["--rotate", rotate]
+    result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError(
             f"gen_test_traces failed:\nstdout: {result.stdout}\nstderr: {result.stderr}"
