@@ -28,6 +28,8 @@ tests/gen_test_traces
 tests/gen_bench_traces
 tests/cross_validate
 tests/test_concurrent_rw
+tests/test_replay_fidelity
+tests/map_reader_core.o
 tests/__pycache__/
 
 # Visual-snapshot diff/actual artifacts (transient — only baselines are tracked)

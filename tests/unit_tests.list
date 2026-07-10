@@ -20,3 +20,4 @@ test_concurrent_rw
 test_pg13_resolve
 test_discovery_pie
 test_discovery_nopie
+test_replay_fidelity

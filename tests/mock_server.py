@@ -556,6 +556,18 @@ def handle_request(msg):
         resp["fidelity"] = _FID.fidelity
         if _FID.fidelity in ("sampled", "mixed"):
             resp["sample_period_ns"] = _FID.sample_period_ns
+    # FID-3 (T1): over a sampled-only window the real server gates the
+    # latency columns — samples carry no real durations, so avg/percentiles
+    # are null and the UI renders "—". Mirror it so the web tests exercise
+    # the same shape.
+    if cmd == "top_events" and _FID.fidelity == "sampled" and "rows" in resp:
+        gated = []
+        for row in resp["rows"]:
+            row = dict(row)
+            for col in ("avg_us", "p50_us", "p95_us", "p99_us", "max_us"):
+                row[col] = None
+            gated.append(row)
+        resp["rows"] = gated
     return resp
 
 
