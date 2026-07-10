@@ -111,7 +111,8 @@ map_reader_core.o: ../src/map_reader.c ../src/map_reader.h
 
 test_replay_fidelity: test_replay_fidelity.c ../src/event_reader.c \
                       map_reader_core.o $(BUILD)/server_event_writer.o \
-                      $(BUILD)/server_wait_event.o $(BUILD)/server_cJSON.o
+                      $(BUILD)/server_wait_event.o $(BUILD)/server_spawn.o \
+                      $(BUILD)/server_cJSON.o
 	$(CC) $(CFLAGS) -o $@ $^ -llz4 -lz
 
 # Server-build objects for gen_test_traces
