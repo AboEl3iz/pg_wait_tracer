@@ -72,6 +72,7 @@ int pgwt_run_replay(struct pgwt_daemon *d, const char *from_str,
     uint64_t total_events = 0;
     int files_read = 0;
     bool pg_version_set = false;
+    struct pgwt_replay_stats rstats = {0};
 
     for (int fi = 0; fi < nfiles; fi++) {
         /* Quick filter: skip files that end before our --from time */
@@ -116,12 +117,15 @@ int pgwt_run_replay(struct pgwt_daemon *d, const char *from_str,
                 reader.block_index[bi].timestamp_ns > to_mono)
                 break;
 
-            int count = pgwt_reader_decode_block(&reader, bi, events,
-                                                  PGWT_BLOCK_EVENTS);
+            struct pgwt_block_info binfo;
+            int count = pgwt_reader_decode_block_info(&reader, bi, events,
+                                                      PGWT_BLOCK_EVENTS,
+                                                      &binfo);
             if (count <= 0)
                 continue;
 
-            pgwt_replay_events(&d->accum, events, count, from_mono, to_mono);
+            pgwt_replay_events(&d->accum, events, count, from_mono, to_mono,
+                               &binfo, &rstats);
             total_events += count;
         }
 
@@ -146,11 +150,34 @@ int pgwt_run_replay(struct pgwt_daemon *d, const char *from_str,
         fprintf(stderr, "INFO: replayed %lu events from %d file(s)\n",
                 (unsigned long)total_events, files_read);
 
+    /* Fidelity notice (FID-5): a tiered trace is mostly SAMPLES records.
+     * Their time contributions are ASH estimates (count × sample period),
+     * and they carry no real latencies — say so loudly instead of quietly
+     * rendering near-zero activity or fabricated histograms. */
+    if (rstats.samples > 0) {
+        printf("NOTE: this trace contains sampled data "
+               "(%llu samples at %.1f ms period, %llu exact transitions).\n"
+               "      Sampled wait durations are ASH estimates "
+               "(sample count x period);\n"
+               "      histograms/min/max reflect exact data only. "
+               "For merged analysis use pgwt-server (--view).\n\n",
+               (unsigned long long)rstats.samples,
+               rstats.sample_period_ns / 1e6,
+               (unsigned long long)rstats.transitions);
+    }
+
     /* Display results using existing output functions */
     d->tick = 1;  /* pretend we have one interval for display */
     d->interval = 0;  /* suppress "interval" display */
 
     pgwt_print_header(d);
+    if (d->view == PGWT_VIEW_HISTOGRAM &&
+        rstats.samples > 0 && rstats.transitions == 0) {
+        printf("Latency histogram unavailable: this window contains only "
+               "sampled data,\nwhich carries no real durations. "
+               "Escalate to full fidelity to capture latencies.\n");
+        return 0;
+    }
     switch (d->view) {
     case PGWT_VIEW_TIME_MODEL:   pgwt_print_time_model(d);   break;
     case PGWT_VIEW_SYSTEM_EVENT: pgwt_print_system_event(d);  break;

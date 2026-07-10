@@ -94,13 +94,32 @@ int pgwt_scan_trace_files(const char *trace_dir,
  * Supports: ISO 8601 ("2025-02-25T14:30:00"), relative ("1h", "30m"), "now". */
 int pgwt_parse_time(const char *str, uint64_t *wall_ns);
 
-/* ── Replay accumulation ───────────────────────────────── */
+/* ── Replay accumulation (fidelity-aware — T1/FID-5) ────── */
 
 struct pgwt_accumulator;
 
-/* Replay decoded events into an accumulator, filtering by time range. */
+/* Counters replay maintains so the caller can report honestly what the
+ * accumulated numbers are made of. */
+struct pgwt_replay_stats {
+    uint64_t transitions;       /* exact records accumulated */
+    uint64_t samples;           /* sampled records accumulated (ASH math) */
+    uint64_t markers_skipped;   /* structural markers skipped */
+    uint64_t sample_period_ns;  /* sample period seen (0 if none) */
+};
+
+/* Replay one decoded block into an accumulator, filtering by time range.
+ * `bi` is the block's header info (required):
+ *   - TRANSITIONS records accumulate exactly (durations, histograms);
+ *     markers (exec/plan/escalation) are structural and skipped.
+ *   - SAMPLES records are point observations: each is worth one
+ *     sample_period_ns of time (ASH estimate) for counts/time-model/query
+ *     totals, but contributes NOTHING to min/max/histograms — those are
+ *     real-latency-only and would be fabricated from samples.
+ * `st` (optional) is updated with what was accumulated. */
 void pgwt_replay_events(struct pgwt_accumulator *acc,
                          const struct pgwt_trace_event *events, int count,
-                         uint64_t from_mono_ns, uint64_t to_mono_ns);
+                         uint64_t from_mono_ns, uint64_t to_mono_ns,
+                         const struct pgwt_block_info *bi,
+                         struct pgwt_replay_stats *st);
 
 #endif /* PGWT_EVENT_READER_H */
