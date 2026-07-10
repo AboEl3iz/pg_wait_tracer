@@ -147,6 +147,16 @@ int pgwt_wait_class_index(uint32_t event_id)
 int pgwt_filter_matches(const struct pgwt_filter *f,
                         const struct pgwt_trace_event *ev)
 {
+    /* Markers (exec/plan/escalation) are structural records, never wait
+     * data: duration 0, sentinel event ids, and — for escalation markers —
+     * a PGWT_ESC_PACK payload in query_id. Excluding them here is the
+     * single chokepoint for every raw compute path (FID-4): top_events,
+     * top_queries, heatmap, sessions, AAS, time model, timeline,
+     * fingerprints, concurrency, lock chains, interference. Consumers that
+     * legitimately READ markers (variants, the exec/plan lifecycle stats)
+     * handle them before calling the filter. */
+    if (PGWT_IS_MARKER(ev->old_event))
+        return 0;
     if (f->class_name[0] != '\0') {
         const char *cls = pgwt_class_name(ev->old_event);
         if (strcasecmp(cls, f->class_name) != 0)
@@ -523,6 +533,10 @@ struct top_event_accum {
     uint32_t event_id;
     uint64_t count;
     uint64_t total_ns;
+    /* Exact-only accumulation for the latency columns (FID-3): samples do
+     * not carry real durations and must not feed avg/max/percentiles. */
+    uint64_t exact_count;
+    uint64_t exact_total_ns;
     uint64_t max_ns;
     uint64_t hist[HISTOGRAM_BUCKETS];
 };
@@ -590,9 +604,14 @@ void pgwt_compute_top_events(const struct pgwt_trace_event *events, int count,
         }
         ht[h].count++;
         ht[h].total_ns += ev->duration_ns;
-        if (ev->duration_ns > ht[h].max_ns)
-            ht[h].max_ns = ev->duration_ns;
-        ht[h].hist[compute_duration_to_bucket(ev->duration_ns)]++;
+        /* Latency stats from exact records only (FID-3). */
+        if (!(ev->flags & PGWT_EVENT_FLAG_SAMPLE)) {
+            ht[h].exact_count++;
+            ht[h].exact_total_ns += ev->duration_ns;
+            if (ev->duration_ns > ht[h].max_ns)
+                ht[h].max_ns = ev->duration_ns;
+            ht[h].hist[compute_duration_to_bucket(ev->duration_ns)]++;
+        }
     }
 
     double db_time_ms = (double)db_time_ns / 1e6;
@@ -609,13 +628,16 @@ void pgwt_compute_top_events(const struct pgwt_trace_event *events, int count,
         r->event_id = ht[i].event_id;
         r->count    = ht[i].count;
         r->total_ms = (double)ht[i].total_ns / 1e6;
-        r->avg_us   = ht[i].count > 0
-                     ? (double)ht[i].total_ns / (double)ht[i].count / 1000.0
+        /* Latency columns from exact data only; exact_count == 0 flags
+         * them as unavailable (sampled-only row). */
+        r->exact_count = ht[i].exact_count;
+        r->avg_us   = ht[i].exact_count > 0
+                     ? (double)ht[i].exact_total_ns / (double)ht[i].exact_count / 1000.0
                      : 0;
         r->max_us   = (double)ht[i].max_ns / 1000.0;
-        r->p50_us   = hist_percentile(ht[i].hist, ht[i].count, 0.50);
-        r->p95_us   = hist_percentile(ht[i].hist, ht[i].count, 0.95);
-        r->p99_us   = hist_percentile(ht[i].hist, ht[i].count, 0.99);
+        r->p50_us   = hist_percentile(ht[i].hist, ht[i].exact_count, 0.50);
+        r->p95_us   = hist_percentile(ht[i].hist, ht[i].exact_count, 0.95);
+        r->p99_us   = hist_percentile(ht[i].hist, ht[i].exact_count, 0.99);
         /* Idle-but-visible events have time but no meaningful share of DB
          * Time; flag their %DB with a sentinel so it renders as "—". */
         if (pgwt_is_idle_event(ht[i].event_id))
@@ -928,6 +950,10 @@ void pgwt_compute_heatmap(const struct pgwt_trace_event *events, int count,
         /* Visibility filter: keep Client:ClientRead in the latency heatmap. */
         if (!pgwt_filter_matches(f, ev) || pgwt_is_hidden_event(ev->old_event))
             continue;
+        /* Samples carry no real durations — a latency distribution built
+         * from normalized sample periods is fabricated (FID-3). */
+        if (ev->flags & PGWT_EVENT_FLAG_SAMPLE)
+            continue;
 
         uint64_t ev_ts = ev->timestamp_ns;
         if (ev_ts < from_ns || ev_ts >= to_ns)
@@ -963,10 +989,14 @@ void pgwt_compute_heatmap(const struct pgwt_trace_event *events, int count,
  * Each pgwt_summary_accum record represents 1 second of pre-aggregated data.
  * ══════════════════════════════════════════════════════════════ */
 
-/* Helper: check if a summary event matches a filter */
+/* Helper: check if a summary event matches a filter.
+ * Marker event ids are rejected outright: summaries written before the
+ * FID-4 write-side fix may still contain accumulated marker rows. */
 static int summary_event_matches_filter(const struct pgwt_filter *f,
                                          uint32_t event_id)
 {
+    if (PGWT_IS_MARKER(event_id))
+        return 0;
     if (f->class_name[0] != '\0') {
         const char *cls = pgwt_class_name(event_id);
         if (strcasecmp(cls, f->class_name) != 0)
@@ -1371,6 +1401,9 @@ static int te_summary_visitor(const struct pgwt_summary_accum *rec, void *arg)
                 }
                 ctx->ht[h].count += sq->top_events[j].count;
                 ctx->ht[h].total_ns += sq->top_events[j].total_ns;
+                /* Summaries are built from exact records only. */
+                ctx->ht[h].exact_count += sq->top_events[j].count;
+                ctx->ht[h].exact_total_ns += sq->top_events[j].total_ns;
             }
             break;
         }
@@ -1397,6 +1430,9 @@ static int te_summary_visitor(const struct pgwt_summary_accum *rec, void *arg)
         }
         ctx->ht[h].count += se->count;
         ctx->ht[h].total_ns += se->total_ns;
+        /* Summaries are built from exact records only. */
+        ctx->ht[h].exact_count += se->count;
+        ctx->ht[h].exact_total_ns += se->total_ns;
         if (se->max_ns > ctx->ht[h].max_ns)
             ctx->ht[h].max_ns = se->max_ns;
         for (int b = 0; b < HISTOGRAM_BUCKETS; b++)
@@ -1434,12 +1470,13 @@ void pgwt_compute_top_events_from_summaries(
         row->event_id = ctx.ht[i].event_id;
         row->count    = ctx.ht[i].count;
         row->total_ms = (double)ctx.ht[i].total_ns / 1e6;
-        row->avg_us   = ctx.ht[i].count > 0
-                       ? (double)ctx.ht[i].total_ns / (double)ctx.ht[i].count / 1000.0 : 0;
+        row->exact_count = ctx.ht[i].exact_count;
+        row->avg_us   = ctx.ht[i].exact_count > 0
+                       ? (double)ctx.ht[i].exact_total_ns / (double)ctx.ht[i].exact_count / 1000.0 : 0;
         row->max_us   = (double)ctx.ht[i].max_ns / 1000.0;
-        row->p50_us   = hist_percentile(ctx.ht[i].hist, ctx.ht[i].count, 0.50);
-        row->p95_us   = hist_percentile(ctx.ht[i].hist, ctx.ht[i].count, 0.95);
-        row->p99_us   = hist_percentile(ctx.ht[i].hist, ctx.ht[i].count, 0.99);
+        row->p50_us   = hist_percentile(ctx.ht[i].hist, ctx.ht[i].exact_count, 0.50);
+        row->p95_us   = hist_percentile(ctx.ht[i].hist, ctx.ht[i].exact_count, 0.95);
+        row->p99_us   = hist_percentile(ctx.ht[i].hist, ctx.ht[i].exact_count, 0.99);
         /* Idle-but-visible events have time but no meaningful share of DB
          * Time; flag their %DB with a sentinel so it renders as "—". */
         if (pgwt_is_idle_event(ctx.ht[i].event_id))
