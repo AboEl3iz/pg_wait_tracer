@@ -53,10 +53,18 @@ volatile const u32 pg13_qd_sourcetext_off = 0;   /* offsetof(QueryDesc, sourceTe
 /* Per-PID state: last event + timestamp for duration computation.
  * Must be regular HASH (not PERCPU) because a backend can migrate
  * between CPUs — we need the same last_ts regardless of CPU.
- * 512 entries is enough for any PG deployment; smaller = better cache. */
+ *
+ * CAP-1: sized to MAX_BACKENDS — the same capacity as the userspace backend
+ * registry. It was 512 (< MAX_BACKENDS < common max_connections): above 512
+ * live backends every insert failed silently and those backends NEVER
+ * recorded an event. Inserts are now also CHECKED (fail_counters slot
+ * PGWT_BPF_FAIL_STATE_MAP + the userspace state_map_full_total counter), and
+ * the daemon may shrink the map before load via PGWT_STATE_MAP_ENTRIES
+ * (test hook — proves the loud path without 1024 real connections).
+ * Memory cost at 1024 entries × ~40B values is ~100KB — negligible. */
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 512);
+    __uint(max_entries, MAX_BACKENDS);
     __type(key, u32);
     __type(value, struct pgwt_pid_state);
 } state_map SEC(".maps");
@@ -105,6 +113,26 @@ struct {
     __type(key, u32);
     __type(value, u64);
 } ringbuf_drops SEC(".maps");
+
+/* Map-insert failure counters (CAP-1/CAP-6). Slots defined in
+ * pg_wait_tracer.h (PGWT_BPF_FAIL_*). PERCPU so the hot path stays
+ * atomic-free; the daemon sums across CPUs and surfaces them as
+ * state_map_full_total / seen_query_ids_full_total on the control socket.
+ * A full map must NEVER be silent: it means backends that record nothing
+ * (state_map) or query text that is never captured (seen_query_ids). */
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, PGWT_BPF_FAIL_MAX);
+    __type(key, u32);
+    __type(value, u64);
+} fail_counters SEC(".maps");
+
+static __always_inline void count_map_fail(u32 slot)
+{
+    u64 *c = bpf_map_lookup_elem(&fail_counters, &slot);
+    if (c)
+        (*c)++;
+}
 
 /* Emit a trace event to event_ringbuf, counting drops on failure.
  * bpf_ringbuf_output() returns 0 on success, negative when the ring is full. */
@@ -253,7 +281,10 @@ int on_watchpoint(struct bpf_perf_event_data *ctx)
             .be_entry_ptr = resolve_be_entry(),
             .wait_event_addr = wait_addr,
         };
-        bpf_map_update_elem(&state_map, &pid, &new_st, BPF_ANY);
+        /* CAP-1: a failed insert (map full) means this backend will never
+         * record a single event — count it so the daemon can scream. */
+        if (bpf_map_update_elem(&state_map, &pid, &new_st, BPF_ANY))
+            count_map_fail(PGWT_BPF_FAIL_STATE_MAP);
     }
     return 0;
 }
@@ -472,9 +503,12 @@ int on_report_query_id(struct pt_regs *ctx)
         bpf_ringbuf_submit(evt, 0);
     }
 
-    /* Mark as seen */
+    /* Mark as seen. CAP-6: when the map is full the insert fails and text
+     * for NEW query_ids is never captured again — count it (the daemon
+     * logs once and surfaces seen_query_ids_full_total). */
     u8 one = 1;
-    bpf_map_update_elem(&seen_query_ids, &query_id, &one, BPF_ANY);
+    if (bpf_map_update_elem(&seen_query_ids, &query_id, &one, BPF_ANY))
+        count_map_fail(PGWT_BPF_FAIL_SEEN_QIDS);
 
     return 0;
 }
@@ -553,7 +587,8 @@ int on_executor_start(struct pt_regs *ctx)
     }
 
     u8 one = 1;
-    bpf_map_update_elem(&seen_query_ids, &query_id, &one, BPF_ANY);
+    if (bpf_map_update_elem(&seen_query_ids, &query_id, &one, BPF_ANY))
+        count_map_fail(PGWT_BPF_FAIL_SEEN_QIDS);
 
     return 0;
 }

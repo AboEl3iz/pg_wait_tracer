@@ -15,6 +15,7 @@
 #include "wait_event.h"
 #include "pg_wait_tracer.h"
 #include "cJSON.h"
+#include "spawn.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -767,22 +768,33 @@ static int load_names_from_fp(FILE *fp)
 int pgwt_load_event_names_from_pg(const char *pg_bindir, int pg_port,
                                   const char *pg_user)
 {
-    char cmd[512];
+    /* pg_wait_events view exists since PG17.
+     * CAP-7: psql is run via fork/execvp with an argv array — pg_bindir and
+     * pg_user are derived from the target process/system and must never be
+     * interpolated into a shell command line in a root daemon. */
+    char psql_path[512];
+    char port_str[16];
+    snprintf(psql_path, sizeof(psql_path), "%s/psql", pg_bindir);
+    snprintf(port_str, sizeof(port_str), "%d", pg_port);
 
-    /* pg_wait_events view exists since PG17 */
-    snprintf(cmd, sizeof(cmd),
-             "%s/psql -U %s -p %d -d postgres -tAF'|' "
-             "-c \"SELECT type, name FROM pg_wait_events ORDER BY type, name\" 2>/dev/null",
-             pg_bindir, pg_user, pg_port);
+    char *argv[] = {
+        psql_path,
+        "-U", (char *)pg_user,
+        "-p", port_str,
+        "-d", "postgres",
+        "-tAF|",
+        "-c", "SELECT type, name FROM pg_wait_events ORDER BY type, name",
+        NULL,
+    };
 
-    FILE *fp = popen(cmd, "r");
-    if (!fp)
+    struct pgwt_proc proc;
+    if (pgwt_proc_open(&proc, argv) != 0)
         return -1;
 
     dyn_clear();
-    int count = load_names_from_fp(fp);
+    int count = load_names_from_fp(proc.out);
 
-    int status = pclose(fp);
+    int status = pgwt_proc_close(&proc);
     if (status != 0 || count == 0) {
         dyn_clear();
         return -1;

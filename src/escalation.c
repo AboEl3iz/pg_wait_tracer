@@ -10,6 +10,7 @@
 #include "daemon.h"
 #include "backend.h"
 #include "event_writer.h"
+#include "perf_event.h"
 
 #include <stdio.h>
 #include <stdlib.h>

@@ -191,6 +191,8 @@ LIVE_TESTS=(
     # justified tiered as the default mode.
     "test_cross_validate_tiered|bash|test_cross_validate_tiered.sh"
     "test_anomaly_live|bash|test_anomaly_live.sh"
+    # T4/CAP-1: a full BPF state_map must be loud (metrics + ERROR log)
+    "test_state_map_loud|python3|test_state_map_loud.py"
 )
 
 # Step 4: integration + live-correctness tests (root + running PG)

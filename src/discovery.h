@@ -16,20 +16,32 @@ int pgwt_find_pg_binary(pid_t pid, char *buf, size_t bufsz);
  * Returns the raw st_value from the ELF symbol table. */
 uint64_t pgwt_find_symbol_offset(const char *binary, const char *symbol);
 
-/* Find the load base address of the binary in the target process. */
-uint64_t pgwt_find_load_base(pid_t pid, const char *binary_basename);
+/* Find the load base address of the binary in the target process.
+ * `binary_path` is matched EXACTLY against the maps pathname field: full
+ * pathname equality when it contains a '/', exact-basename equality
+ * otherwise — never a substring match (CAP-4: extension .so paths that
+ * contain "postgres" must not win). */
+uint64_t pgwt_find_load_base(pid_t pid, const char *binary_path);
 
 /* Same, but against an explicit maps file (the /proc/<pid>/maps format).
  * pgwt_find_load_base() is a thin wrapper over this; the split exists so
  * unit tests can drive the parser with committed fixture files
  * (tests/test_discovery.c — the #24 load-base regression class). */
 uint64_t pgwt_find_load_base_in_maps(const char *maps_path,
-                                     const char *binary_basename);
+                                     const char *binary_path);
 
 /* Resolve a symbol to its runtime virtual address in the target process.
- * Handles both PIE (ET_DYN) and non-PIE (ET_EXEC) binaries correctly. */
+ * Handles both PIE (ET_DYN) and non-PIE (ET_EXEC) binaries correctly.
+ * The load base is matched against the FULL `binary` path (CAP-4). */
 uint64_t pgwt_resolve_symbol(const char *binary, const char *symbol,
-                             pid_t pid, const char *binary_basename);
+                             pid_t pid);
+
+/* Is addr inside a MAP_SHARED mapping of pid? 1 = shared, 0 = private or
+ * not mapped, -1 = maps unreadable. The sampler may only BATCH-read
+ * addresses that are shared (SMP-2): a process-local address mapped at the
+ * same VA in every forked child reads *successfully* through another pid
+ * and returns the reader's value, silently misattributed. */
+int pgwt_addr_is_shared(pid_t pid, uint64_t addr);
 
 /* Read an 8-byte pointer from /proc/<pid>/mem at addr. Returns 0 on error. */
 uint64_t pgwt_read_pointer(pid_t pid, uint64_t addr);
@@ -83,10 +95,17 @@ int pgwt_detect_pgproc_wait_offset(int pg_major);
 uint64_t pgwt_resolve_wait_addr_via_myproc(pid_t pid, uint64_t my_proc_global_addr,
                                            int pgproc_wait_offset);
 
-/* Validate that a resolved wait_event_info address holds a plausible value:
- * the class byte must be CPU (0) or a known wait-event class (0x01..0x0B).
- * Guards against a wrong offset (custom build) producing garbage. Returns 1
- * if valid, 0 if the value looks like garbage, -1 on read error. */
+/* Validate a resolved wait_event_info address by classifying the value it
+ * currently holds (CAP-2/3/5). Returns (see pgwt_classify_wei):
+ *   PGWT_WEI_VALID_NONZERO (1) — a known wait class: PROOF the address is
+ *                                right (callers may set validated).
+ *   PGWT_WEI_ZERO (2)          — on-CPU: consistent with a correct address
+ *                                but ALSO the most likely reading from a
+ *                                WRONG offset (zeroed memory). NEVER proof —
+ *                                keep sampling other backends / re-check.
+ *   PGWT_WEI_GARBAGE (0)       — unknown class byte: the offset/address is
+ *                                wrong — the caller must refuse to attach.
+ *   -1                         — transient read error (process gone). */
 int pgwt_validate_wait_addr(pid_t pid, uint64_t wait_addr);
 
 /* Detect st_activity_raw offset in PgBackendStatus.

@@ -147,6 +147,38 @@ struct pgwt_query_text_event {
 /* Client:ClientRead — idle between queries (like Oracle's SQL*Net message from client) */
 #define PG_WAIT_CLIENT_READ  ((PG_WAIT_CLIENT << 24) | 0x000000)
 
+/* ── wait_event_info reading classification (CAP-2/3/5) ─────────
+ * A reading from a resolved wait_event_info address falls in one of three
+ * classes. Only a NON-ZERO reading with a known class byte PROVES the
+ * address/offset is right: zero is also the most likely reading from a
+ * WRONG offset (pointing into zeroed memory), so it must never be taken
+ * as validation proof — only as "consistent, keep checking". */
+#define PGWT_WEI_GARBAGE        0   /* unknown class byte — wrong offset */
+#define PGWT_WEI_VALID_NONZERO  1   /* known wait class — proof of validity */
+#define PGWT_WEI_ZERO           2   /* on-CPU; consistent but NOT proof */
+
+#ifndef __BPF__
+/* Pure classifier shared by the runtime validator (discovery.c), the
+ * watchpoint preseed (backend.c) and the sampler read path (sampler.c).
+ * PG wait classes occupy 0x01..0x0B (LWLock..InjectionPoint). */
+static inline int pgwt_classify_wei(uint32_t wei)
+{
+    if (wei == 0)
+        return PGWT_WEI_ZERO;
+    unsigned cls = (wei >> 24) & 0xFF;
+    return (cls >= 0x01 && cls <= 0x0B) ? PGWT_WEI_VALID_NONZERO
+                                        : PGWT_WEI_GARBAGE;
+}
+#endif
+
+/* ── BPF-side failure counters (CAP-1/CAP-6) ────────────────────
+ * Slots in the fail_counters PERCPU_ARRAY map. The BPF programs bump these
+ * when a map insert fails (map full); the daemon sums across CPUs and
+ * surfaces them via the control socket so a full map is never silent. */
+#define PGWT_BPF_FAIL_STATE_MAP  0  /* state_map insert failed (map full) */
+#define PGWT_BPF_FAIL_SEEN_QIDS  1  /* seen_query_ids insert failed (full) */
+#define PGWT_BPF_FAIL_MAX        2
+
 /* ── BPF Accumulator (lightweight mode — no ringbuf) ───── */
 #define ACCUM_MAP_MAX_ENTRIES 1024
 

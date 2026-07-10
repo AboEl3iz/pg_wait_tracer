@@ -14,6 +14,10 @@ struct pgwt_backend {
     int      wp_fd;            /* real watchpoint perf_event fd (-1 if none) */
     int      bootstrap_fd;     /* bootstrap watchpoint fd (-1 if none) */
     uint64_t wp_addr;          /* PGPROC->wait_event_info address */
+    /* Is wp_addr in a MAP_SHARED mapping? -1 unknown (not yet checked),
+     * 0 process-local, 1 shared. SMP-2: the sampler may only batch-read
+     * SHARED addresses through one pid; local ones need per-pid reads. */
+    int      wp_addr_shared;
     uint64_t attach_ts;        /* monotonic ns when attached */
     bool     is_alive;
     struct pgwt_metadata meta;
@@ -55,6 +59,16 @@ int pgwt_attach_backend_watchpoint(struct pgwt_daemon *d,
  * path (PG17+ my_wait_event_info global vs PG<17 MyProc+offset). Returns 0 if
  * the backend has not yet set the pointer (still in early init). */
 uint64_t pgwt_resolve_backend_wait_addr(struct pgwt_daemon *d, pid_t pid);
+
+/* CAP-2/3: confirm the resolved wait_event_info addresses with a NON-ZERO
+ * class-valid reading before trusting them. Called once after the initial
+ * backend scan when the scan itself produced no proof (every backend read
+ * zero at that instant — also exactly what a WRONG offset reads forever).
+ * Re-polls the resolved backends briefly; on the PG<17 hardcoded-offset path
+ * an unconfirmed offset is FATAL (returns -1, refuse to attach); on PG17+
+ * (address derived from the backend's own pointer) it degrades to a loud
+ * warning. A garbage reading is FATAL on every version. */
+int pgwt_confirm_wait_offset(struct pgwt_daemon *d);
 
 /* Find backend by PID. Returns NULL if not found. */
 struct pgwt_backend *pgwt_find_backend(struct pgwt_backend_table *bt, pid_t pid);

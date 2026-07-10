@@ -1,6 +1,7 @@
 /* discovery.c — Postmaster PID, ELF symbol offset, /proc helpers,
  *                PG version detection, st_query_id offset detection */
 #include "discovery.h"
+#include "pg_wait_tracer.h"   /* pgwt_classify_wei, PGWT_WEI_* */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -138,13 +139,16 @@ static uint64_t elf_base_vaddr(const char *binary)
 }
 
 uint64_t pgwt_resolve_symbol(const char *binary, const char *symbol,
-                             pid_t pid, const char *binary_basename)
+                             pid_t pid)
 {
     uint64_t sym_val = pgwt_find_symbol_offset(binary, symbol);
     if (sym_val == 0)
         return 0;
 
-    uint64_t load_base = pgwt_find_load_base(pid, binary_basename);
+    /* Load base is matched against the FULL binary path (CAP-4): a basename
+     * or substring match can hit an extension .so whose path contains
+     * "postgres" and is mapped below the binary. */
+    uint64_t load_base = pgwt_find_load_base(pid, binary);
     if (load_base == 0)
         return 0;
 
@@ -155,12 +159,74 @@ uint64_t pgwt_resolve_symbol(const char *binary, const char *symbol,
     return sym_val - elf_base + load_base;
 }
 
+/* Extract the pathname field from a /proc/<pid>/maps line, in place.
+ * Format: "address perms offset dev inode   pathname\n" — the pathname is
+ * everything after the 5th field (it may itself contain spaces). Returns
+ * NULL for anonymous mappings (no pathname field). */
+static char *maps_line_pathname(char *line)
+{
+    char *p = line;
+    for (int field = 0; field < 5; field++) {
+        while (*p && *p != ' ' && *p != '\t')
+            p++;                     /* skip field */
+        while (*p == ' ' || *p == '\t')
+            p++;                     /* skip separator */
+    }
+    if (*p == '\0' || *p == '\n')
+        return NULL;
+    char *nl = strchr(p, '\n');
+    if (nl)
+        *nl = '\0';
+    return p;
+}
+
+/* Does this maps pathname refer to `binary_path`?
+ *
+ * CAP-4 (the #24 class): this used to be strstr(line, basename) over the
+ * whole line, which also matched extension libraries whose PATH contains
+ * "postgres" (e.g. /usr/lib/postgresql/17/lib/pg_stat_statements.so). Under
+ * PIE, such a .so mapped below the binary won the "lowest match" and every
+ * resolved symbol VA was garbage — zero events, silently. The match is now
+ * EXACT:
+ *   - binary_path with a '/': full-pathname equality against the maps field
+ *     (this is the daemon's path — /proc/<pid>/exe and the maps pathname
+ *     both come from the kernel's dentry path, so they agree);
+ *   - bare name: exact-basename equality (unit-test fixtures; never a
+ *     substring match).
+ * A " (deleted)" suffix (binary replaced while running) is tolerated on
+ * either side — both /proc/<pid>/exe and maps grow the same suffix. */
+static int maps_path_matches(const char *maps_path_field,
+                             const char *binary_path)
+{
+    static const char DELETED[] = " (deleted)";
+
+    /* Strip " (deleted)" suffixes for comparison. */
+    char field[512], want[512];
+    snprintf(field, sizeof(field), "%s", maps_path_field);
+    snprintf(want, sizeof(want), "%s", binary_path);
+    size_t fl = strlen(field), wl = strlen(want), dl = sizeof(DELETED) - 1;
+    if (fl > dl && strcmp(field + fl - dl, DELETED) == 0)
+        field[fl - dl] = '\0';
+    if (wl > dl && strcmp(want + wl - dl, DELETED) == 0)
+        want[wl - dl] = '\0';
+
+    if (strchr(want, '/'))
+        return strcmp(field, want) == 0;
+
+    const char *bn = strrchr(field, '/');
+    bn = bn ? bn + 1 : field;
+    return strcmp(bn, want) == 0;
+}
+
 /* Parse a maps file (the /proc/<pid>/maps format) and return the load base
- * for the given binary basename. Split out from pgwt_find_load_base so unit
- * tests can drive it with committed fixture files (tests/test_discovery.c —
- * the #24 regression class: EL8 non-PIE vs EL9/Ubuntu PIE layouts). */
+ * for the given binary. `binary_path` is matched exactly against the
+ * pathname field (full path, or exact basename if it contains no '/' —
+ * see maps_path_matches). Split out from pgwt_find_load_base so unit tests
+ * can drive it with committed fixture files (tests/test_discovery.c —
+ * the #24 regression class: EL8 non-PIE vs EL9/Ubuntu PIE layouts, plus the
+ * CAP-4 adversarial extension-.so-below-binary case). */
 uint64_t pgwt_find_load_base_in_maps(const char *maps_path,
-                                     const char *binary_basename)
+                                     const char *binary_path)
 {
     FILE *f = fopen(maps_path, "r");
     if (!f) {
@@ -171,7 +237,8 @@ uint64_t pgwt_find_load_base_in_maps(const char *maps_path,
     uint64_t base = 0;
     char line[512];
     while (fgets(line, sizeof(line), f)) {
-        if (!strstr(line, binary_basename))
+        char *path_field = maps_line_pathname(line);
+        if (!path_field || !maps_path_matches(path_field, binary_path))
             continue;
         /* The load base is the LOWEST-address mapping of the binary.
          * /proc/<pid>/maps is sorted by start address, so the first mapping
@@ -195,15 +262,54 @@ uint64_t pgwt_find_load_base_in_maps(const char *maps_path,
 
     if (base == 0)
         fprintf(stderr, "Load base for '%s' not found in %s\n",
-                binary_basename, maps_path);
+                binary_path, maps_path);
     return base;
 }
 
-uint64_t pgwt_find_load_base(pid_t pid, const char *binary_basename)
+uint64_t pgwt_find_load_base(pid_t pid, const char *binary_path)
 {
     char path[64];
     snprintf(path, sizeof(path), "/proc/%d/maps", pid);
-    return pgwt_find_load_base_in_maps(path, binary_basename);
+    return pgwt_find_load_base_in_maps(path, binary_path);
+}
+
+/* Is `addr` inside a MAP_SHARED mapping of process `pid`? (SMP-2)
+ *
+ * The sampler may batch-read many backends' wait_event_info through ONE
+ * reader pid — sound ONLY for addresses in PG's shared memory (mapped at the
+ * same VA in every backend AND backed by the same pages). A process-LOCAL
+ * address (.data/.bss — e.g. the my_wait_event_info dummy in aux processes
+ * without a PGPROC) exists at the same VA in every forked child but is
+ * backed by PRIVATE pages: reading it through another pid SUCCEEDS and
+ * returns the reader's value, silently misattributed. The 's' perm bit in
+ * /proc/<pid>/maps distinguishes the two.
+ *
+ * Returns 1 (shared), 0 (private / not found), -1 (maps unreadable).
+ * Callers must treat anything but 1 as "not batchable" (per-pid reads). */
+int pgwt_addr_is_shared(pid_t pid, uint64_t addr)
+{
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/maps", pid);
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return -1;
+
+    int result = 0;
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        unsigned long long start = 0, end = 0;
+        char perms[8] = "";
+        if (sscanf(line, "%llx-%llx %7s", &start, &end, perms) != 3)
+            continue;
+        if (addr < start)
+            break;      /* maps is address-sorted — no containing range */
+        if (addr >= end)
+            continue;
+        result = (perms[3] == 's') ? 1 : 0;
+        break;
+    }
+    fclose(f);
+    return result;
 }
 
 uint64_t pgwt_read_pointer(pid_t pid, uint64_t addr)
@@ -249,7 +355,18 @@ int pgwt_detect_pgproc_wait_offset(int pg_major)
      * PG14/15/16 deliberately omitted here until their offset is header-derived
      * and validated; the runtime guard (pgwt_validate_wait_addr) refuses to
      * attach if an offset is wrong, so a missing entry fails safe rather than
-     * tracing garbage. */
+     * tracing garbage.
+     *
+     * CAP-3 CONSTRAINT: these values are from ONE build (PGDG RPM/deb,
+     * default configure flags, x86_64). PGPROC layout is NOT ABI-stable
+     * across configure options (e.g. --with-blocksize, atomics fallbacks) or
+     * forks — a custom build can shift the field. The offsets here are
+     * therefore only a HYPOTHESIS; the strict runtime validation is the
+     * authority: the daemon refuses to attach until at least one backend
+     * reads a NON-ZERO value with a valid wait-class byte at the resolved
+     * address (see pgwt_confirm_wait_offset / pgwt_validate_wait_addr —
+     * zero readings are never accepted as proof), and every later read path
+     * (preseed, sampler) keeps classifying values and screams on garbage. */
     case 13: return 684;
     default: return 0;
     }
@@ -335,34 +452,39 @@ int pgwt_validate_wait_addr(pid_t pid, uint64_t wait_addr)
     if (r != (ssize_t)sizeof(wei))
         return -1;
 
-    /* Class byte is the high byte. CPU (0x00000000) is valid (not waiting);
-     * otherwise the class must be a known wait-event class. PG wait classes
-     * occupy 0x01..0x0B (LWLock..InjectionPoint); anything else means the
-     * offset is wrong (custom build / mis-detected layout). */
-    if (wei == 0)
-        return 1;
-    unsigned cls = (wei >> 24) & 0xFF;
-    if (cls >= 0x01 && cls <= 0x0B)
-        return 1;
-    return 0;
+    /* Classify the reading (pgwt_classify_wei, pg_wait_tracer.h):
+     *   PGWT_WEI_GARBAGE (0)       — unknown class byte: the offset is wrong
+     *                                (custom build / mis-detected layout).
+     *   PGWT_WEI_VALID_NONZERO (1) — a real wait class: PROOF the address
+     *                                is right.
+     *   PGWT_WEI_ZERO (2)          — on-CPU. Consistent with a correct
+     *                                address, but ALSO the most likely read
+     *                                from a WRONG offset (zeroed memory) —
+     *                                CAP-2: callers must NEVER take zero as
+     *                                validation proof, only as "keep
+     *                                checking other backends / later". */
+    return pgwt_classify_wei(wei);
 }
 
 /* ── PG Version Detection ─────────────────────────────────── */
 
+#include "spawn.h"
+
 int pgwt_detect_pg_version(const char *pg_binary)
 {
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "%s --version 2>/dev/null", pg_binary);
-
-    FILE *fp = popen(cmd, "r");
-    if (!fp) {
+    /* CAP-7: run the binary directly (fork/execvp, no shell) — the path
+     * comes from /proc/<pid>/exe and must never touch a shell command line
+     * in a root daemon. */
+    char *argv[] = { (char *)pg_binary, "--version", NULL };
+    struct pgwt_proc proc;
+    if (pgwt_proc_open(&proc, argv) != 0) {
         fprintf(stderr, "WARN: cannot run '%s --version'\n", pg_binary);
         return 0;
     }
 
-    char line[256];
+    char line[256] = "";
     int major = 0;
-    if (fgets(line, sizeof(line), fp)) {
+    if (fgets(line, sizeof(line), proc.out)) {
         /* Format: "postgres (PostgreSQL) 18.2" or "postgres (PostgreSQL) 14.12" */
         char *p = strstr(line, "PostgreSQL");
         if (p) {
@@ -373,7 +495,7 @@ int pgwt_detect_pg_version(const char *pg_binary)
             major = atoi(p);
         }
     }
-    pclose(fp);
+    pgwt_proc_close(&proc);
 
     if (major < 1 || major > 99) {
         fprintf(stderr, "WARN: cannot parse PG version from '%s'\n", line);
@@ -384,39 +506,71 @@ int pgwt_detect_pg_version(const char *pg_binary)
 
 /* ── st_query_id Offset Detection ─────────────────────────── */
 
+/* Extract the trailing decimal integer from a line ("[0-9]+$" after
+ * stripping the newline), or 0 if the line does not end in digits. */
+static int trailing_int(const char *line)
+{
+    size_t len = strlen(line);
+    while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+        len--;
+    size_t end = len;
+    while (len > 0 && line[len - 1] >= '0' && line[len - 1] <= '9')
+        len--;
+    if (len == end)
+        return 0;   /* no trailing digits */
+    return atoi(line + len);
+}
+
+/* Find offsetof(struct_name, member_name) in DWARF debug info by streaming
+ * `readelf --debug-dump=info <binary>` (fork/execvp — CAP-7: no shell, the
+ * binary path is caller-derived and the daemon runs as root). C port of the
+ * awk program this replaced, with identical matching behavior:
+ *   - a DW_TAG_structure_type line resets the in-struct flag
+ *   - a DW_AT_name line containing struct_name sets it
+ *   - inside the struct, a DW_AT_name line containing member_name starts a
+ *     scan of the following lines for DW_AT_data_member_location (trailing
+ *     integer = the offset), aborted at the next DW_TAG_.
+ * readelf handles detached debug info (Debian/Ubuntu .build-id) itself.
+ * Returns the offset, or 0 if unavailable. */
+static int dwarf_member_offset(const char *pg_binary,
+                               const char *struct_name,
+                               const char *member_name)
+{
+    char *argv[] = { "readelf", "--debug-dump=info", (char *)pg_binary, NULL };
+    struct pgwt_proc proc;
+    if (pgwt_proc_open(&proc, argv) != 0)
+        return 0;
+
+    int offset = 0;
+    int in_struct = 0;
+    char line[1024];
+    while (offset == 0 && fgets(line, sizeof(line), proc.out)) {
+        if (strstr(line, "DW_TAG_structure_type"))
+            in_struct = 0;
+        if (strstr(line, "DW_AT_name") && strstr(line, struct_name))
+            in_struct = 1;
+        if (in_struct && strstr(line, "DW_AT_name")
+            && strstr(line, member_name)) {
+            while (fgets(line, sizeof(line), proc.out)) {
+                if (strstr(line, "DW_AT_data_member_location")) {
+                    offset = trailing_int(line);
+                    break;
+                }
+                if (strstr(line, "DW_TAG_"))
+                    break;
+            }
+        }
+    }
+    /* We may stop reading before EOF (found early) — readelf gets EPIPE;
+     * its exit status is meaningless then, so it is deliberately ignored. */
+    pgwt_proc_close(&proc);
+    return offset;
+}
+
 /* Tier 1: Try DWARF debug info via readelf */
 static int detect_offset_dwarf(const char *pg_binary)
 {
-    /* Try the binary itself first, then the detached debug info.
-     * Debian/Ubuntu: /usr/lib/debug/.build-id/XX/YYYY.debug
-     * We let readelf handle the debug link automatically. */
-    char cmd[1024];
-    snprintf(cmd, sizeof(cmd),
-             "readelf --debug-dump=info '%s' 2>/dev/null | awk '"
-             "/DW_TAG_structure_type/ { s=0 } "
-             "/DW_AT_name.*PgBackendStatus/ { s=1 } "
-             "s && /DW_AT_name.*st_query_id/ { "
-             "  while ((getline line) > 0) { "
-             "    if (line ~ /DW_AT_data_member_location/) { "
-             "      match(line, /[0-9]+$/); "
-             "      if (RSTART>0) { print substr(line,RSTART,RLENGTH); exit } "
-             "    } "
-             "    if (line ~ /DW_TAG_/) break "
-             "  } "
-             "}'",
-             pg_binary);
-
-    FILE *fp = popen(cmd, "r");
-    if (!fp)
-        return 0;
-
-    char buf[64];
-    int offset = 0;
-    if (fgets(buf, sizeof(buf), fp))
-        offset = atoi(buf);
-    pclose(fp);
-
-    return offset;
+    return dwarf_member_offset(pg_binary, "PgBackendStatus", "st_query_id");
 }
 
 /* Tier 2: Known offsets for common PG versions on x86_64 */
@@ -467,33 +621,7 @@ int pgwt_detect_query_id_offset(const char *pg_binary, int pg_major)
 /* Tier 1: Try DWARF debug info via readelf */
 static int detect_activity_offset_dwarf(const char *pg_binary)
 {
-    char cmd[1024];
-    snprintf(cmd, sizeof(cmd),
-             "readelf --debug-dump=info '%s' 2>/dev/null | awk '"
-             "/DW_TAG_structure_type/ { s=0 } "
-             "/DW_AT_name.*PgBackendStatus/ { s=1 } "
-             "s && /DW_AT_name.*st_activity_raw/ { "
-             "  while ((getline line) > 0) { "
-             "    if (line ~ /DW_AT_data_member_location/) { "
-             "      match(line, /[0-9]+$/); "
-             "      if (RSTART>0) { print substr(line,RSTART,RLENGTH); exit } "
-             "    } "
-             "    if (line ~ /DW_TAG_/) break "
-             "  } "
-             "}'",
-             pg_binary);
-
-    FILE *fp = popen(cmd, "r");
-    if (!fp)
-        return 0;
-
-    char buf[64];
-    int offset = 0;
-    if (fgets(buf, sizeof(buf), fp))
-        offset = atoi(buf);
-    pclose(fp);
-
-    return offset;
+    return dwarf_member_offset(pg_binary, "PgBackendStatus", "st_activity_raw");
 }
 
 /* Tier 2: Known offsets for common PG versions on x86_64 */
@@ -796,10 +924,6 @@ int pgwt_discover(struct pgwt_daemon *d)
     if (d->trace_dir)
         pgwt_write_names_json(d->trace_dir);
 
-    /* Extract basename for /proc/pid/maps matching */
-    const char *base = strrchr(binary, '/');
-    base = base ? base + 1 : binary;
-
     /* Resolve the wait_event_info access path. Per-version strategy:
      *   PG17+  → the `my_wait_event_info` global (a uint32* pointing AT the
      *            field). UNCHANGED — must not regress.
@@ -818,7 +942,7 @@ int pgwt_discover(struct pgwt_daemon *d)
                     d->pg_major_version);
             return -1;
         }
-        d->my_wait_ptr_addr = pgwt_resolve_symbol(binary, "MyProc", pm_pid, base);
+        d->my_wait_ptr_addr = pgwt_resolve_symbol(binary, "MyProc", pm_pid);
         if (d->my_wait_ptr_addr == 0) {
             fprintf(stderr, "FATAL: cannot resolve 'MyProc' in %s (PID %d)\n",
                     binary, pm_pid);
@@ -831,7 +955,7 @@ int pgwt_discover(struct pgwt_daemon *d)
                     d->pgproc_wait_offset);
     } else {
         d->my_wait_ptr_addr = pgwt_resolve_symbol(binary, "my_wait_event_info",
-                                                   pm_pid, base);
+                                                   pm_pid);
         if (d->my_wait_ptr_addr == 0) {
             fprintf(stderr, "FATAL: cannot resolve 'my_wait_event_info' in %s (PID %d)\n",
                     binary, pm_pid);
@@ -853,7 +977,7 @@ int pgwt_discover(struct pgwt_daemon *d)
      * (Route B1, resolved below), NOT from MyBEEntry — and PG13 does not export
      * MyBEEntry in .dynsym anyway — so a missing MyBEEntry is not fatal there. */
     d->my_be_entry_addr = pgwt_resolve_symbol(binary, "MyBEEntry",
-                                               pm_pid, base);
+                                               pm_pid);
     if (d->my_be_entry_addr == 0) {
         if (d->view == PGWT_VIEW_QUERY_EVENT && d->pg_major_version != 13) {
             fprintf(stderr, "FATAL: symbol 'MyBEEntry' not found — query_event view unavailable\n");

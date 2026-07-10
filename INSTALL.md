@@ -475,3 +475,44 @@ that field depends on the PostgreSQL major version:
   `MyProc->wait_event_info`, but their verified PGPROC offsets and per-version
   name tables are not yet added, so the daemon fails fast at startup rather than
   capturing incorrect data. Support is planned.
+
+### Operational contracts (run under a supervisor)
+
+Two behaviors are by design and must be handled by your service manager:
+
+- **The daemon exits when the postmaster dies.** All resolved addresses
+  (load base, `MyProc`/`my_wait_event_info`, per-backend PGPROC slots) are
+  specific to one postmaster instance; after a PostgreSQL restart they are
+  meaningless, so the daemon exits with the reason
+  `PostgreSQL (PID ...) stopped` instead of guessing. Run it under systemd
+  so it re-attaches to the new postmaster automatically:
+
+  ```ini
+  [Service]
+  ExecStart=/usr/local/bin/pg_wait_tracer --daemon --mode tiered -T /var/lib/pgwt
+  Restart=always
+  RestartSec=5
+  # Watchpoint + bootstrap fds: 2 per backend + headroom (the daemon also
+  # raises RLIMIT_NOFILE itself at startup, but the hard limit must allow it)
+  LimitNOFILE=4096
+  ```
+
+  (`--daemon` already retries discovery in a loop; `Restart=always` covers
+  daemon crashes as well.)
+
+- **Same PID namespace as PostgreSQL.** The daemon matches BPF-reported
+  kernel PIDs against `/proc` and `postmaster.pid`, which assumes it shares
+  the PID namespace with PostgreSQL. Run it on the host for a host
+  PostgreSQL. For a containerized PostgreSQL, run the daemon **inside that
+  container** (or join its PID namespace, e.g.
+  `nsenter -t <postmaster-pid> -p`); running it on the host against a
+  container's PostgreSQL will mis-map PIDs.
+
+### File descriptor limits (many backends)
+
+Full/tiered capture holds up to two perf fds per backend. The daemon raises
+`RLIMIT_NOFILE` at startup to cover its 1024-backend registry, but it cannot
+exceed the hard limit granted to it. If you see
+`perf_event_open: ... file descriptor limit reached` in the log (each such
+failure also increments `wp_attach_failures_total` on the control socket),
+raise the hard limit: `LimitNOFILE=` in the systemd unit or `ulimit -Hn`.

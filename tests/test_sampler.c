@@ -1,12 +1,21 @@
-/* test_sampler.c — Unit tests for the sampled provider's core (Phase A2)
+/* test_sampler.c — Unit tests for the sampled provider's core (A2, T4)
  *
  * Exercises the BPF-free sampler core (pgwt_sampler_read_targets and
  * pgwt_sampler_build_batch) against a controlled target: this process's own
- * memory (read via process_vm_readv on getpid()) and a child process with a
- * known 4-byte value at a known address (read via the per-pid pread
- * fallback). Built with -DPGWT_SERVER against the server objects so it needs
- * no BPF skeleton (buildable without bpftool, and in CI), matching
- * test_trace_v2.
+ * memory (read via process_vm_readv on getpid()) and child processes with
+ * known 4-byte values at known addresses. Built with -DPGWT_SERVER against
+ * the server objects so it needs no BPF skeleton (buildable without bpftool,
+ * and in CI), matching test_trace_v2.
+ *
+ * T4 additions:
+ *   - SMP-2: a process-LOCAL address (same VA in a forked child, private
+ *     pages) must be read per-pid, never batched through another pid — the
+ *     batched read SUCCEEDS with the wrong (reader's) value.
+ *   - CAP-2/5 backstop: garbage class-byte readings are dropped + counted.
+ *   - SMP-1: the read-health state machine (loud on first + persistent
+ *     failure, recovery).
+ *   - SMP-3: effective sample period compensates missed/late ticks.
+ *   - SMP-4: the pid->query_id join index.
  */
 #define _GNU_SOURCE
 #include "sampler.h"
@@ -37,15 +46,16 @@ static void test_self_read(void)
     printf("--- self-read via process_vm_readv ---\n");
 
     /* Three known values; one is 0 (on-CPU) to confirm reads, not just
-     * encoding, handle it. */
+     * encoding, handle it. Marked is_shared so the batch path is used
+     * (reading one's own memory through one's own pid is trivially sound). */
     volatile uint32_t v0 = WEI(PG_WAIT_IO, 0x12);     /* IO:something */
     volatile uint32_t v1 = 0;                          /* on CPU */
     volatile uint32_t v2 = WEI(PG_WAIT_LOCK, 0x03);   /* Lock:something */
 
     struct pgwt_sample_target targets[3] = {
-        { .pid = getpid(), .wait_event_addr = (uint64_t)(uintptr_t)&v0, .query_id = 111 },
-        { .pid = getpid(), .wait_event_addr = (uint64_t)(uintptr_t)&v1, .query_id = 222 },
-        { .pid = getpid(), .wait_event_addr = (uint64_t)(uintptr_t)&v2, .query_id = 333 },
+        { .pid = getpid(), .wait_event_addr = (uint64_t)(uintptr_t)&v0, .query_id = 111, .is_shared = 1 },
+        { .pid = getpid(), .wait_event_addr = (uint64_t)(uintptr_t)&v1, .query_id = 222, .is_shared = 1 },
+        { .pid = getpid(), .wait_event_addr = (uint64_t)(uintptr_t)&v2, .query_id = 333, .is_shared = 1 },
     };
 
     uint32_t vals[3] = { 0xdead, 0xdead, 0xdead };
@@ -80,7 +90,7 @@ static void test_build_batch(void)
     struct pgwt_trace_event out[3];
     memset(out, 0xAA, sizeof(out));
     uint64_t ts = 0x123456789ABCULL;
-    int n = pgwt_sampler_build_batch(targets, vals, 3, ts, out);
+    int n = pgwt_sampler_build_batch(targets, vals, 3, ts, out, NULL);
 
     CHECK(n == 2, "expected 2 records (1 on-CPU skipped), got %d", n);
 
@@ -102,6 +112,37 @@ static void test_build_batch(void)
           (unsigned long long)out[1].query_id);
 }
 
+/* ── Test 2b: build_batch drops + counts garbage readings (CAP-2/5) ───── */
+
+static void test_build_batch_garbage(void)
+{
+    printf("--- build_batch garbage class-byte filter (CAP-2/5) ---\n");
+
+    struct pgwt_sample_target targets[3] = {
+        { .pid = 2001, .wait_event_addr = 0x1000, .query_id = 1 },
+        { .pid = 2002, .wait_event_addr = 0x2000, .query_id = 2 },
+        { .pid = 2003, .wait_event_addr = 0x3000, .query_id = 3 },
+    };
+    uint32_t vals[3] = {
+        WEI(PG_WAIT_LOCK, 0x00),  /* valid — recorded */
+        0xDEADBEEFu,              /* garbage class 0xDE — dropped + counted */
+        0x7F000001u,              /* garbage class 0x7F — dropped + counted */
+    };
+
+    struct pgwt_trace_event out[3];
+    uint64_t invalid = 0;
+    int n = pgwt_sampler_build_batch(targets, vals, 3, 1, out, &invalid);
+
+    CHECK(n == 1, "expected 1 record (2 garbage dropped), got %d", n);
+    CHECK(out[0].pid == 2001, "the valid record survived");
+    CHECK(invalid == 2, "expected 2 invalid reads counted, got %llu",
+          (unsigned long long)invalid);
+
+    /* NULL counter must not crash and must still drop garbage. */
+    n = pgwt_sampler_build_batch(targets, vals, 3, 1, out, NULL);
+    CHECK(n == 1, "NULL invalid counter: still 1 record, got %d", n);
+}
+
 /* ── Test 3: per-pid pread fallback on a bad leading entry ────────────── */
 
 static void test_fallback(void)
@@ -120,8 +161,8 @@ static void test_fallback(void)
     munmap(bad, 4096);   /* now definitely unmapped */
 
     struct pgwt_sample_target targets[2] = {
-        { .pid = getpid(), .wait_event_addr = (uint64_t)(uintptr_t)bad, .query_id = 1 },
-        { .pid = getpid(), .wait_event_addr = (uint64_t)(uintptr_t)&good, .query_id = 2 },
+        { .pid = getpid(), .wait_event_addr = (uint64_t)(uintptr_t)bad, .query_id = 1, .is_shared = 1 },
+        { .pid = getpid(), .wait_event_addr = (uint64_t)(uintptr_t)&good, .query_id = 2, .is_shared = 1 },
     };
 
     uint32_t vals[2] = { 0xdead, 0xdead };
@@ -135,11 +176,11 @@ static void test_fallback(void)
           (unsigned long long)faults);
 }
 
-/* ── Test 4: child process read via fallback (different pid) ───────────── */
+/* ── Test 4: child process read (cross-pid, shared mapping) ───────────── */
 
 static void test_child_read(void)
 {
-    printf("--- read child process value (cross-pid) ---\n");
+    printf("--- read child process value (cross-pid, MAP_SHARED) ---\n");
 
     /* Shared anonymous mmap: parent writes a known value, child sees it at
      * its own (possibly different) virtual address, reports the address back
@@ -173,7 +214,7 @@ static void test_child_read(void)
     CHECK(r == (ssize_t)sizeof(child_addr), "did not get child address");
 
     struct pgwt_sample_target targets[1] = {
-        { .pid = child, .wait_event_addr = child_addr, .query_id = 7 },
+        { .pid = child, .wait_event_addr = child_addr, .query_id = 7, .is_shared = 1 },
     };
     uint32_t vals[1] = { 0xdead };
     uint64_t faults = 0;
@@ -190,12 +231,190 @@ static void test_child_read(void)
     munmap(page, 4096);
 }
 
+/* ── Test 5 (SMP-2): process-LOCAL addresses must be read per-pid ─────── */
+
+/* A .data global: after fork it exists at the SAME virtual address in the
+ * child, but the pages are PRIVATE (COW) — the child's value diverges from
+ * the parent's. The old batched sweep read the child's target through the
+ * PARENT pid (the batch's reader): the read SUCCEEDED and returned the
+ * PARENT's value, silently misattributed to the child. With is_shared unset
+ * the target must be read via /proc/<child>/mem and return the CHILD's
+ * value. */
+static volatile uint32_t smp2_local_slot = WEI(PG_WAIT_LOCK, 0x01);
+
+static void test_local_addr_not_batched(void)
+{
+    printf("--- SMP-2: process-local address read per-pid, not batched ---\n");
+
+    const uint32_t parent_val = WEI(PG_WAIT_LOCK, 0x01);
+    const uint32_t child_val  = WEI(PG_WAIT_IO, 0x05);
+
+    int pfd[2];
+    if (pipe(pfd) != 0) { CHECK(0, "pipe failed"); return; }
+
+    pid_t child = fork();
+    if (child == 0) {
+        /* Child: overwrite ITS OWN copy of the global (COW page), signal
+         * readiness, idle until killed. */
+        smp2_local_slot = child_val;
+        char ready = 1;
+        ssize_t w = write(pfd[1], &ready, 1);
+        (void)w;
+        for (;;) pause();
+        _exit(0);
+    }
+    CHECK(child > 0, "fork failed");
+
+    char ready = 0;
+    ssize_t r = read(pfd[0], &ready, 1);
+    CHECK(r == 1 && ready == 1, "child did not signal readiness");
+
+    /* Target 0: the parent's own slot (batched — its own pid is the batch
+     * reader, sound). Target 1: the CHILD's slot at the same VA, correctly
+     * marked NOT shared. Before the SMP-2 fix, target 1 was read through
+     * target 0's pid (the parent) and returned parent_val — this asserts
+     * the child's value comes back. */
+    struct pgwt_sample_target targets[2] = {
+        { .pid = getpid(), .query_id = 1, .is_shared = 1,
+          .wait_event_addr = (uint64_t)(uintptr_t)&smp2_local_slot },
+        { .pid = child, .query_id = 2, .is_shared = 0,
+          .wait_event_addr = (uint64_t)(uintptr_t)&smp2_local_slot },
+    };
+    uint32_t vals[2] = { 0xdead, 0xdead };
+    int got = pgwt_sampler_read_targets(targets, 2, vals, NULL);
+
+    CHECK(got == 2, "expected both targets read, got %d", got);
+    CHECK(vals[0] == parent_val, "parent slot = 0x%x expected 0x%x",
+          vals[0], parent_val);
+    CHECK(vals[1] == child_val,
+          "SMP-2: child's local slot = 0x%x expected the CHILD's value 0x%x "
+          "(reader-pid value = misattribution)", vals[1], child_val);
+
+    kill(child, SIGKILL);
+    waitpid(child, NULL, 0);
+    close(pfd[0]);
+    close(pfd[1]);
+}
+
+/* ── Test 6 (SMP-1): read-health state machine ────────────────────────── */
+
+static void test_health(void)
+{
+    printf("--- SMP-1: sampler read-health state machine ---\n");
+
+    const uint64_t SEC = 1000000000ULL;
+    struct pgwt_sampler_health h;
+    memset(&h, 0, sizeof(h));
+    h.healthy = 1;
+
+    /* Healthy ticks: no action, stays healthy. */
+    CHECK(pgwt_sampler_health_note(&h, 10, 10, 0, 1 * SEC)
+              == PGWT_SAMPLER_LOG_NONE, "healthy tick -> no log");
+    CHECK(h.healthy == 1, "still healthy");
+
+    /* Zero-target ticks are neutral (nothing to read != failure). */
+    CHECK(pgwt_sampler_health_note(&h, 0, 0, 0, 2 * SEC)
+              == PGWT_SAMPLER_LOG_NONE, "no-target tick is neutral");
+    CHECK(h.healthy == 1, "no-target tick must not flag unhealthy");
+
+    /* FIRST total failure: loud immediately + unhealthy. */
+    CHECK(pgwt_sampler_health_note(&h, 10, 0, 1 /*EPERM*/, 3 * SEC)
+              == PGWT_SAMPLER_LOG_DEGRADED, "first total failure logs");
+    CHECK(h.healthy == 0, "unhealthy after first total failure");
+    CHECK(h.last_errno == 1, "errno recorded");
+
+    /* Following failures within the re-log window: silent but counted. */
+    CHECK(pgwt_sampler_health_note(&h, 10, 0, 1, 4 * SEC)
+              == PGWT_SAMPLER_LOG_NONE, "repeat failure within window silent");
+    CHECK(h.consec_failed_ticks == 2, "consecutive failures counted");
+
+    /* Persistent failure: re-logs after the period (60s). */
+    CHECK(pgwt_sampler_health_note(&h, 10, 0, 1, 64 * SEC)
+              == PGWT_SAMPLER_LOG_DEGRADED, "persistent failure re-logs");
+
+    /* Recovery: logs once, healthy again, consec reset. */
+    CHECK(pgwt_sampler_health_note(&h, 10, 5, 0, 65 * SEC)
+              == PGWT_SAMPLER_LOG_RECOVERED, "recovery logs");
+    CHECK(h.healthy == 1, "healthy after recovery");
+    CHECK(h.consec_failed_ticks == 0, "consecutive counter reset");
+    CHECK(h.failed_ticks_total == 3, "total failed ticks preserved (got %llu)",
+          (unsigned long long)h.failed_ticks_total);
+
+    /* A partial read (some targets fail) is NOT a health failure — only a
+     * TOTAL failure is indistinguishable from idle. */
+    CHECK(pgwt_sampler_health_note(&h, 10, 1, 0, 66 * SEC)
+              == PGWT_SAMPLER_LOG_NONE, "partial read stays healthy");
+    CHECK(h.healthy == 1, "partial read keeps healthy");
+}
+
+/* ── Test 7 (SMP-3): effective sample period ──────────────────────────── */
+
+static void test_effective_period(void)
+{
+    printf("--- SMP-3: effective sample period (missed-tick weight) ---\n");
+
+    const uint64_t NOM = 100000000ULL;   /* 100ms nominal (10 Hz) */
+
+    /* First tick: nominal. */
+    CHECK(pgwt_sampler_effective_period(NOM, 0, 5000) == NOM,
+          "first tick uses nominal");
+
+    /* On-time tick: measured == nominal. */
+    CHECK(pgwt_sampler_effective_period(NOM, 1000, 1000 + NOM) == NOM,
+          "on-time tick = nominal");
+
+    /* Stalled daemon: 3 ticks coalesced -> weight = the real elapsed time
+     * (this is the SMP-3 fix: nominal weight would deflate AAS under load). */
+    CHECK(pgwt_sampler_effective_period(NOM, 1000, 1000 + 3 * NOM) == 3 * NOM,
+          "coalesced ticks weighted by measured elapsed");
+
+    /* Early/backwards clock never shrinks below nominal. */
+    CHECK(pgwt_sampler_effective_period(NOM, 1000, 1000 + NOM / 2) == NOM,
+          "early tick clamps to nominal");
+    CHECK(pgwt_sampler_effective_period(NOM, 5000, 1000) == NOM,
+          "non-monotonic input clamps to nominal");
+
+    /* Absurd stall clamps at 60s. */
+    CHECK(pgwt_sampler_effective_period(NOM, 0x1000, 0x1000 + 3600ULL * 1000000000ULL)
+              == 60ULL * 1000000000ULL,
+          "stall clamped to 60s");
+}
+
+/* ── Test 8 (SMP-4): pid -> query_id join index ───────────────────────── */
+
+static void test_qid_index(void)
+{
+    printf("--- SMP-4: qid join index sort + lookup ---\n");
+
+    struct pgwt_qid_entry e[5] = {
+        { .pid = 500, .query_id = 55 },
+        { .pid = 100, .query_id = 11 },
+        { .pid = 900, .query_id = 99 },
+        { .pid = 300, .query_id = 33 },
+        { .pid = 700, .query_id = 77 },
+    };
+    pgwt_qid_index_sort(e, 5);
+    for (int i = 1; i < 5; i++)
+        CHECK(e[i - 1].pid < e[i].pid, "sorted order at %d", i);
+
+    CHECK(pgwt_qid_index_lookup(e, 5, 100) == 11, "lookup first");
+    CHECK(pgwt_qid_index_lookup(e, 5, 900) == 99, "lookup last");
+    CHECK(pgwt_qid_index_lookup(e, 5, 300) == 33, "lookup middle");
+    CHECK(pgwt_qid_index_lookup(e, 5, 301) == 0, "missing pid -> 0");
+    CHECK(pgwt_qid_index_lookup(e, 0, 100) == 0, "empty index -> 0");
+}
+
 int main(void)
 {
     test_self_read();
     test_build_batch();
+    test_build_batch_garbage();
     test_fallback();
     test_child_read();
+    test_local_addr_not_batched();
+    test_health();
+    test_effective_period();
+    test_qid_index();
 
     printf("\n%d/%d checks passed\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;

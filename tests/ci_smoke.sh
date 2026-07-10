@@ -153,6 +153,12 @@ run_section() {
 run_section "capture smoke: --mode tiered (live view + trace file)" \
     python3 "$SCRIPT_DIR/test_capture_smoke.py" --mode tiered --pid "$PM_PID"
 
+# ── T4/CAP-1: a full state_map must be loud (metrics + ERROR log). ──
+# Uses the PGWT_STATE_MAP_ENTRIES test hook to shrink the map, so the
+# loud path is proven with ~10 connections instead of >1024.
+run_section "state_map full is loud (CAP-1, --mode tiered)" \
+    python3 "$SCRIPT_DIR/test_state_map_loud.py" --pid "$PM_PID"
+
 # ── Full mode: hard when watchpoints exist; loud skip when they don't ──
 if [[ "$WP" == "yes" ]]; then
     run_section "capture smoke: --mode full (live view + trace file)" \

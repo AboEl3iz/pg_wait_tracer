@@ -39,6 +39,12 @@ struct pgwt_counters {
     uint64_t prev_samples_total;       /* samples_total at previous timer tick */
     double   samples_per_sec;          /* recent sample rate, refreshed each tick */
     uint64_t sample_read_faults_total; /* process_vm_readv partial/EFAULT fallbacks */
+
+    /* Capture hardening (T4). All of these mean "something the operator
+     * must know about is happening" — each is paired with a loud log. */
+    uint64_t state_map_full_total;     /* userspace state_map inserts failed (map full, CAP-1) */
+    uint64_t invalid_wait_reads_total; /* wait_event_info reads with a garbage class byte (CAP-2/5) */
+    uint64_t sampler_ticks_missed_total; /* sampler timer expirations coalesced/missed (SMP-3) */
 };
 
 /* View modes */
@@ -172,6 +178,12 @@ struct pgwt_daemon {
     /* Control socket (D4) — created when trace_dir is set */
     struct pgwt_control *control;           /* NULL if disabled/unavailable */
     struct pgwt_counters counters;          /* self-observability (D6) */
+
+    /* Log-once latches for loud degradation warnings (T4). The counters
+     * above keep counting; the log fires once so it cannot flood. */
+    bool state_map_full_logged;      /* CAP-1 */
+    bool seen_qids_full_logged;      /* CAP-6 */
+    bool invalid_wait_reads_logged;  /* CAP-2/5 backstop */
 
     /* State */
     struct pgwt_backend_table backends;

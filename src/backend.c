@@ -14,6 +14,7 @@
 #include <time.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <errno.h>
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 #include "pg_wait_tracer.skel.h"
@@ -24,6 +25,7 @@ void pgwt_backend_init(struct pgwt_backend_table *bt)
     for (int i = 0; i < MAX_BACKENDS; i++) {
         bt->entries[i].wp_fd = -1;
         bt->entries[i].bootstrap_fd = -1;
+        bt->entries[i].wp_addr_shared = -1;
     }
 }
 
@@ -44,6 +46,7 @@ static struct pgwt_backend *alloc_backend(struct pgwt_backend_table *bt, pid_t p
             memset(&bt->entries[i], 0, sizeof(bt->entries[i]));
             bt->entries[i].wp_fd = -1;
             bt->entries[i].bootstrap_fd = -1;
+            bt->entries[i].wp_addr_shared = -1;
             bt->entries[i].pid = pid;
             bt->entries[i].is_alive = true;
             return &bt->entries[i];
@@ -59,6 +62,7 @@ static struct pgwt_backend *alloc_backend(struct pgwt_backend_table *bt, pid_t p
     memset(be, 0, sizeof(*be));
     be->wp_fd = -1;
     be->bootstrap_fd = -1;
+    be->wp_addr_shared = -1;
     be->pid = pid;
     be->is_alive = true;
     return be;
@@ -84,24 +88,72 @@ uint64_t pgwt_resolve_backend_wait_addr(struct pgwt_daemon *d, pid_t pid)
     return pgwt_read_pointer(pid, d->my_wait_ptr_addr);
 }
 
+/* Loud, once-only report that the BPF state_map is full (CAP-1). Every
+ * failed insert is a backend that will record NOTHING — never silent. */
+static void report_state_map_full(struct pgwt_daemon *d, pid_t pid)
+{
+    d->counters.state_map_full_total++;
+    if (d->state_map_full_logged)
+        return;
+    d->state_map_full_logged = true;
+    fprintf(stderr,
+            "ERROR: BPF state_map is FULL — cannot track PID %d (and any "
+            "further backend).\n"
+            "  Backends without a state_map entry record NO events/samples. "
+            "state_map_full_total on the control socket counts every "
+            "affected backend.\n",
+            pid);
+}
+
 /* Pre-seed the BPF state_map for a backend whose wait_event_info address is
  * already resolved (be->wp_addr). Reads the backend's CURRENT wait_event_info
  * and query_id and writes them as the initial state, so the first watchpoint
  * fire ACCUMULATES the in-progress wait instead of discarding it (otherwise a
  * backend already blocked at attach time — e.g. Lock:relation — loses its
- * opening interval). Idempotent via BPF_NOEXIST. */
-static void preseed_state_map(struct pgwt_daemon *d, pid_t pid, uint64_t addr,
-                              uint64_t attach_ts)
+ * opening interval).
+ *
+ * CAP-2/5 backstop: the value read here is classified on EVERY call (all PG
+ * versions, re-exercised on each escalation): a garbage class byte means the
+ * resolved address is wrong — counted + logged loudly, and never seeded as
+ * if it were a real wait. A non-zero valid reading (re)confirms the offset.
+ * Returns 0 on success, -1 if the state_map insert failed (map full). */
+static int preseed_state_map(struct pgwt_daemon *d, pid_t pid, uint64_t addr,
+                             uint64_t attach_ts)
 {
     char mem_path[64];
     snprintf(mem_path, sizeof(mem_path), "/proc/%d/mem", pid);
     int mem_fd = open(mem_path, O_RDONLY);
     if (mem_fd < 0)
-        return;
+        return 0;   /* backend gone — nothing to seed */
 
+    int rc = 0;
     uint32_t current_wei = 0;
     if (pread(mem_fd, &current_wei, sizeof(current_wei), addr) ==
         sizeof(current_wei)) {
+        switch (pgwt_classify_wei(current_wei)) {
+        case PGWT_WEI_VALID_NONZERO:
+            d->wait_offset_validated = true;   /* ongoing re-validation */
+            break;
+        case PGWT_WEI_GARBAGE:
+            d->counters.invalid_wait_reads_total++;
+            if (!d->invalid_wait_reads_logged) {
+                d->invalid_wait_reads_logged = true;
+                fprintf(stderr,
+                        "ERROR: wait_event_info read for PID %d returned "
+                        "0x%08x — invalid wait-event class byte.\n"
+                        "  The resolved address/offset is wrong for this "
+                        "PostgreSQL build; data from this address is NOT "
+                        "recorded (invalid_wait_reads_total counts these).\n",
+                        pid, current_wei);
+            }
+            /* Do not seed a garbage wait state; seed as on-CPU so nothing
+             * fabricated ever enters the trace. */
+            current_wei = 0;
+            break;
+        default:
+            break;   /* zero: consistent, not proof */
+        }
+
         /* Read current query_id from MyBEEntry->st_query_id */
         uint64_t current_qid = 0;
         if (d->my_be_entry_addr && d->st_query_id_offset > 0) {
@@ -127,10 +179,18 @@ static void preseed_state_map(struct pgwt_daemon *d, pid_t pid, uint64_t addr,
         /* BPF_ANY (not NOEXIST): on first full-mode attach this creates the
          * entry; on tiered RE-escalation it REFRESHES a reset/sampled entry to
          * the backend's CURRENT wait state, so an in-progress wait at escalate
-         * time is captured instead of being lost behind a stale last_event. */
-        bpf_map_update_elem(state_fd, &pid_key, &init_state, BPF_ANY);
+         * time is captured instead of being lost behind a stale last_event.
+         * (This BPF_ANY refresh also covers the PID-reuse window — CAP-9: a
+         * stale entry from a recycled PID is overwritten on every attach.)
+         * CAP-1: the insert is CHECKED — a full map is a backend that records
+         * nothing, which must never be silent. */
+        if (bpf_map_update_elem(state_fd, &pid_key, &init_state, BPF_ANY) != 0) {
+            report_state_map_full(d, pid);
+            rc = -1;
+        }
     }
     close(mem_fd);
+    return rc;
 }
 
 int pgwt_attach_backend_watchpoint(struct pgwt_daemon *d,
@@ -139,8 +199,12 @@ int pgwt_attach_backend_watchpoint(struct pgwt_daemon *d,
     if (be->wp_addr == 0 || be->wp_fd >= 0)
         return be->wp_fd >= 0 ? 0 : -1;
 
+    /* CAP-8 ordering: open DISABLED → preseed state_map → enable. Opening
+     * enabled first left a window where the first transition fired against
+     * an unseeded (or stale, on re-escalation) state entry and the opening
+     * interval was mis-timed. */
     int wp_prog_fd = bpf_program__fd(d->skel->progs.on_watchpoint);
-    be->wp_fd = pgwt_open_watchpoint(be->pid, be->wp_addr, wp_prog_fd);
+    be->wp_fd = pgwt_open_watchpoint_disabled(be->pid, be->wp_addr, wp_prog_fd);
     if (be->wp_fd < 0) {
         /* Process likely exited before attach — caller decides on cleanup. */
         d->counters.wp_attach_failures_total++;
@@ -150,6 +214,13 @@ int pgwt_attach_backend_watchpoint(struct pgwt_daemon *d,
     if (be->attach_ts == 0)
         be->attach_ts = now_ns();
     preseed_state_map(d, be->pid, be->wp_addr, be->attach_ts);
+
+    if (pgwt_watchpoint_enable(be->wp_fd) != 0) {
+        pgwt_close_watchpoint(be->wp_fd);
+        be->wp_fd = -1;
+        d->counters.wp_attach_failures_total++;
+        return -1;
+    }
     return 0;
 }
 
@@ -190,7 +261,16 @@ int pgwt_scan_existing_backends(struct pgwt_daemon *d)
             continue;
 
         /* This is a postgres child. Resolve its wait_event_info address
-         * (PG17+ my_wait_event_info global; PG<17 MyProc + offset). */
+         * (PG17+ my_wait_event_info global; PG<17 MyProc + offset).
+         *
+         * Note: on PG17+ a long-lived process whose pointer still targets
+         * the process-local dummy (aux processes without a PGPROC, e.g.
+         * syslogger) is deliberately accepted here — the dummy IS that
+         * process's wait_event_info, so watchpointing it is correct. The
+         * one residual edge is a backend caught in its few-ms init window
+         * DURING this one-time scan (dummy now, PGPROC in a moment); the
+         * fork path (pgwt_handle_fork) closes the same race properly via
+         * the shared-memory check + bootstrap watchpoint. */
         uint64_t ptr = pgwt_resolve_backend_wait_addr(d, pid);
         if (ptr == 0) {
             /* Not yet initialized — treat as fresh fork */
@@ -200,27 +280,37 @@ int pgwt_scan_existing_backends(struct pgwt_daemon *d)
             continue;
         }
 
-        /* Runtime validation (PG<17 MyProc path): the offset is global, so a
-         * single sane reading proves it. Check the first backend we resolve;
-         * if its wait_event_info value's class byte is garbage, the offset is
-         * wrong (custom build / mis-detected layout) — refuse to attach rather
-         * than trace nonsense. PG17+ skips this (my_wait_event_info already
-         * points exactly at the field). */
-        if (d->use_myproc && !d->wait_offset_validated) {
+        /* Runtime validation (CAP-2/3/5) — ALL versions. Classify the value
+         * at the resolved address for EVERY backend until one produces
+         * proof:
+         *   garbage class byte  → the offset/address is wrong (custom build
+         *                         / mis-detected layout) — refuse to attach
+         *                         rather than trace nonsense;
+         *   non-zero valid      → proof, offset validated;
+         *   zero                → NOT proof (zero is also the most likely
+         *                         reading from a wrong offset) — keep
+         *                         checking the remaining backends; if the
+         *                         whole scan proves nothing,
+         *                         pgwt_confirm_wait_offset() re-polls. */
+        if (!d->wait_offset_validated) {
             int v = pgwt_validate_wait_addr(pid, ptr);
-            if (v == 0) {
+            if (v == PGWT_WEI_GARBAGE) {
                 fprintf(stderr,
                         "FATAL: resolved wait_event_info for PID %d holds a value "
                         "with an invalid wait-event class byte.\n"
-                        "  offsetof(PGPROC, wait_event_info)=%d is likely wrong for "
-                        "this PG%d build — refusing to attach.\n",
-                        pid, d->pgproc_wait_offset, d->pg_major_version);
+                        "  %s is likely wrong for this PG%d build — refusing "
+                        "to attach.\n",
+                        pid,
+                        d->use_myproc
+                            ? "offsetof(PGPROC, wait_event_info)"
+                            : "the resolved my_wait_event_info address",
+                        d->pg_major_version);
                 closedir(proc);
-                return -1;
+                return -2;   /* validation refusal — caller must ABORT */
             }
-            if (v == 1)
+            if (v == PGWT_WEI_VALID_NONZERO)
                 d->wait_offset_validated = true;
-            /* v < 0: transient read error — try the next backend. */
+            /* v == PGWT_WEI_ZERO or v < 0: inconclusive — next backend. */
         }
 
         /* Already initialized — record the address. */
@@ -245,7 +335,12 @@ int pgwt_scan_existing_backends(struct pgwt_daemon *d)
                 .wait_event_addr = ptr,
             };
             uint32_t pid_key = pid;
-            bpf_map_update_elem(state_fd, &pid_key, &init_state, BPF_NOEXIST);
+            /* CAP-1: EEXIST is fine (idempotent seed); anything else means
+             * the map is full — this backend's query_ids will be missing. */
+            int urc = bpf_map_update_elem(state_fd, &pid_key, &init_state,
+                                          BPF_NOEXIST);
+            if (urc != 0 && urc != -EEXIST && errno != EEXIST)
+                report_state_map_full(d, pid);
 
             if (d->verbose)
                 fprintf(stderr, "INFO: tracking PID %d (%s), sampled at 0x%lx\n",
@@ -279,6 +374,87 @@ int pgwt_scan_existing_backends(struct pgwt_daemon *d)
     }
     closedir(proc);
     return count;
+}
+
+/* CAP-2/3: post-scan offset confirmation. Only reached when the initial scan
+ * resolved backends but NONE of them read a non-zero class-valid value at
+ * that instant. On a real PostgreSQL this is transient (aux processes sit in
+ * Activity:*Main waits almost always), so a short re-poll settles it; a
+ * WRONG offset pointing into zeroed memory reads zero FOREVER — exactly the
+ * case CAP-2 exists for — and must not be blessed. */
+int pgwt_confirm_wait_offset(struct pgwt_daemon *d)
+{
+    if (d->wait_offset_validated)
+        return 0;
+
+    /* Collect resolved live backends. */
+    int have_resolved = 0;
+    for (int i = 0; i < d->backends.count; i++)
+        if (d->backends.entries[i].is_alive
+            && d->backends.entries[i].pid > 0
+            && d->backends.entries[i].wp_addr != 0)
+            have_resolved++;
+    if (have_resolved == 0)
+        return 0;   /* nothing to confirm yet — handle_init validates later */
+
+    /* Re-poll for up to ~2s (40 × 50ms). Exits on the FIRST proof, so on a
+     * healthy system this costs one round. */
+    for (int round = 0; round < 40; round++) {
+        for (int i = 0; i < d->backends.count; i++) {
+            struct pgwt_backend *be = &d->backends.entries[i];
+            if (!be->is_alive || be->pid <= 0 || be->wp_addr == 0)
+                continue;
+            int v = pgwt_validate_wait_addr(be->pid, be->wp_addr);
+            if (v == PGWT_WEI_VALID_NONZERO) {
+                d->wait_offset_validated = true;
+                if (d->verbose)
+                    fprintf(stderr, "INFO: wait_event_info offset confirmed "
+                            "(PID %d, non-zero class-valid reading)\n",
+                            be->pid);
+                return 0;
+            }
+            if (v == PGWT_WEI_GARBAGE) {
+                fprintf(stderr,
+                        "FATAL: resolved wait_event_info for PID %d holds a "
+                        "value with an invalid wait-event class byte.\n"
+                        "  %s is wrong for this PG%d build — refusing to "
+                        "attach.\n",
+                        be->pid,
+                        d->use_myproc
+                            ? "offsetof(PGPROC, wait_event_info)"
+                            : "the resolved my_wait_event_info address",
+                        d->pg_major_version);
+                return -1;
+            }
+        }
+        usleep(50000);
+    }
+
+    if (d->use_myproc) {
+        /* Hardcoded-offset path (PG<17): an offset that cannot be confirmed
+         * is indistinguishable from a wrong one — fail safe, never trace
+         * garbage (or nothing) labeled as real. */
+        fprintf(stderr,
+                "FATAL: cannot confirm offsetof(PGPROC, wait_event_info)=%d "
+                "for PG%d: every reading from %d resolved backend(s) was "
+                "zero.\n"
+                "  A wrong offset into zeroed memory reads exactly this way. "
+                "Refusing to attach rather than record garbage or nothing.\n"
+                "  If this instance is genuinely all-idle, retry while a "
+                "session is waiting (e.g. run SELECT pg_sleep(60)).\n",
+                d->pgproc_wait_offset, d->pg_major_version, have_resolved);
+        return -1;
+    }
+
+    /* PG17+: the address comes from the backend's own my_wait_event_info
+     * pointer, so an unconfirmed (all-zero) state is far less suspicious —
+     * degrade to a loud warning; preseed/sampler reads keep re-validating. */
+    fprintf(stderr,
+            "WARN: wait_event_info address not yet confirmed by a non-zero "
+            "reading (%d backends, all on-CPU/zero). Validation continues on "
+            "every read; garbage readings will be counted and reported.\n",
+            have_resolved);
+    return 0;
 }
 
 int pgwt_handle_fork(struct pgwt_daemon *d, pid_t child_pid)
@@ -317,6 +493,33 @@ int pgwt_handle_fork(struct pgwt_daemon *d, pid_t child_pid)
         return -1;
     }
 
+    /* fork→attach race (T4/CAP-8, observed live by the T0 CI smoke job):
+     * the sched_process_fork event travels fork → BPF ringbuf → daemon
+     * epoll → here, while the child races through InitProcess(). If the
+     * child already WROTE the my_wait_event_info/MyProc pointer before the
+     * bootstrap watchpoint armed, the watchpoint NEVER fires and the backend
+     * records nothing, silently, for its whole life. Close the race by
+     * checking the pointer NOW that the watchpoint is armed: either the
+     * write comes later (watchpoint catches it) or it already happened
+     * (visible right here) — no gap between the two.
+     *
+     * "Already happened" must mean the pointer targets SHARED memory: on
+     * PG17+ my_wait_event_info is non-zero from the very first instruction
+     * (its static initializer points at the process-LOCAL dummy
+     * local_my_wait_event_info), so non-zero alone proves nothing —
+     * InitProcess is done only once the pointer targets the backend's
+     * PGPROC, which lives in shm. A local (non-shared) target here means
+     * init has not switched the pointer yet — the armed bootstrap
+     * watchpoint will catch that write. (PG<17: MyProc starts NULL, and a
+     * non-NULL PGPROC is in shm, so the same predicate holds.) */
+    uint64_t ptr = pgwt_resolve_backend_wait_addr(d, child_pid);
+    if (ptr != 0 && pgwt_addr_is_shared(child_pid, ptr) == 1) {
+        if (d->verbose)
+            fprintf(stderr, "INFO: fork PID %d already initialized "
+                    "(fork->attach race) — attaching directly\n", child_pid);
+        return pgwt_handle_init(d, child_pid, ptr);
+    }
+
     if (d->verbose)
         fprintf(stderr, "INFO: fork detected PID %d, bootstrap watchpoint attached\n",
                 child_pid);
@@ -344,38 +547,44 @@ int pgwt_handle_init(struct pgwt_daemon *d, pid_t pid, uint64_t addr)
         be->wp_fd = -1;
     }
 
-    /* Runtime offset validation (PG<17 MyProc path), once. Covers the case
+    /* Runtime offset validation (CAP-2/5) — all versions. Covers the case
      * where PG was idle at daemon start (scan validated nothing) and the
      * first backend arrives via bootstrap→init. A garbage class byte means
-     * the offset is wrong — refuse rather than trace nonsense. */
-    if (d->use_myproc && !d->wait_offset_validated) {
+     * the offset/address is wrong — refuse rather than trace nonsense; a
+     * zero reading is NOT proof (keep validating on later backends). */
+    if (!d->wait_offset_validated) {
         int v = pgwt_validate_wait_addr(pid, addr);
-        if (v == 0) {
+        if (v == PGWT_WEI_GARBAGE) {
             fprintf(stderr,
                     "FATAL: resolved wait_event_info for PID %d holds a value "
                     "with an invalid wait-event class byte.\n"
-                    "  offsetof(PGPROC, wait_event_info)=%d is likely wrong for "
-                    "this PG%d build — refusing to attach.\n",
-                    pid, d->pgproc_wait_offset, d->pg_major_version);
+                    "  %s is likely wrong for this PG%d build — refusing to "
+                    "attach.\n",
+                    pid,
+                    d->use_myproc
+                        ? "offsetof(PGPROC, wait_event_info)"
+                        : "the resolved my_wait_event_info address",
+                    d->pg_major_version);
             return -1;
         }
-        if (v == 1)
+        if (v == PGWT_WEI_VALID_NONZERO)
             d->wait_offset_validated = true;
     }
 
-    /* Attach real watchpoint on PGPROC->wait_event_info */
+    /* Attach real watchpoint on PGPROC->wait_event_info via the shared
+     * helper: open DISABLED → preseed state_map → enable (CAP-8). This also
+     * closes the old gap where init-path backends were never preseeded (the
+     * raw BPF first-event path had to reconstruct their state). */
     be->wp_addr = addr;
-    int wp_prog_fd = bpf_program__fd(d->skel->progs.on_watchpoint);
-    be->wp_fd = pgwt_open_watchpoint(pid, addr, wp_prog_fd);
-    if (be->wp_fd < 0) {
+    be->wp_addr_shared = -1;   /* address may have changed — re-detect */
+    be->attach_ts = 0;         /* stamp attach time fresh in the helper */
+    if (pgwt_attach_backend_watchpoint(d, be) != 0) {
         /* Silently skip — process likely exited before attach */
-        d->counters.wp_attach_failures_total++;
         be->is_alive = false;
         be->pid = 0;
         return -1;
     }
 
-    be->attach_ts = now_ns();
     pgwt_parse_cmdline(pid, &be->meta);
     if (d->backend_meta)
         pgwt_bm_write(d->backend_meta, pid, &be->meta);

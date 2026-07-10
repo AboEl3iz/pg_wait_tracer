@@ -5,6 +5,8 @@
 #include "event_writer.h"
 #include "provider.h"
 #include "escalation.h"
+#include "sampler.h"
+#include "map_reader.h"
 #include "cJSON.h"
 
 #include <stdio.h>
@@ -109,6 +111,23 @@ static cJSON *build_status(const struct pgwt_daemon *d)
                             d->escalation.active
                                 ? esc_reason_str(d->escalation.window_reason)
                                 : "none");
+
+    /* Sampler read health (SMP-1). A total read failure renders as an idle
+     * database in the DATA — this out-of-band flag is how a client can tell
+     * "idle" from "blind". healthy=true when no sampler runs (full mode). */
+    bool sampler_healthy = true;
+    char reason[160] = "";
+    if (d->sampler && !d->sampler->health.healthy) {
+        sampler_healthy = false;
+        snprintf(reason, sizeof(reason),
+                 "sampler reads failing: %s (%llu consecutive ticks, "
+                 "%llu total)",
+                 strerror(d->sampler->health.last_errno),
+                 (unsigned long long)d->sampler->health.consec_failed_ticks,
+                 (unsigned long long)d->sampler->health.failed_ticks_total);
+    }
+    cJSON_AddBoolToObject(root, "sampler_healthy", sampler_healthy);
+    cJSON_AddStringToObject(root, "sampler_unhealthy_reason", reason);
     return root;
 }
 
@@ -138,6 +157,26 @@ static cJSON *build_metrics(const struct pgwt_daemon *d)
     cJSON_AddNumberToObject(root, "samples_per_sec", ctr->samples_per_sec);
     cjson_add_uint64(root, "sample_read_faults_total",
                      ctr->sample_read_faults_total);
+    cjson_add_uint64(root, "sampler_ticks_missed_total",
+                     ctr->sampler_ticks_missed_total);
+
+    /* Capture hardening (T4): any non-zero here is a loudly-logged problem.
+     * state_map_full_total = BPF-side insert failures + userspace
+     * preseed/seed failures (each one is a backend recording nothing or
+     * losing query attribution — CAP-1). seen_query_ids_full_total = query
+     * text capture lost for new ids (CAP-6). invalid_wait_reads_total =
+     * garbage class-byte readings dropped (wrong offset backstop, CAP-2/5). */
+    cjson_add_uint64(root, "state_map_full_total",
+                     ctr->state_map_full_total
+                     + pgwt_read_bpf_fail_counter((struct pgwt_daemon *)d,
+                                                  PGWT_BPF_FAIL_STATE_MAP));
+    cjson_add_uint64(root, "seen_query_ids_full_total",
+                     pgwt_read_bpf_fail_counter((struct pgwt_daemon *)d,
+                                                PGWT_BPF_FAIL_SEEN_QIDS));
+    cjson_add_uint64(root, "invalid_wait_reads_total",
+                     ctr->invalid_wait_reads_total);
+    cJSON_AddBoolToObject(root, "sampler_healthy",
+                          !(d->sampler && !d->sampler->health.healthy));
 
     /* Provider self-metrics. ringbuf_drops_total is the full tier's BPF-side
      * event_ringbuf drop count (A2 wired this; A0 deliberately omitted it). */

@@ -419,6 +419,10 @@ class DaemonState:
             "escalation_seconds_remaining": self.seconds_remaining,
             "escalation_budget_remaining_s": self.budget_remaining_s,
             "escalation_reason": self.reason if self.tier == "escalated" else "none",
+            # Sampler read health (T4/SMP-1): false + reason means the sampler
+            # cannot read backend memory — "blind", not "idle".
+            "sampler_healthy": True,
+            "sampler_unhealthy_reason": "",
         }
 
     def metrics(self):
@@ -433,6 +437,13 @@ class DaemonState:
             "samples_total": 540000,
             "samples_per_sec": 60.0,
             "sample_read_faults_total": 0,
+            # Capture hardening counters (T4): non-zero = loudly-logged
+            # degradation (CAP-1/2/5/6, SMP-1/3).
+            "sampler_ticks_missed_total": 0,
+            "state_map_full_total": 0,
+            "seen_query_ids_full_total": 0,
+            "invalid_wait_reads_total": 0,
+            "sampler_healthy": True,
             "ringbuf_drops_total": 3,
             "trace_events_written_total": 1_250_000,
             "trace_bytes_written_total": 18_000_000,

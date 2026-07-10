@@ -35,24 +35,52 @@ int main(void)
 
     pid_t self = getpid();
 
-    /* Valid values: CPU (0) and each known wait class byte must be accepted. */
-    volatile uint32_t v_cpu   = 0x00000000u;
+    /* Non-zero class-valid values: the ONLY readings that PROVE the offset
+     * (PGWT_WEI_VALID_NONZERO). */
     volatile uint32_t v_lock  = 0x03000000u;   /* Lock:relation */
     volatile uint32_t v_sleep = 0x09000001u;   /* Timeout:PgSleep */
     volatile uint32_t v_io    = 0x0A00000Du;   /* IO:DataFileRead (PG13) */
-    CHECK(pgwt_validate_wait_addr(self, (uint64_t)(uintptr_t)&v_cpu)   == 1, "CPU value valid");
-    CHECK(pgwt_validate_wait_addr(self, (uint64_t)(uintptr_t)&v_lock)  == 1, "Lock class valid");
-    CHECK(pgwt_validate_wait_addr(self, (uint64_t)(uintptr_t)&v_sleep) == 1, "Timeout class valid");
-    CHECK(pgwt_validate_wait_addr(self, (uint64_t)(uintptr_t)&v_io)    == 1, "IO class valid");
+    CHECK(pgwt_validate_wait_addr(self, (uint64_t)(uintptr_t)&v_lock)
+              == PGWT_WEI_VALID_NONZERO, "Lock class = proof");
+    CHECK(pgwt_validate_wait_addr(self, (uint64_t)(uintptr_t)&v_sleep)
+              == PGWT_WEI_VALID_NONZERO, "Timeout class = proof");
+    CHECK(pgwt_validate_wait_addr(self, (uint64_t)(uintptr_t)&v_io)
+              == PGWT_WEI_VALID_NONZERO, "IO class = proof");
+
+    /* CAP-2: ZEROED MEMORY MUST NOT VALIDATE. Zero (on-CPU) is consistent
+     * with a correct offset but is also exactly what a WRONG offset into
+     * zeroed memory reads — it must classify as inconclusive
+     * (PGWT_WEI_ZERO), never as proof. The old validator returned the same
+     * "1" for zero as for real proof, blessing wrong offsets forever. */
+    volatile uint32_t v_cpu = 0x00000000u;
+    CHECK(pgwt_validate_wait_addr(self, (uint64_t)(uintptr_t)&v_cpu)
+              == PGWT_WEI_ZERO, "zero reading is NOT proof (inconclusive)");
+    CHECK(pgwt_validate_wait_addr(self, (uint64_t)(uintptr_t)&v_cpu)
+              != PGWT_WEI_VALID_NONZERO, "zeroed memory must not validate");
 
     /* Garbage values (what a WRONG offset produces): class byte outside the
      * known 0x01..0x0B range must be REJECTED so the daemon refuses to attach. */
     volatile uint32_t v_garbage1 = 0xDEADBEEFu;  /* class 0xDE */
     volatile uint32_t v_garbage2 = 0x7F000000u;  /* class 0x7F (e.g. a pointer high byte) */
     volatile uint32_t v_garbage3 = 0x20000000u;  /* class 0x20 */
-    CHECK(pgwt_validate_wait_addr(self, (uint64_t)(uintptr_t)&v_garbage1) == 0, "garbage class rejected");
-    CHECK(pgwt_validate_wait_addr(self, (uint64_t)(uintptr_t)&v_garbage2) == 0, "high-byte pointer rejected");
-    CHECK(pgwt_validate_wait_addr(self, (uint64_t)(uintptr_t)&v_garbage3) == 0, "class 0x20 rejected");
+    CHECK(pgwt_validate_wait_addr(self, (uint64_t)(uintptr_t)&v_garbage1)
+              == PGWT_WEI_GARBAGE, "garbage class rejected");
+    CHECK(pgwt_validate_wait_addr(self, (uint64_t)(uintptr_t)&v_garbage2)
+              == PGWT_WEI_GARBAGE, "high-byte pointer rejected");
+    CHECK(pgwt_validate_wait_addr(self, (uint64_t)(uintptr_t)&v_garbage3)
+              == PGWT_WEI_GARBAGE, "class 0x20 rejected");
+
+    /* The shared pure classifier must agree (it is what the preseed and
+     * sampler backstops use — CAP-5 extends the check to every read path). */
+    CHECK(pgwt_classify_wei(0) == PGWT_WEI_ZERO, "classify: zero");
+    CHECK(pgwt_classify_wei(0x06000000u) == PGWT_WEI_VALID_NONZERO,
+          "classify: Client:ClientRead is proof");
+    CHECK(pgwt_classify_wei(0x0B000001u) == PGWT_WEI_VALID_NONZERO,
+          "classify: InjectionPoint (0x0B) valid");
+    CHECK(pgwt_classify_wei(0x0C000000u) == PGWT_WEI_GARBAGE,
+          "classify: class 0x0C is garbage");
+    CHECK(pgwt_classify_wei(0xDEADBEEFu) == PGWT_WEI_GARBAGE,
+          "classify: 0xDEADBEEF is garbage");
 
     /* Unreadable address -> -1 (transient read error, not a hard reject). */
     CHECK(pgwt_validate_wait_addr(self, 0x1) == -1, "unreadable addr -> -1");
