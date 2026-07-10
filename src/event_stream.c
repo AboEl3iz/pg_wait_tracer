@@ -30,7 +30,10 @@ int pgwt_handle_trace_event(void *ctx, void *data, size_t data_sz)
     if (d->event_writer)
         pgwt_writer_push_event(d->event_writer, evt);
 
-    /* Write to summary file if recording is enabled */
+    /* Write to summary file if recording is enabled. Markers pass through
+     * here too, but the summary writer's accum_event filters them (FID-4):
+     * they must land in the trace (variants / lifecycle / escalation
+     * coverage need them) while never entering wait accounting. */
     if (d->summary_writer)
         pgwt_summary_push_event(d->summary_writer, evt);
 

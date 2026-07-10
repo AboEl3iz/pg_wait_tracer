@@ -93,6 +93,9 @@ export function fmtCount(n) {
 export function fmtPct(p) { return p.toFixed(1) + '%'; }
 export function fmtAas(a) { return a.toFixed(2); }
 export function fmtUs(us) {
+    // null = gated latency column (sampled-only row, no real durations —
+    // T1/FID-3); render as em-dash like fmtMs does.
+    if (us == null || isNaN(us)) return '—';
     if (us >= 1e6) return (us / 1e6).toFixed(1) + 's';
     if (us >= 1000) return (us / 1000).toFixed(1) + 'ms';
     return us.toFixed(0) + 'µs';

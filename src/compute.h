@@ -186,6 +186,13 @@ struct pgwt_event_row {
     char     name[64];
     uint64_t count;
     double   total_ms;
+    /* Latency statistics (avg/max/percentiles) are computed from EXACT
+     * (transition) records only — samples carry no real durations, so
+     * feeding their normalized sample_period_ns durations into these
+     * columns fabricates percentiles (FID-3). exact_count == 0 means the
+     * row is sampled-only and the latency columns must be gated (rendered
+     * as null / "—"); count and total_ms stay valid via ASH math. */
+    uint64_t exact_count;
     double   avg_us;
     double   max_us;
     double   p50_us;

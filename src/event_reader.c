@@ -483,13 +483,21 @@ done_relative:
     return -1;
 }
 
-/* ── Replay accumulation ───────────────────────────────── */
+/* ── Replay accumulation (fidelity-aware — T1/FID-5) ────── */
 
 #ifndef PGWT_SERVER
 void pgwt_replay_events(struct pgwt_accumulator *acc,
                          const struct pgwt_trace_event *events, int count,
-                         uint64_t from_mono_ns, uint64_t to_mono_ns)
+                         uint64_t from_mono_ns, uint64_t to_mono_ns,
+                         const struct pgwt_block_info *bi,
+                         struct pgwt_replay_stats *st)
 {
+    int is_samples = bi && bi->block_type == PGWT_BLOCK_SAMPLES;
+    uint64_t period = is_samples ? bi->sample_period_ns : 0;
+
+    if (st && is_samples && period)
+        st->sample_period_ns = period;
+
     for (int i = 0; i < count; i++) {
         const struct pgwt_trace_event *evt = &events[i];
 
@@ -498,8 +506,34 @@ void pgwt_replay_events(struct pgwt_accumulator *acc,
         if (to_mono_ns > 0 && evt->timestamp_ns > to_mono_ns)
             break;  /* events are sorted by timestamp */
 
-        uint32_t we = evt->old_event;
-        uint64_t dur = evt->duration_ns;
+        uint32_t we;
+        uint64_t dur;
+        int exact;
+
+        if (is_samples || (evt->flags & PGWT_EVENT_FLAG_SAMPLE)) {
+            /* A sample is a point observation of the CURRENT wait
+             * (new_event); it is worth one sample period of estimated
+             * time, and carries no real duration. */
+            we = evt->new_event;
+            dur = period;
+            exact = 0;
+        } else {
+            we = evt->old_event;
+            dur = evt->duration_ns;
+            exact = 1;
+
+            /* Markers (exec/plan/escalation) are structural records —
+             * never wait data (FID-4/5). */
+            if (PGWT_IS_MARKER(we)) {
+                if (st) st->markers_skipped++;
+                continue;
+            }
+        }
+
+        if (st) {
+            if (exact) st->transitions++;
+            else       st->samples++;
+        }
 
         /* Per-PID accumulation */
         struct pgwt_pid_accum *pa = pgwt_get_or_create_pid(acc, evt->pid);
@@ -508,11 +542,13 @@ void pgwt_replay_events(struct pgwt_accumulator *acc,
             if (es) {
                 es->count++;
                 es->total_ns += dur;
-                if (dur < es->min_ns) es->min_ns = dur;
-                if (dur > es->max_ns) es->max_ns = dur;
-                uint32_t bucket = pgwt_duration_to_bucket(dur);
-                if (bucket < HISTOGRAM_BUCKETS)
-                    es->histogram[bucket]++;
+                if (exact) {
+                    if (dur < es->min_ns) es->min_ns = dur;
+                    if (dur > es->max_ns) es->max_ns = dur;
+                    uint32_t bucket = pgwt_duration_to_bucket(dur);
+                    if (bucket < HISTOGRAM_BUCKETS)
+                        es->histogram[bucket]++;
+                }
             }
             if (we == 0)
                 pa->cpu_time_ns += dur;
@@ -527,11 +563,13 @@ void pgwt_replay_events(struct pgwt_accumulator *acc,
         if (se) {
             se->count++;
             se->total_ns += dur;
-            if (dur < se->min_ns) se->min_ns = dur;
-            if (dur > se->max_ns) se->max_ns = dur;
-            uint32_t bucket = pgwt_duration_to_bucket(dur);
-            if (bucket < HISTOGRAM_BUCKETS)
-                se->histogram[bucket]++;
+            if (exact) {
+                if (dur < se->min_ns) se->min_ns = dur;
+                if (dur > se->max_ns) se->max_ns = dur;
+                uint32_t bucket = pgwt_duration_to_bucket(dur);
+                if (bucket < HISTOGRAM_BUCKETS)
+                    se->histogram[bucket]++;
+            }
         }
 
         /* Time model */
@@ -544,8 +582,10 @@ void pgwt_replay_events(struct pgwt_accumulator *acc,
             if (qe) {
                 qe->count++;
                 qe->total_ns += dur;
-                if (dur < qe->min_ns) qe->min_ns = dur;
-                if (dur > qe->max_ns) qe->max_ns = dur;
+                if (exact) {
+                    if (dur < qe->min_ns) qe->min_ns = dur;
+                    if (dur > qe->max_ns) qe->max_ns = dur;
+                }
             }
         }
     }

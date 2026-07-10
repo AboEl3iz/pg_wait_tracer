@@ -161,6 +161,14 @@ static void accum_event(struct pgwt_summary_accum *acc,
     if (old_ev == PGWT_EVENT_EXIT)
         return;
 
+    /* Markers must never be accumulated (FID-4): exec/plan markers inflate
+     * per-query counts (skewing avg low) and escalation markers insert
+     * bogus PGWT_ESC_PACK query_ids. This is the write-side chokepoint —
+     * event_stream pushes every record (markers included, so they land in
+     * the trace) before its own marker check. */
+    if (PGWT_IS_MARKER(old_ev))
+        return;
+
     acc->total_events++;
 
     /* Time model: classify old_event into wait class */

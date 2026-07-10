@@ -102,33 +102,96 @@ struct bm_entry {
 
 /* ── Server state ─────────────────────────────────────────── */
 
-/* A time range [start, end] in wall ns covered by a TRANSITIONS block.
- * Used for the exact-wins merge (D3): samples inside a transition-covered
- * range are dropped at read time so a sampler running through a
- * full-fidelity window does not double-count. */
-struct trans_range {
-    uint64_t start_wall_ns;
-    uint64_t end_wall_ns;
+/* ═══ Exact-coverage & clock domains (T1: FID-1/2/6/7) ═══════
+ *
+ * The exact-wins merge needs to know WHERE full-fidelity (transition) data
+ * is authoritative, so overlapping samples can be dropped without double
+ * counting. Coverage is derived per file:
+ *
+ *   1. Escalation-marker windows are the authority (FID-1). The daemon
+ *      writes PGWT_MARKER_ESCALATE_START/END into the trace; a window
+ *      covers [START_ts, END_ts]. Transition timestamps are wait-END
+ *      times, so per-block ranges have a hole exactly over a long wait —
+ *      markers do not.
+ *   2. START with no matching END (daemon crash, or the window is still
+ *      open in current.trace): the window is clamped to the LAST
+ *      TRANSITIONS-block timestamp committed in its clock generation —
+ *      exact coverage never extends past the last exact evidence, so
+ *      samples beyond it (e.g. of a still-running wait whose transition
+ *      has not landed yet) survive and remain visible.
+ *   3. END with no earlier START (window opened before this file; older
+ *      file rotated away/deleted): the window starts at that file's first
+ *      block timestamp.
+ *   4. A file with transitions and NO SAMPLES blocks (--mode full) is
+ *      covered whole-file: [first_block_ts, last_block_ts].
+ *   5. Legacy fallback: a file with samples + transitions but no
+ *      escalation markers anywhere keeps the old per-TRANSITIONS-block
+ *      coverage.
+ *
+ * Boundary rule (FID-6): a sample represents the interval
+ * (ts − period, ts]. It is dropped iff its MIDPOINT (ts − period/2) falls
+ * inside a covered span (inclusive); worst-case error per window edge is
+ * period/2, zero-mean.
+ *
+ * Clock domain (FID-7): all coverage comparison happens in the MONOTONIC
+ * domain. Files written by one daemon run share the monotonic clock; their
+ * per-file mono→wall offsets differ whenever NTP steps the wall clock
+ * between file opens, so comparing wall times derived from different
+ * files' offsets can misplace coverage by the step size. Files are grouped
+ * into clock "generations" (monotonic strictly increases across a run;
+ * a backwards jump or a large offset change means reboot/restart), the
+ * merge runs in mono within each generation, and event timestamps are
+ * re-anchored to wall using ONE canonical offset per generation — the
+ * newest file's, so "last 15 minutes from now" lines up with the data that
+ * is actually newest. */
+
+struct pgwt_span { uint64_t start_ns, end_ns; };    /* mono ns */
+
+struct pgwt_cov_mark {
+    uint64_t ts;        /* mono */
+    int      is_start;  /* 1 = ESCALATE_START, 0 = ESCALATE_END */
 };
 
-/* Per-file event cache — for immutable .trace.lz4 files only */
+struct pgwt_file_cov {
+    char     path[512];
+    int      present;              /* seen in the latest directory scan */
+    int      valid;                /* readable, has at least one block */
+    int      is_current;
+    uint64_t hdr_start_wall_ns;    /* identity: header fields change when */
+    uint64_t hdr_mono_ns;          /* the daemon restarts + truncates */
+    int64_t  own_offset;           /* this file's mono→wall offset */
+    uint64_t mono_first, mono_last;
+    int      has_samples, has_transitions;
+    uint64_t sample_period_ns;
+    int      blocks_scanned;       /* header-scan watermark (incremental) */
+    struct pgwt_span *s_spans; int n_s, cap_s;   /* SAMPLES block spans */
+    struct pgwt_span *t_spans; int n_t, cap_t;   /* TRANSITIONS block spans */
+    struct pgwt_cov_mark *marks; int n_marks, cap_marks;
+    int     *pending_tb; int n_pending, cap_pending;  /* blocks awaiting
+                                                         marker decode */
+    int      gen;                  /* clock-domain generation */
+    int64_t  canon_offset;         /* generation-canonical mono→wall */
+};
+
+/* Assembled per-generation coverage, rebuilt on every refresh. */
+struct pgwt_gen_cov {
+    int      gen;
+    int64_t  canon_offset;
+    struct pgwt_span *exact;   int n_exact;    /* sorted, merged */
+    struct pgwt_span *sampled; int n_sampled;  /* sorted, merged */
+    uint64_t sample_period_ns;
+};
+
+/* Per-file event cache — for immutable .trace.lz4 files only.
+ * Timestamps are kept MONOTONIC; the wall conversion happens at query time
+ * with the generation-canonical offset (FID-7). */
 struct file_cache_entry {
     char     path[512];
     struct pgwt_trace_event *events;
     int      count;
     int      immutable;
-    uint64_t first_wall_ns;  /* earliest event timestamp (for range skip) */
-    uint64_t last_wall_ns;   /* latest event timestamp */
-
-    /* Fidelity (trace format v2). Samples are stored already normalized:
-     * old_event = sampled event, duration_ns = sample_period_ns, with the
-     * PGWT_EVENT_FLAG_SAMPLE bit set so estimators apply ASH math and the
-     * exact-wins merge can identify them. */
-    int       has_transitions;
-    int       has_samples;
-    uint64_t  sample_period_ns;
-    struct trans_range *trans_ranges;  /* malloc'd; TRANSITIONS block ranges */
-    int       num_trans_ranges;
+    uint64_t first_mono_ns;  /* earliest event timestamp (for range skip) */
+    uint64_t last_mono_ns;   /* latest event timestamp */
 };
 
 /* Fidelity summary of a loaded window, returned alongside the event array
@@ -151,6 +214,13 @@ struct pgwt_server {
     /* Per-file event cache */
     struct file_cache_entry cache[256];
     int  cache_count;
+
+    /* Coverage / clock-domain state (refreshed per request) */
+    struct pgwt_file_cov cov[256];
+    int  cov_count;
+    int  any_samples;              /* any file has SAMPLES blocks */
+    struct pgwt_gen_cov *gens;
+    int  num_gens;
 
     /* Query text map: query_id → SQL text (dynamic, power-of-2 sized) */
     struct qt_entry *qt_map;
@@ -473,8 +543,6 @@ static void cache_evict_oldest(struct pgwt_server *srv)
     /* Evict the first (oldest) cached entry */
     free(srv->cache[0].events);
     srv->cache[0].events = NULL;
-    free(srv->cache[0].trans_ranges);
-    srv->cache[0].trans_ranges = NULL;
     memmove(&srv->cache[0], &srv->cache[1],
             (srv->cache_count - 1) * sizeof(srv->cache[0]));
     srv->cache_count--;
@@ -530,42 +598,17 @@ get_cached_immutable(struct pgwt_server *srv, const char *path)
     ce->events = malloc(cap * sizeof(*ce->events));
     struct pgwt_trace_event block_buf[PGWT_BLOCK_EVENTS];
 
-    /* Store time range for this file */
+    /* Store time range for this file (monotonic) */
     if (reader.num_blocks > 0) {
-        ce->first_wall_ns = pgwt_reader_mono_to_wall(&reader,
-            reader.block_index[0].timestamp_ns);
-        ce->last_wall_ns = pgwt_reader_mono_to_wall(&reader,
-            reader.block_index[reader.num_blocks - 1].timestamp_ns);
+        ce->first_mono_ns = reader.block_index[0].timestamp_ns;
+        ce->last_mono_ns = reader.block_index[reader.num_blocks - 1].timestamp_ns;
     }
 
-    int tr_cap = 0;
     for (int b = 0; b < reader.num_blocks; b++) {
         struct pgwt_block_info bi;
         int n = pgwt_reader_decode_block_info(&reader, b, block_buf,
                                               PGWT_BLOCK_EVENTS, &bi);
         if (n < 0) continue;
-
-        if (bi.block_type == PGWT_BLOCK_SAMPLES) {
-            ce->has_samples = 1;
-            if (bi.sample_period_ns)
-                ce->sample_period_ns = bi.sample_period_ns;
-        } else {
-            ce->has_transitions = 1;
-            /* Record this transition block's wall range for the merge. */
-            if (ce->num_trans_ranges >= tr_cap) {
-                tr_cap = tr_cap ? tr_cap * 2 : 16;
-                struct trans_range *tmp = realloc(ce->trans_ranges,
-                                                  tr_cap * sizeof(*tmp));
-                if (tmp) ce->trans_ranges = tmp;
-            }
-            if (ce->trans_ranges && ce->num_trans_ranges < tr_cap) {
-                ce->trans_ranges[ce->num_trans_ranges].start_wall_ns =
-                    pgwt_reader_mono_to_wall(&reader, bi.first_timestamp_ns);
-                ce->trans_ranges[ce->num_trans_ranges].end_wall_ns =
-                    pgwt_reader_mono_to_wall(&reader, bi.last_timestamp_ns);
-                ce->num_trans_ranges++;
-            }
-        }
 
         for (int i = 0; i < n; i++) {
             if (ce->count >= cap) {
@@ -577,13 +620,13 @@ get_cached_immutable(struct pgwt_server *srv, const char *path)
             ce->events[ce->count] = block_buf[i];
             /* Normalize samples into interval shape so the duration-based
              * estimators apply ASH math (each sample worth sample_period_ns).
-             * Keep the SAMPLE flag for the exact-wins merge and fidelity. */
+             * Keep the SAMPLE flag for the exact-wins merge and fidelity.
+             * Timestamps stay MONOTONIC in the cache; the wall conversion
+             * happens per query with the generation-canonical offset. */
             if (block_buf[i].flags & PGWT_EVENT_FLAG_SAMPLE) {
                 ce->events[ce->count].old_event = block_buf[i].new_event;
                 ce->events[ce->count].duration_ns = bi.sample_period_ns;
             }
-            ce->events[ce->count].timestamp_ns =
-                pgwt_reader_mono_to_wall(&reader, block_buf[i].timestamp_ns);
             ce->count++;
         }
     }
@@ -606,44 +649,21 @@ get_cached_immutable(struct pgwt_server *srv, const char *path)
     return ce;
 }
 
-/* Append one transition range to a growable collector. */
-static void trans_ranges_add(struct trans_range **ranges, int *count, int *cap,
-                             uint64_t start_wall_ns, uint64_t end_wall_ns)
-{
-    if (*count >= *cap) {
-        int newcap = *cap ? *cap * 2 : 16;
-        struct trans_range *tmp = realloc(*ranges, newcap * sizeof(**ranges));
-        if (!tmp) return;
-        *ranges = tmp;
-        *cap = newcap;
-    }
-    (*ranges)[*count].start_wall_ns = start_wall_ns;
-    (*ranges)[*count].end_wall_ns   = end_wall_ns;
-    (*count)++;
-}
-
-/* Read events from a trace file for a time range — on demand, no caching.
- * Opens file, seeks to the right blocks via block index, decodes only
- * the blocks that overlap [from_wall_ns, to_wall_ns].
- * Appends events at *total (growing as needed) and, for the exact-wins
- * merge, appends each TRANSITIONS block's wall range to *ranges. Sets
- * fidelity flags / sample period in *info. SAMPLES records are normalized
- * to interval shape (old_event = sampled event, duration_ns =
- * sample_period_ns) so the duration-based estimators apply ASH math. */
-static void load_current_trace_range(const char *path,
-                                      uint64_t from_wall_ns, uint64_t to_wall_ns,
-                                      struct pgwt_trace_event **events,
-                                      int *total, int *cap,
-                                      struct trans_range **ranges,
-                                      int *nranges, int *ranges_cap,
-                                      struct pgwt_load_info *info)
+/* Read events from a trace file for a MONO time range — on demand, no
+ * caching. Opens file, seeks to the right blocks via block index, decodes
+ * only the blocks that overlap [from_mono, to_mono]. Appends events at
+ * *total (growing as needed) with timestamps left MONOTONIC. SAMPLES
+ * records are normalized to interval shape (old_event = sampled event,
+ * duration_ns = sample_period_ns) so the duration-based estimators apply
+ * ASH math. */
+static void load_file_range_mono(const char *path,
+                                 uint64_t from_mono, uint64_t to_mono,
+                                 struct pgwt_trace_event **events,
+                                 int *total, int *cap)
 {
     struct pgwt_event_reader reader;
     if (pgwt_reader_open(&reader, path) != 0)
         return;
-
-    uint64_t from_mono = pgwt_reader_wall_to_mono(&reader, from_wall_ns);
-    uint64_t to_mono   = pgwt_reader_wall_to_mono(&reader, to_wall_ns);
 
     int first_block = pgwt_reader_find_block(&reader, from_mono);
     struct pgwt_trace_event block_buf[PGWT_BLOCK_EVENTS];
@@ -656,15 +676,6 @@ static void load_current_trace_range(const char *path,
         int n = pgwt_reader_decode_block_info(&reader, b, block_buf,
                                               PGWT_BLOCK_EVENTS, &bi);
         if (n < 0) continue;
-
-        if (bi.block_type == PGWT_BLOCK_SAMPLES) {
-            if (info && bi.sample_period_ns)
-                info->sample_period_ns = bi.sample_period_ns;
-        } else if (ranges) {
-            trans_ranges_add(ranges, nranges, ranges_cap,
-                pgwt_reader_mono_to_wall(&reader, bi.first_timestamp_ns),
-                pgwt_reader_mono_to_wall(&reader, bi.last_timestamp_ns));
-        }
 
         for (int i = 0; i < n; i++) {
             uint64_t ts_mono = block_buf[i].timestamp_ns;
@@ -683,43 +694,543 @@ static void load_current_trace_range(const char *path,
                 (*events)[*total].old_event = block_buf[i].new_event;
                 (*events)[*total].duration_ns = bi.sample_period_ns;
             }
-            (*events)[*total].timestamp_ns =
-                pgwt_reader_mono_to_wall(&reader, ts_mono);
             (*total)++;
         }
     }
     pgwt_reader_close(&reader);
 }
 
-/* Get latest wall-clock timestamp from current.trace — quick, O(1).
- * Opens file, reads last block header, converts, closes. */
-static uint64_t get_current_trace_latest(const char *path)
+/* ── Coverage & clock-domain refresh (T1) ─────────────────── */
+
+static void span_list_add(struct pgwt_span **spans, int *n, int *cap,
+                          uint64_t start, uint64_t end, uint64_t merge_gap)
+{
+    if (end < start) end = start;
+    /* Coalesce with the previous span (blocks arrive in file/time order) */
+    if (*n > 0 && start <= (*spans)[*n - 1].end_ns + merge_gap) {
+        if (end > (*spans)[*n - 1].end_ns)
+            (*spans)[*n - 1].end_ns = end;
+        return;
+    }
+    if (*n >= *cap) {
+        int newcap = *cap ? *cap * 2 : 16;
+        struct pgwt_span *tmp = realloc(*spans, newcap * sizeof(**spans));
+        if (!tmp) return;
+        *spans = tmp;
+        *cap = newcap;
+    }
+    (*spans)[*n].start_ns = start;
+    (*spans)[*n].end_ns = end;
+    (*n)++;
+}
+
+static void cov_reset(struct pgwt_file_cov *fc)
+{
+    free(fc->s_spans);
+    free(fc->t_spans);
+    free(fc->marks);
+    free(fc->pending_tb);
+    char path[512];
+    memcpy(path, fc->path, sizeof(path));
+    memset(fc, 0, sizeof(*fc));
+    memcpy(fc->path, path, sizeof(path));
+}
+
+static struct pgwt_file_cov *cov_find_or_add(struct pgwt_server *srv,
+                                             const char *path)
+{
+    for (int i = 0; i < srv->cov_count; i++)
+        if (strcmp(srv->cov[i].path, path) == 0)
+            return &srv->cov[i];
+    if (srv->cov_count >= 256)
+        return NULL;
+    struct pgwt_file_cov *fc = &srv->cov[srv->cov_count++];
+    memset(fc, 0, sizeof(*fc));
+    snprintf(fc->path, sizeof(fc->path), "%s", path);
+    return fc;
+}
+
+/* Decode the pending TRANSITIONS blocks of a file, collecting escalation
+ * markers. Committed blocks are immutable, so this is incremental-safe. */
+static void cov_decode_markers(struct pgwt_file_cov *fc,
+                               struct pgwt_event_reader *reader)
+{
+    struct pgwt_trace_event buf[PGWT_BLOCK_EVENTS];
+
+    for (int p = 0; p < fc->n_pending; p++) {
+        int b = fc->pending_tb[p];
+        if (b >= reader->num_blocks)
+            continue;
+        int n = pgwt_reader_decode_block(reader, b, buf, PGWT_BLOCK_EVENTS);
+        for (int i = 0; i < n; i++) {
+            uint32_t m = buf[i].old_event;
+            if (m != PGWT_MARKER_ESCALATE_START &&
+                m != PGWT_MARKER_ESCALATE_END)
+                continue;
+            if (fc->n_marks >= fc->cap_marks) {
+                int newcap = fc->cap_marks ? fc->cap_marks * 2 : 8;
+                struct pgwt_cov_mark *tmp =
+                    realloc(fc->marks, newcap * sizeof(*tmp));
+                if (!tmp) return;
+                fc->marks = tmp;
+                fc->cap_marks = newcap;
+            }
+            fc->marks[fc->n_marks].ts = buf[i].timestamp_ns;
+            fc->marks[fc->n_marks].is_start =
+                (m == PGWT_MARKER_ESCALATE_START);
+            fc->n_marks++;
+        }
+    }
+    fc->n_pending = 0;
+}
+
+/* Incrementally scan one file's block headers into its coverage entry.
+ * Marker decode is deferred (cov_decode_markers) so full-mode dirs — where
+ * no samples exist and coverage is never consulted — never pay for it. */
+static void cov_scan_file(struct pgwt_server *srv, struct pgwt_file_cov *fc)
 {
     struct pgwt_event_reader reader;
-    if (pgwt_reader_open(&reader, path) != 0)
-        return 0;
+    if (pgwt_reader_open(&reader, fc->path) != 0) {
+        fc->valid = 0;
+        return;
+    }
 
-    uint64_t latest = 0;
-    if (reader.num_blocks > 0)
-        latest = pgwt_reader_mono_to_wall(&reader,
-            reader.block_index[reader.num_blocks - 1].timestamp_ns);
+    fc->is_current = is_current_trace(fc->path);
+
+    /* Identity check: a daemon restart truncates + rewrites current.trace
+     * (new header clocks); a shrunken block count means the same. */
+    if (fc->blocks_scanned > 0 &&
+        (fc->hdr_start_wall_ns != reader.header.start_time_ns ||
+         fc->hdr_mono_ns != reader.header.clock_offset_ns ||
+         reader.num_blocks < fc->blocks_scanned)) {
+        cov_reset(fc);
+        fc->is_current = is_current_trace(fc->path);
+    }
+
+    fc->hdr_start_wall_ns = reader.header.start_time_ns;
+    fc->hdr_mono_ns = reader.header.clock_offset_ns;
+    fc->own_offset = (int64_t)reader.header.start_time_ns
+                   - (int64_t)reader.header.clock_offset_ns;
+
+    if (reader.num_blocks <= 0) {
+        fc->valid = 0;
+        pgwt_reader_close(&reader);
+        return;
+    }
+    fc->valid = 1;
+    if (fc->blocks_scanned == 0) {
+        /* block-index timestamps are block FIRST timestamps; mono_last is
+         * extended block by block below (bi.last_timestamp_ns). */
+        fc->mono_first = reader.block_index[0].timestamp_ns;
+        fc->mono_last = reader.block_index[0].timestamp_ns;
+    }
+
+    for (int b = fc->blocks_scanned; b < reader.num_blocks; b++) {
+        struct pgwt_block_info bi;
+        if (pgwt_reader_block_info(&reader, b, &bi) != 0)
+            continue;
+        if (bi.last_timestamp_ns > fc->mono_last)
+            fc->mono_last = bi.last_timestamp_ns;
+        if (bi.block_type == PGWT_BLOCK_SAMPLES) {
+            fc->has_samples = 1;
+            if (bi.sample_period_ns)
+                fc->sample_period_ns = bi.sample_period_ns;
+            /* Merge adjacent sample spans (gap up to 2 periods) */
+            span_list_add(&fc->s_spans, &fc->n_s, &fc->cap_s,
+                          bi.first_timestamp_ns, bi.last_timestamp_ns,
+                          fc->sample_period_ns * 2);
+        } else {
+            fc->has_transitions = 1;
+            span_list_add(&fc->t_spans, &fc->n_t, &fc->cap_t,
+                          bi.first_timestamp_ns, bi.last_timestamp_ns, 0);
+            if (fc->n_pending >= fc->cap_pending) {
+                int newcap = fc->cap_pending ? fc->cap_pending * 2 : 16;
+                int *tmp = realloc(fc->pending_tb, newcap * sizeof(int));
+                if (tmp) { fc->pending_tb = tmp; fc->cap_pending = newcap; }
+            }
+            if (fc->n_pending < fc->cap_pending)
+                fc->pending_tb[fc->n_pending++] = b;
+        }
+    }
+    fc->blocks_scanned = reader.num_blocks;
+
+    /* Markers matter only when the merge has samples to arbitrate. */
+    if (srv->any_samples || fc->has_samples)
+        cov_decode_markers(fc, &reader);
 
     pgwt_reader_close(&reader);
-    return latest;
+}
+
+/* Sort + merge a span list in place; returns new count. */
+static int spans_normalize(struct pgwt_span *s, int n)
+{
+    if (n <= 1) return n;
+    /* insertion sort by start (lists are small and mostly sorted) */
+    for (int i = 1; i < n; i++) {
+        struct pgwt_span tmp = s[i];
+        int j = i - 1;
+        while (j >= 0 && s[j].start_ns > tmp.start_ns) {
+            s[j + 1] = s[j];
+            j--;
+        }
+        s[j + 1] = tmp;
+    }
+    int w = 0;
+    for (int i = 1; i < n; i++) {
+        if (s[i].start_ns <= s[w].end_ns) {
+            if (s[i].end_ns > s[w].end_ns)
+                s[w].end_ns = s[i].end_ns;
+        } else {
+            s[++w] = s[i];
+        }
+    }
+    return w + 1;
+}
+
+static void gens_free(struct pgwt_server *srv)
+{
+    for (int g = 0; g < srv->num_gens; g++) {
+        free(srv->gens[g].exact);
+        free(srv->gens[g].sampled);
+    }
+    free(srv->gens);
+    srv->gens = NULL;
+    srv->num_gens = 0;
+}
+
+/* Build one generation's assembled coverage from its files' entries. */
+static void gen_cov_build(struct pgwt_server *srv, struct pgwt_gen_cov *gc)
+{
+    int ex_cap = 0, sm_cap = 0;
+    gc->exact = NULL; gc->n_exact = 0;
+    gc->sampled = NULL; gc->n_sampled = 0;
+    gc->sample_period_ns = 0;
+
+    /* Gather all escalation marks of the generation, tagged with the mono
+     * start of their file (for the END-without-START rule). */
+    struct gmark { uint64_t ts; int is_start; uint64_t file_first; };
+    struct gmark *gm = NULL;
+    int n_gm = 0, gm_cap = 0;
+    uint64_t last_trans_end = 0;   /* latest exact evidence in the gen */
+
+    for (int i = 0; i < srv->cov_count; i++) {
+        struct pgwt_file_cov *fc = &srv->cov[i];
+        if (!fc->present || !fc->valid || fc->gen != gc->gen)
+            continue;
+
+        if (fc->sample_period_ns > gc->sample_period_ns)
+            gc->sample_period_ns = fc->sample_period_ns;
+
+        for (int s = 0; s < fc->n_s; s++)
+            span_list_add(&gc->sampled, &gc->n_sampled, &sm_cap,
+                          fc->s_spans[s].start_ns, fc->s_spans[s].end_ns, 0);
+
+        if (fc->has_transitions && fc->n_t > 0 &&
+            fc->t_spans[fc->n_t - 1].end_ns > last_trans_end)
+            last_trans_end = fc->t_spans[fc->n_t - 1].end_ns;
+
+        if (!fc->has_samples && fc->has_transitions) {
+            /* Rule 4: --mode full file → whole-file exact coverage. */
+            span_list_add(&gc->exact, &gc->n_exact, &ex_cap,
+                          fc->mono_first, fc->mono_last, 0);
+            continue;
+        }
+
+        if (fc->has_samples && fc->has_transitions && fc->n_marks == 0) {
+            /* Rule 5: legacy tiered file without markers — per-block spans. */
+            for (int s = 0; s < fc->n_t; s++)
+                span_list_add(&gc->exact, &gc->n_exact, &ex_cap,
+                              fc->t_spans[s].start_ns, fc->t_spans[s].end_ns,
+                              0);
+            continue;
+        }
+
+        for (int m = 0; m < fc->n_marks; m++) {
+            if (n_gm >= gm_cap) {
+                gm_cap = gm_cap ? gm_cap * 2 : 16;
+                struct gmark *tmp = realloc(gm, gm_cap * sizeof(*tmp));
+                if (!tmp) { free(gm); return; }
+                gm = tmp;
+            }
+            gm[n_gm].ts = fc->marks[m].ts;
+            gm[n_gm].is_start = fc->marks[m].is_start;
+            gm[n_gm].file_first = fc->mono_first;
+            n_gm++;
+        }
+    }
+
+    /* Marker state machine over the generation's mark stream (Rules 1-3) */
+    if (n_gm > 0) {
+        /* sort by ts (insertion, small) */
+        for (int i = 1; i < n_gm; i++) {
+            struct gmark tmp = gm[i];
+            int j = i - 1;
+            while (j >= 0 && gm[j].ts > tmp.ts) {
+                gm[j + 1] = gm[j];
+                j--;
+            }
+            gm[j + 1] = tmp;
+        }
+        uint64_t open_start = 0;
+        int have_open = 0;
+        for (int i = 0; i < n_gm; i++) {
+            if (gm[i].is_start) {
+                if (!have_open) {
+                    open_start = gm[i].ts;
+                    have_open = 1;
+                }
+            } else {
+                uint64_t start = have_open ? open_start : gm[i].file_first;
+                span_list_add(&gc->exact, &gc->n_exact, &ex_cap,
+                              start, gm[i].ts, 0);
+                have_open = 0;
+            }
+        }
+        if (have_open) {
+            /* Rule 2: unclosed window (crash / still open) — clamp to the
+             * last committed exact evidence, never beyond. */
+            uint64_t end = last_trans_end > open_start
+                         ? last_trans_end : open_start;
+            span_list_add(&gc->exact, &gc->n_exact, &ex_cap,
+                          open_start, end, 0);
+        }
+    }
+    free(gm);
+
+    gc->n_exact = spans_normalize(gc->exact, gc->n_exact);
+    gc->n_sampled = spans_normalize(gc->sampled, gc->n_sampled);
+}
+
+/* Refresh the coverage table and clock-domain generations. Called at the
+ * start of every load / summary decision (cheap: incremental block-header
+ * scans; marker decode only for files that can affect a merge). */
+static void coverage_refresh(struct pgwt_server *srv)
+{
+    srv->num_files = pgwt_scan_trace_files(srv->trace_dir, srv->files, 256);
+
+    for (int i = 0; i < srv->cov_count; i++)
+        srv->cov[i].present = 0;
+
+    int had_samples = srv->any_samples;
+    for (int i = 0; i < srv->num_files; i++) {
+        struct pgwt_file_cov *fc = cov_find_or_add(srv, srv->files[i].path);
+        if (!fc) continue;
+        fc->present = 1;
+        cov_scan_file(srv, fc);
+        if (fc->has_samples)
+            srv->any_samples = 1;
+    }
+
+    /* If samples appeared for the first time, files scanned earlier may
+     * have skipped marker decode — finish them now. */
+    if (srv->any_samples && !had_samples) {
+        for (int i = 0; i < srv->cov_count; i++) {
+            struct pgwt_file_cov *fc = &srv->cov[i];
+            if (!fc->present || !fc->valid || fc->n_pending == 0)
+                continue;
+            struct pgwt_event_reader reader;
+            if (pgwt_reader_open(&reader, fc->path) != 0)
+                continue;
+            cov_decode_markers(fc, &reader);
+            pgwt_reader_close(&reader);
+        }
+    }
+
+    /* Drop entries for deleted files (compact the array). */
+    int w = 0;
+    for (int i = 0; i < srv->cov_count; i++) {
+        if (srv->cov[i].present) {
+            if (w != i) srv->cov[w] = srv->cov[i];
+            w++;
+        } else {
+            cov_reset(&srv->cov[i]);
+        }
+    }
+    srv->cov_count = w;
+
+    /* Sort by own wall start so generation assignment sees run order. */
+    for (int i = 1; i < srv->cov_count; i++) {
+        struct pgwt_file_cov tmp = srv->cov[i];
+        int64_t key = tmp.own_offset + (int64_t)tmp.mono_first;
+        int j = i - 1;
+        while (j >= 0 &&
+               srv->cov[j].own_offset + (int64_t)srv->cov[j].mono_first > key) {
+            srv->cov[j + 1] = srv->cov[j];
+            j--;
+        }
+        srv->cov[j + 1] = tmp;
+    }
+
+    /* Assign clock-domain generations: within one daemon run/boot the
+     * monotonic clock strictly increases across files. A backwards jump —
+     * or an offset change too large to be an NTP step — means a new
+     * domain. Canonical offset per generation = the newest file's. */
+    int gen = -1;
+    uint64_t prev_mono_last = 0;
+    int64_t prev_offset = 0;
+    for (int i = 0; i < srv->cov_count; i++) {
+        struct pgwt_file_cov *fc = &srv->cov[i];
+        if (!fc->valid) { fc->gen = gen < 0 ? 0 : gen; continue; }
+        int64_t doff = fc->own_offset - prev_offset;
+        if (gen < 0 ||
+            fc->mono_first < prev_mono_last ||
+            doff > 300LL * 1000000000LL || doff < -300LL * 1000000000LL)
+            gen++;
+        fc->gen = gen;
+        if (fc->mono_last > prev_mono_last)
+            prev_mono_last = fc->mono_last;
+        prev_offset = fc->own_offset;
+    }
+    int num_gens = gen + 1;
+    if (num_gens < 1) num_gens = srv->cov_count > 0 ? 1 : 0;
+
+    /* canonical offset: newest (max mono_last) file of each generation */
+    for (int g = 0; g < num_gens; g++) {
+        uint64_t best_last = 0;
+        int64_t canon = 0;
+        int found = 0;
+        for (int i = 0; i < srv->cov_count; i++) {
+            if (srv->cov[i].gen != g || !srv->cov[i].valid) continue;
+            if (!found || srv->cov[i].mono_last >= best_last) {
+                best_last = srv->cov[i].mono_last;
+                canon = srv->cov[i].own_offset;
+                found = 1;
+            }
+        }
+        for (int i = 0; i < srv->cov_count; i++)
+            if (srv->cov[i].gen == g)
+                srv->cov[i].canon_offset = canon;
+    }
+
+    /* Rebuild the assembled per-generation coverage. */
+    gens_free(srv);
+    if (num_gens > 0) {
+        srv->gens = calloc(num_gens, sizeof(*srv->gens));
+        if (srv->gens) {
+            srv->num_gens = num_gens;
+            for (int g = 0; g < num_gens; g++) {
+                srv->gens[g].gen = g;
+                for (int i = 0; i < srv->cov_count; i++)
+                    if (srv->cov[i].gen == g && srv->cov[i].valid)
+                        srv->gens[g].canon_offset = srv->cov[i].canon_offset;
+                gen_cov_build(srv, &srv->gens[g]);
+            }
+        }
+    }
+
+    /* Overall wall range from the canonical offsets (re-anchored) and the
+     * approximate total event count (block-count based, as before). */
+    uint64_t earliest = 0, latest = 0;
+    int64_t total = 0;
+    for (int i = 0; i < srv->cov_count; i++) {
+        struct pgwt_file_cov *fc = &srv->cov[i];
+        if (!fc->valid) continue;
+        uint64_t fw = (uint64_t)((int64_t)fc->mono_first + fc->canon_offset);
+        uint64_t lw = (uint64_t)((int64_t)fc->mono_last + fc->canon_offset);
+        if (earliest == 0 || fw < earliest) earliest = fw;
+        if (lw > latest) latest = lw;
+        total += (int64_t)fc->blocks_scanned * PGWT_BLOCK_EVENTS;
+    }
+    if (earliest) srv->earliest_wall_ns = earliest;
+    if (latest) srv->latest_wall_ns = latest;
+    srv->total_events = total;
+}
+
+/* True if mono_ns falls inside any span (spans sorted, merged). */
+static int spans_contain(const struct pgwt_span *s, int n, uint64_t mono_ns)
+{
+    int lo = 0, hi = n;
+    while (lo < hi) {
+        int mid = (lo + hi) / 2;
+        if (s[mid].end_ns < mono_ns)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return lo < n && mono_ns >= s[lo].start_ns && mono_ns <= s[lo].end_ns;
+}
+
+static const struct pgwt_gen_cov *gen_cov_get(const struct pgwt_server *srv,
+                                              int gen)
+{
+    for (int g = 0; g < srv->num_gens; g++)
+        if (srv->gens[g].gen == gen)
+            return &srv->gens[g];
+    return NULL;
+}
+
+/* ── Window fidelity from coverage metadata (FID-2) ───────── */
+
+struct pgwt_wfid {
+    enum pgwt_fidelity fid;
+    uint64_t sample_period_ns;
+};
+
+/* Overlap length of [a1,a2] with [b1,b2]. */
+static uint64_t span_overlap(uint64_t a1, uint64_t a2, uint64_t b1, uint64_t b2)
+{
+    uint64_t s = a1 > b1 ? a1 : b1;
+    uint64_t e = a2 < b2 ? a2 : b2;
+    return e > s ? e - s : 0;
+}
+
+/* Classify a wall window from coverage metadata WITHOUT loading events:
+ * EXACT   — exact coverage overlaps and no sampled data lies outside it;
+ * SAMPLED — only sampled data overlaps;
+ * MIXED   — exact coverage plus sampled data outside it;
+ * NONE    — nothing overlaps.
+ * Used to gate the summary fast path: summaries are fed by exact records
+ * only, so they are valid iff the window is EXACT (or NONE — empty). */
+static struct pgwt_wfid window_fidelity(struct pgwt_server *srv,
+                                        uint64_t from_wall, uint64_t to_wall)
+{
+    struct pgwt_wfid wf = { PGWT_FIDELITY_NONE, 0 };
+    int has_exact = 0, has_uncovered_samples = 0;
+
+    for (int g = 0; g < srv->num_gens; g++) {
+        const struct pgwt_gen_cov *gc = &srv->gens[g];
+        int64_t off = gc->canon_offset;
+        if ((int64_t)to_wall - off <= 0)
+            continue;
+        uint64_t fm = ((int64_t)from_wall - off) > 0
+                    ? (uint64_t)((int64_t)from_wall - off) : 0;
+        uint64_t tm = (uint64_t)((int64_t)to_wall - off);
+
+        for (int i = 0; i < gc->n_exact; i++)
+            if (span_overlap(gc->exact[i].start_ns, gc->exact[i].end_ns,
+                             fm, tm) > 0)
+                has_exact = 1;
+
+        /* Sampled data outside exact coverage? Tolerate up to one sample
+         * period of slop at span/window edges. */
+        uint64_t slop = gc->sample_period_ns ? gc->sample_period_ns
+                                             : 1000000000ULL;
+        for (int i = 0; i < gc->n_sampled; i++) {
+            uint64_t s = gc->sampled[i].start_ns > fm
+                       ? gc->sampled[i].start_ns : fm;
+            uint64_t e = gc->sampled[i].end_ns < tm
+                       ? gc->sampled[i].end_ns : tm;
+            if (e <= s) continue;
+            wf.sample_period_ns = gc->sample_period_ns;
+            uint64_t covered = 0;
+            for (int j = 0; j < gc->n_exact; j++)
+                covered += span_overlap(gc->exact[j].start_ns,
+                                        gc->exact[j].end_ns, s, e);
+            if (e - s > covered + slop)
+                has_uncovered_samples = 1;
+        }
+    }
+
+    if (has_exact && has_uncovered_samples) wf.fid = PGWT_FIDELITY_MIXED;
+    else if (has_exact)                     wf.fid = PGWT_FIDELITY_EXACT;
+    else if (has_uncovered_samples)         wf.fid = PGWT_FIDELITY_SAMPLED;
+    else                                    wf.fid = PGWT_FIDELITY_NONE;
+    if (wf.fid == PGWT_FIDELITY_EXACT)
+        wf.sample_period_ns = 0;
+    return wf;
 }
 
 /* ── Event loading ────────────────────────────────────────── */
-
-/* True if wall_ns falls inside any collected transition range [start,end]. */
-static int ts_in_trans_range(const struct trans_range *ranges, int n,
-                             uint64_t wall_ns)
-{
-    for (int i = 0; i < n; i++)
-        if (wall_ns >= ranges[i].start_wall_ns &&
-            wall_ns <= ranges[i].end_wall_ns)
-            return 1;
-    return 0;
-}
 
 /*
  * Load events in [from_wall_ns, to_wall_ns] from trace files.
@@ -727,10 +1238,14 @@ static int ts_in_trans_range(const struct trans_range *ranges, int n,
  * current.trace: on-demand block reads (no caching, no memory growth).
  * Returns malloc'd array. Caller must free(). Sets *out_count.
  *
- * Fidelity (trace format v2, D3): SAMPLES records are normalized so the
- * duration-based estimators apply ASH math. The exact-wins merge drops any
- * sample whose timestamp falls inside a TRANSITIONS block's range, so a
- * sampler running through a full-fidelity window does not double-count.
+ * Fidelity (trace format v2, D3 + T1): SAMPLES records are normalized so
+ * the duration-based estimators apply ASH math. The exact-wins merge drops
+ * any sample whose interval midpoint falls inside the exact coverage
+ * (escalation-marker windows — see the coverage block comment above), so a
+ * sampler running through a full-fidelity window does not double-count —
+ * including across long waits whose single transition lands only at
+ * wait-end (FID-1), and across files whose wall offsets disagree (FID-7:
+ * the merge runs in the monotonic domain per clock generation).
  * When `info` is non-NULL it is filled with what actually contributed
  * (has_transitions / has_samples / sample_period_ns).
  */
@@ -742,8 +1257,8 @@ server_load_events_fi(struct pgwt_server *srv,
     *out_count = 0;
     if (info) memset(info, 0, sizeof(*info));
 
-    /* Quick rescan for new files (directory listing only, no file opens) */
-    srv->num_files = pgwt_scan_trace_files(srv->trace_dir, srv->files, 256);
+    /* Rescan directory + refresh coverage/clock-domain state. */
+    coverage_refresh(srv);
 
     if (from_wall_ns == 0)
         from_wall_ns = srv->earliest_wall_ns;
@@ -755,88 +1270,97 @@ server_load_events_fi(struct pgwt_server *srv,
     if (!events) return NULL;
     int total = 0;
 
-    /* Build the set of transition-covered ranges first, across ALL files,
-     * so the exact-wins merge sees a sampler in one file overlapping an
-     * escalation window in another. */
-    struct trans_range *ranges = NULL;
-    int nranges = 0, ranges_cap = 0;
+    /* Per-segment bookkeeping: each file contributes one contiguous run of
+     * events; merge + wall conversion need its generation and offset. */
+    struct load_seg { int start, count, gen; int64_t off; };
+    struct load_seg segs[256];
+    int n_segs = 0;
     uint64_t sample_period_ns = 0;
 
-    for (int fi = 0; fi < srv->num_files; fi++) {
-        const char *path = srv->files[fi].path;
+    for (int ci = 0; ci < srv->cov_count && n_segs < 256; ci++) {
+        struct pgwt_file_cov *fc = &srv->cov[ci];
+        if (!fc->valid)
+            continue;
 
-        if (is_current_trace(path)) {
+        /* Query window in this file's mono domain (canonical offset). */
+        if ((int64_t)to_wall_ns - fc->canon_offset <= 0)
+            continue;
+        uint64_t from_m = ((int64_t)from_wall_ns - fc->canon_offset) > 0
+                        ? (uint64_t)((int64_t)from_wall_ns - fc->canon_offset)
+                        : 0;
+        uint64_t to_m = (uint64_t)((int64_t)to_wall_ns - fc->canon_offset);
+
+        if (fc->mono_first > to_m || fc->mono_last < from_m)
+            continue;
+
+        if (fc->sample_period_ns)
+            sample_period_ns = fc->sample_period_ns;
+
+        int seg_start = total;
+
+        if (fc->is_current) {
             /* On-demand: read only blocks in [from, to] */
-            struct pgwt_load_info fileinfo = {0};
-            load_current_trace_range(path, from_wall_ns, to_wall_ns,
-                                     &events, &total, &cap,
-                                     &ranges, &nranges, &ranges_cap, &fileinfo);
-            if (fileinfo.sample_period_ns)
-                sample_period_ns = fileinfo.sample_period_ns;
+            load_file_range_mono(fc->path, from_m, to_m,
+                                 &events, &total, &cap);
         } else {
-            /* Immutable: try cache, fall back to on-demand for large files */
-            struct file_cache_entry *ce = get_cached_immutable(srv, path);
+            struct file_cache_entry *ce = get_cached_immutable(srv, fc->path);
             if (!ce || !ce->events) {
-                /* Cache miss (file too large or alloc failed) — read on demand */
-                struct pgwt_load_info fileinfo = {0};
-                load_current_trace_range(path, from_wall_ns, to_wall_ns,
-                                         &events, &total, &cap,
-                                         &ranges, &nranges, &ranges_cap,
-                                         &fileinfo);
-                if (fileinfo.sample_period_ns)
-                    sample_period_ns = fileinfo.sample_period_ns;
-                continue;
-            }
+                /* Cache miss (file too large or alloc failed) */
+                load_file_range_mono(fc->path, from_m, to_m,
+                                     &events, &total, &cap);
+            } else {
+                for (int i = 0; i < ce->count; i++) {
+                    uint64_t ts = ce->events[i].timestamp_ns;
+                    if (ts < from_m) continue;
+                    if (ts > to_m) break;
 
-            /* Skip file entirely if its time range doesn't overlap */
-            if (ce->last_wall_ns > 0 && ce->first_wall_ns > to_wall_ns)
-                continue;
-            if (ce->last_wall_ns > 0 && ce->last_wall_ns < from_wall_ns)
-                continue;
-
-            if (ce->sample_period_ns)
-                sample_period_ns = ce->sample_period_ns;
-
-            /* Contribute this file's transition ranges to the merge set */
-            for (int r = 0; r < ce->num_trans_ranges; r++)
-                trans_ranges_add(&ranges, &nranges, &ranges_cap,
-                                 ce->trans_ranges[r].start_wall_ns,
-                                 ce->trans_ranges[r].end_wall_ns);
-
-            /* Filter cached events by time range */
-            for (int i = 0; i < ce->count; i++) {
-                uint64_t ts = ce->events[i].timestamp_ns;
-                if (ts < from_wall_ns) continue;
-                if (ts > to_wall_ns) break;
-
-                if (total >= cap) {
-                    cap *= 2;
-                    struct pgwt_trace_event *tmp = realloc(events, cap * sizeof(*tmp));
-                    if (!tmp) { free(ranges); *out_count = total; return events; }
-                    events = tmp;
+                    if (total >= cap) {
+                        cap *= 2;
+                        struct pgwt_trace_event *tmp =
+                            realloc(events, cap * sizeof(*tmp));
+                        if (!tmp) { *out_count = total; return events; }
+                        events = tmp;
+                    }
+                    events[total++] = ce->events[i];
                 }
-                events[total++] = ce->events[i];
             }
+        }
+
+        if (total > seg_start) {
+            segs[n_segs].start = seg_start;
+            segs[n_segs].count = total - seg_start;
+            segs[n_segs].gen = fc->gen;
+            segs[n_segs].off = fc->canon_offset;
+            n_segs++;
         }
     }
 
-    /* Exact-wins merge: drop samples inside any transition range, then
+    /* Exact-wins merge (mono, per generation) + wall re-anchoring, then
      * derive what actually contributed for the fidelity indicator. */
     int has_transitions = 0, has_samples = 0;
     int kept = 0;
-    for (int i = 0; i < total; i++) {
-        if (events[i].flags & PGWT_EVENT_FLAG_SAMPLE) {
-            if (nranges > 0 &&
-                ts_in_trans_range(ranges, nranges, events[i].timestamp_ns))
-                continue;  /* transition data is authoritative here */
-            has_samples = 1;
-        } else {
-            has_transitions = 1;
+    for (int s = 0; s < n_segs; s++) {
+        const struct pgwt_gen_cov *gc = gen_cov_get(srv, segs[s].gen);
+        for (int i = segs[s].start; i < segs[s].start + segs[s].count; i++) {
+            if (events[i].flags & PGWT_EVENT_FLAG_SAMPLE) {
+                /* Boundary rule (FID-6): drop iff the sample's interval
+                 * midpoint lies inside exact coverage. */
+                uint64_t mid = events[i].timestamp_ns
+                             - events[i].duration_ns / 2;
+                if (gc && gc->n_exact > 0 &&
+                    spans_contain(gc->exact, gc->n_exact, mid))
+                    continue;   /* exact data is authoritative here */
+                has_samples = 1;
+            } else {
+                has_transitions = 1;
+            }
+            events[kept] = events[i];
+            events[kept].timestamp_ns = (uint64_t)
+                ((int64_t)events[kept].timestamp_ns + segs[s].off);
+            kept++;
         }
-        events[kept++] = events[i];
     }
     total = kept;
-    free(ranges);
 
     if (info) {
         info->has_transitions = has_transitions;
@@ -848,13 +1372,20 @@ server_load_events_fi(struct pgwt_server *srv,
     return events;
 }
 
-/* Backward-compatible wrapper for callers that don't need fidelity info. */
-static struct pgwt_trace_event *
-server_load_events(struct pgwt_server *srv,
-                   uint64_t from_wall_ns, uint64_t to_wall_ns,
-                   int *out_count)
+/* Free everything the server owns (cache, coverage, metadata maps) so
+ * sanitizer/valgrind runs end clean. */
+static void server_destroy(struct pgwt_server *srv)
 {
-    return server_load_events_fi(srv, from_wall_ns, to_wall_ns, out_count, NULL);
+    for (int i = 0; i < srv->cache_count; i++)
+        free(srv->cache[i].events);
+    srv->cache_count = 0;
+    for (int i = 0; i < srv->cov_count; i++)
+        cov_reset(&srv->cov[i]);
+    srv->cov_count = 0;
+    gens_free(srv);
+    qt_map_clear(srv);
+    free(srv->bm_map);
+    srv->bm_map = NULL;
 }
 
 /* ── Server init ──────────────────────────────────────────── */
@@ -881,34 +1412,12 @@ static int server_init(struct pgwt_server *srv, const char *trace_dir)
         return -1;
     }
 
-    /* Determine time range by opening first and last files */
+    /* Scan block headers, build the coverage table + clock generations,
+     * and derive the (re-anchored) wall time range. */
     srv->earliest_wall_ns = 0;
     srv->latest_wall_ns   = 0;
     srv->total_events     = 0;
-
-    for (int i = 0; i < srv->num_files; i++) {
-        struct pgwt_event_reader reader;
-        if (pgwt_reader_open(&reader, srv->files[i].path) != 0)
-            continue;
-
-        if (reader.num_blocks > 0) {
-            uint64_t first_mono = reader.block_index[0].timestamp_ns;
-            uint64_t last_mono  = reader.block_index[reader.num_blocks - 1].timestamp_ns;
-
-            uint64_t first_wall = pgwt_reader_mono_to_wall(&reader, first_mono);
-            uint64_t last_wall  = pgwt_reader_mono_to_wall(&reader, last_mono);
-
-            if (srv->earliest_wall_ns == 0 || first_wall < srv->earliest_wall_ns)
-                srv->earliest_wall_ns = first_wall;
-            if (last_wall > srv->latest_wall_ns)
-                srv->latest_wall_ns = last_wall;
-
-            /* Approximate event count from block count */
-            srv->total_events += reader.num_blocks * PGWT_BLOCK_EVENTS;
-        }
-
-        pgwt_reader_close(&reader);
-    }
+    coverage_refresh(srv);
 
     fprintf(stderr, "pgwt-server: %d trace files, %d CPUs, ~%lld events\n",
             srv->num_files, srv->num_cpus, (long long)srv->total_events);
@@ -919,21 +1428,36 @@ static int server_init(struct pgwt_server *srv, const char *trace_dir)
     return 0;
 }
 
-/* ── Summary threshold ────────────────────────────────────── */
+/* ── Summary threshold (coverage-aware — FID-2) ───────────── */
 
-/* Use summary path for ranges >= 120s (instant response, ~300KB peak memory).
- * Raw events used for ranges < 120s (exact per-event resolution).
- * Force raw events when pid filter is active — summaries don't have
- * per-PID event/class breakdown. query_id is handled via v2 per-query data. */
-static int should_use_summaries(struct pgwt_server *srv, struct pgwt_request *req)
+/* Use the summary fast path for ranges >= 120 s (instant response, ~300KB
+ * peak memory) — but ONLY when the window is fully exact-covered (or
+ * empty): summaries are fed by the exact (watchpoint) path alone, so over
+ * a window with uncovered sampled data they would silently drop it — in
+ * default tiered mode that made "last 15 minutes" return escalation
+ * slivers (or nothing) labeled "exact". Such windows fall back to the raw
+ * path, which merges samples with ASH math and labels honestly.
+ * Force raw events when a pid filter is active — summaries don't have
+ * per-PID event/class breakdown. query_id is handled via v2 per-query
+ * data. *wf is always filled with the window's coverage-derived fidelity
+ * so the summary-path response can carry an honest label. */
+static int should_use_summaries(struct pgwt_server *srv,
+                                struct pgwt_request *req,
+                                struct pgwt_wfid *wf)
 {
-    if (req->filter.pid != 0)
-        return 0;
+    coverage_refresh(srv);
     uint64_t from = req->from_ns ? req->from_ns : srv->earliest_wall_ns;
     uint64_t to   = req->to_ns   ? req->to_ns   : srv->latest_wall_ns;
+    *wf = window_fidelity(srv, from, to);
+
+    if (req->filter.pid != 0)
+        return 0;
     if (to <= from) return 0;
-    uint64_t range_ns = to - from;
-    return (range_ns >= 120ULL * 1000000000ULL);
+    if (to - from < 120ULL * 1000000000ULL)
+        return 0;
+    /* Summaries are only honest when exact data covers everything the
+     * window contains (EXACT), or the window is empty (NONE). */
+    return wf->fid == PGWT_FIDELITY_EXACT || wf->fid == PGWT_FIDELITY_NONE;
 }
 
 /* ── Fidelity (trace format v2, D3) ───────────────────────── */
@@ -954,11 +1478,14 @@ static void add_fidelity(cJSON *root, const struct pgwt_load_info *info)
         cjson_add_uint64(root, "sample_period_ns", info->sample_period_ns);
 }
 
-/* When summaries are used the window is full-fidelity transition data
- * (summaries are derived from the watchpoint path). */
-static void add_fidelity_exact(cJSON *root)
+/* Label for a summary-path response: derived from coverage, never
+ * hardcoded (FID-2). The summary path is only taken for EXACT or NONE. */
+static void add_fidelity_window(cJSON *root, const struct pgwt_wfid *wf)
 {
-    cJSON_AddStringToObject(root, "fidelity", "exact");
+    cJSON_AddStringToObject(root, "fidelity", pgwt_fidelity_str(wf->fid));
+    if (wf->sample_period_ns &&
+        (wf->fid == PGWT_FIDELITY_SAMPLED || wf->fid == PGWT_FIDELITY_MIXED))
+        cjson_add_uint64(root, "sample_period_ns", wf->sample_period_ns);
 }
 
 /* Emit the structured "unavailable" response for an EXACT-required view over
@@ -977,8 +1504,9 @@ static void emit_unavailable(uint64_t req_id, enum pgwt_fidelity fid)
 
 static void handle_info(struct pgwt_server *srv, struct pgwt_request *req)
 {
-    /* Refresh: rescan directory, reload metadata, update latest_wall_ns. */
-    srv->num_files = pgwt_scan_trace_files(srv->trace_dir, srv->files, 256);
+    /* Refresh: rescan directory + coverage (updates earliest/latest with
+     * the re-anchored canonical offsets), reload metadata. */
+    coverage_refresh(srv);
 
     /* Reload query texts and backend metadata (daemon appends new entries
      * as it discovers backends/queries). These files are small — fast. */
@@ -989,15 +1517,6 @@ static void handle_info(struct pgwt_server *srv, struct pgwt_request *req)
     srv->bm_capacity = 0;
     srv->bm_count = 0;
     server_load_backends(srv);
-
-    /* Update latest_wall_ns from current.trace (one quick open+close) */
-    for (int i = 0; i < srv->num_files; i++) {
-        if (is_current_trace(srv->files[i].path)) {
-            uint64_t t = get_current_trace_latest(srv->files[i].path);
-            if (t > srv->latest_wall_ns)
-                srv->latest_wall_ns = t;
-        }
-    }
 
     cJSON *root = cJSON_CreateObject();
     cJSON_AddNumberToObject(root, "id", (double)req->id);
@@ -1026,10 +1545,11 @@ static void handle_aas(struct pgwt_server *srv, struct pgwt_request *req)
 
     struct pgwt_aas_result aas;
     struct pgwt_load_info linfo = {0};
+    struct pgwt_wfid wfid = {0};
     int from_summaries = 0;
 
     /* Event-detail mode always uses raw events (no summary path yet) */
-    if (!detail_events && should_use_summaries(srv, req)) {
+    if (!detail_events && should_use_summaries(srv, req, &wfid)) {
         pgwt_compute_aas_from_summaries(srv->trace_dir, from, to,
                                          &req->filter, num_buckets, &aas);
         from_summaries = 1;
@@ -1044,7 +1564,7 @@ static void handle_aas(struct pgwt_server *srv, struct pgwt_request *req)
 
     cJSON *root = cJSON_CreateObject();
     cJSON_AddNumberToObject(root, "id", (double)req->id);
-    if (from_summaries) add_fidelity_exact(root);
+    if (from_summaries) add_fidelity_window(root, &wfid);
     else                add_fidelity(root, &linfo);
 
     if (aas.num_event_series > 0) {
@@ -1100,9 +1620,10 @@ static void handle_time_model(struct pgwt_server *srv, struct pgwt_request *req)
 
     struct pgwt_tm_result tm;
     struct pgwt_load_info linfo = {0};
+    struct pgwt_wfid wfid = {0};
     int from_summaries = 0;
 
-    if (should_use_summaries(srv, req)) {
+    if (should_use_summaries(srv, req, &wfid)) {
         pgwt_compute_time_model_from_summaries(srv->trace_dir, from, to,
                                                 &req->filter, wall_ms, &tm);
         from_summaries = 1;
@@ -1116,7 +1637,7 @@ static void handle_time_model(struct pgwt_server *srv, struct pgwt_request *req)
 
     cJSON *root = cJSON_CreateObject();
     cJSON_AddNumberToObject(root, "id", (double)req->id);
-    if (from_summaries) add_fidelity_exact(root);
+    if (from_summaries) add_fidelity_window(root, &wfid);
     else                add_fidelity(root, &linfo);
 
     cJSON *rows = cJSON_AddArrayToObject(root, "rows");
@@ -1147,9 +1668,10 @@ static void handle_top_events(struct pgwt_server *srv, struct pgwt_request *req)
 
     struct pgwt_events_result res;
     struct pgwt_load_info linfo = {0};
+    struct pgwt_wfid wfid = {0};
     int from_summaries = 0;
 
-    if (should_use_summaries(srv, req)) {
+    if (should_use_summaries(srv, req, &wfid)) {
         pgwt_compute_top_events_from_summaries(srv->trace_dir, from, to,
                                                 &req->filter, wall_ms, &res);
         from_summaries = 1;
@@ -1163,7 +1685,7 @@ static void handle_top_events(struct pgwt_server *srv, struct pgwt_request *req)
 
     cJSON *root = cJSON_CreateObject();
     cJSON_AddNumberToObject(root, "id", (double)req->id);
-    if (from_summaries) add_fidelity_exact(root);
+    if (from_summaries) add_fidelity_window(root, &wfid);
     else                add_fidelity(root, &linfo);
 
     cJSON *rows = cJSON_AddArrayToObject(root, "rows");
@@ -1175,11 +1697,23 @@ static void handle_top_events(struct pgwt_server *srv, struct pgwt_request *req)
                                 pgwt_class_name(res.rows[i].event_id));
         cjson_add_uint64(r, "count", res.rows[i].count);
         cJSON_AddNumberToObject(r, "total_ms", res.rows[i].total_ms);
-        cJSON_AddNumberToObject(r, "avg_us", res.rows[i].avg_us);
-        cJSON_AddNumberToObject(r, "p50_us", res.rows[i].p50_us);
-        cJSON_AddNumberToObject(r, "p95_us", res.rows[i].p95_us);
-        cJSON_AddNumberToObject(r, "p99_us", res.rows[i].p99_us);
-        cJSON_AddNumberToObject(r, "max_us", res.rows[i].max_us);
+        /* Latency statistics exist only where exact records contributed:
+         * over sampled data they would be fabrications (p95 ≈ sample
+         * period), so sampled-only rows carry null and render as "—"
+         * (FID-3). count/total_ms stay valid via ASH math. */
+        if (res.rows[i].exact_count > 0) {
+            cJSON_AddNumberToObject(r, "avg_us", res.rows[i].avg_us);
+            cJSON_AddNumberToObject(r, "p50_us", res.rows[i].p50_us);
+            cJSON_AddNumberToObject(r, "p95_us", res.rows[i].p95_us);
+            cJSON_AddNumberToObject(r, "p99_us", res.rows[i].p99_us);
+            cJSON_AddNumberToObject(r, "max_us", res.rows[i].max_us);
+        } else {
+            cJSON_AddNullToObject(r, "avg_us");
+            cJSON_AddNullToObject(r, "p50_us");
+            cJSON_AddNullToObject(r, "p95_us");
+            cJSON_AddNullToObject(r, "p99_us");
+            cJSON_AddNullToObject(r, "max_us");
+        }
         /* Idle-but-visible events (Client:ClientRead) have no meaningful
          * share of DB Time; emit null so the client renders "—". */
         if (PGWT_PCT_DB_IS_IDLE(res.rows[i].pct_db))
@@ -1204,10 +1738,11 @@ static void handle_top_sessions(struct pgwt_server *srv, struct pgwt_request *re
 
     struct pgwt_sessions_result res;
     struct pgwt_load_info linfo = {0};
+    struct pgwt_wfid wfid = {0};
     int from_summaries = 0;
 
     /* Sessions + query_id: summaries lack per-session query data, use raw events */
-    if (should_use_summaries(srv, req) && req->filter.query_id == 0) {
+    if (should_use_summaries(srv, req, &wfid) && req->filter.query_id == 0) {
         pgwt_compute_top_sessions_from_summaries(srv->trace_dir, from, to,
                                                   &req->filter, wall_ms, &res);
         from_summaries = 1;
@@ -1221,7 +1756,7 @@ static void handle_top_sessions(struct pgwt_server *srv, struct pgwt_request *re
 
     cJSON *root = cJSON_CreateObject();
     cJSON_AddNumberToObject(root, "id", (double)req->id);
-    if (from_summaries) add_fidelity_exact(root);
+    if (from_summaries) add_fidelity_window(root, &wfid);
     else                add_fidelity(root, &linfo);
 
     cJSON *rows = cJSON_AddArrayToObject(root, "rows");
@@ -1262,6 +1797,7 @@ static void handle_top_queries(struct pgwt_server *srv, struct pgwt_request *req
     struct pgwt_trace_event *all_events = NULL;
     struct pgwt_queries_result res;
     struct pgwt_load_info linfo = {0};
+    struct pgwt_wfid wfid = {0};
     int from_summaries = 0;
 
     /* Use summaries for large ranges (>120s) for the class breakdown.
@@ -1269,7 +1805,7 @@ static void handle_top_queries(struct pgwt_server *srv, struct pgwt_request *req
      * Large files are read on-demand (not cached) so this is safe. */
     all_events = server_load_events_fi(srv, req->from_ns, req->to_ns, &ecount,
                                        &linfo);
-    if (!has_event_filter && should_use_summaries(srv, req)) {
+    if (!has_event_filter && should_use_summaries(srv, req, &wfid)) {
         pgwt_compute_top_queries_from_summaries(srv->trace_dir, from, to,
                                                  &req->filter, wall_ms, &res);
         from_summaries = 1;
@@ -1365,7 +1901,7 @@ static void handle_top_queries(struct pgwt_server *srv, struct pgwt_request *req
 
     cJSON *root = cJSON_CreateObject();
     cJSON_AddNumberToObject(root, "id", (double)req->id);
-    if (from_summaries) add_fidelity_exact(root);
+    if (from_summaries) add_fidelity_window(root, &wfid);
     else                add_fidelity(root, &linfo);
 
     cJSON *rows = cJSON_AddArrayToObject(root, "rows");
@@ -1504,14 +2040,18 @@ static void handle_heatmap(struct pgwt_server *srv, struct pgwt_request *req)
     int num_buckets = req->num_buckets > 0 ? req->num_buckets : 200;
 
     struct pgwt_heatmap_result res;
+    struct pgwt_wfid wfid = {0};
     int from_summaries = 0;
+    enum pgwt_fidelity out_fid = PGWT_FIDELITY_EXACT;
 
     /* Heatmap (latency distribution) is EXACT-required: it needs real
-     * per-event durations, which samples do not carry. */
-    if (should_use_summaries(srv, req) && req->filter.query_id == 0) {
+     * per-event durations, which samples do not carry (the compute skips
+     * sample records, so mixed windows show exact cells only). */
+    if (should_use_summaries(srv, req, &wfid) && req->filter.query_id == 0) {
         pgwt_compute_heatmap_from_summaries(srv->trace_dir, from, to,
                                              &req->filter, num_buckets, &res);
         from_summaries = 1;
+        out_fid = wfid.fid;
     } else {
         int count;
         struct pgwt_load_info linfo = {0};
@@ -1526,6 +2066,7 @@ static void handle_heatmap(struct pgwt_server *srv, struct pgwt_request *req)
         pgwt_compute_heatmap(events, count, &req->filter,
                              from, to, num_buckets, &res);
         free(events);
+        out_fid = fid;
     }
 
     /* Latency bucket labels (UTF-8: µ = \xc2\xb5, ≥ = \xe2\x89\xa5) */
@@ -1538,7 +2079,7 @@ static void handle_heatmap(struct pgwt_server *srv, struct pgwt_request *req)
 
     cJSON *root = cJSON_CreateObject();
     cJSON_AddNumberToObject(root, "id", (double)req->id);
-    add_fidelity_exact(root);
+    cJSON_AddStringToObject(root, "fidelity", pgwt_fidelity_str(out_fid));
     (void)from_summaries;
 
     cJSON *times_arr = cJSON_AddArrayToObject(root, "times");
@@ -2426,14 +2967,19 @@ static void dump_summary(struct pgwt_server *srv)
     int n = ev.num_rows < 15 ? ev.num_rows : 15;
     for (int i = 0; i < n; i++) {
         struct pgwt_event_row *r = &ev.rows[i];
-        char pctbuf[16];
+        char pctbuf[16], avgbuf[16];
         /* Idle-but-visible events: time but no meaningful %DB share. */
         if (PGWT_PCT_DB_IS_IDLE(r->pct_db))
             snprintf(pctbuf, sizeof(pctbuf), "%8s", "—");
         else
             snprintf(pctbuf, sizeof(pctbuf), "%7.1f%%", r->pct_db);
-        printf("  %-28s %10llu %12.1f %10.1f %s\n",
-               r->name, (unsigned long long)r->count, r->total_ms, r->avg_us, pctbuf);
+        /* Sampled-only rows have no real latency measurements (FID-3). */
+        if (r->exact_count > 0)
+            snprintf(avgbuf, sizeof(avgbuf), "%10.1f", r->avg_us);
+        else
+            snprintf(avgbuf, sizeof(avgbuf), "%10s", "—");
+        printf("  %-28s %10llu %12.1f %s %s\n",
+               r->name, (unsigned long long)r->count, r->total_ms, avgbuf, pctbuf);
     }
     free(ev.rows);
 
@@ -2503,6 +3049,7 @@ int main(int argc, char **argv)
     if (dump_mode) {
         dump_daemon_status(srv.trace_dir);
         dump_summary(&srv);
+        server_destroy(&srv);
         return 0;
     }
 
@@ -2522,5 +3069,6 @@ int main(int argc, char **argv)
         dispatch(&srv, &req, line);
     }
 
+    server_destroy(&srv);
     return 0;
 }

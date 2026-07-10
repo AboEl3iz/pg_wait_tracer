@@ -119,6 +119,12 @@ def test_sampled_only(t):
             io = evrows.get("IO:DataFileRead", {})
             t.check_eq(io.get("count"), 10, "IO:DataFileRead sample count = 10")
 
+            # FID-3: latency columns are fabrications over sampled data —
+            # gated (null) on sampled-only rows; count/total stay valid.
+            for col in ("avg_us", "p50_us", "p95_us", "p99_us", "max_us"):
+                t.check(io.get(col, "missing") is None,
+                        f"sampled-only row gates latency column {col}")
+
             # --- AAS: active-sample-time / window ---
             # 28 total samples span (28-1) periods = 2700ms of wall-clock.
             # The harness queries the full file range. Verify AAS integrates
@@ -167,10 +173,11 @@ def test_exact_unavailable(t):
 def build_mixed():
     """Transition coverage overlapping a continuous sample stream.
 
-    The exact-wins merge (D3) drops any sample whose timestamp falls inside
-    a TRANSITIONS block's [first_ts, last_ts] span — i.e. the span of the
-    transition events' timestamps. So the transition block must actually
-    SPAN the overlap window.
+    This trace has samples + transitions but NO escalation markers, so the
+    exact-wins merge uses the LEGACY per-TRANSITIONS-block coverage
+    (marker windows are the authority when markers exist — see
+    test_data_esc_coverage.py). The transition block must therefore
+    actually SPAN the overlap window.
 
     TRANSITIONS (exact) for PID 1000: a chain of IO:DataFileRead intervals
     with event timestamps from BASE+1.0s to BASE+2.0s (the block's
@@ -178,10 +185,10 @@ def build_mixed():
     exact IO total over the window is 11 * 100ms = 1100ms.
 
     SAMPLES (10 Hz) of Lock:relation run continuously over
-    [BASE+1.0s .. BASE+4.0s] (31 samples). Samples whose ts is in
-    [1.0s, 2.0s] (11 of them) are DROPPED — transition data is
-    authoritative there. The remaining 20 out-of-range samples each add
-    100ms → 2000ms of Lock. No double counting in the overlap.
+    [BASE+1.0s .. BASE+4.0s] (31 samples). Boundary rule (FID-6): a sample
+    represents (ts − period, ts] and is dropped iff its MIDPOINT
+    (ts − period/2) lies inside the covered span. Surviving samples each
+    add 100ms of Lock. No double counting in the overlap.
     """
     one_s = 1_000_000_000
     trans_start = BASE_TS + one_s
@@ -206,9 +213,9 @@ def build_mixed():
         ts += PERIOD
     samples.sort(key=lambda s: s["ts"])
 
-    # Samples inside the transition block span [first_ts, last_ts] are dropped.
+    # Midpoint rule: dropped iff (ts - PERIOD/2) in [first_ts, last_ts].
     in_range = sum(1 for s in samples
-                   if trans_start <= s["ts"] <= trans_end)
+                   if trans_start <= s["ts"] - PERIOD // 2 <= trans_end)
     out_range = len(samples) - in_range
 
     return ({
@@ -252,6 +259,17 @@ def test_mixed_merge(t):
                     "transitions available in a mixed window (has exact data)")
             t.check_eq(tr.get("fidelity"), "mixed",
                        "transitions fidelity = mixed")
+
+            # FID-3 in a mixed window: exact-fed rows keep real latency
+            # stats, sampled-only rows gate them.
+            ev = srv.query("top_events")
+            evrows = {r["name"]: r for r in ev["rows"]}
+            io = evrows.get("IO:DataFileRead", {})
+            lk = evrows.get("Lock:relation", {})
+            t.check(isinstance(io.get("p95_us"), (int, float)),
+                    "mixed window: exact-fed row keeps numeric p95")
+            t.check(lk.get("p95_us", "missing") is None,
+                    "mixed window: sampled-only row gates p95 (null)")
     finally:
         cleanup_traces(trace_dir)
 

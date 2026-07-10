@@ -13,6 +13,7 @@ LIBBPF_LIB ?= -lbpf
 TESTS     = test_wait_event test_cmdline test_event_writer test_event_reader \
             test_trace_v2 test_sampler test_anomaly test_coop test_bucket \
             test_pg13_resolve test_discovery_pie test_discovery_nopie \
+            test_replay_fidelity \
             gen_test_traces gen_bench_traces test_concurrent_rw cross_validate \
             dump_markers
 
@@ -99,6 +100,21 @@ test_anomaly: test_anomaly.c ../src/anomaly.c
 test_coop: test_coop.c ../src/provider_coop.c
 	$(CC) $(CFLAGS) -DPGWT_SERVER -o $@ $^
 
+# test_replay_fidelity: fidelity-aware --replay accumulation (T1/FID-5) —
+# samples contribute ASH-estimated time (never fabricated histograms),
+# markers are skipped. Links the daemon-flavor event_reader.c (which holds
+# pgwt_replay_events) against the BPF-free accumulator core: map_reader.c
+# compiled with -DPGWT_SERVER strips its libbpf/skeleton half (same pattern
+# as sampler.c/anomaly.c), so no bpftool is needed.
+map_reader_core.o: ../src/map_reader.c ../src/map_reader.h
+	$(CC) $(CFLAGS) -DPGWT_SERVER -c -o $@ $<
+
+test_replay_fidelity: test_replay_fidelity.c ../src/event_reader.c \
+                      map_reader_core.o $(BUILD)/server_event_writer.o \
+                      $(BUILD)/server_wait_event.o $(BUILD)/server_spawn.o \
+                      $(BUILD)/server_cJSON.o
+	$(CC) $(CFLAGS) -o $@ $^ -llz4 -lz
+
 # Server-build objects for gen_test_traces
 SERVER_OBJS = $(BUILD)/server_event_writer.o $(BUILD)/server_summary_writer.o \
               $(BUILD)/server_wait_event.o $(BUILD)/server_spawn.o $(BUILD)/server_cJSON.o
@@ -130,4 +146,4 @@ dump_markers: dump_markers.c $(BUILD)/server_event_reader.o \
 	$(CC) $(CFLAGS) -DPGWT_SERVER -o $@ $^ -llz4 -lz
 
 clean:
-	rm -f $(TESTS)
+	rm -f $(TESTS) map_reader_core.o

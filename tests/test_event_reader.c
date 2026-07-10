@@ -279,7 +279,9 @@ static void test_time_range_replay(void)
     CHECK(pgwt_reader_open(&reader, path) == 0, "reader_open");
 
     struct pgwt_trace_event *decoded = calloc(PGWT_BLOCK_EVENTS, sizeof(*decoded));
-    int count = pgwt_reader_decode_block(&reader, 0, decoded, PGWT_BLOCK_EVENTS);
+    struct pgwt_block_info binfo;
+    int count = pgwt_reader_decode_block_info(&reader, 0, decoded,
+                                              PGWT_BLOCK_EVENTS, &binfo);
     CHECK(count == N, "decoded count=%d", count);
 
     /* Replay with time bounds: skip first 50, take next 100 */
@@ -288,7 +290,7 @@ static void test_time_range_replay(void)
 
     struct pgwt_accumulator *acc = calloc(1, sizeof(*acc));
     pgwt_accum_init(acc);
-    pgwt_replay_events(acc, decoded, count, from_mono, to_mono);
+    pgwt_replay_events(acc, decoded, count, from_mono, to_mono, &binfo, NULL);
 
     /* Should have accumulated ~101 events (50..150 inclusive) */
     CHECK(acc->num_system_events > 0, "system events accumulated");
@@ -304,7 +306,7 @@ static void test_time_range_replay(void)
 
     /* Replay all events (no bounds) */
     pgwt_accum_init(acc);
-    pgwt_replay_events(acc, decoded, count, 0, 0);
+    pgwt_replay_events(acc, decoded, count, 0, 0, &binfo, NULL);
     se = pgwt_find_system_event(acc, 0x0A000001);
     CHECK(se != NULL, "system event found (full)");
     if (se) {
@@ -535,12 +537,14 @@ static void test_replay_time_model(void)
     CHECK(pgwt_reader_open(&reader, path) == 0, "reader_open");
 
     struct pgwt_trace_event *decoded = calloc(PGWT_BLOCK_EVENTS, sizeof(*decoded));
-    int count = pgwt_reader_decode_block(&reader, 0, decoded, PGWT_BLOCK_EVENTS);
+    struct pgwt_block_info binfo;
+    int count = pgwt_reader_decode_block_info(&reader, 0, decoded,
+                                              PGWT_BLOCK_EVENTS, &binfo);
     CHECK(count == N, "decoded count=%d", count);
 
     struct pgwt_accumulator *acc = calloc(1, sizeof(*acc));
     pgwt_accum_init(acc);
-    pgwt_replay_events(acc, decoded, count, 0, 0);
+    pgwt_replay_events(acc, decoded, count, 0, 0, &binfo, NULL);
 
     /* Verify time model */
     CHECK(acc->tm.cpu_time_ns == 20 * 1000ULL,

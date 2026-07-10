@@ -1,12 +1,20 @@
-/* map_reader.c — Read BPF state_map for open intervals, accumulator helpers */
+/* map_reader.c — Read BPF state_map for open intervals, accumulator helpers
+ *
+ * The accumulator core (get-or-create helpers, time model, histogram
+ * bucketing) is pure and BPF-free; the map-reading functions need libbpf
+ * and the skeleton. Guarded by !PGWT_SERVER — same pattern as sampler.c /
+ * anomaly.c — so unit tests (e.g. test_replay_fidelity) can link the pure
+ * core on a box without bpftool. */
 #include "map_reader.h"
-#include "daemon.h"
 #include "wait_event.h"
 
 #include <string.h>
 #include <stdio.h>
 #include <stdbool.h>
 #include <time.h>
+
+#ifndef PGWT_SERVER
+#include "daemon.h"
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 #include "pg_wait_tracer.skel.h"
@@ -18,6 +26,7 @@ static uint64_t now_ns(void)
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 }
+#endif /* !PGWT_SERVER */
 
 void pgwt_accum_init(struct pgwt_accumulator *acc)
 {
@@ -151,6 +160,7 @@ uint32_t pgwt_duration_to_bucket(uint64_t ns)
     return 15;
 }
 
+#ifndef PGWT_SERVER
 void pgwt_read_state_map(struct pgwt_daemon *d)
 {
     int state_fd = bpf_map__fd(d->skel->maps.state_map);
@@ -299,3 +309,4 @@ uint64_t pgwt_read_bpf_fail_counter(struct pgwt_daemon *d, uint32_t slot)
         total += per_cpu[i];
     return total;
 }
+#endif /* !PGWT_SERVER */

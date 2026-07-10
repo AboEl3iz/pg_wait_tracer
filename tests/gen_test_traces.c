@@ -28,6 +28,23 @@
  *             100000000 = 10 Hz) is stored in the block header. Samples must
  *             be sorted by ts ascending. A scenario may have events, samples,
  *             or both. Both arrays produce A3 fixtures.
+ * "interleave": 1 (top-level, optional) → events and samples are written in
+ *             global timestamp order, so the file's block structure matches
+ *             a real tiered capture: a transitions block is flushed whenever
+ *             the sample stream catches up, sample blocks land between
+ *             transition blocks. Without it, all events are written first,
+ *             then all samples (one big transitions block — NOT what the
+ *             tiered daemon produces).
+ *
+ * Extra options (T1 fidelity tests):
+ *   --wall-offset <ns>  patch headers so mono→wall offset = <ns> instead of 0
+ *                       (simulates an NTP step between file opens — FID-7).
+ *   --rotate <name>     after writing, rename current.trace →
+ *                       <name>.trace.lz4 and current.summary →
+ *                       <name>.summary.lz4 (footers are present because the
+ *                       writers are closed first) and remove the .meta files.
+ *                       Lets a test build a multi-file trace dir by invoking
+ *                       the generator several times with the same -o dir.
  *
  * Event IDs: old_event/new_event/event are uint32 wait_event_info values.
  *   CPU = 0, IO:DataFileRead = 0x0A000001, Lock:relation = 0x03000001, etc.
@@ -74,6 +91,7 @@ struct scenario {
     struct pgwt_trace_event samples[MAX_EVENTS];
     int num_samples;
     uint64_t sample_period_ns;
+    int interleave;   /* write events+samples in global ts order */
 
     struct test_backend backends[MAX_TEST_BACKENDS];
     int num_backends;
@@ -270,6 +288,8 @@ static int parse_scenario(const char *json, struct scenario *sc)
         sc->sample_period_ns = strtoull(v, NULL, 10);
     if ((v = find_key(json, "samples")))
         parse_samples(v, sc);
+    if ((v = find_key(json, "interleave")))
+        sc->interleave = (int)strtol(v, NULL, 10);
 
     return 0;
 }
@@ -330,10 +350,46 @@ static int write_query_texts(const char *dir, struct scenario *sc)
     return 0;
 }
 
-static int write_traces(const char *dir, struct scenario *sc)
+/* Earliest timestamp in the scenario — the synthetic "mono" clock anchor. */
+static uint64_t scenario_first_ts(const struct scenario *sc)
+{
+    uint64_t first = UINT64_MAX;
+    for (int i = 0; i < sc->num_events; i++)
+        if (sc->events[i].timestamp_ns < first)
+            first = sc->events[i].timestamp_ns;
+    for (int i = 0; i < sc->num_samples; i++)
+        if (sc->samples[i].timestamp_ns < first)
+            first = sc->samples[i].timestamp_ns;
+    return first == UINT64_MAX ? 0 : first;
+}
+
+/* Re-anchor the (lazily opened) summary writer's clocks to the synthetic
+ * timestamp domain, so summary block wall timestamps come out as
+ * scenario_ts + wall_offset — coherent with the patched trace headers.
+ * Must run after the first push (which opens the file) and before the first
+ * second-boundary flush. Without this, summary blocks carry wall values
+ * derived from the real machine clocks and the summary path is untestable
+ * with synthetic data. */
+static void anchor_summary_clock(struct pgwt_summary_writer *sw,
+                                 uint64_t anchor_mono, uint64_t wall_offset_ns)
+{
+    if (!sw->fp)
+        return;
+    sw->clock_offset_mono_ns = anchor_mono;
+    sw->clock_offset_wall_ns = anchor_mono + wall_offset_ns;
+    /* Fix up the accumulator second opened by the first push. */
+    if (sw->accum_active)
+        sw->accum.second_wall_ns = sw->accum.second_mono_ns + wall_offset_ns;
+}
+
+static int write_traces(const char *dir, struct scenario *sc,
+                        uint64_t wall_offset_ns)
 {
     struct pgwt_event_writer ew;
     struct pgwt_summary_writer sw;
+    uint64_t anchor_mono = scenario_first_ts(sc);
+    anchor_mono = (anchor_mono / 1000000000ULL) * 1000000000ULL;
+    int summary_anchored = 0;
 
     if (pgwt_writer_init(&ew, dir, 18, 24, NULL) != 0) {
         fprintf(stderr, "Failed to init event writer\n");
@@ -345,24 +401,63 @@ static int write_traces(const char *dir, struct scenario *sc)
         pgwt_writer_destroy(&ew);
         return -1;
     }
+    #define PUSH_SUMMARY(evp) do { \
+        pgwt_summary_push_event(&sw, (evp)); \
+        if (!summary_anchored) { \
+            anchor_summary_clock(&sw, anchor_mono, wall_offset_ns); \
+            summary_anchored = 1; \
+        } \
+    } while (0)
 
-    /* TRANSITIONS block(s): the "events" array. Also feeds the summary
-     * writer (summaries are transition-based; sampled summaries are A3). */
-    for (int i = 0; i < sc->num_events; i++) {
-        if (pgwt_writer_push_event(&ew, &sc->events[i]) != 0) {
-            fprintf(stderr, "Failed to write event %d\n", i);
-            break;
+    if (sc->interleave) {
+        /* Realistic tiered block structure: walk events and samples in
+         * global timestamp order. Contiguous runs of samples are pushed as
+         * SAMPLES blocks; pgwt_writer_push_samples flushes any buffered
+         * transitions first, so transition blocks are split exactly where
+         * the sample stream interleaves — like the live daemon. */
+        int ei = 0, si = 0;
+        while (ei < sc->num_events || si < sc->num_samples) {
+            if (si >= sc->num_samples ||
+                (ei < sc->num_events &&
+                 sc->events[ei].timestamp_ns <= sc->samples[si].timestamp_ns)) {
+                if (pgwt_writer_push_event(&ew, &sc->events[ei]) != 0) {
+                    fprintf(stderr, "Failed to write event %d\n", ei);
+                    break;
+                }
+                PUSH_SUMMARY(&sc->events[ei]);
+                ei++;
+            } else {
+                /* Collect the contiguous run of samples before the next event */
+                int run = si;
+                while (run < sc->num_samples &&
+                       (ei >= sc->num_events ||
+                        sc->samples[run].timestamp_ns < sc->events[ei].timestamp_ns))
+                    run++;
+                if (pgwt_writer_push_samples(&ew, &sc->samples[si], run - si,
+                                             sc->sample_period_ns) != 0)
+                    fprintf(stderr, "Failed to write samples %d..%d\n", si, run);
+                si = run;
+            }
         }
-        pgwt_summary_push_event(&sw, &sc->events[i]);
-    }
+    } else {
+        /* TRANSITIONS block(s): the "events" array. Also feeds the summary
+         * writer (summaries are transition-based; sampled summaries are A3). */
+        for (int i = 0; i < sc->num_events; i++) {
+            if (pgwt_writer_push_event(&ew, &sc->events[i]) != 0) {
+                fprintf(stderr, "Failed to write event %d\n", i);
+                break;
+            }
+            PUSH_SUMMARY(&sc->events[i]);
+        }
 
-    /* SAMPLES block: the "samples" array (trace format v2). Written after
-     * the transitions so a scenario with both produces a transition block
-     * followed by a sample block. */
-    if (sc->num_samples > 0) {
-        if (pgwt_writer_push_samples(&ew, sc->samples, sc->num_samples,
-                                     sc->sample_period_ns) != 0)
-            fprintf(stderr, "Failed to write %d samples\n", sc->num_samples);
+        /* SAMPLES block: the "samples" array (trace format v2). Written after
+         * the transitions so a scenario with both produces a transition block
+         * followed by a sample block. */
+        if (sc->num_samples > 0) {
+            if (pgwt_writer_push_samples(&ew, sc->samples, sc->num_samples,
+                                         sc->sample_period_ns) != 0)
+                fprintf(stderr, "Failed to write %d samples\n", sc->num_samples);
+        }
     }
 
     /* Flush summary */
@@ -378,9 +473,10 @@ static int write_traces(const char *dir, struct scenario *sc)
     return 0;
 }
 
-/* ── Patch file headers so mono_to_wall = 0 ────────────────── */
+/* ── Patch file headers so mono_to_wall = wall_offset ─────── */
 
-static int patch_file_header(const char *path)
+static int patch_file_header(const char *path, uint64_t anchor_mono,
+                             uint64_t wall_offset_ns)
 {
     FILE *f = fopen(path, "r+b");
     if (!f) return -1;
@@ -391,10 +487,14 @@ static int patch_file_header(const char *path)
         return -1;
     }
 
-    /* Set start_time_ns = clock_offset_ns so mono_to_wall = 0
-     * This makes wall-clock timestamps equal to monotonic timestamps,
-     * allowing test scenarios to use known timestamp values. */
-    hdr.start_time_ns = hdr.clock_offset_ns;
+    /* Anchor the header clocks to the synthetic timestamp domain:
+     * clock_offset_ns (mono at open) = first scenario timestamp,
+     * start_time_ns (wall at open)   = same + wall_offset,
+     * so mono_to_wall = wall_offset (0 by default: wall == mono and test
+     * scenarios can use known values). A non-zero offset simulates an NTP
+     * step between file opens (FID-7). */
+    hdr.clock_offset_ns = anchor_mono;
+    hdr.start_time_ns = anchor_mono + wall_offset_ns;
 
     fseek(f, 0, SEEK_SET);
     if (fwrite(&hdr, sizeof(hdr), 1, f) != 1) {
@@ -406,17 +506,21 @@ static int patch_file_header(const char *path)
     return 0;
 }
 
-static int patch_trace_headers(const char *dir)
+static int patch_trace_headers(const char *dir, uint64_t anchor_mono,
+                               uint64_t wall_offset_ns)
 {
     DIR *d = opendir(dir);
     if (!d) return -1;
 
     struct dirent *ent;
     while ((ent = readdir(d)) != NULL) {
-        if (strstr(ent->d_name, ".trace") || strstr(ent->d_name, ".summary")) {
+        /* Only the files this run just wrote (current.*): repeated runs into
+         * one dir must not re-patch already-rotated files. */
+        if (strcmp(ent->d_name, "current.trace") == 0 ||
+            strcmp(ent->d_name, "current.summary") == 0) {
             char path[512];
             snprintf(path, sizeof(path), "%s/%s", dir, ent->d_name);
-            if (patch_file_header(path) != 0) {
+            if (patch_file_header(path, anchor_mono, wall_offset_ns) != 0) {
                 fprintf(stderr, "WARN: failed to patch header of %s\n", ent->d_name);
             }
         }
@@ -424,6 +528,28 @@ static int patch_trace_headers(const char *dir)
 
     closedir(d);
     return 0;
+}
+
+/* ── --rotate: turn current.* into archived hourly files ──── */
+
+static int rotate_output(const char *dir, const char *name)
+{
+    char oldp[600], newp[700];
+    int rc = 0;
+
+    snprintf(oldp, sizeof(oldp), "%s/current.trace", dir);
+    snprintf(newp, sizeof(newp), "%s/%s.trace.lz4", dir, name);
+    if (rename(oldp, newp) != 0) { perror(newp); rc = -1; }
+    snprintf(oldp, sizeof(oldp), "%s/current.trace.meta", dir);
+    unlink(oldp);
+
+    snprintf(oldp, sizeof(oldp), "%s/current.summary", dir);
+    snprintf(newp, sizeof(newp), "%s/%s.summary.lz4", dir, name);
+    rename(oldp, newp);   /* summary may not exist (samples-only scenario) */
+    snprintf(oldp, sizeof(oldp), "%s/current.summary.meta", dir);
+    unlink(oldp);
+
+    return rc;
 }
 
 /* ── Main ──────────────────────────────────────────────────── */
@@ -439,21 +565,27 @@ int main(int argc, char **argv)
     const char *outdir = NULL;
     const char *scenario_file = NULL;
     const char *inline_json = NULL;
+    const char *rotate_name = NULL;
+    uint64_t wall_offset_ns = 0;
 
     static struct option long_opts[] = {
-        {"output",  required_argument, NULL, 'o'},
-        {"scenario", required_argument, NULL, 's'},
-        {"inline",  required_argument, NULL, 'i'},
-        {"help",    no_argument,       NULL, 'h'},
+        {"output",      required_argument, NULL, 'o'},
+        {"scenario",    required_argument, NULL, 's'},
+        {"inline",      required_argument, NULL, 'i'},
+        {"wall-offset", required_argument, NULL, 'w'},
+        {"rotate",      required_argument, NULL, 'r'},
+        {"help",        no_argument,       NULL, 'h'},
         {NULL, 0, NULL, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "o:s:i:h", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "o:s:i:w:r:h", long_opts, NULL)) != -1) {
         switch (opt) {
         case 'o': outdir = optarg; break;
         case 's': scenario_file = optarg; break;
         case 'i': inline_json = optarg; break;
+        case 'w': wall_offset_ns = strtoull(optarg, NULL, 10); break;
+        case 'r': rotate_name = optarg; break;
         default:  usage(argv[0]); return 1;
         }
     }
@@ -493,12 +625,21 @@ int main(int argc, char **argv)
     int rc = 0;
     if (write_backends_jsonl(outdir, sc) != 0) rc = 1;
     if (write_query_texts(outdir, sc) != 0) rc = 1;
-    if (write_traces(outdir, sc) != 0) rc = 1;
+    if (write_traces(outdir, sc, wall_offset_ns) != 0) rc = 1;
 
-    /* Patch file headers so mono_to_wall = 0 (wall timestamps == mono timestamps).
-     * This is essential for test correctness: synthetic events use known monotonic
-     * timestamps, and we need the server to treat them as-is without offset. */
-    patch_trace_headers(outdir);
+    /* Patch file headers so mono_to_wall = wall_offset (default 0: wall
+     * timestamps == mono timestamps). Synthetic events use known monotonic
+     * timestamps; --wall-offset simulates an NTP step between files (FID-7). */
+    {
+        uint64_t anchor = scenario_first_ts(sc);
+        anchor = (anchor / 1000000000ULL) * 1000000000ULL;
+        patch_trace_headers(outdir, anchor, wall_offset_ns);
+    }
+
+    /* Optionally rotate this run's output aside so the next run can add
+     * another file to the same trace dir. */
+    if (rotate_name && rotate_output(outdir, rotate_name) != 0)
+        rc = 1;
 
     free(sc);
     return rc;
