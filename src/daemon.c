@@ -385,7 +385,15 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
          *           populated PlannedStmt.queryId. Same arg0 (QueryDesc*). */
         if (d->use_pg13_query_attr) {
             uint64_t es_va = pgwt_find_symbol_offset(bin, "standard_ExecutorStart");
-            uint64_t es_off = es_va > 0x400000 ? es_va - 0x400000 : es_va;
+            /* vaddr -> uprobe FILE offset via the ELF program headers. The
+             * old `va - 0x400000` non-PIE heuristic attached the probe to a
+             * dead byte on PIE builds — attach "succeeded", the probe never
+             * fired, query attribution was silently zero (study defect 1). */
+            uint64_t es_off = pgwt_vaddr_to_file_offset(bin, es_va);
+            if (es_va && !es_off)
+                fprintf(stderr, "WARN: cannot translate standard_ExecutorStart "
+                        "VA 0x%lx to a file offset in %s (PG13 query "
+                        "attribution disabled)\n", (unsigned long)es_va, bin);
             if (es_off) {
                 LIBBPF_OPTS(bpf_uprobe_opts, uprobe_opts, .retprobe = false);
                 d->skel->links.on_executor_start =
@@ -404,7 +412,11 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
             }
         } else {
             uint64_t qid_func_va = pgwt_find_symbol_offset(bin, "pgstat_report_query_id");
-            uint64_t qid_func_off = qid_func_va > 0x400000 ? qid_func_va - 0x400000 : qid_func_va;
+            uint64_t qid_func_off = pgwt_vaddr_to_file_offset(bin, qid_func_va);
+            if (qid_func_va && !qid_func_off)
+                fprintf(stderr, "WARN: cannot translate pgstat_report_query_id "
+                        "VA 0x%lx to a file offset in %s (query attribution "
+                        "disabled)\n", (unsigned long)qid_func_va, bin);
             if (qid_func_off) {
                 LIBBPF_OPTS(bpf_uprobe_opts, uprobe_opts, .retprobe = false);
                 d->skel->links.on_report_query_id =

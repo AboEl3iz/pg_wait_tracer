@@ -179,6 +179,77 @@ int main(void)
         CHECK((uint32_t)readback == 0xC0FFEE42u,
               "read-through-/proc/mem at resolved VA gave 0x%llx, not the magic",
               (unsigned long long)readback);
+
+        /* ── 3. vaddr -> uprobe FILE offset (the T2-study defect-1 class) ──
+         * The daemon computes uprobe file offsets from a symbol's st_value.
+         * The old `va - 0x400000` heuristic was a non-PIE assumption: on PIE
+         * builds the uprobe attached to a dead byte and NEVER fired,
+         * silently. pgwt_vaddr_to_file_offset must translate through the
+         * PT_LOAD program headers for BOTH ELF types (this test runs in the
+         * -pie and -no-pie builds).
+         *
+         * Proof "the offset lands on the symbol": the bytes in the FILE at
+         * the computed offset must equal the bytes in MEMORY at the symbol's
+         * runtime address — for a data object (the magic value) and for a
+         * function (the daemon probes functions). x86_64 text/data are not
+         * relocated in place, so file bytes == memory bytes. */
+        uint64_t data_off = pgwt_vaddr_to_file_offset(exe, sym_val);
+        CHECK(data_off != 0, "vaddr_to_file_offset(data symbol) returned 0");
+
+        FILE *ef = fopen(exe, "rb");
+        CHECK(ef != NULL, "cannot open own binary");
+        if (ef) {
+            /* Offset must land inside the file. */
+            fseek(ef, 0, SEEK_END);
+            long fsz = ftell(ef);
+            CHECK(data_off + 4 <= (uint64_t)fsz,
+                  "data offset 0x%llx beyond file size %ld",
+                  (unsigned long long)data_off, fsz);
+
+            uint32_t file_val = 0;
+            fseek(ef, (long)data_off, SEEK_SET);
+            CHECK(fread(&file_val, 1, 4, ef) == 4 && file_val == 0xC0FFEE42u,
+                  "file bytes at translated offset 0x%llx are 0x%x, not the "
+                  "magic — offset does not land on the symbol",
+                  (unsigned long long)data_off, file_val);
+
+            /* Function symbol — the actual uprobe use case. */
+            uint64_t fn_val = pgwt_find_symbol_offset(exe, "main");
+            CHECK(fn_val != 0, "cannot resolve 'main' in own binary");
+            uint64_t fn_off = pgwt_vaddr_to_file_offset(exe, fn_val);
+            CHECK(fn_off != 0, "vaddr_to_file_offset(function) returned 0");
+            CHECK(fn_off + 16 <= (uint64_t)fsz,
+                  "function offset 0x%llx beyond file size %ld",
+                  (unsigned long long)fn_off, fsz);
+
+            uint8_t file_bytes[16] = {0};
+            fseek(ef, (long)fn_off, SEEK_SET);
+            CHECK(fread(file_bytes, 1, 16, ef) == 16 &&
+                  memcmp(file_bytes, (const void *)(uintptr_t)main, 16) == 0,
+                  "file bytes at fn offset 0x%llx != memory bytes of main() — "
+                  "a uprobe at this offset would land on a dead/wrong byte "
+                  "(the PIE defect class)",
+                  (unsigned long long)fn_off);
+
+            /* The old heuristic must be provably wrong on at least one of
+             * the two builds: on PIE, st_value - 0x400000 (when applicable)
+             * must NOT equal the correct translation. On non-PIE, where
+             * p_offset == p_vaddr - image_base for the classic layout, the
+             * two may coincide — that coincidence is exactly why the bug
+             * shipped. Only assert the divergence where it must exist. */
+#if PGWT_TEST_EXPECT_PIE
+            uint64_t heuristic = fn_val > 0x400000 ? fn_val - 0x400000 : fn_val;
+            CHECK(heuristic != fn_off || fn_val <= 0x400000,
+                  "PIE: heuristic accidentally equals the real offset — "
+                  "fixture no longer covers the defect");
+#endif
+
+            /* A vaddr in no PT_LOAD (way past the image) must return 0. */
+            CHECK(pgwt_vaddr_to_file_offset(exe, 0x7FFFFFFFFFFFULL) == 0,
+                  "unmapped vaddr must translate to 0");
+
+            fclose(ef);
+        }
     }
 
     printf("\n%d/%d tests passed\n", ok, run);

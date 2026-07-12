@@ -138,6 +138,57 @@ static uint64_t elf_base_vaddr(const char *binary)
     return (base == UINT64_MAX) ? 0 : base;
 }
 
+/* Translate an ELF virtual address (e.g. a symbol's st_value) to the FILE
+ * offset a uprobe attach needs, via the program headers: find the PT_LOAD
+ * segment containing the vaddr and return vaddr - p_vaddr + p_offset.
+ * Correct for both ET_EXEC (non-PIE, where p_vaddr embeds the fixed image
+ * base) and ET_DYN (PIE, where p_vaddr is already file-relative but text
+ * segments still have p_vaddr != p_offset under separate-code layouts).
+ *
+ * This replaces the old `va - 0x400000` heuristic (daemon.c), which silently
+ * attached uprobes to a dead byte on PIE builds (PGDG Ubuntu/EL9: the probe
+ * NEVER fired — run_cnt 0 — while attach "succeeded"; T2 study defect 1).
+ * Returns 0 if no PT_LOAD contains the vaddr (0 is never a valid probe
+ * offset — it is the ELF header). */
+uint64_t pgwt_vaddr_to_file_offset(const char *binary, uint64_t vaddr)
+{
+    if (vaddr == 0)
+        return 0;
+    if (elf_version(EV_CURRENT) == EV_NONE)
+        return 0;
+
+    int fd = open(binary, O_RDONLY);
+    if (fd < 0)
+        return 0;
+
+    Elf *elf = elf_begin(fd, ELF_C_READ, NULL);
+    if (!elf) {
+        close(fd);
+        return 0;
+    }
+
+    uint64_t off = 0;
+    size_t phnum = 0;
+    elf_getphdrnum(elf, &phnum);
+    for (size_t i = 0; i < phnum; i++) {
+        GElf_Phdr phdr;
+        if (gelf_getphdr(elf, i, &phdr) == NULL)
+            continue;
+        if (phdr.p_type != PT_LOAD)
+            continue;
+        /* p_filesz (not p_memsz): a vaddr in a segment's .bss tail has no
+         * file bytes and cannot host a probe. */
+        if (vaddr >= phdr.p_vaddr && vaddr < phdr.p_vaddr + phdr.p_filesz) {
+            off = vaddr - phdr.p_vaddr + phdr.p_offset;
+            break;
+        }
+    }
+
+    elf_end(elf);
+    close(fd);
+    return off;
+}
+
 uint64_t pgwt_resolve_symbol(const char *binary, const char *symbol,
                              pid_t pid)
 {
