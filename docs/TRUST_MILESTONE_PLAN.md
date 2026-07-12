@@ -423,8 +423,20 @@ traces, enforced by CI.
 ### Phase T2 — AAS semantics: one definition, all paths (DECISION GATE)
 Owns: AAS-1, SMP-5; folds in the io_worker open question
 (REWORK_PLAN risk #6).
-**Decision needed before implementation** (ClientRead-class semantic
-call): what counts as an active session?
+**GATE PASSED (2026-07-12).** Empirical study: docs/T2_IOWORKER_STUDY.md;
+decision: docs/AAS_SEMANTICS_DECISION.md — the full decomposed model
+(active = non-idle wait + on-CPU; command-open gate for client
+backends, ungated for backgrounds whose idle is instrumented;
+categories foreground plan/exec/command-overhead + maintenance +
+background; io_workers excluded from AAS, surfaced as a busy%
+utilization metric). The study also registered three tracer defects
+for the implementation to absorb: (1) PIE uprobe attach offset
+(`va − 0x400000` heuristic → silently dead uprobes on PIE builds;
+prerequisite fix for the gate probe), (2) exit-record phantom CPU in
+traces, (3) in-trace samples/exact overlap observed on a pre-T1 build
+— re-verify on current master, likely already fixed.
+
+Original decision framing (superseded by the above):
 - Recommended: ASH standard — active = on-CPU + non-idle wait. Sampler
   records on-CPU samples (`we==0` for a backend in an active
   transaction/query) as first-class `CPU` samples; anomaly engine sees
