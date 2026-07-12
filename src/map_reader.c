@@ -170,6 +170,16 @@ void pgwt_read_state_map(struct pgwt_daemon *d)
 
     while (bpf_map_get_next_key(state_fd, &skey, &snext) == 0) {
         if (bpf_map_lookup_elem(state_fd, &snext, &sval) == 0) {
+            /* T2: entries without a live watchpoint are query-id/cmd-gate
+             * seeds — their last_event/last_ts are NOT interval state.
+             * Counting them fabricated an ever-growing open "CPU" interval
+             * per seeded backend (the live-view sibling of study defect 2).
+             * Only reached in tiered mode during escalation, where every
+             * ATTACHED backend has wp_live = 1 from the preseed. */
+            if (!sval.wp_live) {
+                skey = snext;
+                continue;
+            }
             uint64_t open_ns = now - sval.last_ts;
             uint32_t we = sval.last_event;
 

@@ -685,12 +685,14 @@ def phase_cpu_storm_escalation(pm_pid):
           + ("" if fires >= 1 else f" (tracer stderr tail: {err[-300:]!r})"))
 
     # No step artifact: every interior 1s bucket across the tier switch
-    # must show the storm. Pre-T2, sampled buckets read ~0.0 while exact
+    # must show the storm. The anomaly fires ~0.3-1 s into the storm, so
+    # starting the window at +0.7 s puts the sampled->exact switch INSIDE
+    # the asserted range. Pre-T2, sampled buckets read ~0.0 while exact
     # (escalated) buckets read ~3 — a hard step.
     resp = server_query(trace_dir, "aas",
-                        extra={"from": storm_from + 1_500_000_000,
-                               "to": storm_to - 1_500_000_000,
-                               "buckets": 6})
+                        extra={"from": storm_from + 700_000_000,
+                               "to": storm_to - 1_000_000_000,
+                               "buckets": 7})
     buckets = resp.get("buckets", [])
     check(len(buckets) >= 3, f"aas buckets across the tier switch "
           f"(got {len(buckets)}, fidelity={resp.get('fidelity')!r})")

@@ -55,17 +55,27 @@ def psql(sql):
 
 
 def prog_run_counts(bpftool):
-    """Parse `bpftool prog show`: BPF object names are truncated to 15
-    chars by the kernel, so match on prefixes. Returns {name: run_cnt}."""
+    """Parse `bpftool prog show`: entries are contiguous lines (no blank
+    separators) — a header line `<id>: <type>  name <name>  tag ...` with
+    `run_time_ns X run_cnt Y` appended when bpf_stats is enabled, followed
+    by indented detail lines. Parse statefully per line. BPF object names
+    are truncated to 15 chars by the kernel, so callers match prefixes.
+    Returns {name: run_cnt}."""
     out = subprocess.run([bpftool, "prog", "show"],
                          capture_output=True, text=True, timeout=15).stdout
     counts = {}
-    for block in out.split("\n\n"):
-        m = re.search(r'\bname\s+(\S+)', block)
-        if not m:
+    current = None
+    for line in out.splitlines():
+        if re.match(r'^\d+:', line):
+            m = re.search(r'\bname\s+(\S+)', line)
+            current = m.group(1) if m else None
+            if current is not None:
+                counts.setdefault(current, 0)
+        if current is None:
             continue
-        r = re.search(r'\brun_cnt\s+(\d+)', block)
-        counts[m.group(1)] = int(r.group(1)) if r else 0
+        r = re.search(r'\brun_cnt\s+(\d+)', line)
+        if r:
+            counts[current] = max(counts[current], int(r.group(1)))
     return counts
 
 
@@ -103,7 +113,7 @@ def main():
 
     tracer = subprocess.Popen(
         [TRACER, "--mode", "tiered", "--pid", str(pm_pid),
-         "--duration", "10", "--quiet", "--interval", "5"],
+         "--duration", "15", "--quiet", "--interval", "5"],
         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     try:
         time.sleep(3.0)   # BPF load + attach + initial scan
@@ -114,7 +124,12 @@ def main():
         time.sleep(1.0)
 
         # Read run counts WHILE the tracer still holds the programs.
+        check(tracer.poll() is None,
+              "tracer still running when run counts are read")
         counts = prog_run_counts(args.bpftool)
+        check(any(k.startswith("on_") for k in counts),
+              f"tracer's BPF programs visible to bpftool "
+              f"(saw {sorted(counts)[:12]})")
     finally:
         try:
             tracer.wait(timeout=15)
