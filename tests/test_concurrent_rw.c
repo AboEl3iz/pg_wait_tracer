@@ -76,6 +76,21 @@ static void writer_process(void)
             ts += ev.duration_ns;
         }
 
+        /* Also push a sampler tick per cycle so the DUR-8 batched-SAMPLES
+         * path races the reader exactly like tiered mode does. */
+        {
+            struct pgwt_trace_event samples[8];
+            for (int i = 0; i < 8; i++) {
+                samples[i] = (struct pgwt_trace_event){
+                    .timestamp_ns = ts,
+                    .pid = 2000 + (uint32_t)i,
+                    .new_event = 0x0A000015,
+                    .query_id = 54321,
+                };
+            }
+            pgwt_writer_push_samples(&w, samples, 8, 100000000ULL);
+        }
+
         /* Sleep to simulate real daemon timing */
         usleep(WRITE_INTERVAL_MS * 1000);
     }

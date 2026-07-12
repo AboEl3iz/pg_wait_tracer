@@ -17,6 +17,8 @@ test_sampler
 test_anomaly
 test_coop
 test_concurrent_rw
+test_durability
+test_query_text
 test_pg13_resolve
 test_discovery_pie
 test_discovery_nopie
