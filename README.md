@@ -416,6 +416,7 @@ per interval, no screen clearing).
 |------|-------|---------|-------------|
 | `--trace-dir <DIR>` | `-T` | disabled | Directory for trace files (enables recording) |
 | `--trace-retention <H>` | `-R` | 24 | Keep trace files for H hours |
+| `--retention-gb <G>` | — | off | Also cap total trace-dir size at G GiB (fractional allowed); oldest archives deleted first, the live current files never |
 | `--trace-group <GROUP>` | — | `dba` | Unix group for trace file access |
 
 ### Replay
@@ -928,47 +929,48 @@ same resources. Available via `interference` server endpoint.
 
 ## Trace File Format
 
-When `--trace-dir` is specified, the daemon (or interactive mode) writes raw
-events to disk in a columnar, LZ4-compressed format.
-
-### File layout
-
-```
-[File Header - 28 bytes]
-  magic: "PGWT"
-  version: 1
-  flags: 0x0001 (LZ4)
-  pg_version: major version (17, 18, ...)
-  start_time_ns: wall-clock (CLOCK_REALTIME)
-  clock_offset_ns: monotonic (CLOCK_MONOTONIC)
-
-[Block 0]
-  [Block Header - 28 bytes]
-    first/last timestamp, num_events, compressed/uncompressed size
-  [LZ4 Compressed Columnar Data]
-    Columns: timestamp (delta + varint), pid, old_event, new_event,
-             duration (varint), query_id
-
-[Block 1]
-  ...
-
-[Footer]
-  [Block Index - N x 16 bytes]
-    (first_timestamp, file_offset) per block
-  [Block Count - 4 bytes]
-```
+When `--trace-dir` is specified, the daemon writes raw events to disk in a
+columnar, LZ4-compressed format (trace format **v2**: typed blocks — exact
+TRANSITIONS from the watchpoint tier, SAMPLES from the always-on sampler).
+The full byte-level spec — endianness/packing, block types and columnar
+layouts, the footer, the `current.trace.meta` committed-block protocol, and
+the durability guarantees — lives in
+[docs/TRACE_FORMAT.md](docs/TRACE_FORMAT.md).
 
 ### File lifecycle
 
-- **Active file**: `current.trace` — being written, no footer. Not readable
-  by the C replay mode. Only rotated `.trace.lz4` files are readable.
-- **Rotation**: Every calendar hour, the current file is finalized (footer
-  written) and renamed to `YYYY-MM-DD_HH.trace.lz4`.
-- **Retention**: Files older than `--trace-retention` hours are deleted.
-  Cleanup runs every 60 ticks (60 x interval seconds).
-- **Block size**: 4096 events per block. Blocks are flushed when full or
-  on rotation.
-- **Compression ratio**: Typical ~36x (36 bytes/event raw, ~1 byte compressed).
+- **Active file**: `current.trace` — being written. Readable while live via
+  the `current.trace.meta` high watermark (this is how `pgwt-server` serves
+  the current hour).
+- **Rotation**: every calendar hour the current file is finalized (footer
+  written, fsynced) and renamed to `YYYY-MM-DD_HH.trace.lz4`. If that name
+  already exists (restart within the hour, DST fold), a collision-safe
+  `YYYY-MM-DD_HH.N.trace.lz4` is used — an existing archive is never
+  clobbered.
+- **Crash recovery**: on startup, a leftover `current.trace` /
+  `current.summary` (crash, `kill -9`, or previous clean shutdown) is
+  finalized — torn tail dropped, footer appended — and archived under a
+  collision-safe name. Existing data is **never truncated**: a daemon crash
+  loses at most the unflushed tail (< 1 block of transitions, < ~1 s of
+  samples), never a committed hour.
+- **Durability**: archives are fsynced at rotation/recovery. The in-progress
+  hour is committed to the OS page cache per block (survives daemon death;
+  an OS crash / power loss can lose it). See docs/TRACE_FORMAT.md for the
+  measured trade-off.
+- **Retention**: archives older than `--trace-retention` hours are deleted,
+  and `--retention-gb` additionally caps total directory size (oldest
+  archives deleted first). Cleanup runs every 60 ticks.
+- **Block size**: 4096 events per block; SAMPLES ticks are batched into
+  ~1 s blocks. Blocks are flushed when full, on batch timeout, and on
+  rotation.
+- **Compression ratio**: typical ~36x (36 bytes/event raw, ~1 byte compressed).
+
+> **PII note:** with recording enabled, `query_texts.jsonl` stores the raw
+> running SQL (inline literals included, unlike the normalized
+> `pg_stat_statements` text), and `backends.jsonl` stores usernames,
+> database names and client addresses. The files get the trace files'
+> `0640` / `--trace-group` permissions; there is no redaction option.
+> Treat the trace directory as sensitive.
 
 ## Wait Event Classes
 
