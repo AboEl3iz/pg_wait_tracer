@@ -200,6 +200,8 @@ struct pgwt_load_info {
     int      has_transitions;   /* a TRANSITIONS block contributed records */
     int      has_samples;       /* a SAMPLES record survived the merge */
     uint64_t sample_period_ns;  /* nominal sample interval (0 if no samples) */
+    int      overloaded;        /* DUR-9: hard load bound hit — result is
+                                   partial; handlers MUST error, not render */
 };
 
 struct pgwt_server {
@@ -699,17 +701,38 @@ get_cached_immutable(struct pgwt_server *srv, const char *path)
     return ce;
 }
 
+/* DUR-9: hard bound on the raw-load working array. Defaults to the same
+ * budget as the immutable-file cache (25% of RAM, capped at 2 GB); the
+ * PGWT_LOAD_MAX_EVENTS environment variable overrides it (tests use a tiny
+ * value to prove the bound fires as a structured error, never an OOM). */
+static int load_max_events(void)
+{
+    static int cached = 0;
+    if (cached)
+        return cached;
+    const char *env = getenv("PGWT_LOAD_MAX_EVENTS");
+    if (env && atoi(env) > 0)
+        cached = atoi(env);
+    else
+        cached = cache_max_events();
+    return cached;
+}
+
 /* Read events from a trace file for a MONO time range — on demand, no
  * caching. Opens file, seeks to the right blocks via block index, decodes
  * only the blocks that overlap [from_mono, to_mono]. Appends events at
  * *total (growing as needed) with timestamps left MONOTONIC. SAMPLES
  * records are normalized to interval shape (old_event = sampled event,
  * duration_ns = sample_period_ns) so the duration-based estimators apply
- * ASH math. */
+ * ASH math.
+ * DUR-9: `pid` != 0 pushes the pid filter into the load (events for other
+ * pids never enter the working array); *overloaded is set and the load
+ * stops when *total reaches load_max_events(). */
 static void load_file_range_mono(const char *path,
                                  uint64_t from_mono, uint64_t to_mono,
+                                 uint32_t pid,
                                  struct pgwt_trace_event **events,
-                                 int *total, int *cap)
+                                 int *total, int *cap, int *overloaded)
 {
     struct pgwt_event_reader reader;
     if (pgwt_reader_open(&reader, path) != 0)
@@ -717,6 +740,7 @@ static void load_file_range_mono(const char *path,
 
     int first_block = pgwt_reader_find_block(&reader, from_mono);
     struct pgwt_trace_event block_buf[PGWT_BLOCK_EVENTS];
+    int max_events = load_max_events();
 
     for (int b = first_block; b < reader.num_blocks; b++) {
         if (reader.block_index[b].timestamp_ns > to_mono)
@@ -731,7 +755,14 @@ static void load_file_range_mono(const char *path,
             uint64_t ts_mono = block_buf[i].timestamp_ns;
             if (ts_mono < from_mono) continue;
             if (ts_mono > to_mono) break;
+            if (pid != 0 && block_buf[i].pid != pid)
+                continue;
 
+            if (*total >= max_events) {
+                *overloaded = 1;
+                pgwt_reader_close(&reader);
+                return;
+            }
             if (*total >= *cap) {
                 *cap *= 2;
                 struct pgwt_trace_event *tmp = realloc(*events, *cap * sizeof(**events));
@@ -1298,14 +1329,26 @@ static struct pgwt_wfid window_fidelity(struct pgwt_server *srv,
  * the merge runs in the monotonic domain per clock generation).
  * When `info` is non-NULL it is filled with what actually contributed
  * (has_transitions / has_samples / sample_period_ns).
+ *
+ * DUR-9: `pid` != 0 is a pushdown of the request's pid filter — only that
+ * pid's events enter the working array, so a pid-filtered query over a long
+ * window costs memory proportional to ONE backend's events, not the whole
+ * window. Callers pass 0 when the compute needs cross-pid records that a
+ * uniform per-event filter would not see (variants reads every pid's
+ * exec/plan markers). The array is hard-bounded by load_max_events(): on
+ * overflow info->overloaded is set and handlers must emit the structured
+ * "window too large" error instead of rendering the partial result.
  */
 static struct pgwt_trace_event *
 server_load_events_fi(struct pgwt_server *srv,
                       uint64_t from_wall_ns, uint64_t to_wall_ns,
+                      uint32_t pid,
                       int *out_count, struct pgwt_load_info *info)
 {
     *out_count = 0;
     if (info) memset(info, 0, sizeof(*info));
+    int overloaded = 0;
+    int max_events = load_max_events();
 
     /* Rescan directory + refresh coverage/clock-domain state. */
     coverage_refresh(srv);
@@ -1327,7 +1370,8 @@ server_load_events_fi(struct pgwt_server *srv,
     int n_segs = 0;
     uint64_t sample_period_ns = 0;
 
-    for (int ci = 0; ci < srv->cov_count && n_segs < 256; ci++) {
+    for (int ci = 0; ci < srv->cov_count && n_segs < 256 && !overloaded;
+         ci++) {
         struct pgwt_file_cov *fc = &srv->cov[ci];
         if (!fc->valid)
             continue;
@@ -1350,20 +1394,26 @@ server_load_events_fi(struct pgwt_server *srv,
 
         if (fc->is_current) {
             /* On-demand: read only blocks in [from, to] */
-            load_file_range_mono(fc->path, from_m, to_m,
-                                 &events, &total, &cap);
+            load_file_range_mono(fc->path, from_m, to_m, pid,
+                                 &events, &total, &cap, &overloaded);
         } else {
             struct file_cache_entry *ce = get_cached_immutable(srv, fc->path);
             if (!ce || !ce->events) {
                 /* Cache miss (file too large or alloc failed) */
-                load_file_range_mono(fc->path, from_m, to_m,
-                                     &events, &total, &cap);
+                load_file_range_mono(fc->path, from_m, to_m, pid,
+                                     &events, &total, &cap, &overloaded);
             } else {
                 for (int i = 0; i < ce->count; i++) {
                     uint64_t ts = ce->events[i].timestamp_ns;
                     if (ts < from_m) continue;
                     if (ts > to_m) break;
+                    if (pid != 0 && ce->events[i].pid != pid)
+                        continue;
 
+                    if (total >= max_events) {
+                        overloaded = 1;
+                        break;
+                    }
                     if (total >= cap) {
                         cap *= 2;
                         struct pgwt_trace_event *tmp =
@@ -1439,7 +1489,13 @@ server_load_events_fi(struct pgwt_server *srv,
         info->has_transitions = has_transitions;
         info->has_samples = has_samples;
         info->sample_period_ns = has_samples ? sample_period_ns : 0;
+        info->overloaded = overloaded;
     }
+    if (overloaded)
+        fprintf(stderr, "ERROR: window too large: the requested range holds "
+                "more than %d events%s — narrow the time range%s\n",
+                max_events, pid ? " for this pid" : "",
+                pid ? "" : " or add a pid/query filter");
 
     *out_count = total;
     return events;
@@ -1577,6 +1633,28 @@ static void emit_unavailable(uint64_t req_id, enum pgwt_fidelity fid)
     emit_json(root);
 }
 
+/* DUR-9: the raw-load hard bound fired — the loaded array is PARTIAL.
+ * Rendering it would silently under-report; emit a structured error the
+ * client can present ("window too large") instead. Frees the partial array
+ * and returns 1 when the handler must stop. */
+static int reject_overload(const struct pgwt_request *req,
+                           struct pgwt_trace_event *events,
+                           const struct pgwt_load_info *info)
+{
+    if (!info->overloaded)
+        return 0;
+    free(events);
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddNumberToObject(root, "id", (double)req->id);
+    cJSON_AddStringToObject(root, "error", "window too large");
+    cJSON_AddStringToObject(root, "code", "window_too_large");
+    cJSON_AddNumberToObject(root, "max_events", load_max_events());
+    cJSON_AddStringToObject(root, "hint",
+        "narrow the time range or add a pid/query filter");
+    emit_json(root);
+    return 1;
+}
+
 /* ── Command handlers ─────────────────────────────────────── */
 
 static void handle_info(struct pgwt_server *srv, struct pgwt_request *req)
@@ -1634,7 +1712,9 @@ static void handle_aas(struct pgwt_server *srv, struct pgwt_request *req)
     } else {
         int count;
         struct pgwt_trace_event *events =
-            server_load_events_fi(srv, req->from_ns, req->to_ns, &count, &linfo);
+            server_load_events_fi(srv, req->from_ns, req->to_ns,
+                                  req->filter.pid, &count, &linfo);
+        if (reject_overload(req, events, &linfo)) return;
         pgwt_compute_aas(events, count, &req->filter, from, to, num_buckets,
                          detail_events, AAS_MAX_EVENT_SERIES, &aas);
         free(events);
@@ -1718,7 +1798,9 @@ static void handle_time_model(struct pgwt_server *srv, struct pgwt_request *req)
     } else {
         int count;
         struct pgwt_trace_event *events =
-            server_load_events_fi(srv, req->from_ns, req->to_ns, &count, &linfo);
+            server_load_events_fi(srv, req->from_ns, req->to_ns,
+                                  req->filter.pid, &count, &linfo);
+        if (reject_overload(req, events, &linfo)) return;
         pgwt_compute_time_model(events, count, &req->filter, wall_ms, &tm);
         free(events);
     }
@@ -1784,7 +1866,9 @@ static void handle_top_events(struct pgwt_server *srv, struct pgwt_request *req)
     } else {
         int count;
         struct pgwt_trace_event *events =
-            server_load_events_fi(srv, req->from_ns, req->to_ns, &count, &linfo);
+            server_load_events_fi(srv, req->from_ns, req->to_ns,
+                                  req->filter.pid, &count, &linfo);
+        if (reject_overload(req, events, &linfo)) return;
         pgwt_compute_top_events(events, count, &req->filter, wall_ms, &res);
         free(events);
     }
@@ -1855,7 +1939,9 @@ static void handle_top_sessions(struct pgwt_server *srv, struct pgwt_request *re
     } else {
         int count;
         struct pgwt_trace_event *events =
-            server_load_events_fi(srv, req->from_ns, req->to_ns, &count, &linfo);
+            server_load_events_fi(srv, req->from_ns, req->to_ns,
+                                  req->filter.pid, &count, &linfo);
+        if (reject_overload(req, events, &linfo)) return;
         pgwt_compute_top_sessions(events, count, &req->filter, wall_ms, &res);
         free(events);
     }
@@ -1908,9 +1994,12 @@ static void handle_top_queries(struct pgwt_server *srv, struct pgwt_request *req
 
     /* Use summaries for large ranges (>120s) for the class breakdown.
      * Always load raw events for lifecycle stats (exec/plan counts).
-     * Large files are read on-demand (not cached) so this is safe. */
-    all_events = server_load_events_fi(srv, req->from_ns, req->to_ns, &ecount,
-                                       &linfo);
+     * Large files are read on-demand (not cached) so this is safe.
+     * No pid pushdown: the lifecycle stats below read exec/plan markers
+     * across ALL pids (markers never pass the uniform filter). */
+    all_events = server_load_events_fi(srv, req->from_ns, req->to_ns, 0,
+                                       &ecount, &linfo);
+    if (reject_overload(req, all_events, &linfo)) return;
     if (!has_event_filter && should_use_summaries(srv, req, &wfid)) {
         pgwt_compute_top_queries_from_summaries(srv->trace_dir, from, to,
                                                  &req->filter, wall_ms, &res);
@@ -2162,7 +2251,9 @@ static void handle_heatmap(struct pgwt_server *srv, struct pgwt_request *req)
         int count;
         struct pgwt_load_info linfo = {0};
         struct pgwt_trace_event *events =
-            server_load_events_fi(srv, req->from_ns, req->to_ns, &count, &linfo);
+            server_load_events_fi(srv, req->from_ns, req->to_ns,
+                                  req->filter.pid, &count, &linfo);
+        if (reject_overload(req, events, &linfo)) return;
         enum pgwt_fidelity fid = load_fidelity(&linfo);
         if (pgwt_fidelity_unavailable(PGWT_REQ_EXACT, fid)) {
             free(events);
@@ -2229,7 +2320,9 @@ static void handle_session_timeline(struct pgwt_server *srv, struct pgwt_request
     int count;
     struct pgwt_load_info linfo = {0};
     struct pgwt_trace_event *events =
-        server_load_events_fi(srv, req->from_ns, req->to_ns, &count, &linfo);
+        server_load_events_fi(srv, req->from_ns, req->to_ns,
+                              req->filter.pid, &count, &linfo);
+    if (reject_overload(req, events, &linfo)) return;
 
     /* First pass: count matching events and collect unique PIDs */
     uint32_t pids[TIMELINE_MAX_PIDS];
@@ -2402,7 +2495,9 @@ static void handle_transitions(struct pgwt_server *srv, struct pgwt_request *req
     int count;
     struct pgwt_load_info linfo = {0};
     struct pgwt_trace_event *events =
-        server_load_events_fi(srv, req->from_ns, req->to_ns, &count, &linfo);
+        server_load_events_fi(srv, req->from_ns, req->to_ns,
+                              req->filter.pid, &count, &linfo);
+    if (reject_overload(req, events, &linfo)) return;
 
     /* Transitions need real old→new order: EXACT-required. */
     enum pgwt_fidelity fid = load_fidelity(&linfo);
@@ -2498,7 +2593,9 @@ static void handle_fingerprints(struct pgwt_server *srv, struct pgwt_request *re
     int count;
     struct pgwt_load_info linfo = {0};
     struct pgwt_trace_event *events =
-        server_load_events_fi(srv, req->from_ns, req->to_ns, &count, &linfo);
+        server_load_events_fi(srv, req->from_ns, req->to_ns,
+                              req->filter.pid, &count, &linfo);
+    if (reject_overload(req, events, &linfo)) return;
 
     /* Fingerprints aggregate transition sequences: EXACT-required. */
     enum pgwt_fidelity fid = load_fidelity(&linfo);
@@ -2552,7 +2649,9 @@ static void handle_lock_chains(struct pgwt_server *srv, struct pgwt_request *req
     int count;
     struct pgwt_load_info linfo = {0};
     struct pgwt_trace_event *events =
-        server_load_events_fi(srv, req->from_ns, req->to_ns, &count, &linfo);
+        server_load_events_fi(srv, req->from_ns, req->to_ns,
+                              req->filter.pid, &count, &linfo);
+    if (reject_overload(req, events, &linfo)) return;
 
     /* Lock-chain inference needs real wait/CPU overlap intervals: EXACT. */
     enum pgwt_fidelity fid = load_fidelity(&linfo);
@@ -2591,7 +2690,9 @@ static void handle_interference(struct pgwt_server *srv, struct pgwt_request *re
     int count;
     struct pgwt_load_info linfo = {0};
     struct pgwt_trace_event *events =
-        server_load_events_fi(srv, req->from_ns, req->to_ns, &count, &linfo);
+        server_load_events_fi(srv, req->from_ns, req->to_ns,
+                              req->filter.pid, &count, &linfo);
+    if (reject_overload(req, events, &linfo)) return;
 
     /* Interference scoring needs real simultaneous-wait overlap: EXACT. */
     enum pgwt_fidelity fid = load_fidelity(&linfo);
@@ -2630,7 +2731,9 @@ static void handle_concurrency(struct pgwt_server *srv, struct pgwt_request *req
     int count;
     struct pgwt_load_info linfo = {0};
     struct pgwt_trace_event *events =
-        server_load_events_fi(srv, req->from_ns, req->to_ns, &count, &linfo);
+        server_load_events_fi(srv, req->from_ns, req->to_ns,
+                              req->filter.pid, &count, &linfo);
+    if (reject_overload(req, events, &linfo)) return;
 
     /* Burst detection needs real simultaneous-wait intervals: EXACT. */
     enum pgwt_fidelity fid = load_fidelity(&linfo);
@@ -2748,7 +2851,12 @@ static void handle_variants(struct pgwt_server *srv, struct pgwt_request *req)
     int count;
     struct pgwt_load_info linfo = {0};
     struct pgwt_trace_event *events =
-        server_load_events_fi(srv, req->from_ns, req->to_ns, &count, &linfo);
+        server_load_events_fi(srv, req->from_ns, req->to_ns,
+                              /* no pid pushdown: variants read every pid's
+                               * exec/plan markers, which never pass the
+                               * uniform per-event filter */ 0,
+                              &count, &linfo);
+    if (reject_overload(req, events, &linfo)) return;
 
     /* Variants are built from marker-delimited transition sequences, which
      * only exist in full-fidelity data: EXACT-required. */
@@ -3018,7 +3126,14 @@ static void dump_summary(struct pgwt_server *srv)
     int count;
     struct pgwt_load_info linfo = {0};
     struct pgwt_trace_event *events =
-        server_load_events_fi(srv, from, to, &count, &linfo);
+        server_load_events_fi(srv, from, to, 0, &count, &linfo);
+    if (linfo.overloaded) {
+        printf("ERROR: window too large — more than %d events in range; "
+               "use the JSON interface with a narrower range\n",
+               load_max_events());
+        free(events);
+        return;
+    }
 
     /* Count sample vs transition records so a sampled-mode trace is visible
      * at a glance (A2 evidence: SAMPLES blocks landed). */
