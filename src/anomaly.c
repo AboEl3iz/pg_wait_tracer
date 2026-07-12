@@ -17,10 +17,9 @@
 
 /* ── Pure rule core (no BPF, no escalation) ───────────────────────────── */
 
-/* The on-CPU sample is never recorded by the sampler (build_batch skips
- * event 0). Idle waits (Activity class, Client:ClientRead) ARE in the batch
- * but must be excluded from "active sessions" exactly as the AAS/DB-Time views
- * do. We inline the same predicate here to keep the pure core dependency-free
+/* Idle waits (Activity class, Client:ClientRead) ARE in the batch but must
+ * be excluded from "active sessions" exactly as the AAS/DB-Time views do. We
+ * inline the same predicate here to keep the pure core dependency-free
  * (pgwt_is_idle_event lives in wait_event.c, which the unit test does not
  * link); the definition must stay in sync with pgwt_is_idle_event(). */
 static bool sample_is_idle(uint32_t wei)
@@ -37,8 +36,17 @@ void pgwt_anomaly_metrics_from_batch(const struct pgwt_trace_event *samples,
     int locks = 0;
     for (int i = 0; i < n; i++) {
         uint32_t we = samples[i].new_event;
-        if (we == 0 || sample_is_idle(we))
-            continue;   /* on-CPU or idle: not an active session */
+        /* T2 (AAS-1): the decomposed model. we==0 records in the batch are
+         * first-class CPU samples (the sampler already applied the
+         * command-open gate / per-type policy) — an on-CPU session IS an
+         * active session, so a pure CPU storm must move this metric.
+         * io_worker samples never count (their busy time shadow-copies the
+         * requesting backends' AioIoCompletion waits and is surfaced as a
+         * utilization metric instead — docs/AAS_SEMANTICS_DECISION.md). */
+        if (samples[i].flags & PGWT_EVENT_FLAG_IO_WORKER)
+            continue;
+        if (we != 0 && sample_is_idle(we))
+            continue;   /* instrumented idle: not an active session */
         active++;
         if (WE_CLASS(we) == PG_WAIT_LOCK)
             locks++;

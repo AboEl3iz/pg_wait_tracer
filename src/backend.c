@@ -169,8 +169,21 @@ static int preseed_state_map(struct pgwt_daemon *d, pid_t pid, uint64_t addr,
         }
 
         int state_fd = bpf_map__fd(d->skel->maps.state_map);
+        /* Preserve the command-open gate across the (re-)seed: the
+         * on_report_activity uprobe only fires on boundaries, so zeroing
+         * cmd_open here would mis-gate the backend until its next command
+         * flip (matters on tiered re-escalation mid-command). */
+        uint16_t prev_cmd_open = 0;
+        {
+            uint32_t k = pid;
+            struct pgwt_pid_state prev;
+            if (bpf_map_lookup_elem(state_fd, &k, &prev) == 0)
+                prev_cmd_open = prev.cmd_open;
+        }
         struct pgwt_pid_state init_state = {
             .last_event = current_wei,
+            .wp_live = 1,   /* a live watchpoint now owns last_event/last_ts */
+            .cmd_open = prev_cmd_open,
             .last_ts = attach_ts,
             .last_query_id = current_qid,
             .wait_event_addr = addr,
@@ -325,7 +338,8 @@ int pgwt_scan_existing_backends(struct pgwt_daemon *d)
          * else creates state_map entries in sampled mode). */
         if (!pgwt_mode_uses_watchpoints(d)) {
             be->attach_ts = now_ns();
-            pgwt_parse_cmdline(pid, &be->meta);
+            if (pgwt_parse_cmdline(pid, &be->meta) == 0)
+                be->meta_parsed = true;
             if (d->backend_meta)
                 pgwt_bm_write(d->backend_meta, pid, &be->meta);
 
@@ -362,7 +376,8 @@ int pgwt_scan_existing_backends(struct pgwt_daemon *d)
             continue;
         }
 
-        pgwt_parse_cmdline(pid, &be->meta);
+        if (pgwt_parse_cmdline(pid, &be->meta) == 0)
+            be->meta_parsed = true;
         if (d->backend_meta)
             pgwt_bm_write(d->backend_meta, pid, &be->meta);
 
@@ -585,7 +600,8 @@ int pgwt_handle_init(struct pgwt_daemon *d, pid_t pid, uint64_t addr)
         return -1;
     }
 
-    pgwt_parse_cmdline(pid, &be->meta);
+    if (pgwt_parse_cmdline(pid, &be->meta) == 0)
+        be->meta_parsed = true;
     if (d->backend_meta)
         pgwt_bm_write(d->backend_meta, pid, &be->meta);
 

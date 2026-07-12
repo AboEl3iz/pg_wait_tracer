@@ -38,6 +38,15 @@ volatile const u32 lightweight_mode = 0;   /* 0=full trace, 1=lightweight (no ri
 volatile const u32 skip_query_id = 0;      /* 1=skip query_id reads (saves 1 probe_read) */
 volatile const u64 debug_query_string_addr = 0; /* VA of debug_query_string global */
 
+/* Command-open gate (T2, docs/AAS_SEMANTICS_DECISION.md): per-PG-version
+ * BackendState enum values for the pgstat_report_activity uprobe. PG13-17:
+ * STATE_RUNNING=2, STATE_FASTPATH=4; PG18+ inserted STATE_STARTING so they
+ * shift to 3/5. 0 = gate unavailable (unknown version / attach failure):
+ * cmd_open then stays 0 and client-backend on-CPU samples are NOT recorded
+ * (loud daemon warning — under-count, never the ungated ~3x over-count). */
+volatile const u32 bs_state_running = 0;
+volatile const u32 bs_state_fastpath = 0;
+
 /* PG13 query attribution (Route B1): standard_ExecutorStart(QueryDesc*) uprobe
  * walks QueryDesc->plannedstmt->queryId (populated by pg_stat_statements' hook)
  * into the state_map query_id slot. 0 => disabled (the PG17+
@@ -231,6 +240,18 @@ int on_watchpoint(struct bpf_perf_event_data *ctx)
         /* Fast path: read wait_event directly (1 probe_read vs 2) */
         u32 new_event = read_wait_event_direct(st->wait_event_addr);
 
+        /* A sampled-tier seed entry (wp_live == 0) carries query_id /
+         * cmd_open only — its last_event/last_ts are NOT interval state.
+         * First watchpoint fire on such an entry (defensive: preseed runs
+         * before enable, CAP-8) starts interval tracking without closing a
+         * fabricated interval. */
+        if (!st->wp_live) {
+            st->last_event = new_event;
+            st->last_ts = bpf_ktime_get_ns();
+            st->wp_live = 1;
+            return 0;
+        }
+
         /* Skip redundant writes — watchpoint fires even if value unchanged */
         if (new_event == st->last_event)
             return 0;
@@ -245,12 +266,16 @@ int on_watchpoint(struct bpf_perf_event_data *ctx)
             /* Full trace: emit to ringbuf.
              * query_id comes from state_map cache, set by EXEC_START
              * marker (not read from shared memory here — avoids race
-             * where st_query_id and st_activity are out of sync). */
+             * where st_query_id and st_activity are out of sync).
+             * flags carries the command-open gate at emission so the LIVE
+             * accumulator can classify we==0 intervals; the trace encoding
+             * has no flags column (offline consumers use CMD markers). */
             struct pgwt_trace_event evt = {
                 .timestamp_ns = now,
                 .pid = pid,
                 .old_event = st->last_event,
                 .new_event = new_event,
+                .flags = st->cmd_open ? PGWT_EVENT_FLAG_CMD_OPEN : 0,
                 .duration_ns = duration,
                 .query_id = st->last_query_id,
             };
@@ -276,6 +301,7 @@ int on_watchpoint(struct bpf_perf_event_data *ctx)
         u32 new_event = read_wait_event(&wait_addr);
         struct pgwt_pid_state new_st = {
             .last_event = new_event,
+            .wp_live = 1,   /* created BY a live watchpoint */
             .last_ts = bpf_ktime_get_ns(),
             .last_query_id = 0,
             .be_entry_ptr = resolve_be_entry(),
@@ -354,23 +380,34 @@ int on_exit(struct trace_event_raw_sched_process_template *ctx)
     if (!st)
         return 0;
 
-    /* Close the last open interval */
     u64 now = bpf_ktime_get_ns();
-    u64 duration = now - st->last_ts;
 
-    if (lightweight_mode) {
-        accum_add(st->last_event, duration);
-    } else {
-        /* Emit final trace event (exit sentinel) */
-        struct pgwt_trace_event evt = {
-            .timestamp_ns = now,
-            .pid = pid,
-            .old_event = st->last_event,
-            .new_event = PGWT_EVENT_EXIT,
-            .duration_ns = duration,
-            .query_id = st->last_query_id,
-        };
-        emit_event(&evt);
+    /* Close the last open interval — ONLY if a live watchpoint was
+     * maintaining it. A sampled-tier seed entry (wp_live == 0) carries
+     * query_id/cmd_open only: last_ts is the SEED time, and "closing" it
+     * manufactured a phantom interval spanning the backend's whole sampled
+     * lifetime, mislabeled as its last_event (usually 0 = CPU) — T2 study
+     * defect 2: every pgbench disconnect back-filled ~120 s of phantom CPU
+     * into the trace. The sampled tier's data is the SAMPLES stream; there
+     * is no exact interval to close. */
+    if (st->wp_live) {
+        u64 duration = now - st->last_ts;
+
+        if (lightweight_mode) {
+            accum_add(st->last_event, duration);
+        } else {
+            /* Emit final trace event (exit sentinel) */
+            struct pgwt_trace_event evt = {
+                .timestamp_ns = now,
+                .pid = pid,
+                .old_event = st->last_event,
+                .new_event = PGWT_EVENT_EXIT,
+                .flags = st->cmd_open ? PGWT_EVENT_FLAG_CMD_OPEN : 0,
+                .duration_ns = duration,
+                .query_id = st->last_query_id,
+            };
+            emit_event(&evt);
+        }
     }
 
     /* Notify daemon */
@@ -510,6 +547,59 @@ int on_report_query_id(struct pt_regs *ctx)
     if (bpf_map_update_elem(&seen_query_ids, &query_id, &one, BPF_ANY))
         count_map_fail(PGWT_BPF_FAIL_SEEN_QIDS);
 
+    return 0;
+}
+
+/* ── Program: uprobe on pgstat_report_activity (command-open gate, T2) ────
+ * pgstat_report_activity(BackendState state, const char *cmd_str) is the
+ * function PostgreSQL itself uses to drive pg_stat_activity.state. Gating
+ * on it gives the tracer the exact same "active" window: query message
+ * received (STATE_RUNNING) -> command complete (STATE_IDLE /
+ * STATE_IDLEINTRANSACTION*), which INCLUDES parse, plan, bind, execute and
+ * commit/abort processing. The sampler reads cmd_open to decide whether a
+ * client backend's we==0 reading is a first-class CPU sample (in-command)
+ * or non-command churn (docs/AAS_SEMANTICS_DECISION.md: ungated counting
+ * measured ~3x true activity on chatty OLTP).
+ *
+ * While a watchpoint is live for the pid (full mode / tiered escalated),
+ * each gate FLIP also lands in the event stream as a CMD_START/CMD_END
+ * marker so offline consumers can classify exact-tier we==0 intervals the
+ * same way — no step artifact at tier switches.
+ *
+ * The uprobe only UPDATES existing state_map entries (like the query-id
+ * uprobes); entries are seeded by the scan/fork/preseed paths. Attached in
+ * every non-lightweight mode. */
+
+SEC("uprobe")
+int on_report_activity(struct pt_regs *ctx)
+{
+    if (!bs_state_running)
+        return 0;   /* gate unavailable for this PG version */
+
+    u32 state = (u32)PT_REGS_PARM1(ctx);
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    struct pgwt_pid_state *st = bpf_map_lookup_elem(&state_map, &pid);
+    if (!st)
+        return 0;
+
+    u16 open = (state == bs_state_running || state == bs_state_fastpath)
+             ? 1 : 0;
+    if (st->cmd_open == open)
+        return 0;   /* no boundary crossed (e.g. RUNNING -> RUNNING) */
+    st->cmd_open = open;
+
+    if (!lightweight_mode && st->wp_live) {
+        u32 marker = open ? PGWT_MARKER_CMD_START : PGWT_MARKER_CMD_END;
+        struct pgwt_trace_event evt = {
+            .timestamp_ns = bpf_ktime_get_ns(),
+            .pid = pid,
+            .old_event = marker,
+            .new_event = marker,
+            .duration_ns = 0,
+            .query_id = st->last_query_id,
+        };
+        emit_event(&evt);
+    }
     return 0;
 }
 

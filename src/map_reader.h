@@ -21,6 +21,11 @@ struct pgwt_event_stats {
 struct pgwt_pid_accum {
     uint32_t pid;
     bool     active;          /* has data */
+    /* T2: cached process category for live accumulation (0 = not yet
+     * resolved against the registry; else 1 + a PGWT_EVENT_FLAG_* category
+     * bit or 1 + 0 for foreground). Lets the hot event path skip the linear
+     * registry scan after the first event of a pid. */
+    uint32_t cat_flag_plus1;
     int      num_events;
     uint64_t db_time_ns;      /* total non-idle time */
     uint64_t cpu_time_ns;     /* event=0 time */

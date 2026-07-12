@@ -157,10 +157,18 @@ static void detach_all(struct pgwt_daemon *d)
             uint32_t key = (uint32_t)be->pid;
             struct pgwt_pid_state st;
             uint64_t qid = 0;
-            if (bpf_map_lookup_elem(state_fd, &key, &st) == 0)
+            uint16_t cmd_open = 0;
+            if (bpf_map_lookup_elem(state_fd, &key, &st) == 0) {
                 qid = st.last_query_id;   /* preserve the join key */
+                cmd_open = st.cmd_open;   /* preserve the command gate */
+            }
+            /* wp_live = 0: the entry is a query-id/cmd-gate seed again —
+             * on_exit must NOT close an interval from it (defect 2), and
+             * the next escalation's preseed re-arms it. */
             struct pgwt_pid_state seed = {
                 .last_event = 0,
+                .wp_live = 0,
+                .cmd_open = cmd_open,
                 .last_ts = now,
                 .last_query_id = qid,
                 .wait_event_addr = be->wp_addr,

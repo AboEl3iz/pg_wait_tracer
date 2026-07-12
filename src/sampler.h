@@ -33,6 +33,7 @@
 #define PGWT_SAMPLER_H
 
 #include "pg_wait_tracer.h"
+#include "cmdline.h"   /* enum pgwt_backend_type — drives the we==0 policy */
 
 #include <stdint.h>
 #include <sys/types.h>
@@ -51,6 +52,13 @@ struct pgwt_sample_target {
     int      is_shared;       /* 1 = addr verified in a MAP_SHARED mapping
                                * (batchable); anything else = per-pid read
                                * only (SMP-2) */
+    /* T2 (docs/AAS_SEMANTICS_DECISION.md): the decomposed-AAS inputs.
+     * backend_type decides the on-CPU (we==0) policy and the category flag
+     * stamped on the sample; cmd_open is the pg_stat_activity
+     * state='active' gate (BPF on_report_activity uprobe) that decides
+     * whether a CLIENT backend's we==0 reading is a CPU sample. */
+    enum pgwt_backend_type backend_type;
+    int      cmd_open;
 };
 
 /* Sampler read-health tracking (SMP-1). Pure state machine (unit-testable):
@@ -116,16 +124,40 @@ void pgwt_sampler_metrics(struct pgwt_daemon *d, struct pgwt_metrics *m);
 int pgwt_sampler_read_targets(const struct pgwt_sample_target *targets, int n,
                               uint32_t *out_vals, uint64_t *read_faults);
 
-/* Build the SAMPLES batch from targets + their freshly-read values. A target
- * whose value is on-CPU (event 0) is skipped (no wait to record). A value
- * with an INVALID class byte (CAP-2/5: garbage from a wrong offset) is
- * skipped too and counted in *invalid_reads (may be NULL) — garbage must
+/* Build the SAMPLES batch from targets + their freshly-read values.
+ *
+ * On-CPU (we==0) policy — the T2 decision (docs/AAS_SEMANTICS_DECISION.md):
+ *   - CLIENT (and UNKNOWN/unclassified) backends: recorded as a first-class
+ *     CPU sample (event id 0) ONLY while the command-open gate is set —
+ *     the pg_stat_activity state='active' window. A we==0 reading with the
+ *     gate closed is between-command churn: NOT recorded as activity, but
+ *     counted in *noncmd_cpu_skipped (may be NULL) for observability.
+ *   - background process types (checkpointer, bgwriter, walwriter,
+ *     autovacuum workers, parallel workers, io_workers, ...): we==0 always
+ *     records as CPU — their parked states are instrumented Activity-class
+ *     waits, so on-CPU unambiguously means working.
+ *
+ * Every record is stamped with an in-memory category flag from the target's
+ * backend_type (FLAG_IO_WORKER / FLAG_MAINT / FLAG_BACKGROUND; client and
+ * parallel workers are the unflagged foreground). Flags are never persisted
+ * — the anomaly engine and the live accumulator consume them (io_worker
+ * records must not enter AAS/DB Time).
+ *
+ * A value with an INVALID class byte (CAP-2/5: garbage from a wrong offset)
+ * is skipped and counted in *invalid_reads (may be NULL) — garbage must
  * never be recorded as data. `tick_ts` is the sample timestamp stamped on
  * every record. Returns the number of sample records written into out. */
 int pgwt_sampler_build_batch(const struct pgwt_sample_target *targets,
                              const uint32_t *vals, int n, uint64_t tick_ts,
                              struct pgwt_trace_event *out,
-                             uint64_t *invalid_reads);
+                             uint64_t *invalid_reads,
+                             uint64_t *noncmd_cpu_skipped);
+
+/* T2: category flag (PGWT_EVENT_FLAG_*) for a backend type, and the we==0
+ * recording policy. Pure helpers shared by the sampler and the server-side
+ * category tagging. */
+uint32_t pgwt_backend_type_flag(enum pgwt_backend_type bt);
+int      pgwt_cpu_sample_recordable(enum pgwt_backend_type bt, int cmd_open);
 
 /* SMP-3: effective sample period for the tick at `now_ns`, given the
  * previous tick's timestamp (0 = first tick → nominal). Late/missed ticks
@@ -142,14 +174,18 @@ enum pgwt_sampler_health_action
 pgwt_sampler_health_note(struct pgwt_sampler_health *h, int n_targets,
                          int n_read, int err_no, uint64_t now_ns);
 
-/* SMP-4: pid -> query_id join index over a dumped state_map. Entries are
- * sorted in place by pid; lookup is a binary search. */
+/* SMP-4: pid -> {query_id, cmd_open} join index over a dumped state_map.
+ * Entries are sorted in place by pid; lookup is a binary search. */
 struct pgwt_qid_entry {
     uint32_t pid;
     uint64_t query_id;
+    int      cmd_open;    /* command-open gate from the state_map (T2) */
 };
 void     pgwt_qid_index_sort(struct pgwt_qid_entry *entries, int n);
 uint64_t pgwt_qid_index_lookup(const struct pgwt_qid_entry *entries, int n,
                                uint32_t pid);
+/* Full-entry variant (query_id + cmd_open). NULL on miss. */
+const struct pgwt_qid_entry *
+pgwt_qid_index_get(const struct pgwt_qid_entry *entries, int n, uint32_t pid);
 
 #endif /* PGWT_SAMPLER_H */

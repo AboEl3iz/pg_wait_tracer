@@ -70,29 +70,37 @@ static void test_self_read(void)
           (unsigned long long)faults);
 }
 
-/* ── Test 2: build_batch skips on-CPU and encodes fields ──────────────── */
+/* ── Test 2: build_batch encodes fields; gated on-CPU skip is counted ──── */
 
 static void test_build_batch(void)
 {
-    printf("--- build_batch encoding + on-CPU skip ---\n");
+    printf("--- build_batch encoding + gated on-CPU skip ---\n");
 
     struct pgwt_sample_target targets[3] = {
-        { .pid = 1001, .wait_event_addr = 0x1000, .query_id = 111 },
-        { .pid = 1002, .wait_event_addr = 0x2000, .query_id = 222 },
-        { .pid = 1003, .wait_event_addr = 0x3000, .query_id = 333 },
+        { .pid = 1001, .wait_event_addr = 0x1000, .query_id = 111,
+          .backend_type = PGWT_BT_CLIENT },
+        /* client, command NOT open: its we==0 reading is between-command
+         * churn — not recorded, but counted (T2 decision). */
+        { .pid = 1002, .wait_event_addr = 0x2000, .query_id = 222,
+          .backend_type = PGWT_BT_CLIENT, .cmd_open = 0 },
+        { .pid = 1003, .wait_event_addr = 0x3000, .query_id = 333,
+          .backend_type = PGWT_BT_CLIENT },
     };
     uint32_t vals[3] = {
         WEI(PG_WAIT_IO, 0x01),  /* recorded */
-        0,                       /* on CPU — skipped */
+        0,                       /* on CPU, no command — skipped + counted */
         WEI(PG_WAIT_LWLOCK, 0x07),
     };
 
     struct pgwt_trace_event out[3];
     memset(out, 0xAA, sizeof(out));
     uint64_t ts = 0x123456789ABCULL;
-    int n = pgwt_sampler_build_batch(targets, vals, 3, ts, out, NULL);
+    uint64_t noncmd = 0;
+    int n = pgwt_sampler_build_batch(targets, vals, 3, ts, out, NULL, &noncmd);
 
-    CHECK(n == 2, "expected 2 records (1 on-CPU skipped), got %d", n);
+    CHECK(n == 2, "expected 2 records (1 non-command on-CPU skipped), got %d", n);
+    CHECK(noncmd == 1, "expected 1 non-command CPU skip counted, got %llu",
+          (unsigned long long)noncmd);
 
     /* Record 0 = target 0 */
     CHECK(out[0].timestamp_ns == ts, "ts mismatch");
@@ -103,13 +111,82 @@ static void test_build_batch(void)
     CHECK(out[0].duration_ns == 0, "duration must be 0 for samples");
     CHECK(out[0].query_id == 111, "query_id=%llu expected 111",
           (unsigned long long)out[0].query_id);
+    CHECK(out[0].flags == 0, "client sample carries no category flag");
 
-    /* Record 1 = target 2 (target 1 was on-CPU) */
+    /* Record 1 = target 2 (target 1 was gated on-CPU) */
     CHECK(out[1].pid == 1003, "pid=%u expected 1003", out[1].pid);
     CHECK(out[1].new_event == vals[2], "new_event=0x%x expected 0x%x",
           out[1].new_event, vals[2]);
     CHECK(out[1].query_id == 333, "query_id=%llu expected 333",
           (unsigned long long)out[1].query_id);
+}
+
+/* ── Test 2c: the T2 on-CPU policy (docs/AAS_SEMANTICS_DECISION.md) ────── */
+
+static void test_build_batch_cpu_policy(void)
+{
+    printf("--- build_batch on-CPU policy (T2 decomposed AAS) ---\n");
+
+    struct pgwt_sample_target targets[6] = {
+        /* client INSIDE a command: we==0 is a first-class CPU sample */
+        { .pid = 1, .query_id = 42, .backend_type = PGWT_BT_CLIENT,
+          .cmd_open = 1 },
+        /* client outside a command: skipped (counted) */
+        { .pid = 2, .backend_type = PGWT_BT_CLIENT, .cmd_open = 0 },
+        /* background types: we==0 always records (their idle states are
+         * instrumented Activity waits), each with its category flag */
+        { .pid = 3, .backend_type = PGWT_BT_CHECKPOINTER },
+        { .pid = 4, .backend_type = PGWT_BT_AUTOVAC_WORKER },
+        { .pid = 5, .backend_type = PGWT_BT_IO_WORKER },
+        /* parallel workers exist only inside a query: always CPU-recordable,
+         * foreground (no flag) */
+        { .pid = 6, .backend_type = PGWT_BT_PARALLEL_WORKER },
+    };
+    uint32_t vals[6] = { 0, 0, 0, 0, 0, 0 };
+
+    struct pgwt_trace_event out[6];
+    uint64_t noncmd = 0;
+    int n = pgwt_sampler_build_batch(targets, vals, 6, 7, out, NULL, &noncmd);
+
+    CHECK(n == 5, "expected 5 CPU records (1 gated out), got %d", n);
+    CHECK(noncmd == 1, "expected 1 gated skip, got %llu",
+          (unsigned long long)noncmd);
+
+    CHECK(out[0].pid == 1 && out[0].new_event == 0,
+          "in-command client CPU sample recorded as event 0");
+    CHECK(out[0].flags == 0, "client CPU sample is foreground (no flag)");
+    CHECK(out[0].query_id == 42, "CPU sample keeps its query_id");
+
+    CHECK(out[1].pid == 3 && out[1].flags == PGWT_EVENT_FLAG_BACKGROUND,
+          "checkpointer CPU sample flagged BACKGROUND");
+    CHECK(out[2].pid == 4 && out[2].flags == PGWT_EVENT_FLAG_MAINT,
+          "autovacuum worker CPU sample flagged MAINT");
+    CHECK(out[3].pid == 5 && out[3].flags == PGWT_EVENT_FLAG_IO_WORKER,
+          "io_worker CPU sample flagged IO_WORKER");
+    CHECK(out[4].pid == 6 && out[4].flags == 0,
+          "parallel worker CPU sample is foreground (no flag)");
+
+    /* Waits carry the category flag too (an io_worker's DataFileRead must
+     * be excludable from AAS by every consumer). */
+    uint32_t wvals[6] = { WEI(PG_WAIT_IO, 1), WEI(PG_WAIT_IO, 1),
+                          WEI(PG_WAIT_IO, 1), WEI(PG_WAIT_IO, 1),
+                          WEI(PG_WAIT_IO, 1), WEI(PG_WAIT_IO, 1) };
+    n = pgwt_sampler_build_batch(targets, wvals, 6, 8, out, NULL, NULL);
+    CHECK(n == 6, "all wait readings recorded, got %d", n);
+    CHECK(out[4].flags == PGWT_EVENT_FLAG_IO_WORKER,
+          "io_worker WAIT sample flagged IO_WORKER");
+    CHECK(out[1].flags == 0,
+          "client WAIT sample recorded even with command closed");
+
+    /* UNKNOWN type is conservative: gated like a client. */
+    struct pgwt_sample_target unk = { .pid = 9,
+                                      .backend_type = PGWT_BT_UNKNOWN };
+    uint32_t zero = 0;
+    n = pgwt_sampler_build_batch(&unk, &zero, 1, 9, out, NULL, NULL);
+    CHECK(n == 0, "UNKNOWN type we==0 is gated (command closed)");
+    unk.cmd_open = 1;
+    n = pgwt_sampler_build_batch(&unk, &zero, 1, 9, out, NULL, NULL);
+    CHECK(n == 1, "UNKNOWN type we==0 records when command open");
 }
 
 /* ── Test 2b: build_batch drops + counts garbage readings (CAP-2/5) ───── */
@@ -131,7 +208,7 @@ static void test_build_batch_garbage(void)
 
     struct pgwt_trace_event out[3];
     uint64_t invalid = 0;
-    int n = pgwt_sampler_build_batch(targets, vals, 3, 1, out, &invalid);
+    int n = pgwt_sampler_build_batch(targets, vals, 3, 1, out, &invalid, NULL);
 
     CHECK(n == 1, "expected 1 record (2 garbage dropped), got %d", n);
     CHECK(out[0].pid == 2001, "the valid record survived");
@@ -139,7 +216,7 @@ static void test_build_batch_garbage(void)
           (unsigned long long)invalid);
 
     /* NULL counter must not crash and must still drop garbage. */
-    n = pgwt_sampler_build_batch(targets, vals, 3, 1, out, NULL);
+    n = pgwt_sampler_build_batch(targets, vals, 3, 1, out, NULL, NULL);
     CHECK(n == 1, "NULL invalid counter: still 1 record, got %d", n);
 }
 
@@ -409,6 +486,7 @@ int main(void)
     test_self_read();
     test_build_batch();
     test_build_batch_garbage();
+    test_build_batch_cpu_policy();
     test_fallback();
     test_child_read();
     test_local_addr_not_batched();

@@ -171,11 +171,42 @@ static void handle_timer(struct pgwt_daemon *d)
             (double)(d->counters.samples_total - d->counters.prev_samples_total)
             / d->interval;
         d->counters.prev_samples_total = d->counters.samples_total;
+
+        /* T2: io_worker utilization over the last display interval. */
+        uint64_t iw_s = d->counters.io_worker_samples_total
+                      - d->counters.prev_io_worker_samples;
+        uint64_t iw_b = d->counters.io_worker_busy_total
+                      - d->counters.prev_io_worker_busy;
+        d->counters.io_worker_busy_pct =
+            iw_s > 0 ? 100.0 * (double)iw_b / (double)iw_s : 0.0;
+        d->counters.prev_io_worker_samples = d->counters.io_worker_samples_total;
+        d->counters.prev_io_worker_busy    = d->counters.io_worker_busy_total;
     }
 
     d->tick++;
     if (d->count > 0 && d->tick >= d->count)
         d->running = false;
+}
+
+/* SMP-5: arm the sampler timer ONE-SHOT with a +/-10% jittered period.
+ * Fixed-phase sampling aliases with periodic workloads (a job that wakes
+ * every 100 ms could hide from — or monopolize — a 10 Hz sampler forever);
+ * jittering each tick's phase breaks the lock-step. Total sample weight is
+ * unaffected: every tick is weighted by the MEASURED inter-tick elapsed
+ * time (SMP-3, pgwt_sampler_effective_period). */
+static void arm_sample_timer_jittered(struct pgwt_daemon *d)
+{
+    int hz = d->sample_rate_hz > 0 ? d->sample_rate_hz : 10;
+    uint64_t period_ns = 1000000000ULL / (uint64_t)hz;
+    uint64_t jitter = period_ns / 10;
+    /* period in [0.9p, 1.1p] — rand() is plenty for phase decorrelation. */
+    uint64_t armed = period_ns - jitter
+                   + (uint64_t)rand() % (2 * jitter + 1);
+    struct itimerspec sits = {
+        .it_value = { .tv_sec  = (time_t)(armed / 1000000000ULL),
+                      .tv_nsec = (long)(armed % 1000000000ULL) },
+    };
+    timerfd_settime(d->sample_timer_fd, 0, &sits, NULL);
 }
 
 static void handle_sample_timer(struct pgwt_daemon *d)
@@ -186,9 +217,13 @@ static void handle_sample_timer(struct pgwt_daemon *d)
      * those samples are gone. The sampler compensates by weighting each tick
      * with the MEASURED inter-tick elapsed time (see pgwt_sampler_poll), so
      * the loss is in resolution, not in total weight. Count it so a chronic
-     * stall is visible on the control socket. */
+     * stall is visible on the control socket. (One-shot arming makes >1
+     * unlikely, but a stalled daemon can still miss re-arms late.) */
     if (r == (ssize_t)sizeof(expirations) && expirations > 1)
         d->counters.sampler_ticks_missed_total += expirations - 1;
+    /* Re-arm FIRST so a slow poll delays the next tick (measured-elapsed
+     * weighting absorbs it) instead of bursting. */
+    arm_sample_timer_jittered(d);
     if (d->provider && d->provider->poll)
         d->provider->poll(d);
 }
@@ -302,6 +337,21 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
     d->skel->rodata->st_query_id_offset = d->st_query_id_offset;
     d->skel->rodata->lightweight_mode = d->lightweight_mode;
     d->skel->rodata->skip_query_id = d->skip_query_id;
+
+    /* Command-open gate (T2): BackendState enum values for this PG version.
+     * PG13-17: STATE_RUNNING=2, STATE_FASTPATH=4. PG18 inserted
+     * STATE_STARTING after STATE_UNDEFINED, shifting them to 3/5 (verified
+     * against REL_13/16/17/18_STABLE backend_status.h/pgstat.h). An unknown
+     * version leaves 0 = gate disabled (loud warning below): client on-CPU
+     * samples are then NOT recorded — an honest under-count, never the
+     * ungated ~3x over-count. */
+    if (d->pg_major_version >= 18) {
+        d->skel->rodata->bs_state_running  = 3;
+        d->skel->rodata->bs_state_fastpath = 5;
+    } else if (d->pg_major_version >= 13) {
+        d->skel->rodata->bs_state_running  = 2;
+        d->skel->rodata->bs_state_fastpath = 4;
+    }
 
     /* PG13 query attribution (Route B1): the ExecutorStart uprobe walks
      * QueryDesc->plannedstmt->queryId into the state_map. Enabled only when
@@ -426,6 +476,42 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
                     fprintf(stderr, "INFO: pgstat_report_query_id at offset 0x%lx\n",
                             (unsigned long)qid_func_off);
             }
+        }
+
+        /* Command-open gate uprobe (T2): pgstat_report_activity(state, ...)
+         * maintains cmd_open in the state_map — the pg_stat_activity
+         * state='active' window the sampler gates client on-CPU samples on,
+         * and (while watchpoints are live) the CMD_START/CMD_END markers the
+         * exact tier's we==0 classification uses. Attached in every
+         * non-lightweight mode, like the query_id uprobe. Failure is loud:
+         * without the gate, client CPU is not sampled — the CPU half of AAS
+         * silently disappears for client backends otherwise. */
+        {
+            uint64_t act_va = pgwt_find_symbol_offset(bin, "pgstat_report_activity");
+            uint64_t act_off = pgwt_vaddr_to_file_offset(bin, act_va);
+            if (act_off && d->skel->rodata->bs_state_running != 0) {
+                LIBBPF_OPTS(bpf_uprobe_opts, act_opts, .retprobe = false);
+                d->skel->links.on_report_activity =
+                    bpf_program__attach_uprobe_opts(d->skel->progs.on_report_activity,
+                                                    -1, bin, act_off, &act_opts);
+                if (d->verbose && d->skel->links.on_report_activity)
+                    fprintf(stderr, "INFO: pgstat_report_activity at offset 0x%lx "
+                            "(command-open gate)\n", (unsigned long)act_off);
+            }
+            d->cmd_gate_active = (d->skel->links.on_report_activity != NULL);
+            if (!d->skel->links.on_report_activity)
+                fprintf(stderr,
+                        "WARN: command-open gate unavailable (%s) — on-CPU "
+                        "samples for CLIENT backends will NOT be recorded; "
+                        "sampled AAS under-counts CPU-bound client activity. "
+                        "Background/parallel-worker CPU is unaffected.\n",
+                        act_va == 0
+                            ? "symbol 'pgstat_report_activity' not found"
+                            : (act_off == 0
+                                   ? "cannot translate VA to file offset"
+                                   : (d->skel->rodata->bs_state_running == 0
+                                          ? "unknown BackendState layout for this PG version"
+                                          : "uprobe attach failed")));
         }
 
         /* USDT marker probes write into event_ringbuf, which only the FULL
@@ -600,22 +686,16 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
     timerfd_settime(d->timer_fd, 0, &its, NULL);
 
     /* High-rate sampler timer (sampled/tiered tiers): fires at sample_rate_hz
-     * independently of the per-second display interval. */
+     * independently of the per-second display interval. Armed ONE-SHOT with
+     * per-tick phase jitter (SMP-5) and re-armed after every poll. */
     if (d->provider && d->provider->fidelity == PGWT_FIDELITY_SAMPLED) {
         d->sample_timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC);
         if (d->sample_timer_fd < 0) {
             perror("timerfd_create (sampler)");
             goto fail;
         }
-        int hz = d->sample_rate_hz > 0 ? d->sample_rate_hz : 10;
-        uint64_t period_ns = 1000000000ULL / (uint64_t)hz;
-        struct itimerspec sits = {
-            .it_interval = { .tv_sec = (time_t)(period_ns / 1000000000ULL),
-                             .tv_nsec = (long)(period_ns % 1000000000ULL) },
-            .it_value    = { .tv_sec = (time_t)(period_ns / 1000000000ULL),
-                             .tv_nsec = (long)(period_ns % 1000000000ULL) },
-        };
-        timerfd_settime(d->sample_timer_fd, 0, &sits, NULL);
+        srand((unsigned)(time(NULL) ^ getpid()));
+        arm_sample_timer_jittered(d);
     }
 
     /* Create signal fd */
