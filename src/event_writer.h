@@ -8,6 +8,7 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <time.h>
 #include <sys/types.h>
 
 /* ── On-disk format constants ─────────────────────────────── */
@@ -17,6 +18,25 @@
 #define PGWT_FLAG_LZ4         0x0001
 
 #define PGWT_BLOCK_EVENTS     4096         /* events per block */
+
+/* Hard cap on blocks per trace/summary file (DUR-7/8). The writer forces an
+ * early rotation when a file reaches it; readers use it as the sanity cap for
+ * footer block counts and meta committed counts (a corrupted footer/meta must
+ * never drive a multi-GB allocation). 1M blocks = a 16 MB footer index; with
+ * ~1 s SAMPLES batching even 1000 Hz × 1024 backends (≈250 full blocks/s)
+ * stays under it for a full hour (~900k blocks). Readers accept up to
+ * PGWT_MAX_READ_BLOCKS (4×) to cover blocks written between the writer cap
+ * being hit and the forced rotation taking effect. */
+#define PGWT_MAX_FILE_BLOCKS  (1024 * 1024)
+#define PGWT_MAX_READ_BLOCKS  (4 * PGWT_MAX_FILE_BLOCKS)
+
+/* Reader/recovery sanity cap for one compressed block (matches the historic
+ * fallback-scan cap; a real block is ≤ ~190 KB uncompressed). */
+#define PGWT_MAX_BLOCK_COMPRESSED (10u * 1024 * 1024)
+
+/* DUR-8: batch buffered sample-type records into ~1 s blocks instead of one
+ * tiny block per sampler tick (~10× fewer blocks at 10 Hz). */
+#define PGWT_SAMPLE_BATCH_NS  1000000000ULL
 
 /* Block type (trace format v2). Identifies what a block's columns mean.
  *   TRANSITIONS — wait-event transition intervals (exact fidelity): the
@@ -84,6 +104,7 @@ struct pgwt_event_writer {
     char          trace_dir[256];
     int           pg_version;
     int           retention_hours;
+    uint64_t      retention_bytes;  /* size cap for archived files (0 = off) */
     gid_t         trace_gid;      /* group for trace files, (gid_t)-1 = no chown */
     bool          enabled;
     bool          verbose;
@@ -92,6 +113,7 @@ struct pgwt_event_writer {
     FILE         *fp;
     char          current_path[512];
     int           current_hour;           /* day*24 + hour for rotation */
+    bool          force_rotate;           /* block cap reached — rotate now */
     uint64_t      file_start_wall_ns;
     uint64_t      file_start_mono_ns;
 
@@ -103,6 +125,16 @@ struct pgwt_event_writer {
     /* Event buffer (current block) */
     struct pgwt_trace_event events[PGWT_BLOCK_EVENTS];
     int           num_events;
+
+    /* Pending sample-type record buffer (DUR-8): many small pushes (one per
+     * sampler tick) are batched into ~1 s blocks. Type-agnostic — any
+     * non-TRANSITIONS block type routed through pgwt_writer_push_samples'
+     * buffering path shares it; a type or period change flushes first. */
+    struct pgwt_trace_event sample_buf[PGWT_BLOCK_EVENTS];
+    int           num_sample_buf;
+    uint16_t      sample_buf_type;        /* enum pgwt_block_type of batch */
+    uint64_t      sample_buf_period_ns;   /* period of the first batched push */
+    uint64_t      sample_buf_weight_ns;   /* Σ period_i per record (weighted mean) */
 
     /* Scratch buffers (allocated once) */
     uint8_t      *encode_buf;
@@ -138,8 +170,27 @@ int  pgwt_writer_push_samples(struct pgwt_event_writer *w,
 
 int  pgwt_writer_check_rotation(struct pgwt_event_writer *w);
 int  pgwt_writer_close(struct pgwt_event_writer *w);
+
+/* Retention (DUR-3). Deletes archived files past retention_hours (if > 0),
+ * cleans orphans (stale current.*.meta / *.meta.tmp with no writer), and —
+ * when retention_bytes > 0 — deletes the OLDEST archived .trace.lz4 /
+ * .summary.lz4 / preserved .corrupt files until total trace-dir usage fits
+ * under the cap. Never touches the live current.trace / current.summary or
+ * the sidecar .jsonl files. */
 int  pgwt_writer_cleanup_old_files(struct pgwt_event_writer *w);
 void pgwt_writer_destroy(struct pgwt_event_writer *w);
+
+/* ── Shared file-lifecycle helpers (used by summary_writer too) ── */
+
+/* Build a collision-safe archive path "<dir>/YYYY-MM-DD_HH<ext>"; if that
+ * exists, "<dir>/YYYY-MM-DD_HH.<n><ext>" for the first free n (DUR-2: a
+ * restart mid-hour or a DST fold must never clobber an existing archive).
+ * Returns 0 on success, -1 if no free name could be found. */
+int pgwt_archive_path_nonclobber(const char *dir, const struct tm *tm,
+                                 const char *ext, char *out, size_t out_size);
+
+/* fsync a directory so a just-renamed file survives power loss (DUR-5). */
+void pgwt_fsync_dir(const char *dir);
 
 /* ── Exposed for unit testing ─────────────────────────────── */
 

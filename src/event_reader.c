@@ -75,7 +75,12 @@ int pgwt_reader_open(struct pgwt_event_reader *r, const char *path)
         FILE *mf = fopen(meta_path, "r");
         if (mf) {
             int committed = 0;
-            if (fscanf(mf, "%d", &committed) == 1 && committed > 0) {
+            /* DUR-7: the committed count sizes an allocation and drives the
+             * scan — cap it like the footer count, and give the block scan
+             * the same per-block sanity caps as the fallback scan (a corrupt
+             * meta or torn block header must never seek us into garbage). */
+            if (fscanf(mf, "%d", &committed) == 1 && committed > 0 &&
+                committed < PGWT_MAX_READ_BLOCKS) {
                 /* Scan exactly 'committed' blocks sequentially */
                 fseek(r->fp, (long)sizeof(struct pgwt_trace_file_header),
                       SEEK_SET);
@@ -86,7 +91,9 @@ int pgwt_reader_open(struct pgwt_event_reader *r, const char *path)
                     struct pgwt_trace_block_header bh;
                     while (r->num_blocks < committed &&
                            fread(&bh, sizeof(bh), 1, r->fp) == 1 &&
-                           bh.compressed_size > 0 && bh.num_events > 0) {
+                           bh.compressed_size > 0 && bh.num_events > 0 &&
+                           bh.num_events <= PGWT_BLOCK_EVENTS &&
+                           bh.compressed_size <= PGWT_MAX_BLOCK_COMPRESSED) {
                         long off = ftell(r->fp) - (long)sizeof(bh);
                         r->block_index[r->num_blocks++] =
                             (struct pgwt_block_index_entry){
@@ -114,7 +121,7 @@ int pgwt_reader_open(struct pgwt_event_reader *r, const char *path)
         uint32_t nb = 0;
         if (fseek(r->fp, -4, SEEK_END) == 0 &&
             fread(&nb, sizeof(nb), 1, r->fp) == 1 &&
-            nb > 0 && nb < 100000) {  /* sanity: < 100K blocks */
+            nb > 0 && nb < PGWT_MAX_READ_BLOCKS) {  /* sanity cap */
             long index_start = ftell(r->fp) - 4
                              - (long)nb * (long)sizeof(struct pgwt_block_index_entry);
             if (index_start >= (long)sizeof(struct pgwt_trace_file_header)) {
@@ -123,8 +130,26 @@ int pgwt_reader_open(struct pgwt_event_reader *r, const char *path)
                 if (r->block_index &&
                     fread(r->block_index, sizeof(struct pgwt_block_index_entry),
                           nb, r->fp) == nb) {
-                    r->num_blocks = (int)nb;
-                    have_index = 1;
+                    /* DUR-7: a footer-less file's trailing bytes can decode
+                     * as a plausible count. A REAL index has its first block
+                     * right after the header and strictly increasing,
+                     * in-bounds offsets — verify before trusting it. */
+                    int valid =
+                        r->block_index[0].file_offset ==
+                        sizeof(struct pgwt_trace_file_header);
+                    for (uint32_t i = 1; valid && i < nb; i++)
+                        if (r->block_index[i].file_offset <=
+                                r->block_index[i - 1].file_offset ||
+                            r->block_index[i].file_offset >=
+                                (uint64_t)index_start)
+                            valid = 0;
+                    if (valid) {
+                        r->num_blocks = (int)nb;
+                        have_index = 1;
+                    } else {
+                        free(r->block_index);
+                        r->block_index = NULL;
+                    }
                 } else {
                     free(r->block_index);
                     r->block_index = NULL;
@@ -147,7 +172,7 @@ int pgwt_reader_open(struct pgwt_event_reader *r, const char *path)
         while (fread(&bh, sizeof(bh), 1, r->fp) == 1 &&
                bh.compressed_size > 0 && bh.num_events > 0 &&
                bh.num_events <= PGWT_BLOCK_EVENTS &&
-               bh.compressed_size <= 10 * 1024 * 1024) {
+               bh.compressed_size <= PGWT_MAX_BLOCK_COMPRESSED) {
             if (r->num_blocks >= cap) {
                 cap *= 2;
                 struct pgwt_block_index_entry *tmp =
@@ -237,6 +262,12 @@ int pgwt_reader_decode_block_info(struct pgwt_event_reader *r, int block_idx,
         info->first_timestamp_ns = bh.first_timestamp_ns;
         info->last_timestamp_ns  = bh.last_timestamp_ns;
     }
+
+    /* Unknown block type (written by a NEWER build): skip the block rather
+     * than decode it with the wrong columnar layout — garbage must never be
+     * surfaced as data. */
+    if (bh.block_type > PGWT_BLOCK_SAMPLES)
+        return -1;
 
     int count = (int)bh.num_events;
     if (count > max_events) count = max_events;
