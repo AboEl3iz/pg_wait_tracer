@@ -603,9 +603,14 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
             goto fail;
         }
         d->event_writer->verbose = d->verbose;
+        /* DUR-3: optional size cap on top of the hours-based retention. */
+        if (d->trace_retention_gb > 0)
+            d->event_writer->retention_bytes =
+                (uint64_t)(d->trace_retention_gb * 1024.0 * 1024.0 * 1024.0);
         if (d->verbose)
-            fprintf(stderr, "INFO: trace writer: %s (retention %dh)\n",
-                    d->trace_dir, ret);
+            fprintf(stderr, "INFO: trace writer: %s (retention %dh%s)\n",
+                    d->trace_dir, ret,
+                    d->event_writer->retention_bytes ? ", size-capped" : "");
 
         /* Init summary writer (alongside event writer) */
         d->summary_writer = calloc(1, sizeof(*d->summary_writer));
@@ -628,7 +633,8 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
             if (d->query_text_capture) {
                 if (pgwt_qt_init(d->query_text_capture, d->trace_dir,
                                   d->my_be_entry_addr,
-                                  d->st_activity_offset) != 0) {
+                                  d->st_activity_offset,
+                                  d->event_writer->trace_gid) != 0) {
                     free(d->query_text_capture);
                     d->query_text_capture = NULL;
                 } else {

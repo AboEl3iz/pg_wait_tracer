@@ -25,10 +25,11 @@ GEN_BIN = os.path.join(SCRIPT_DIR, "gen_test_traces")
 class ServerHarness:
     """Manages a pgwt-server subprocess for testing."""
 
-    def __init__(self, trace_dir):
+    def __init__(self, trace_dir, env=None):
         self.trace_dir = trace_dir
         self.proc = None
         self._next_id = 1
+        self._extra_env = env  # extra environment vars for pgwt-server
 
     def __enter__(self):
         self.start()
@@ -40,12 +41,17 @@ class ServerHarness:
     def start(self):
         if not os.path.exists(SERVER_BIN):
             raise FileNotFoundError(f"pgwt-server not found at {SERVER_BIN}")
+        env = None
+        if self._extra_env:
+            env = dict(os.environ)
+            env.update({k: str(v) for k, v in self._extra_env.items()})
         self.proc = subprocess.Popen(
             [SERVER_BIN, self.trace_dir],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            env=env,
         )
         # Query info to get time range, then expand slightly so all events
         # in the first/last block are included
@@ -130,7 +136,14 @@ def generate_traces(scenario, output_dir=None, wall_offset_ns=None, rotate=None)
         )
 
     scenario_json = json.dumps(scenario)
-    cmd = [GEN_BIN, "-o", output_dir, "--inline", scenario_json]
+    if len(scenario_json) > 65536:
+        # Large scenarios exceed the OS argv limit — pass via a file.
+        scenario_path = os.path.join(output_dir, "_scenario.json")
+        with open(scenario_path, "w") as f:
+            f.write(scenario_json)
+        cmd = [GEN_BIN, "-o", output_dir, "-s", scenario_path]
+    else:
+        cmd = [GEN_BIN, "-o", output_dir, "--inline", scenario_json]
     if wall_offset_ns is not None:
         cmd += ["--wall-offset", str(wall_offset_ns)]
     if rotate is not None:

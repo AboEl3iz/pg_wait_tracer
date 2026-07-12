@@ -10,6 +10,7 @@
 #include <time.h>
 #include <sys/stat.h>
 #include <dirent.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <grp.h>
 #include <lz4.h>
@@ -131,6 +132,207 @@ size_t pgwt_encode_sample_block(const struct pgwt_trace_event *events, int count
     return (size_t)(p - out);
 }
 
+/* ── Shared file-lifecycle helpers (DUR-1/2/5) ────────────── */
+
+void pgwt_fsync_dir(const char *dir)
+{
+    int fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd >= 0) {
+        fsync(fd);
+        close(fd);
+    }
+}
+
+int pgwt_archive_path_nonclobber(const char *dir, const struct tm *tm,
+                                 const char *ext, char *out, size_t out_size)
+{
+    snprintf(out, out_size, "%s/%04d-%02d-%02d_%02d%s",
+             dir, tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,
+             tm->tm_hour, ext);
+    if (access(out, F_OK) != 0)
+        return 0;
+    /* Target exists (restart mid-hour, or a DST fold repeating the hour):
+     * pick a numeric-suffix name instead of clobbering. Readers accept the
+     * suffixed form — pgwt_scan_trace_files / retention parse the leading
+     * YYYY-MM-DD_HH and match the .trace.lz4/.summary.lz4 suffix, which the
+     * extra ".N." does not disturb. */
+    for (int n = 1; n < 10000; n++) {
+        snprintf(out, out_size, "%s/%04d-%02d-%02d_%02d.%d%s",
+                 dir, tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,
+                 tm->tm_hour, n, ext);
+        if (access(out, F_OK) != 0)
+            return 0;
+    }
+    return -1;
+}
+
+/* ── Startup recovery (DUR-1) ─────────────────────────────── */
+
+/* A previous daemon left a current.trace behind (crash, kill -9, or plain
+ * shutdown). NEVER truncate it — the old code's fopen("wb") erased up to an
+ * hour of committed data on every restart. Instead: scan its committed
+ * blocks (same sanity rules as the reader's fallback scan), drop any torn
+ * tail, append a real footer, fsync, and rename it aside to a collision-safe
+ * archive name so it stays readable like any rotated file. A file with a
+ * valid header but no complete block carries no events; if it has any
+ * payload beyond the header it is preserved as *.corrupt.<ts> for forensics,
+ * otherwise removed. */
+static void recover_current_trace(struct pgwt_event_writer *w)
+{
+    char cur[512], meta[600], meta_tmp[600];
+    snprintf(cur, sizeof(cur), "%s/current.trace", w->trace_dir);
+    snprintf(meta, sizeof(meta), "%s/current.trace.meta", w->trace_dir);
+    snprintf(meta_tmp, sizeof(meta_tmp), "%s/current.trace.meta.tmp",
+             w->trace_dir);
+
+    /* A half-written meta tmp from a crash mid-meta-write is always stale. */
+    unlink(meta_tmp);
+
+    struct stat st;
+    if (stat(cur, &st) != 0) {
+        unlink(meta);   /* meta without a current file is an orphan */
+        return;
+    }
+
+    /* Read the meta high-watermark BEFORE touching the file: it is the
+     * committed-block floor the recovery scan must reach. */
+    int committed = 0;
+    {
+        FILE *mf = fopen(meta, "r");
+        if (mf) {
+            if (fscanf(mf, "%d", &committed) != 1)
+                committed = 0;
+            fclose(mf);
+        }
+    }
+
+    FILE *fp = fopen(cur, "r+b");
+    struct pgwt_trace_file_header hdr;
+    if (!fp) {
+        fprintf(stderr, "WARN: cannot open %s for recovery: %s "
+                "(leaving it in place)\n", cur, strerror(errno));
+        return;
+    }
+    if (fread(&hdr, sizeof(hdr), 1, fp) != 1 ||
+        hdr.magic != PGWT_TRACE_MAGIC ||
+        hdr.version != PGWT_TRACE_VERSION) {
+        fclose(fp);
+        char aside[600];
+        snprintf(aside, sizeof(aside), "%s.corrupt.%lld", cur,
+                 (long long)time(NULL));
+        if (rename(cur, aside) == 0)
+            fprintf(stderr, "WARN: %s has an unreadable header — preserved "
+                    "as %s\n", cur, aside);
+        unlink(meta);
+        pgwt_fsync_dir(w->trace_dir);
+        return;
+    }
+
+    /* Scan committed blocks (strict: same caps as the reader, plus the block
+     * payload must lie fully inside the file — a torn tail ends the scan). */
+    long fsize = (long)st.st_size;
+    struct pgwt_block_index_entry *idx = NULL;
+    int nidx = 0, cap = 0;
+    uint64_t nevents = 0;
+    long pos = (long)sizeof(hdr);
+    struct pgwt_trace_block_header bh;
+    while (nidx < PGWT_MAX_READ_BLOCKS) {
+        if (fseek(fp, pos, SEEK_SET) != 0 ||
+            fread(&bh, sizeof(bh), 1, fp) != 1)
+            break;
+        if (bh.num_events == 0 || bh.num_events > PGWT_BLOCK_EVENTS ||
+            bh.compressed_size == 0 ||
+            bh.compressed_size > PGWT_MAX_BLOCK_COMPRESSED ||
+            bh.block_type > 15)
+            break;
+        long end = pos + (long)sizeof(bh) + (long)bh.compressed_size;
+        if (end > fsize)
+            break;   /* torn tail: block header landed, payload didn't */
+        if (nidx >= cap) {
+            int newcap = cap ? cap * 2 : 256;
+            struct pgwt_block_index_entry *tmp =
+                realloc(idx, newcap * sizeof(*tmp));
+            if (!tmp)
+                break;
+            idx = tmp;
+            cap = newcap;
+        }
+        idx[nidx++] = (struct pgwt_block_index_entry){
+            .timestamp_ns = bh.first_timestamp_ns,
+            .file_offset = (uint64_t)pos,
+        };
+        nevents += bh.num_events;
+        pos = end;
+    }
+
+    if (committed > nidx)
+        fprintf(stderr, "ERROR: recovery of %s found %d complete blocks but "
+                "the meta high-watermark says %d were committed — data below "
+                "the watermark is missing or corrupt\n", cur, nidx, committed);
+
+    if (nidx == 0) {
+        free(idx);
+        fclose(fp);
+        if (fsize > (long)sizeof(hdr)) {
+            char aside[600];
+            snprintf(aside, sizeof(aside), "%s.corrupt.%lld", cur,
+                     (long long)time(NULL));
+            if (rename(cur, aside) == 0)
+                fprintf(stderr, "WARN: %s had no complete block — preserved "
+                        "as %s\n", cur, aside);
+        } else {
+            unlink(cur);   /* header-only file: nothing to preserve */
+        }
+        unlink(meta);
+        pgwt_fsync_dir(w->trace_dir);
+        return;
+    }
+
+    /* Finalize: drop the torn tail (or the previous footer, which re-scans
+     * as an invalid block and is rewritten identically), append the footer,
+     * make it durable. */
+    int finalize_failed = 0;
+    if (ftruncate(fileno(fp), (off_t)pos) != 0)
+        finalize_failed = 1;
+    if (!finalize_failed && fseek(fp, pos, SEEK_SET) == 0) {
+        for (int i = 0; i < nidx && !finalize_failed; i++)
+            if (fwrite(&idx[i], sizeof(idx[i]), 1, fp) != 1)
+                finalize_failed = 1;
+        uint32_t nb = (uint32_t)nidx;
+        if (!finalize_failed && fwrite(&nb, sizeof(nb), 1, fp) != 1)
+            finalize_failed = 1;
+    } else {
+        finalize_failed = 1;
+    }
+    fflush(fp);
+    fsync(fileno(fp));
+    fclose(fp);
+    free(idx);
+    if (finalize_failed)
+        fprintf(stderr, "WARN: could not append a footer to recovered %s "
+                "(%s) — archiving anyway; readers will fall back to a "
+                "sequential scan\n", cur, strerror(errno));
+
+    /* Archive under the hour of the file's own start time, never clobbering
+     * an existing archive. */
+    time_t start_sec = (time_t)(hdr.start_time_ns / 1000000000ULL);
+    struct tm tm;
+    localtime_r(&start_sec, &tm);
+    char dest[512];
+    if (pgwt_archive_path_nonclobber(w->trace_dir, &tm, ".trace.lz4",
+                                     dest, sizeof(dest)) != 0 ||
+        rename(cur, dest) != 0) {
+        fprintf(stderr, "WARN: cannot archive recovered %s: %s "
+                "(leaving it in place; it will NOT be truncated)\n",
+                cur, strerror(errno));
+        return;
+    }
+    unlink(meta);
+    pgwt_fsync_dir(w->trace_dir);
+    fprintf(stderr, "INFO: recovered previous current.trace: %d blocks, "
+            "%llu events -> %s\n", nidx, (unsigned long long)nevents, dest);
+}
+
 /* ── File operations (static) ─────────────────────────────── */
 
 static int write_footer(struct pgwt_event_writer *w)
@@ -152,7 +354,14 @@ static int open_trace_file(struct pgwt_event_writer *w, uint64_t first_mono_ns)
     snprintf(w->current_path, sizeof(w->current_path),
              "%s/current.trace", w->trace_dir);
 
-    w->fp = fopen(w->current_path, "wb");
+    /* DUR-1: NEVER truncate an existing current.trace ("wbx", not "wb").
+     * Init already recovered any leftover file; if one (re)appeared since —
+     * e.g. lazy first-open long after init — recover it now and retry. */
+    w->fp = fopen(w->current_path, "wbx");
+    if (!w->fp && errno == EEXIST) {
+        recover_current_trace(w);
+        w->fp = fopen(w->current_path, "wbx");
+    }
     if (!w->fp) {
         fprintf(stderr, "WARN: cannot create %s: %s\n",
                 w->current_path, strerror(errno));
@@ -223,6 +432,17 @@ static int write_typed_block(struct pgwt_event_writer *w,
         return -1;
     }
 
+    /* DUR-8: a file must never outgrow what the readers' footer/meta sanity
+     * caps accept. Ask for an early rotation at the writer cap; the readers
+     * accept up to 4× it, which covers the few blocks written between the
+     * cap being hit and the next rotation check (only reachable at
+     * pathological block rates — see PGWT_MAX_FILE_BLOCKS). */
+    if (w->num_blocks >= PGWT_MAX_FILE_BLOCKS && !w->force_rotate) {
+        w->force_rotate = true;
+        fprintf(stderr, "WARN: trace file reached %d blocks — forcing an "
+                "early rotation\n", PGWT_MAX_FILE_BLOCKS);
+    }
+
     /* Grow block index if needed */
     if (w->num_blocks >= w->block_index_cap) {
         int new_cap = w->block_index_cap * 2;
@@ -287,7 +507,8 @@ static int write_typed_block(struct pgwt_event_writer *w,
     return 0;
 }
 
-static int flush_block(struct pgwt_event_writer *w)
+/* Write the buffered TRANSITIONS block (no ordering logic — see flush_block). */
+static int flush_block_core(struct pgwt_event_writer *w)
 {
     if (w->num_events == 0 || !w->fp) return 0;
 
@@ -295,6 +516,48 @@ static int flush_block(struct pgwt_event_writer *w)
                                PGWT_BLOCK_TRANSITIONS, 0);
     w->num_events = 0;
     return rc;
+}
+
+/* Write the pending batched sample-type block (DUR-8). The block period is
+ * the count-weighted mean of the batched pushes' periods, so the block's
+ * TOTAL estimated time equals the exact per-tick sum (SMP-3 weights are
+ * preserved in aggregate; the compatibility gate in push bounds the per-tick
+ * skew to ~1.6%). */
+static int flush_sample_buf(struct pgwt_event_writer *w)
+{
+    if (w->num_sample_buf == 0 || !w->fp) return 0;
+
+    uint64_t period = w->sample_buf_weight_ns / (uint64_t)w->num_sample_buf;
+    int rc = write_typed_block(w, w->sample_buf, w->num_sample_buf,
+                               (enum pgwt_block_type)w->sample_buf_type,
+                               period);
+    w->num_sample_buf = 0;
+    w->sample_buf_weight_ns = 0;
+    w->sample_buf_period_ns = 0;
+    return rc;
+}
+
+/* Ordered flushes: whichever pending buffer holds the OLDER first timestamp
+ * is written first, so the file's block index stays sorted (readers
+ * binary-search it). Each buffer is internally time-sorted already. */
+static int flush_block(struct pgwt_event_writer *w)
+{
+    if (w->num_sample_buf > 0 && w->num_events > 0 &&
+        w->sample_buf[0].timestamp_ns < w->events[0].timestamp_ns) {
+        if (flush_sample_buf(w) != 0)
+            return -1;
+    }
+    return flush_block_core(w);
+}
+
+static int flush_samples(struct pgwt_event_writer *w)
+{
+    if (w->num_events > 0 && w->num_sample_buf > 0 &&
+        w->events[0].timestamp_ns <= w->sample_buf[0].timestamp_ns) {
+        if (flush_block_core(w) != 0)
+            return -1;
+    }
+    return flush_sample_buf(w);
 }
 
 /* ── Public API ───────────────────────────────────────────── */
@@ -328,6 +591,10 @@ int pgwt_writer_init(struct pgwt_event_writer *w, const char *trace_dir,
         chown(w->trace_dir, (uid_t)-1, w->trace_gid);
         chmod(w->trace_dir, 0750);
     }
+
+    /* DUR-1: recover (finalize + archive) any current.trace a previous
+     * daemon left behind — never truncate it. */
+    recover_current_trace(w);
 
     /* Allocate scratch buffers */
     w->encode_buf_size = PGWT_BLOCK_EVENTS * 36 + PGWT_BLOCK_EVENTS * 10;
@@ -383,24 +650,49 @@ int pgwt_writer_push_samples(struct pgwt_event_writer *w,
         }
     }
 
-    /* Flush any pending buffered TRANSITIONS block first so block
-     * boundaries stay clean (one block is either all transitions or all
-     * samples — never mixed). */
-    if (w->num_events > 0) {
-        if (flush_block(w) != 0)
-            return -1;
+    /* DUR-8: buffer sample-type records and cut a block roughly once per
+     * second instead of once per sampler tick (~10× fewer blocks at 10 Hz).
+     * The buffering is type-agnostic: a pending batch of a DIFFERENT block
+     * type is flushed before this one starts. A push whose period deviates
+     * from the pending batch by more than ~1.6% (period/64) also flushes
+     * first — timer jitter batches, an SMP-3 stall tick (measured elapsed ≫
+     * nominal) gets its own block so its compensation weight stays exact. */
+    if (w->num_sample_buf > 0) {
+        uint64_t p0 = w->sample_buf_period_ns;
+        uint64_t diff = sample_period_ns > p0 ? sample_period_ns - p0
+                                              : p0 - sample_period_ns;
+        if (w->sample_buf_type != (uint16_t)PGWT_BLOCK_SAMPLES ||
+            diff > p0 / 64) {
+            if (flush_samples(w) != 0)
+                return -1;
+        }
     }
 
-    /* Samples can exceed one block; split into PGWT_BLOCK_EVENTS chunks. */
     int off = 0;
     while (off < count) {
+        if (w->num_sample_buf == 0) {
+            w->sample_buf_type = (uint16_t)PGWT_BLOCK_SAMPLES;
+            w->sample_buf_period_ns = sample_period_ns;
+        }
+        int room = PGWT_BLOCK_EVENTS - w->num_sample_buf;
         int chunk = count - off;
-        if (chunk > PGWT_BLOCK_EVENTS) chunk = PGWT_BLOCK_EVENTS;
-        if (write_typed_block(w, samples + off, chunk,
-                              PGWT_BLOCK_SAMPLES, sample_period_ns) != 0)
-            return -1;
+        if (chunk > room) chunk = room;
+        memcpy(&w->sample_buf[w->num_sample_buf], samples + off,
+               (size_t)chunk * sizeof(*samples));
+        w->num_sample_buf += chunk;
+        w->sample_buf_weight_ns += (uint64_t)chunk * sample_period_ns;
         off += chunk;
+        if (w->num_sample_buf >= PGWT_BLOCK_EVENTS) {
+            if (flush_samples(w) != 0)
+                return -1;
+        }
     }
+
+    /* Time-based cut: the pending batch spans ~1 s of ticks. */
+    if (w->num_sample_buf > 0 &&
+        w->sample_buf[w->num_sample_buf - 1].timestamp_ns -
+        w->sample_buf[0].timestamp_ns >= PGWT_SAMPLE_BATCH_NS)
+        return flush_samples(w);
 
     return 0;
 }
@@ -416,11 +708,12 @@ int pgwt_writer_check_rotation(struct pgwt_event_writer *w)
     localtime_r(&now, &tm);
     int current_hour = tm.tm_yday * 24 + tm.tm_hour;
 
-    if (current_hour == w->current_hour)
+    if (current_hour == w->current_hour && !w->force_rotate)
         return 0;
 
-    /* Hour changed — rotate */
+    /* Hour changed (or the block cap forced it) — rotate */
     flush_block(w);
+    flush_samples(w);
     write_footer(w);
 
     if (w->verbose) {
@@ -433,19 +726,31 @@ int pgwt_writer_check_rotation(struct pgwt_event_writer *w)
                 (unsigned long)w->total_bytes_written, ratio);
     }
 
+    /* DUR-5: an archive is durable once rotated — flush it to stable
+     * storage before it gets its final name. */
+    fflush(w->fp);
+    fsync(fileno(w->fp));
     fclose(w->fp);
     w->fp = NULL;
 
-    /* Rename current.trace → YYYY-MM-DD_HH.trace.lz4 */
+    /* Rename current.trace → YYYY-MM-DD_HH[.N].trace.lz4. DUR-2: the target
+     * is derived from the file's START hour; a restart mid-hour (the
+     * recovered archive already claimed the name) or a DST fold (localtime_r
+     * repeats an hour) must never clobber an existing archive — the helper
+     * picks a numeric-suffix name instead. Naming stays in LOCAL time
+     * (operators read these against server logs); collision safety, not
+     * unique naming, is what prevents data loss. */
     time_t file_start_sec = (time_t)(w->file_start_wall_ns / 1000000000ULL);
     struct tm file_tm;
     localtime_r(&file_start_sec, &file_tm);
     char new_path[512];
-    snprintf(new_path, sizeof(new_path), "%s/%04d-%02d-%02d_%02d.trace.lz4",
-             w->trace_dir,
-             file_tm.tm_year + 1900, file_tm.tm_mon + 1,
-             file_tm.tm_mday, file_tm.tm_hour);
-    rename(w->current_path, new_path);
+    if (pgwt_archive_path_nonclobber(w->trace_dir, &file_tm, ".trace.lz4",
+                                     new_path, sizeof(new_path)) == 0)
+        rename(w->current_path, new_path);
+    else
+        fprintf(stderr, "WARN: no free archive name for %s — leaving it as "
+                "current.trace (it will be recovered on next start)\n",
+                w->current_path);
 
     /* Remove meta file — the rotated .trace.lz4 has a real footer */
     {
@@ -454,10 +759,12 @@ int pgwt_writer_check_rotation(struct pgwt_event_writer *w)
                  w->trace_dir);
         unlink(meta_path);
     }
+    pgwt_fsync_dir(w->trace_dir);
 
     /* Reset stats for next file */
     w->total_events_written = 0;
     w->total_bytes_written = 0;
+    w->force_rotate = false;
 
     return 0;
 }
@@ -467,6 +774,7 @@ int pgwt_writer_close(struct pgwt_event_writer *w)
     if (!w->fp) return 0;
 
     flush_block(w);
+    flush_samples(w);
     write_footer(w);
 
     if (w->verbose) {
@@ -479,45 +787,178 @@ int pgwt_writer_close(struct pgwt_event_writer *w)
                 (unsigned long)w->total_bytes_written, ratio);
     }
 
+    /* DUR-5: a cleanly closed file is durable (it is archived on the next
+     * daemon start by recovery, footer intact). */
+    fflush(w->fp);
+    fsync(fileno(w->fp));
     fclose(w->fp);
     w->fp = NULL;
     return 0;
 }
 
-int pgwt_writer_cleanup_old_files(struct pgwt_event_writer *w)
+/* Classify a trace-dir entry for retention purposes. */
+enum retn_kind {
+    RETN_SKIP = 0,        /* live files, sidecars, unknown names */
+    RETN_TRACE_ARCHIVE,   /* *.trace.lz4 (incl. numeric-suffix names) */
+    RETN_SUMMARY_ARCHIVE, /* *.summary.lz4 */
+    RETN_CORRUPT,         /* preserved *.corrupt.<ts> files */
+    RETN_ORPHAN_META,     /* current.*.meta[.tmp] with no live writer file */
+};
+
+static int has_suffix(const char *name, const char *suffix)
 {
-    if (w->retention_hours <= 0) return 0;
+    size_t nl = strlen(name), sl = strlen(suffix);
+    return nl >= sl && strcmp(name + nl - sl, suffix) == 0;
+}
 
-    DIR *dir = opendir(w->trace_dir);
-    if (!dir) return -1;
+static enum retn_kind retn_classify(const char *dir, const char *name)
+{
+    if (strcmp(name, "current.trace") == 0 ||
+        strcmp(name, "current.summary") == 0)
+        return RETN_SKIP;
+    if (has_suffix(name, ".trace.lz4"))
+        return RETN_TRACE_ARCHIVE;
+    if (has_suffix(name, ".summary.lz4"))
+        return RETN_SUMMARY_ARCHIVE;
+    if (strstr(name, ".corrupt."))
+        return RETN_CORRUPT;
+    if (has_suffix(name, ".meta.tmp") || has_suffix(name, ".jsonl.tmp"))
+        return RETN_ORPHAN_META;   /* torn meta/compaction write — stale */
+    if (strcmp(name, "current.trace.meta") == 0 ||
+        strcmp(name, "current.summary.meta") == 0) {
+        /* Orphan only if the file it describes is gone. */
+        char live[600];
+        snprintf(live, sizeof(live), "%s/%.*s", dir,
+                 (int)(strlen(name) - 5), name);
+        return access(live, F_OK) == 0 ? RETN_SKIP : RETN_ORPHAN_META;
+    }
+    return RETN_SKIP;
+}
 
-    time_t cutoff = time(NULL) - (time_t)w->retention_hours * 3600;
-
-    struct dirent *ent;
-    while ((ent = readdir(dir)) != NULL) {
-        if (!strstr(ent->d_name, ".trace.lz4"))
-            continue;
-
-        struct tm ftm = {0};
-        int hour;
-        if (sscanf(ent->d_name, "%4d-%2d-%2d_%2d.trace.lz4",
-                   &ftm.tm_year, &ftm.tm_mon, &ftm.tm_mday, &hour) != 4)
-            continue;
-
+/* Archive age: from the YYYY-MM-DD_HH name when parseable (recovered
+ * archives are CREATED late but hold old data), else the file mtime. */
+static time_t retn_file_time(const char *name, time_t mtime)
+{
+    struct tm ftm = {0};
+    int hour;
+    if (sscanf(name, "%4d-%2d-%2d_%2d",
+               &ftm.tm_year, &ftm.tm_mon, &ftm.tm_mday, &hour) == 4) {
         ftm.tm_year -= 1900;
         ftm.tm_mon -= 1;
         ftm.tm_hour = hour;
         ftm.tm_isdst = -1;
-        time_t file_time = mktime(&ftm);
+        time_t t = mktime(&ftm);
+        if (t > 0)
+            return t;
+    }
+    return mtime;
+}
 
-        if (file_time > 0 && file_time < cutoff) {
-            char path[512];
-            snprintf(path, sizeof(path), "%s/%s", w->trace_dir, ent->d_name);
-            if (unlink(path) == 0 && w->verbose)
-                fprintf(stderr, "INFO: deleted old trace file %s\n", ent->d_name);
+struct retn_entry {
+    char     name[300];
+    time_t   ftime;
+    uint64_t size;
+};
+
+static int retn_cmp_oldest(const void *a, const void *b)
+{
+    time_t ta = ((const struct retn_entry *)a)->ftime;
+    time_t tb = ((const struct retn_entry *)b)->ftime;
+    return (ta > tb) - (ta < tb);
+}
+
+int pgwt_writer_cleanup_old_files(struct pgwt_event_writer *w)
+{
+    DIR *dir = opendir(w->trace_dir);
+    if (!dir) return -1;
+
+    time_t now = time(NULL);
+    time_t cutoff = w->retention_hours > 0
+                  ? now - (time_t)w->retention_hours * 3600 : 0;
+
+    struct retn_entry *kept = NULL;
+    int n_kept = 0, cap_kept = 0;
+    uint64_t total_bytes = 0;   /* everything in the dir, live files included */
+
+    struct dirent *ent;
+    while ((ent = readdir(dir)) != NULL) {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+            continue;
+        char path[600];
+        snprintf(path, sizeof(path), "%s/%s", w->trace_dir, ent->d_name);
+        struct stat st;
+        if (stat(path, &st) != 0 || !S_ISREG(st.st_mode))
+            continue;
+
+        enum retn_kind kind = retn_classify(w->trace_dir, ent->d_name);
+        if (kind == RETN_ORPHAN_META) {
+            /* DUR-3: leftovers of a dead writer — but only when provably
+             * stale (an hour old) so we never race a live daemon's
+             * meta-tmp-rename cycle. */
+            if (now - st.st_mtime > 3600 && unlink(path) == 0 && w->verbose)
+                fprintf(stderr, "INFO: deleted orphaned %s\n", ent->d_name);
+            continue;
+        }
+        if (kind == RETN_SKIP) {
+            total_bytes += (uint64_t)st.st_size;
+            continue;
+        }
+
+        /* Hours-based retention (archives + preserved corrupt files). */
+        time_t ftime = retn_file_time(ent->d_name, st.st_mtime);
+        if (cutoff && ftime < cutoff) {
+            if (unlink(path) == 0) {
+                if (w->verbose)
+                    fprintf(stderr, "INFO: deleted old file %s\n",
+                            ent->d_name);
+                continue;
+            }
+        }
+
+        total_bytes += (uint64_t)st.st_size;
+        if (w->retention_bytes > 0) {
+            if (n_kept >= cap_kept) {
+                int newcap = cap_kept ? cap_kept * 2 : 64;
+                struct retn_entry *tmp =
+                    realloc(kept, (size_t)newcap * sizeof(*tmp));
+                if (!tmp)
+                    continue;
+                kept = tmp;
+                cap_kept = newcap;
+            }
+            snprintf(kept[n_kept].name, sizeof(kept[n_kept].name), "%s",
+                     ent->d_name);
+            kept[n_kept].ftime = ftime;
+            kept[n_kept].size = (uint64_t)st.st_size;
+            n_kept++;
         }
     }
     closedir(dir);
+
+    /* DUR-3: size cap. Total dir usage (live files included) must fit under
+     * retention_bytes; delete the OLDEST archives first, never the live
+     * current files or sidecars. */
+    if (w->retention_bytes > 0 && total_bytes > w->retention_bytes) {
+        if (n_kept > 0)
+            qsort(kept, (size_t)n_kept, sizeof(*kept), retn_cmp_oldest);
+        for (int i = 0; i < n_kept && total_bytes > w->retention_bytes; i++) {
+            char path[600];
+            snprintf(path, sizeof(path), "%s/%s", w->trace_dir, kept[i].name);
+            if (unlink(path) == 0) {
+                total_bytes -= kept[i].size;
+                if (w->verbose)
+                    fprintf(stderr, "INFO: size cap: deleted %s (%llu bytes)\n",
+                            kept[i].name,
+                            (unsigned long long)kept[i].size);
+            }
+        }
+        if (total_bytes > w->retention_bytes)
+            fprintf(stderr, "WARN: trace dir still %llu bytes over the "
+                    "--retention-gb cap after deleting every archive — the "
+                    "live current files alone exceed the cap\n",
+                    (unsigned long long)(total_bytes - w->retention_bytes));
+    }
+    free(kept);
     return 0;
 }
 

@@ -398,6 +398,153 @@ int pgwt_summary_deserialize(const uint8_t *in, size_t in_size,
     return 0;
 }
 
+/* ── Startup recovery (DUR-1) ─────────────────────────────── */
+
+/* Same contract as the trace writer's recovery: a leftover current.summary
+ * is finalized (torn tail dropped, footer appended) and renamed aside to a
+ * collision-safe archive — NEVER truncated. */
+static void recover_current_summary(struct pgwt_summary_writer *w)
+{
+    char cur[512], meta[600], meta_tmp[600];
+    snprintf(cur, sizeof(cur), "%s/current.summary", w->trace_dir);
+    snprintf(meta, sizeof(meta), "%s/current.summary.meta", w->trace_dir);
+    snprintf(meta_tmp, sizeof(meta_tmp), "%s/current.summary.meta.tmp",
+             w->trace_dir);
+
+    unlink(meta_tmp);   /* torn meta write — always stale */
+
+    struct stat st;
+    if (stat(cur, &st) != 0) {
+        unlink(meta);
+        return;
+    }
+
+    int committed = 0;
+    {
+        FILE *mf = fopen(meta, "r");
+        if (mf) {
+            if (fscanf(mf, "%d", &committed) != 1)
+                committed = 0;
+            fclose(mf);
+        }
+    }
+
+    FILE *fp = fopen(cur, "r+b");
+    struct pgwt_trace_file_header hdr;
+    if (!fp) {
+        fprintf(stderr, "WARN: cannot open %s for recovery: %s "
+                "(leaving it in place)\n", cur, strerror(errno));
+        return;
+    }
+    if (fread(&hdr, sizeof(hdr), 1, fp) != 1 ||
+        hdr.magic != PGWT_SUMMARY_MAGIC ||
+        (hdr.version != 1 && hdr.version != PGWT_SUMMARY_VERSION)) {
+        fclose(fp);
+        char aside[600];
+        snprintf(aside, sizeof(aside), "%s.corrupt.%lld", cur,
+                 (long long)time(NULL));
+        if (rename(cur, aside) == 0)
+            fprintf(stderr, "WARN: %s has an unreadable header — preserved "
+                    "as %s\n", cur, aside);
+        unlink(meta);
+        pgwt_fsync_dir(w->trace_dir);
+        return;
+    }
+
+    long fsize = (long)st.st_size;
+    struct pgwt_block_index_entry *idx = NULL;
+    int nidx = 0, cap = 0;
+    long pos = (long)sizeof(hdr);
+    struct pgwt_summary_block_header bh;
+    while (nidx < PGWT_MAX_READ_BLOCKS) {
+        if (fseek(fp, pos, SEEK_SET) != 0 ||
+            fread(&bh, sizeof(bh), 1, fp) != 1)
+            break;
+        if (bh.compressed_size == 0 || bh.uncompressed_size == 0 ||
+            bh.compressed_size > PGWT_MAX_BLOCK_COMPRESSED ||
+            bh.uncompressed_size > PGWT_MAX_BLOCK_COMPRESSED)
+            break;
+        long end = pos + (long)sizeof(bh) + (long)bh.compressed_size;
+        if (end > fsize)
+            break;   /* torn tail */
+        if (nidx >= cap) {
+            int newcap = cap ? cap * 2 : 256;
+            struct pgwt_block_index_entry *tmp =
+                realloc(idx, newcap * sizeof(*tmp));
+            if (!tmp)
+                break;
+            idx = tmp;
+            cap = newcap;
+        }
+        idx[nidx++] = (struct pgwt_block_index_entry){
+            .timestamp_ns = bh.wall_ns,
+            .file_offset = (uint64_t)pos,
+        };
+        pos = end;
+    }
+
+    if (committed > nidx)
+        fprintf(stderr, "ERROR: recovery of %s found %d complete blocks but "
+                "the meta high-watermark says %d were committed\n",
+                cur, nidx, committed);
+
+    if (nidx == 0) {
+        free(idx);
+        fclose(fp);
+        if (fsize > (long)sizeof(hdr)) {
+            char aside[600];
+            snprintf(aside, sizeof(aside), "%s.corrupt.%lld", cur,
+                     (long long)time(NULL));
+            if (rename(cur, aside) == 0)
+                fprintf(stderr, "WARN: %s had no complete block — preserved "
+                        "as %s\n", cur, aside);
+        } else {
+            unlink(cur);
+        }
+        unlink(meta);
+        pgwt_fsync_dir(w->trace_dir);
+        return;
+    }
+
+    int finalize_failed = 0;
+    if (ftruncate(fileno(fp), (off_t)pos) != 0)
+        finalize_failed = 1;
+    if (!finalize_failed && fseek(fp, pos, SEEK_SET) == 0) {
+        for (int i = 0; i < nidx && !finalize_failed; i++)
+            if (fwrite(&idx[i], sizeof(idx[i]), 1, fp) != 1)
+                finalize_failed = 1;
+        uint32_t nb = (uint32_t)nidx;
+        if (!finalize_failed && fwrite(&nb, sizeof(nb), 1, fp) != 1)
+            finalize_failed = 1;
+    } else {
+        finalize_failed = 1;
+    }
+    fflush(fp);
+    fsync(fileno(fp));
+    fclose(fp);
+    free(idx);
+    if (finalize_failed)
+        fprintf(stderr, "WARN: could not append a footer to recovered %s "
+                "(%s) — archiving anyway\n", cur, strerror(errno));
+
+    time_t start_sec = (time_t)(hdr.start_time_ns / 1000000000ULL);
+    struct tm tm;
+    localtime_r(&start_sec, &tm);
+    char dest[512];
+    if (pgwt_archive_path_nonclobber(w->trace_dir, &tm, ".summary.lz4",
+                                     dest, sizeof(dest)) != 0 ||
+        rename(cur, dest) != 0) {
+        fprintf(stderr, "WARN: cannot archive recovered %s: %s "
+                "(leaving it in place; it will NOT be truncated)\n",
+                cur, strerror(errno));
+        return;
+    }
+    unlink(meta);
+    pgwt_fsync_dir(w->trace_dir);
+    fprintf(stderr, "INFO: recovered previous current.summary: %d blocks "
+            "-> %s\n", nidx, dest);
+}
+
 /* ── File operations ──────────────────────────────────────── */
 
 static int write_footer(struct pgwt_summary_writer *w)
@@ -417,7 +564,13 @@ static int open_summary_file(struct pgwt_summary_writer *w)
     snprintf(w->current_path, sizeof(w->current_path),
              "%s/current.summary", w->trace_dir);
 
-    w->fp = fopen(w->current_path, "wb");
+    /* DUR-1: never truncate an existing current.summary ("wbx"); recover
+     * and retry if one (re)appeared after init. */
+    w->fp = fopen(w->current_path, "wbx");
+    if (!w->fp && errno == EEXIST) {
+        recover_current_summary(w);
+        w->fp = fopen(w->current_path, "wbx");
+    }
     if (!w->fp) {
         fprintf(stderr, "WARN: cannot create %s: %s\n",
                 w->current_path, strerror(errno));
@@ -578,6 +731,10 @@ int pgwt_summary_writer_init(struct pgwt_summary_writer *w,
 
     /* Directory already created by event_writer */
 
+    /* DUR-1: recover (finalize + archive) any current.summary a previous
+     * daemon left behind — never truncate it. */
+    recover_current_summary(w);
+
     /* Allocate scratch buffers.
      * Worst case: 1024 events × 156 + 1024 sessions × 32 + 2048 queries × 36
      *           = 159744 + 32768 + 73728 = ~260 KB uncompressed */
@@ -661,19 +818,25 @@ int pgwt_summary_check_rotation(struct pgwt_summary_writer *w)
                 (unsigned long)w->total_bytes_written);
     }
 
+    /* DUR-5: archives are durable once rotated. */
+    fflush(w->fp);
+    fsync(fileno(w->fp));
     fclose(w->fp);
     w->fp = NULL;
 
-    /* Rename current.summary → YYYY-MM-DD_HH.summary.lz4 */
+    /* Rename current.summary → YYYY-MM-DD_HH[.N].summary.lz4 (DUR-2:
+     * collision-safe — see the trace writer's rotation comment). */
     time_t file_start_sec = (time_t)(w->clock_offset_wall_ns / 1000000000ULL);
     struct tm file_tm;
     localtime_r(&file_start_sec, &file_tm);
     char new_path[512];
-    snprintf(new_path, sizeof(new_path), "%s/%04d-%02d-%02d_%02d.summary.lz4",
-             w->trace_dir,
-             file_tm.tm_year + 1900, file_tm.tm_mon + 1,
-             file_tm.tm_mday, file_tm.tm_hour);
-    rename(w->current_path, new_path);
+    if (pgwt_archive_path_nonclobber(w->trace_dir, &file_tm, ".summary.lz4",
+                                     new_path, sizeof(new_path)) == 0)
+        rename(w->current_path, new_path);
+    else
+        fprintf(stderr, "WARN: no free archive name for %s — leaving it as "
+                "current.summary (it will be recovered on next start)\n",
+                w->current_path);
 
     /* Remove meta file */
     {
@@ -682,6 +845,7 @@ int pgwt_summary_check_rotation(struct pgwt_summary_writer *w)
                  w->trace_dir);
         unlink(meta_path);
     }
+    pgwt_fsync_dir(w->trace_dir);
 
     /* Reset stats */
     w->total_records_written = 0;
@@ -703,6 +867,8 @@ int pgwt_summary_close(struct pgwt_summary_writer *w)
                 (unsigned long)w->total_bytes_written);
     }
 
+    fflush(w->fp);
+    fsync(fileno(w->fp));
     fclose(w->fp);
     w->fp = NULL;
     return 0;

@@ -21,6 +21,11 @@
 /* Max length of captured query text (matches PG's max track_activity_query_size) */
 #define QT_MAX_TEXT (1024 * 1024)
 
+/* DUR-4: query_texts.jsonl is compacted (deduplicated in place, atomically)
+ * at startup only when it exceeds this size. Overridable for tests via the
+ * PGWT_QT_COMPACT_BYTES environment variable. */
+#define QT_COMPACT_THRESHOLD (32 * 1024 * 1024)
+
 struct pgwt_query_text_capture {
     char          trace_dir[256];
     FILE         *fp;                    /* query_texts.jsonl file handle */
@@ -28,10 +33,13 @@ struct pgwt_query_text_capture {
     /* Seen set: open-addressing hash table of query_ids */
     uint64_t      seen[QT_HT_SIZE];
     int           num_seen;
+    bool          cap_logged;            /* DUR-10: seen-table-full logged once */
 
     /* Addresses for reading st_activity_raw */
     uint64_t      my_be_entry_addr;     /* MyBEEntry symbol VA */
     int           st_activity_offset;   /* offset of st_activity_raw in PgBackendStatus */
+
+    gid_t         trace_gid;             /* group for the file, (gid_t)-1 = none */
 
     char         *read_buf;              /* reusable read buffer (QT_MAX_TEXT bytes) */
 
@@ -39,11 +47,17 @@ struct pgwt_query_text_capture {
     bool          verbose;
 };
 
-/* Initialize query text capture. Returns 0 on success. */
+/* Initialize query text capture. Returns 0 on success.
+ * DUR-4: query_texts.jsonl is opened in APPEND mode and existing entries are
+ * loaded into the seen set (dedup-on-load) — retained trace files reference
+ * these query_ids across daemon restarts, so the file must never be
+ * truncated. trace_gid mirrors the trace files' group/permissions (DUR-10);
+ * pass (gid_t)-1 for none. */
 int pgwt_qt_init(struct pgwt_query_text_capture *qt,
                  const char *trace_dir,
                  uint64_t my_be_entry_addr,
-                 int st_activity_offset);
+                 int st_activity_offset,
+                 gid_t trace_gid);
 
 /* Check if query_id is new; if so, capture st_activity_raw from the backend.
  * Called from the event stream handler for each trace event with query_id != 0.

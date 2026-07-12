@@ -13,7 +13,7 @@ LIBBPF_LIB ?= -lbpf
 TESTS     = test_wait_event test_cmdline test_event_writer test_event_reader \
             test_trace_v2 test_sampler test_anomaly test_coop test_bucket \
             test_pg13_resolve test_discovery_pie test_discovery_nopie \
-            test_replay_fidelity \
+            test_replay_fidelity test_durability test_query_text \
             gen_test_traces gen_bench_traces test_concurrent_rw cross_validate \
             dump_markers
 
@@ -114,6 +114,24 @@ test_replay_fidelity: test_replay_fidelity.c ../src/event_reader.c \
                       $(BUILD)/server_wait_event.o $(BUILD)/server_spawn.o \
                       $(BUILD)/server_cJSON.o
 	$(CC) $(CFLAGS) -o $@ $^ -llz4 -lz
+
+# test_durability: T5 file-lifecycle guarantees (DUR-1/2/3/7/8) — crash
+# recovery (kill -9 matrix), collision-safe archive names, size-cap
+# retention, meta/footer sanity caps, ~1 s SAMPLES batching. Server build
+# (no BPF skeleton) — the writers/readers are BPF-free.
+test_durability: test_durability.c $(BUILD)/server_event_writer.o \
+                 $(BUILD)/server_event_reader.o \
+                 $(BUILD)/server_summary_writer.o \
+                 $(BUILD)/server_summary_reader.o \
+                 $(BUILD)/server_wait_event.o $(BUILD)/server_spawn.o \
+                 $(BUILD)/server_cJSON.o
+	$(CC) $(CFLAGS) -DPGWT_SERVER -o $@ $^ -llz4 -lz
+
+# test_query_text: T5 DUR-4/10 — query_texts.jsonl append + dedup-on-load +
+# bounded compaction + cap logging + permissions. Compiles query_text.c
+# directly (BPF-free).
+test_query_text: test_query_text.c ../src/query_text.c
+	$(CC) $(CFLAGS) -o $@ $^
 
 # Server-build objects for gen_test_traces
 SERVER_OBJS = $(BUILD)/server_event_writer.o $(BUILD)/server_summary_writer.o \

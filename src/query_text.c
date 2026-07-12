@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <time.h>
+#include <sys/stat.h>
 
 /* ── Hash set for seen query_ids ─────────────────────────── */
 
@@ -22,7 +23,8 @@ static uint64_t hash64(uint64_t x)
     return x;
 }
 
-/* Returns 1 if query_id was already in the set, 0 if newly inserted. */
+/* Returns 0 if newly inserted, 1 if already in the set, 2 if the table is
+ * full (id NOT tracked — DUR-10: callers log this loudly, once). */
 static int seen_check_or_insert(struct pgwt_query_text_capture *qt,
                                  uint64_t query_id)
 {
@@ -38,8 +40,20 @@ static int seen_check_or_insert(struct pgwt_query_text_capture *qt,
         }
         idx = (idx + 1) & (QT_HT_SIZE - 1);
     }
-    /* Table full — treat as "seen" to avoid repeated reads */
-    return 1;
+    return 2;  /* table full */
+}
+
+/* DUR-10: the 4096-id dedup table capping out means query TEXT for further
+ * new query_ids is never captured again — that must be loud, once. */
+static void qt_log_cap_once(struct pgwt_query_text_capture *qt)
+{
+    if (qt->cap_logged)
+        return;
+    qt->cap_logged = true;
+    fprintf(stderr,
+            "WARN: query-text id table is FULL (%d unique query_ids) — "
+            "text for NEW query_ids will no longer be captured until the "
+            "daemon restarts (ids and waits are unaffected)\n", QT_HT_SIZE);
 }
 
 /* ── Read st_activity_raw from backend process ───────────── */
@@ -115,17 +129,113 @@ static void write_json_string(FILE *fp, const char *s, int len)
     fputc('"', fp);
 }
 
+/* ── Load / compact existing file (DUR-4) ────────────────── */
+
+/* Parse the query_id out of a JSONL line ({"q":"<signed id>",...}).
+ * Returns 0 on success. */
+static int qt_parse_line_qid(const char *line, uint64_t *qid)
+{
+    long long v;
+    if (sscanf(line, "{\"q\":\"%lld\"", &v) != 1)
+        return -1;
+    *qid = (uint64_t)(int64_t)v;
+    return 0;
+}
+
+/* Load the ids of an existing query_texts.jsonl into the seen set so a
+ * restarted daemon appends instead of re-capturing (and NEVER truncates —
+ * retained traces reference these ids). Memory is bounded by the fixed
+ * QT_HT_SIZE table; the line buffer is the only allocation (getline, freed).
+ *
+ * If the file exceeds the compaction threshold, it is rewritten atomically
+ * (tmp + rename) keeping the FIRST line per query_id — first-seen matches
+ * the capture semantics. Lines whose ids no longer fit in the table are
+ * kept verbatim (they may be referenced by retained traces; dropping them
+ * would lose data). */
+static void qt_load_existing(struct pgwt_query_text_capture *qt,
+                             const char *path)
+{
+    struct stat st;
+    if (stat(path, &st) != 0)
+        return;
+
+    long threshold = QT_COMPACT_THRESHOLD;
+    const char *env = getenv("PGWT_QT_COMPACT_BYTES");
+    if (env && atol(env) > 0)
+        threshold = atol(env);
+    int compact = st.st_size > threshold;
+
+    FILE *in = fopen(path, "r");
+    if (!in)
+        return;
+
+    FILE *out = NULL;
+    char tmp_path[600];
+    if (compact) {
+        snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
+        out = fopen(tmp_path, "w");
+        if (!out)
+            compact = 0;   /* fall back to plain load */
+    }
+
+    char *line = NULL;
+    size_t line_cap = 0;
+    ssize_t len;
+    int loaded = 0, dropped = 0;
+    while ((len = getline(&line, &line_cap, in)) > 0) {
+        uint64_t qid;
+        if (qt_parse_line_qid(line, &qid) != 0 || qid == 0) {
+            dropped++;   /* torn/garbage line (e.g. crash mid-append) */
+            continue;
+        }
+        int rc = seen_check_or_insert(qt, qid);
+        if (rc == 0)
+            loaded++;
+        else if (rc == 2)
+            qt_log_cap_once(qt);
+        if (compact && (rc == 0 || rc == 2)) {
+            /* keep first occurrence; keep untracked (table-full) lines */
+            if (fwrite(line, 1, (size_t)len, out) != (size_t)len) {
+                /* tmp write failed — abandon compaction, keep original */
+                fclose(out);
+                out = NULL;
+                unlink(tmp_path);
+                compact = 0;
+            }
+        }
+    }
+    free(line);
+    fclose(in);
+
+    if (compact && out) {
+        fflush(out);
+        fsync(fileno(out));
+        fclose(out);
+        if (rename(tmp_path, path) != 0)
+            unlink(tmp_path);
+        else if (qt->verbose)
+            fprintf(stderr, "INFO: compacted query_texts.jsonl\n");
+    }
+
+    if (qt->verbose)
+        fprintf(stderr, "INFO: loaded %d existing query text ids "
+                "(%d unreadable lines skipped)%s\n", loaded, dropped,
+                qt->cap_logged ? " — id table full" : "");
+}
+
 /* ── Public API ──────────────────────────────────────────── */
 
 int pgwt_qt_init(struct pgwt_query_text_capture *qt,
                  const char *trace_dir,
                  uint64_t my_be_entry_addr,
-                 int st_activity_offset)
+                 int st_activity_offset,
+                 gid_t trace_gid)
 {
     memset(qt, 0, sizeof(*qt));
     snprintf(qt->trace_dir, sizeof(qt->trace_dir), "%s", trace_dir);
     qt->my_be_entry_addr = my_be_entry_addr;
     qt->st_activity_offset = st_activity_offset;
+    qt->trace_gid = trace_gid;
     qt->enabled = true;
 
     /* Allocate reusable read buffer (1 MB on heap, not stack) */
@@ -136,14 +246,25 @@ int pgwt_qt_init(struct pgwt_query_text_capture *qt,
         return -1;
     }
 
-    /* Open (truncate) query_texts.jsonl */
     char path[512];
     snprintf(path, sizeof(path), "%s/query_texts.jsonl", trace_dir);
-    qt->fp = fopen(path, "w");
+
+    /* DUR-4: dedup-on-load + bounded compaction, then APPEND — never "w".
+     * Retained trace files reference these ids across restarts. */
+    qt_load_existing(qt, path);
+
+    qt->fp = fopen(path, "a");
     if (!qt->fp) {
-        fprintf(stderr, "WARN: cannot create %s: %s\n", path, strerror(errno));
+        fprintf(stderr, "WARN: cannot open %s: %s\n", path, strerror(errno));
         qt->enabled = false;
         return -1;
+    }
+
+    /* DUR-10: match trace-file group/permissions (raw SQL may contain
+     * literals — it must not be more readable than the traces). */
+    if (qt->trace_gid != (gid_t)-1) {
+        fchown(fileno(qt->fp), (uid_t)-1, qt->trace_gid);
+        fchmod(fileno(qt->fp), 0640);
     }
 
     return 0;
@@ -156,8 +277,12 @@ void pgwt_qt_check(struct pgwt_query_text_capture *qt,
         return;
 
     /* Check if already seen */
-    if (seen_check_or_insert(qt, query_id))
+    int rc = seen_check_or_insert(qt, query_id);
+    if (rc != 0) {
+        if (rc == 2)
+            qt_log_cap_once(qt);
         return;
+    }
 
     /* New query_id — read st_activity_raw from the backend */
     int len = read_activity(qt, pid, qt->read_buf, QT_MAX_TEXT);
@@ -197,8 +322,12 @@ void pgwt_qt_store(struct pgwt_query_text_capture *qt,
         return;
 
     /* Check if already seen */
-    if (seen_check_or_insert(qt, query_id))
+    int rc = seen_check_or_insert(qt, query_id);
+    if (rc != 0) {
+        if (rc == 2)
+            qt_log_cap_once(qt);
         return;
+    }
 
     int len = (int)strnlen(text, PGWT_QUERY_TEXT_LEN - 1);
 

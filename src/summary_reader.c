@@ -57,7 +57,10 @@ int pgwt_summary_reader_open(struct pgwt_summary_reader *r, const char *path)
         FILE *mf = fopen(meta_path, "r");
         if (mf) {
             int committed = 0;
-            if (fscanf(mf, "%d", &committed) == 1 && committed > 0) {
+            /* DUR-7: cap the committed count (it sizes an allocation) and
+             * sanity-check each block header, exactly like event_reader. */
+            if (fscanf(mf, "%d", &committed) == 1 && committed > 0 &&
+                committed < PGWT_MAX_READ_BLOCKS) {
                 fseek(r->fp, (long)sizeof(struct pgwt_trace_file_header),
                       SEEK_SET);
                 r->block_index = malloc(committed *
@@ -67,7 +70,8 @@ int pgwt_summary_reader_open(struct pgwt_summary_reader *r, const char *path)
                     struct pgwt_summary_block_header bh;
                     while (r->num_blocks < committed &&
                            fread(&bh, sizeof(bh), 1, r->fp) == 1 &&
-                           bh.compressed_size > 0) {
+                           bh.compressed_size > 0 &&
+                           bh.compressed_size <= PGWT_MAX_BLOCK_COMPRESSED) {
                         long off = ftell(r->fp) - (long)sizeof(bh);
                         r->block_index[r->num_blocks].file_offset = (uint64_t)off;
                         r->block_index[r->num_blocks].timestamp_ns = bh.wall_ns;
@@ -93,7 +97,7 @@ int pgwt_summary_reader_open(struct pgwt_summary_reader *r, const char *path)
         uint32_t nb = 0;
         if (fseek(r->fp, -4, SEEK_END) == 0 &&
             fread(&nb, sizeof(nb), 1, r->fp) == 1 &&
-            nb > 0 && nb < 100000) {
+            nb > 0 && nb < PGWT_MAX_READ_BLOCKS) {
             long index_start = ftell(r->fp) - 4
                              - (long)nb * (long)sizeof(struct pgwt_block_index_entry);
             if (index_start >= (long)sizeof(struct pgwt_trace_file_header)) {
@@ -102,8 +106,24 @@ int pgwt_summary_reader_open(struct pgwt_summary_reader *r, const char *path)
                 if (r->block_index &&
                     fread(r->block_index, sizeof(struct pgwt_block_index_entry),
                           nb, r->fp) == nb) {
-                    r->num_blocks = (int)nb;
-                    have_index = 1;
+                    /* DUR-7: verify the index shape before trusting it
+                     * (see event_reader.c Strategy 2). */
+                    int valid =
+                        r->block_index[0].file_offset ==
+                        sizeof(struct pgwt_trace_file_header);
+                    for (uint32_t i = 1; valid && i < nb; i++)
+                        if (r->block_index[i].file_offset <=
+                                r->block_index[i - 1].file_offset ||
+                            r->block_index[i].file_offset >=
+                                (uint64_t)index_start)
+                            valid = 0;
+                    if (valid) {
+                        r->num_blocks = (int)nb;
+                        have_index = 1;
+                    } else {
+                        free(r->block_index);
+                        r->block_index = NULL;
+                    }
                 } else {
                     free(r->block_index);
                     r->block_index = NULL;
@@ -124,7 +144,9 @@ int pgwt_summary_reader_open(struct pgwt_summary_reader *r, const char *path)
         r->num_blocks = 0;
         struct pgwt_summary_block_header bh;
         while (fread(&bh, sizeof(bh), 1, r->fp) == 1 &&
-               bh.compressed_size > 0 && bh.uncompressed_size > 0) {
+               bh.compressed_size > 0 && bh.uncompressed_size > 0 &&
+               bh.compressed_size <= PGWT_MAX_BLOCK_COMPRESSED &&
+               bh.uncompressed_size <= PGWT_MAX_BLOCK_COMPRESSED) {
             if (r->num_blocks >= cap) {
                 cap *= 2;
                 struct pgwt_block_index_entry *tmp =
