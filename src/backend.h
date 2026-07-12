@@ -20,6 +20,11 @@ struct pgwt_backend {
     int      wp_addr_shared;
     uint64_t attach_ts;        /* monotonic ns when attached */
     bool     is_alive;
+    /* meta has been filled by pgwt_parse_cmdline. A zeroed meta reads as
+     * backend_type == CLIENT (enum value 0), which is WRONG for an unparsed
+     * entry — consumers must treat !meta_parsed as UNKNOWN. The sampled-tier
+     * fork path parses lazily (the process title is only set after init). */
+    bool     meta_parsed;
     struct pgwt_metadata meta;
 };
 

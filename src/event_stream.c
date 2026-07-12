@@ -10,6 +10,7 @@
 #include "query_text.h"
 #include "map_reader.h"
 #include "wait_event.h"
+#include "sampler.h"   /* pgwt_backend_type_flag (T2 category mapping) */
 
 #include <string.h>
 #include <time.h>
@@ -49,6 +50,29 @@ int pgwt_handle_trace_event(void *ctx, void *data, size_t data_sz)
 
     /* Per-PID accumulation */
     struct pgwt_pid_accum *pa = pgwt_get_or_create_pid(acc, evt->pid);
+
+    /* T2 live classification (decomposed AAS, docs/AAS_SEMANTICS_DECISION.md).
+     * Resolve the pid's category ONCE against the registry and cache it in
+     * the accumulator (the hot path must not linear-scan 1024 entries per
+     * event). io_worker time never enters DB Time/AAS; a client backend's
+     * we==0 interval outside a command (BPF stamps the gate in flags) is
+     * post/between-command time — idle, not CPU. Both stay VISIBLE in the
+     * per-event stats; only the load accounting differs. */
+    int io_worker = 0;
+    int noncmd_cpu = 0;
+    if (pa) {
+        if (pa->cat_flag_plus1 == 0) {
+            struct pgwt_backend *be = pgwt_find_backend(&d->backends, evt->pid);
+            uint32_t f = (be && be->meta_parsed)
+                       ? pgwt_backend_type_flag(be->meta.backend_type) : 0;
+            pa->cat_flag_plus1 = f + 1;
+        }
+        uint32_t cat = pa->cat_flag_plus1 - 1;
+        io_worker = (cat == PGWT_EVENT_FLAG_IO_WORKER);
+        noncmd_cpu = (we == 0 && cat == 0 && d->cmd_gate_active
+                      && !(evt->flags & PGWT_EVENT_FLAG_CMD_OPEN));
+    }
+
     if (pa) {
         struct pgwt_event_stats *es = pgwt_get_or_create_event(pa, we);
         if (es) {
@@ -61,13 +85,15 @@ int pgwt_handle_trace_event(void *ctx, void *data, size_t data_sz)
                 es->histogram[bucket]++;
         }
 
-        if (we == 0) {
-            pa->cpu_time_ns += dur;
-        } else if (!pgwt_is_idle_event(we)) {
-            pa->wait_time_ns += dur;
+        if (!io_worker && !noncmd_cpu) {
+            if (we == 0) {
+                pa->cpu_time_ns += dur;
+            } else if (!pgwt_is_idle_event(we)) {
+                pa->wait_time_ns += dur;
+            }
+            if (we == 0 || !pgwt_is_idle_event(we))
+                pa->db_time_ns += dur;
         }
-        if (!pgwt_is_idle_event(we))
-            pa->db_time_ns += dur;
     }
 
     /* System-wide accumulation */
@@ -82,11 +108,15 @@ int pgwt_handle_trace_event(void *ctx, void *data, size_t data_sz)
             se->histogram[bucket]++;
     }
 
-    /* Time model by class */
-    pgwt_update_time_model(&acc->tm, we, dur);
+    /* Time model by class. io_worker time is excluded from DB Time; a
+     * non-command CPU interval lands in the idle (Activity) bucket. */
+    if (!io_worker)
+        pgwt_update_time_model(&acc->tm,
+                               noncmd_cpu ? WEI(PG_WAIT_ACTIVITY, 0) : we,
+                               dur);
 
     /* Query events */
-    if (evt->query_id != 0) {
+    if (evt->query_id != 0 && !io_worker) {
         struct pgwt_query_event_stats *qe =
             pgwt_get_or_create_query_event(acc, evt->query_id, we);
         if (qe) {

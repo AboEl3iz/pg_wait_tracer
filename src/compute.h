@@ -42,6 +42,56 @@ static const char *pgwt_class_display[PGWT_NUM_CLASSES] = {
 /* Map wait_event_info → class index (0–10) */
 int pgwt_wait_class_index(uint32_t event_id);
 
+/* ── T2: decomposed AAS categories (docs/AAS_SEMANTICS_DECISION.md) ─────
+ * Every non-idle record falls in exactly one category:
+ *   fg planning / execution / command — client-backend (and parallel-
+ *     worker) work, split by the PLAN/EXEC marker windows; "command" is
+ *     in-command time outside both (parse, bind, commit/abort);
+ *   maintenance — autovacuum workers;
+ *   background — checkpointer / bgwriter / walwriter / other aux;
+ *   io_worker — PG18 io_method=worker processes: EXCLUDED from AAS and
+ *     DB Time (their busy time shadow-copies the requesting backends'
+ *     AioIoCompletion waits) but tracked for the busy%% utilization metric.
+ * Idle records (Activity class, ClientRead, non-command CPU) are category
+ * -1: excluded-but-visible, exactly as before. */
+#define PGWT_NUM_CATS 6
+#define PGWT_CAT_FG_PLAN   0
+#define PGWT_CAT_FG_EXEC   1
+#define PGWT_CAT_FG_CMD    2
+#define PGWT_CAT_MAINT     3
+#define PGWT_CAT_BG        4
+#define PGWT_CAT_IO_WORKER 5
+
+static const char *pgwt_cat_names[PGWT_NUM_CATS] = {
+    "planning", "execution", "command", "maintenance", "background",
+    "io_worker"
+};
+
+/* pid → category-flag table (PGWT_EVENT_FLAG_IO_WORKER/MAINT/BACKGROUND or
+ * 0 for foreground), sorted by pid, built from backends.jsonl metadata. */
+struct pgwt_pid_cat {
+    uint32_t pid;
+    uint32_t flag;
+};
+
+/* Annotation pass (T2) over a merged, time-ordered event array:
+ *   - stamps each record's flags with its pid's category flag;
+ *   - sweeps the PLAN/EXEC/CMD markers per pid and stamps FLAG_PLAN /
+ *     FLAG_EXEC / FLAG_CMD_OPEN on the records inside those windows;
+ *   - rewrites exact we==0 intervals that are MAJORITY-outside a command
+ *     window to PGWT_WEI_NONCMD_CPU (idle post-command time, per the
+ *     decision table). Only for pids that HAVE CMD markers in the window —
+ *     legacy traces and background processes keep all we==0 as CPU;
+ *   - samples: foreground samples with a query_id are tagged FLAG_EXEC
+ *     (the cheap sampled-tier phase attribution; plan/exec sub-windows
+ *     need the exact tier's markers).
+ * cats may be NULL/empty (no metadata: everything is foreground). */
+void pgwt_tag_events(struct pgwt_trace_event *events, int count,
+                     const struct pgwt_pid_cat *cats, int n_cats);
+
+/* Category of a tagged record: 0..PGWT_NUM_CATS-1, or -1 for idle. */
+int pgwt_event_category(const struct pgwt_trace_event *ev);
+
 /* ── Fidelity (trace format v2 — D3) ───────────────────────── */
 
 /* The fidelity of the data covering a queried time window.
@@ -128,6 +178,9 @@ int pgwt_filter_matches(const struct pgwt_filter *f,
 struct pgwt_aas_bucket {
     uint64_t start_ns;
     double   class_aas[PGWT_NUM_CLASSES];
+    /* T2: the same AAS decomposed by category. io_worker records appear
+     * ONLY here (their own slot) — never in class_aas or max_aas. */
+    double   cat_aas[PGWT_NUM_CATS];
 };
 
 #define AAS_MAX_EVENT_SERIES 16
@@ -173,6 +226,10 @@ struct pgwt_tm_result {
     double idle_time_ms;
     double aas;
     double wall_ms;
+    /* T2 category decomposition (raw path only; 0 on the summary path).
+     * cat_ms[PGWT_CAT_IO_WORKER] is io_worker BUSY ms — outside DB Time. */
+    double cat_ms[PGWT_NUM_CATS];
+    double io_worker_busy_pct;  /* busy ms / (io_worker pids × wall) × 100 */
 };
 
 void pgwt_compute_time_model(const struct pgwt_trace_event *events, int count,

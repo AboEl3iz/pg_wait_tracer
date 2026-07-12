@@ -72,11 +72,23 @@ def main():
 
             if buckets:
                 b = buckets[0]
-                # Sum all class values
+                # Sum all class values (skip the T2 "cat" decomposition —
+                # it is a parallel breakdown of the same time, not a class)
                 total_aas = sum(v for k, v in b.items()
-                                if k not in ("t", "total"))
+                                if k not in ("t", "total", "cat"))
                 t.check_approx(total_aas, 4.0, 0.05,
                                "Total AAS = 4.0 (4 active sessions)")
+
+                # T2: the category decomposition covers the same total
+                # (all backends here are foreground clients; no io_workers)
+                cat = b.get("cat", {})
+                t.check(isinstance(cat, dict) and "execution" in cat,
+                        "bucket carries the T2 category decomposition")
+                cat_total = sum(cat.values())
+                t.check_approx(cat_total, 4.0, 0.05,
+                               "category AAS total = class AAS total")
+                t.check_approx(cat.get("io_worker", -1), 0.0, 0.001,
+                               "no io_worker AAS in a client-only scenario")
 
             # Also check time_model for AAS (use same 5s window)
             resp_tm = srv.query("time_model",

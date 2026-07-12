@@ -178,6 +178,21 @@ static cJSON *build_metrics(const struct pgwt_daemon *d)
     cJSON_AddBoolToObject(root, "sampler_healthy",
                           !(d->sampler && !d->sampler->health.healthy));
 
+    /* T2 decomposed-AAS observability (docs/AAS_SEMANTICS_DECISION.md):
+     * io_worker_busy_pct is the utilization signal that replaces counting
+     * io_workers in AAS (busy% over the last display interval; a sustained
+     * high value means the io_worker pool is near saturation).
+     * noncmd_cpu_samples_total counts client we==0 readings outside a
+     * command — observed but deliberately not recorded as activity. */
+    cJSON_AddNumberToObject(root, "io_worker_busy_pct",
+                            ctr->io_worker_busy_pct);
+    cjson_add_uint64(root, "io_worker_samples_total",
+                     ctr->io_worker_samples_total);
+    cjson_add_uint64(root, "io_worker_busy_total",
+                     ctr->io_worker_busy_total);
+    cjson_add_uint64(root, "noncmd_cpu_samples_total",
+                     ctr->noncmd_cpu_samples_total);
+
     /* Provider self-metrics. ringbuf_drops_total is the full tier's BPF-side
      * event_ringbuf drop count (A2 wired this; A0 deliberately omitted it). */
     struct pgwt_metrics pm;

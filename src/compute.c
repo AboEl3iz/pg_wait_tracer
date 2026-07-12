@@ -171,6 +171,170 @@ int pgwt_filter_matches(const struct pgwt_filter *f,
     return 1;
 }
 
+/* ── T2: category tagging pass (docs/AAS_SEMANTICS_DECISION.md) ──────── */
+
+/* Per-pid sweep state for pgwt_tag_events. Open-addressing hash on pid. */
+#define TAG_HT_SIZE 4096
+#define TAG_HT_MASK (TAG_HT_SIZE - 1)
+struct tag_pid_state {
+    uint32_t pid;          /* 0 = empty slot */
+    uint32_t cat_flag;     /* category flag from the pid table */
+    uint8_t  cat_resolved;
+    uint8_t  plan_open, exec_open;
+    uint8_t  cmd_open, seen_cmd;
+    uint64_t cmd_anchor;   /* start of the current open run / last record end */
+    uint64_t banked_ns;    /* closed command-open ns since the last record */
+};
+
+static uint32_t pid_cat_lookup(const struct pgwt_pid_cat *cats, int n,
+                               uint32_t pid)
+{
+    int lo = 0, hi = n - 1;
+    while (lo <= hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (cats[mid].pid == pid)
+            return cats[mid].flag;
+        if (cats[mid].pid < pid)
+            lo = mid + 1;
+        else
+            hi = mid - 1;
+    }
+    return 0;   /* unknown pid: foreground (conservative) */
+}
+
+static struct tag_pid_state *tag_pid_get(struct tag_pid_state *ht, uint32_t pid)
+{
+    int h = hash32(pid, TAG_HT_MASK);
+    for (int probe = 0; probe < TAG_HT_SIZE; probe++) {
+        if (ht[h].pid == pid)
+            return &ht[h];
+        if (ht[h].pid == 0) {
+            ht[h].pid = pid;
+            return &ht[h];
+        }
+        h = (h + 1) & TAG_HT_MASK;
+    }
+    return NULL;   /* table full — untagged records stay foreground */
+}
+
+void pgwt_tag_events(struct pgwt_trace_event *events, int count,
+                     const struct pgwt_pid_cat *cats, int n_cats)
+{
+    struct tag_pid_state *ht = calloc(TAG_HT_SIZE, sizeof(*ht));
+    if (!ht)
+        return;   /* untagged: everything foreground, CPU stays CPU */
+
+    for (int i = 0; i < count; i++) {
+        struct pgwt_trace_event *ev = &events[i];
+        struct tag_pid_state *st = tag_pid_get(ht, ev->pid);
+        if (!st)
+            continue;
+
+        /* Markers drive the per-pid windows and are otherwise left alone. */
+        if (PGWT_IS_MARKER(ev->old_event)) {
+            uint64_t ts = ev->timestamp_ns;
+            switch (ev->old_event) {
+            case PGWT_MARKER_PLAN_START: st->plan_open = 1; break;
+            case PGWT_MARKER_PLAN_END:   st->plan_open = 0; break;
+            case PGWT_MARKER_EXEC_START: st->exec_open = 1; break;
+            case PGWT_MARKER_EXEC_END:   st->exec_open = 0; break;
+            case PGWT_MARKER_CMD_START:
+                st->seen_cmd = 1;
+                if (!st->cmd_open) {
+                    st->cmd_open = 1;
+                    st->cmd_anchor = ts;
+                }
+                break;
+            case PGWT_MARKER_CMD_END:
+                st->seen_cmd = 1;
+                if (st->cmd_open) {
+                    st->banked_ns += ts - st->cmd_anchor;
+                    st->cmd_open = 0;
+                }
+                /* A command closing also closes any stale plan/exec window
+                 * (an EXEC_END lost to a ringbuf drop must not leak the
+                 * window across statements). */
+                st->plan_open = 0;
+                st->exec_open = 0;
+                break;
+            default:
+                break;   /* escalation markers: pid 0, no per-pid state */
+            }
+            continue;
+        }
+
+        if (!st->cat_resolved) {
+            st->cat_flag = pid_cat_lookup(cats, n_cats, ev->pid);
+            st->cat_resolved = 1;
+        }
+        ev->flags |= st->cat_flag;
+
+        if (ev->flags & PGWT_EVENT_FLAG_SAMPLE) {
+            /* Sampled tier: no plan/exec markers exist. Cheap phase
+             * attribution — a foreground sample carrying a query_id is
+             * execution; without one it is command overhead. */
+            if (st->cat_flag == 0 && ev->query_id != 0)
+                ev->flags |= PGWT_EVENT_FLAG_EXEC;
+            continue;
+        }
+
+        /* Exact record: interval [t1 - dur, t1). */
+        uint64_t t1 = ev->timestamp_ns;
+        uint64_t t0 = t1 - ev->duration_ns;
+        if (st->plan_open) ev->flags |= PGWT_EVENT_FLAG_PLAN;
+        if (st->exec_open) ev->flags |= PGWT_EVENT_FLAG_EXEC;
+
+        if (st->seen_cmd) {
+            /* Command-open ns inside this interval: the banked closed runs
+             * plus the currently-open run clipped to the interval. Records
+             * for one pid are contiguous in an exact span, so banked time
+             * since the previous record belongs to this interval. */
+            uint64_t open_ns = st->banked_ns;
+            if (st->cmd_open) {
+                uint64_t a = st->cmd_anchor > t0 ? st->cmd_anchor : t0;
+                if (t1 > a)
+                    open_ns += t1 - a;
+            }
+            st->banked_ns = 0;
+            if (st->cmd_open)
+                st->cmd_anchor = t1;
+
+            /* Majority rule: an interval more than half inside a command
+             * window is in-command (bounded by one interval's length —
+             * we==0 intervals are µs-ms vs multi-second buckets). */
+            int in_cmd = ev->duration_ns == 0
+                       ? st->cmd_open
+                       : (open_ns * 2 >= ev->duration_ns);
+            if (in_cmd)
+                ev->flags |= PGWT_EVENT_FLAG_CMD_OPEN;
+
+            /* The decision table: we==0 OUTSIDE a command is idle
+             * post/between-command time, not CPU. Foreground pids only —
+             * background processes never report activity states. */
+            if (ev->old_event == 0 && st->cat_flag == 0 && !in_cmd)
+                ev->old_event = PGWT_WEI_NONCMD_CPU;
+        }
+    }
+    free(ht);
+}
+
+int pgwt_event_category(const struct pgwt_trace_event *ev)
+{
+    if (ev->flags & PGWT_EVENT_FLAG_IO_WORKER)
+        return PGWT_CAT_IO_WORKER;
+    if (pgwt_is_idle_event(ev->old_event))
+        return -1;
+    if (ev->flags & PGWT_EVENT_FLAG_MAINT)
+        return PGWT_CAT_MAINT;
+    if (ev->flags & PGWT_EVENT_FLAG_BACKGROUND)
+        return PGWT_CAT_BG;
+    if (ev->flags & PGWT_EVENT_FLAG_PLAN)
+        return PGWT_CAT_FG_PLAN;
+    if (ev->flags & PGWT_EVENT_FLAG_EXEC)
+        return PGWT_CAT_FG_EXEC;
+    return PGWT_CAT_FG_CMD;
+}
+
 /* ── AAS Buckets ──────────────────────────────────────────── */
 
 /* Hash table entry for per-event total accumulation (pass 1) */
@@ -228,6 +392,13 @@ void pgwt_compute_aas(const struct pgwt_trace_event *events, int count,
         if (!pgwt_filter_matches(f, ev) || pgwt_is_idle_event(ev->old_event))
             continue;
 
+        /* T2: io_worker records never enter the class AAS (or max_aas) —
+         * they appear only in their own category slot, so the headline AAS
+         * keeps the "≤ sessions doing work" invariant and stays comparable
+         * across io_method settings. */
+        int cat = pgwt_event_category(ev);
+        int io_worker = (cat == PGWT_CAT_IO_WORKER);
+
         /* Event covers [timestamp_ns - duration_ns, timestamp_ns) */
         uint64_t ev_start = ev->timestamp_ns - ev->duration_ns;
         uint64_t ev_end   = ev->timestamp_ns;
@@ -249,12 +420,16 @@ void pgwt_compute_aas(const struct pgwt_trace_event *events, int count,
             uint64_t b_end   = b_start + bucket_ns;
             uint64_t o_start = ev_start > b_start ? ev_start : b_start;
             uint64_t o_end   = ev_end < b_end ? ev_end : b_end;
-            if (o_end > o_start)
-                buckets[b].class_aas[class_idx] += (double)(o_end - o_start);
+            if (o_end > o_start) {
+                if (!io_worker)
+                    buckets[b].class_aas[class_idx] += (double)(o_end - o_start);
+                if (cat >= 0)
+                    buckets[b].cat_aas[cat] += (double)(o_end - o_start);
+            }
         }
 
         /* Per-event total for sorting (pass 1) */
-        if (evt_ht) {
+        if (evt_ht && !io_worker) {
             uint32_t h = ev->old_event & AAS_EVT_HT_MASK;
             while (evt_ht[h].total_ns > 0 && evt_ht[h].event_id != ev->old_event)
                 h = (h + 1) & AAS_EVT_HT_MASK;
@@ -263,7 +438,7 @@ void pgwt_compute_aas(const struct pgwt_trace_event *events, int count,
         }
     }
 
-    /* Convert accumulated ns → AAS (class buckets) */
+    /* Convert accumulated ns → AAS (class + category buckets) */
     double max_aas = 0.0;
     for (int i = 0; i < actual_buckets; i++) {
         double total = 0.0;
@@ -271,6 +446,8 @@ void pgwt_compute_aas(const struct pgwt_trace_event *events, int count,
             buckets[i].class_aas[c] /= (double)bucket_ns;
             total += buckets[i].class_aas[c];
         }
+        for (int c = 0; c < PGWT_NUM_CATS; c++)
+            buckets[i].cat_aas[c] /= (double)bucket_ns;
         if (total > max_aas)
             max_aas = total;
     }
@@ -315,6 +492,8 @@ void pgwt_compute_aas(const struct pgwt_trace_event *events, int count,
                 const struct pgwt_trace_event *ev = &events[i];
                 if (!pgwt_filter_matches(f, ev) || pgwt_is_idle_event(ev->old_event))
                     continue;
+                if (ev->flags & PGWT_EVENT_FLAG_IO_WORKER)
+                    continue;   /* T2: excluded from AAS in any view */
 
                 /* Find series index for this event */
                 int si = -1;
@@ -409,6 +588,11 @@ void pgwt_compute_time_model(const struct pgwt_trace_event *events, int count,
 
     double db_time_ns  = 0.0;
     double idle_time_ns = 0.0;
+    double cat_ns[PGWT_NUM_CATS] = {0};
+    /* io_worker busy%% needs the worker-pool size: count distinct io_worker
+     * pids seen in the window (a handful — io_workers defaults to 3). */
+    uint32_t iw_pids[64];
+    int n_iw_pids = 0;
 
     for (int i = 0; i < count; i++) {
         const struct pgwt_trace_event *ev = &events[i];
@@ -417,10 +601,28 @@ void pgwt_compute_time_model(const struct pgwt_trace_event *events, int count,
 
         double dur_ns = (double)ev->duration_ns;
 
+        /* T2: io_worker time is OUTSIDE DB Time/idle — busy time goes to
+         * its category slot (the utilization signal), idle time (their
+         * instrumented IoWorkerMain wait) is dropped from the model. */
+        if (ev->flags & PGWT_EVENT_FLAG_IO_WORKER) {
+            int seen = 0;
+            for (int k = 0; k < n_iw_pids; k++)
+                if (iw_pids[k] == ev->pid) { seen = 1; break; }
+            if (!seen && n_iw_pids < 64)
+                iw_pids[n_iw_pids++] = ev->pid;
+            if (!pgwt_is_idle_event(ev->old_event))
+                cat_ns[PGWT_CAT_IO_WORKER] += dur_ns;
+            continue;
+        }
+
         if (pgwt_is_idle_event(ev->old_event)) {
             idle_time_ns += dur_ns;
             continue;
         }
+
+        int cat = pgwt_event_category(ev);
+        if (cat >= 0)
+            cat_ns[cat] += dur_ns;
 
         db_time_ns += dur_ns;
         int cls_idx = pgwt_wait_class_index(ev->old_event);
@@ -431,6 +633,14 @@ void pgwt_compute_time_model(const struct pgwt_trace_event *events, int count,
         if (slot >= 0)
             ev_ht[slot].total_ns += dur_ns;
     }
+
+    for (int c = 0; c < PGWT_NUM_CATS; c++)
+        out->cat_ms[c] = cat_ns[c] / 1e6;
+    out->io_worker_busy_pct =
+        (n_iw_pids > 0 && wall_ms > 0)
+            ? 100.0 * (cat_ns[PGWT_CAT_IO_WORKER] / 1e6)
+              / ((double)n_iw_pids * wall_ms)
+            : 0.0;
 
     double db_time_ms  = db_time_ns / 1e6;
     double idle_ms     = idle_time_ns / 1e6;
@@ -584,6 +794,12 @@ void pgwt_compute_top_events(const struct pgwt_trace_event *events, int count,
         const struct pgwt_trace_event *ev = &events[i];
         if (!pgwt_filter_matches(f, ev) || pgwt_is_hidden_event(ev->old_event))
             continue;
+        /* T2: io_worker time never enters the DB-Time-ranked event list —
+         * it would double-represent the same I/O already counted in the
+         * requesting backends' AioIoCompletion waits. Their records stay
+         * in the raw trace/timeline; the utilization metric covers them. */
+        if (ev->flags & PGWT_EVENT_FLAG_IO_WORKER)
+            continue;
 
         /* Idle-but-visible events (Client:ClientRead) appear in the list
          * but are excluded from DB Time. Their time is not part of the
@@ -696,6 +912,8 @@ void pgwt_compute_top_sessions(const struct pgwt_trace_event *events, int count,
         const struct pgwt_trace_event *ev = &events[i];
         if (!pgwt_filter_matches(f, ev) || pgwt_is_idle_event(ev->old_event))
             continue;
+        if (ev->flags & PGWT_EVENT_FLAG_IO_WORKER)
+            continue;   /* T2: io_workers are not sessions doing DB work */
 
         uint32_t h = ev->pid % SESSION_HT_SIZE;
         while (ht[h].pid != 0 && ht[h].pid != ev->pid)
@@ -796,6 +1014,8 @@ void pgwt_compute_top_queries(const struct pgwt_trace_event *events, int count,
         const struct pgwt_trace_event *ev = &events[i];
         if (!pgwt_filter_matches(f, ev) || pgwt_is_idle_event(ev->old_event))
             continue;
+        if (ev->flags & PGWT_EVENT_FLAG_IO_WORKER)
+            continue;   /* T2: io_workers are structurally query-less */
         if (ev->query_id == 0)
             continue;
 

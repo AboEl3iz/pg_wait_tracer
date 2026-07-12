@@ -287,6 +287,13 @@ def test_db_time_sanity(pm_pid):
 def test_io_count_cross_check(pm_pid):
     """Compare tracer IO:DataFileRead count against pg_stat_io reads.
 
+    COUNTS, deliberately not time (T2 study Q3): pg_stat_io.read_time's
+    INSTR_TIME window covers per-op AIO bookkeeping + per-page completion
+    work (~9us + ~1.7us/page more than the wait_event set/clear window),
+    so a time ratio floats 0.55-0.90 with mean op latency — the historical
+    "0.80 async overlap" was instrumentation-window overhead, not overlap
+    and not data loss. Counts agree to +/-0.2% when windows align.
+
     Strategy: use pgbench TPC-B (not -S) which does updates and generates
     real IO.  Start pgbench first, let backends attach, THEN reset pg_stat_io
     and start the tracer measurement window simultaneously.

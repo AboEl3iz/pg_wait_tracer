@@ -258,9 +258,11 @@ static void test_metrics_from_batch(void)
 {
     printf("--- metrics_from_batch: AAS + lock-fraction derivation ---\n");
 
-    /* A batch as build_batch would produce: on-CPU (event 0) is already
-     * absent. Mix of Lock, LWLock, IO and idle (ClientRead / Activity). */
-    struct pgwt_trace_event batch[6];
+    /* A batch as build_batch would produce (T2: gated on-CPU records are
+     * first-class CPU samples with new_event == 0). Mix of CPU, Lock,
+     * LWLock, IO and idle (ClientRead / Activity), plus an io_worker
+     * record that must be excluded. */
+    struct pgwt_trace_event batch[8];
     memset(batch, 0, sizeof(batch));
     batch[0].new_event = WEI(PG_WAIT_LOCK, 0x03);     /* active, lock */
     batch[1].new_event = WEI(PG_WAIT_LOCK, 0x01);     /* active, lock */
@@ -268,12 +270,16 @@ static void test_metrics_from_batch(void)
     batch[3].new_event = WEI(PG_WAIT_IO, 0x10);       /* active, not lock */
     batch[4].new_event = WEI(PG_WAIT_CLIENT, 0);      /* idle (ClientRead) */
     batch[5].new_event = WEI(PG_WAIT_ACTIVITY, 0x02); /* idle (Activity) */
+    batch[6].new_event = 0;                           /* on-CPU: ACTIVE (T2) */
+    batch[7].new_event = WEI(PG_WAIT_IO, 0x10);       /* io_worker: excluded */
+    batch[7].flags     = PGWT_EVENT_FLAG_IO_WORKER;
 
     double aas = -1, frac = -1;
-    pgwt_anomaly_metrics_from_batch(batch, 6, &aas, &frac);
-    /* Active = 4 (the two idle excluded); locks = 2 → fraction 0.5. */
-    CHECK(aas == 4.0, "aas=%.1f expected 4", aas);
-    CHECK(frac == 0.5, "lock_fraction=%.2f expected 0.50", frac);
+    pgwt_anomaly_metrics_from_batch(batch, 8, &aas, &frac);
+    /* Active = 5 (two idle + the io_worker excluded, the CPU sample
+     * included); locks = 2 → fraction 0.4. */
+    CHECK(aas == 5.0, "aas=%.1f expected 5", aas);
+    CHECK(frac == 0.4, "lock_fraction=%.2f expected 0.40", frac);
 
     /* All-idle batch → AAS 0, fraction 0 (no divide-by-zero). */
     struct pgwt_trace_event idle[2];
@@ -283,6 +289,66 @@ static void test_metrics_from_batch(void)
     pgwt_anomaly_metrics_from_batch(idle, 2, &aas, &frac);
     CHECK(aas == 0.0, "all-idle aas=%.1f expected 0", aas);
     CHECK(frac == 0.0, "all-idle frac=%.2f expected 0", frac);
+}
+
+/* ── Test 8b: a pure CPU storm must be able to trip the AAS rule (AAS-1) ─ */
+static void test_cpu_storm_fires(void)
+{
+    printf("--- CPU storm: we==0 samples drive the AAS rule ---\n");
+
+    struct pgwt_anomaly a;
+    pgwt_anomaly_init(&a, true, 10);
+    a.aas_factor = 3.0;
+    a.aas_ticks  = 3;
+
+    uint64_t clk = TICK_NS;
+    warm_baseline(&a, 1.0, &clk);   /* quiet baseline ~1 */
+
+    /* A CPU-storm batch: 8 client backends all on-CPU inside a command —
+     * exactly the incident class the pre-T2 sampler was blind to (it
+     * reported AAS 0.017 for a machine-saturating -S run; study Q4). */
+    struct pgwt_trace_event storm[8];
+    memset(storm, 0, sizeof(storm));   /* new_event = 0 = CPU, no flags */
+
+    int fired = 0;
+    for (int t = 0; t < 5; t++) {
+        double aas = -1, frac = -1;
+        pgwt_anomaly_metrics_from_batch(storm, 8, &aas, &frac);
+        CHECK(aas == 8.0, "storm tick aas=%.1f expected 8", aas);
+        struct pgwt_anomaly_decision d = pgwt_anomaly_eval(&a, aas, frac, clk);
+        clk += TICK_NS;
+        if (d.action == PGWT_ANOMALY_FIRE) {
+            CHECK(d.fired_mask & PGWT_RULE_AAS, "CPU storm fires the AAS rule");
+            fired = 1;
+            break;
+        }
+    }
+    CHECK(fired, "sustained CPU storm must FIRE (the anomaly engine was "
+          "blind to exactly this before T2)");
+
+    /* The same storm made of io_worker records must NOT fire — io_workers
+     * are excluded from AAS by decision. */
+    struct pgwt_anomaly b;
+    pgwt_anomaly_init(&b, true, 10);
+    b.aas_factor = 3.0;
+    b.aas_ticks  = 3;
+    clk = TICK_NS;
+    warm_baseline(&b, 1.0, &clk);
+    struct pgwt_trace_event iostorm[8];
+    memset(iostorm, 0, sizeof(iostorm));
+    for (int i = 0; i < 8; i++) {
+        iostorm[i].new_event = WEI(PG_WAIT_IO, 0x01);
+        iostorm[i].flags = PGWT_EVENT_FLAG_IO_WORKER;
+    }
+    for (int t = 0; t < 5; t++) {
+        double aas = -1, frac = -1;
+        pgwt_anomaly_metrics_from_batch(iostorm, 8, &aas, &frac);
+        CHECK(aas == 0.0, "io_worker-only batch aas=%.1f expected 0", aas);
+        struct pgwt_anomaly_decision d = pgwt_anomaly_eval(&b, aas, frac, clk);
+        clk += TICK_NS;
+        CHECK(d.action != PGWT_ANOMALY_FIRE,
+              "io_worker load must never fire the AAS rule");
+    }
 }
 
 /* ── Test 9: AAS + lock can fire together (combined fired_mask) ────────── */
@@ -317,6 +383,7 @@ int main(void)
     test_baseline_protected();
     test_budget_boundary();
     test_metrics_from_batch();
+    test_cpu_storm_fires();
     test_combined_fire();
 
     printf("\n%d/%d checks passed\n", tests_passed, tests_run);

@@ -498,6 +498,216 @@ def phase_fork_after_attach(pm_pid, mode):
           f"(saw: {names})")
 
 
+class CpuStorm:
+    """N psql sessions each executing a long run of SHORT CPU-bound
+    statements (~30-100 ms each, fully cached): pg_stat_activity shows
+    them state='active' nearly continuously, and the real command
+    boundaries exercise the T2 command-open gate exactly like production
+    OLTP (one long DO block would hide the gate)."""
+
+    def __init__(self, n):
+        self.sessions = [subprocess.Popen(
+            ["psql", "-U", "postgres", "-d", "postgres"],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, text=True) for _ in range(n)]
+        time.sleep(1.5)   # connected (and, pre-attach, scanned)
+
+    def fire(self, reps=400):
+        stmt = "SELECT count(*) FROM generate_series(1,300000);\n"
+        for s in self.sessions:
+            s.stdin.write(stmt * reps)
+            s.stdin.flush()
+
+    def stop(self):
+        for s in self.sessions:
+            s.terminate()
+            try:
+                s.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                s.kill()
+        cleanup_stale_backends()
+
+
+def sample_active_sessions(duration_s, interval=0.5):
+    """pg_stat_activity 1-per-interval ground truth: count of client
+    backends with state='active', excluding the sampling connection."""
+    counts = []
+    end = time.time() + duration_s
+    while time.time() < end:
+        out = psql("SELECT count(*) FROM pg_stat_activity "
+                   "WHERE state = 'active' "
+                   "AND backend_type = 'client backend' "
+                   "AND pid != pg_backend_pid()", timeout=10)
+        if re.fullmatch(r'\d+', out or ''):
+            counts.append(int(out))
+        time.sleep(interval)
+    return counts
+
+
+def aas_bucket_total(bucket):
+    return sum(v for k, v in bucket.items()
+               if k not in ("t", "total", "cat") and isinstance(v, (int, float)))
+
+
+def ctl_query(trace_dir, cmd):
+    """One JSON request over the daemon control socket."""
+    import socket
+    path = os.path.join(trace_dir, "pgwt.sock")
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(5)
+    try:
+        s.connect(path)
+        s.sendall((json.dumps({"cmd": cmd}) + "\n").encode())
+        buf = b""
+        while b"\n" not in buf:
+            c = s.recv(4096)
+            if not c:
+                break
+            buf += c
+        return json.loads(buf.decode().split("\n")[0])
+    finally:
+        s.close()
+
+
+def phase_sampled_aas_truth(pm_pid):
+    """T2 (AAS-1) definition-of-done: sampled AAS — now CPU-inclusive —
+    must match pg_stat_activity 1s-sampling ground truth. A CPU-bound
+    storm (3 hogs) + a pg_sleep session; pre-T2 the sampler skipped all
+    we==0 and reported AAS ~ 0.0x for exactly this shape (study Q4:
+    -98%%). Anomaly escalation is disabled (huge factor) so the window is
+    PURE sampled tier."""
+    print("--- Phase 5: sampled CPU-inclusive AAS vs pg_stat_activity ---")
+    trace_dir = tempfile.mkdtemp(prefix="pgwt_smoke_aas_")
+    os.chmod(trace_dir, 0o755)
+
+    storm = CpuStorm(3)
+    sleeper = subprocess.Popen(
+        ["psql", "-U", "postgres", "-d", "postgres"],
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL, text=True)
+    time.sleep(1.0)
+
+    tracer = subprocess.Popen(
+        [TRACER, "--mode", "tiered", "--pid", str(pm_pid),
+         "-T", trace_dir, "--duration", "17", "--quiet",
+         "--interval", "5", "--anomaly-aas-factor", "1000000"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    time.sleep(3.0)   # BPF load + scan + first ticks
+    try:
+        win_from = time.time_ns()
+        storm.fire()
+        sleeper.stdin.write("SELECT pg_sleep(10);\n")
+        sleeper.stdin.flush()
+        time.sleep(0.5)
+        psa = sample_active_sessions(9.0, interval=0.5)
+        win_to = time.time_ns()
+        _, stderr = tracer.communicate(timeout=40)
+        err = stderr.decode('utf-8', errors='replace')
+    except subprocess.TimeoutExpired:
+        tracer.kill()
+        _, stderr = tracer.communicate()
+        err = stderr.decode('utf-8', errors='replace')
+    finally:
+        storm.stop()
+        sleeper.terminate()
+
+    psa_mean = sum(psa) / len(psa) if psa else 0.0
+    check(psa_mean >= 2.0,
+          f"ground truth: pg_stat_activity mean active = {psa_mean:.2f} "
+          f"(storm running; n={len(psa)})")
+
+    resp = server_query(trace_dir, "aas",
+                        extra={"from": win_from, "to": win_to, "buckets": 9})
+    buckets = resp.get("buckets", [])
+    check(len(buckets) > 0,
+          "aas view has buckets over the storm window" if buckets else
+          f"aas view has buckets (stderr tail: {err[-300:]!r})")
+    if buckets:
+        totals = [aas_bucket_total(b) for b in buckets]
+        tracer_mean = sum(totals) / len(totals)
+        cpu_mean = sum(b.get("cpu", 0.0) for b in buckets) / len(buckets)
+        tol = max(0.9, 0.35 * psa_mean)
+        check(abs(tracer_mean - psa_mean) <= tol,
+              f"sampled AAS matches pg_stat_activity ground truth: "
+              f"tracer={tracer_mean:.2f} vs psa={psa_mean:.2f} (tol ±{tol:.2f}) "
+              f"[AAS-1 definition of done]")
+        check(cpu_mean >= 1.0,
+              f"CPU class carries the storm: cpu AAS = {cpu_mean:.2f} "
+              f"(pre-T2 sampler reported ~0 here)")
+        check(resp.get("fidelity") == "sampled",
+              f"window is pure sampled tier (fidelity={resp.get('fidelity')!r})")
+
+    subprocess.run(["rm", "-rf", trace_dir])
+
+
+def phase_cpu_storm_escalation(pm_pid):
+    """T2 definition-of-done: a SELECT-storm CPU incident raises sampled
+    AAS enough to trigger anomaly escalation (the engine was blind to CPU
+    before — AAS-1), and the AAS chart shows no step artifact across the
+    sampled->exact tier switch."""
+    print("--- Phase 6: CPU storm triggers escalation; no AAS step ---")
+    trace_dir = tempfile.mkdtemp(prefix="pgwt_smoke_esc_")
+    os.chmod(trace_dir, 0o755)
+
+    storm = CpuStorm(3)
+    tracer = subprocess.Popen(
+        [TRACER, "--mode", "tiered", "--pid", str(pm_pid),
+         "-T", trace_dir, "--duration", "20", "--quiet",
+         "--interval", "5"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    time.sleep(7.0)   # BPF load + scan + anomaly baseline warmup (~5 s idle)
+    try:
+        storm_from = time.time_ns()
+        storm.fire()
+        time.sleep(5.0)
+        metrics = {}
+        try:
+            metrics = ctl_query(trace_dir, "metrics")
+        except OSError as e:
+            print(f"  (control socket: {e})")
+        storm_active = sample_active_sessions(3.0, interval=0.5)
+        storm_to = time.time_ns()
+        _, stderr = tracer.communicate(timeout=40)
+        err = stderr.decode('utf-8', errors='replace')
+    except subprocess.TimeoutExpired:
+        tracer.kill()
+        _, stderr = tracer.communicate()
+        err = stderr.decode('utf-8', errors='replace')
+    finally:
+        storm.stop()
+
+    fires = metrics.get("anomaly_fires_total", 0)
+    windows = metrics.get("escalation_windows_total", 0)
+    check(fires >= 1 and windows >= 1,
+          f"CPU storm triggered anomaly escalation "
+          f"(anomaly_fires_total={fires}, escalation_windows_total={windows}, "
+          f"tier={metrics.get('tier')!r}) [AAS-1: engine no longer CPU-blind]"
+          + ("" if fires >= 1 else f" (tracer stderr tail: {err[-300:]!r})"))
+
+    # No step artifact: every interior 1s bucket across the tier switch
+    # must show the storm. The anomaly fires ~0.3-1 s into the storm, so
+    # starting the window at +0.7 s puts the sampled->exact switch INSIDE
+    # the asserted range. Pre-T2, sampled buckets read ~0.0 while exact
+    # (escalated) buckets read ~3 — a hard step.
+    resp = server_query(trace_dir, "aas",
+                        extra={"from": storm_from + 700_000_000,
+                               "to": storm_to - 1_000_000_000,
+                               "buckets": 7})
+    buckets = resp.get("buckets", [])
+    check(len(buckets) >= 3, f"aas buckets across the tier switch "
+          f"(got {len(buckets)}, fidelity={resp.get('fidelity')!r})")
+    if buckets:
+        totals = [aas_bucket_total(b) for b in buckets]
+        lo = min(totals)
+        truth = (sum(storm_active) / len(storm_active)) if storm_active else 3.0
+        check(lo >= 1.2,
+              f"no AAS step artifact at the tier switch: min bucket = "
+              f"{lo:.2f}, buckets = {[f'{t:.1f}' for t in totals]}, "
+              f"psa during storm = {truth:.1f}")
+
+    subprocess.run(["rm", "-rf", trace_dir])
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--pid', type=int, help='Postmaster PID')
@@ -538,6 +748,12 @@ def main():
     phase_live_query_event(pm_pid, args.mode)
     phase_trace_file(pm_pid, args.mode)
     phase_fork_after_attach(pm_pid, args.mode)
+    if args.mode == 'tiered':
+        # T2 (AAS semantics): CPU-inclusive sampled AAS vs pg_stat_activity
+        # ground truth, and the CPU-storm escalation + tier-switch
+        # continuity checks (docs/AAS_SEMANTICS_DECISION.md).
+        phase_sampled_aas_truth(pm_pid)
+        phase_cpu_storm_escalation(pm_pid)
 
     print(f"\n{tests_passed}/{tests_run} checks passed")
     sys.exit(0 if tests_failed == 0 else 1)

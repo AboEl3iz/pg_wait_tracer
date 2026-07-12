@@ -231,6 +231,12 @@ struct pgwt_server {
     struct bm_entry *bm_map;
     int  bm_capacity;
     int  bm_count;
+
+    /* T2: pid → category-flag table (sorted by pid), derived from bm_map.
+     * Feeds pgwt_tag_events so every raw compute path can apply the
+     * decomposed-AAS model (io_worker exclusion, categories). */
+    struct pgwt_pid_cat *pid_cats;
+    int  n_pid_cats;
 };
 
 /* ── JSON request parsing (cJSON) ─────────────────────────── */
@@ -502,6 +508,50 @@ static void server_load_backends(struct pgwt_server *srv)
     if (srv->bm_count > 0)
         fprintf(stderr, "pgwt-server: loaded %d backend metadata entries\n",
                 srv->bm_count);
+}
+
+/* Map a backends.jsonl type string to its T2 category flag (mirrors
+ * pgwt_backend_type_flag over the pgwt_backend_type_name strings). */
+static uint32_t bm_type_to_cat_flag(const char *type)
+{
+    if (strcmp(type, "io_worker") == 0)
+        return PGWT_EVENT_FLAG_IO_WORKER;
+    if (strcmp(type, "autovac_worker") == 0)
+        return PGWT_EVENT_FLAG_MAINT;
+    if (strcmp(type, "client") == 0 || strcmp(type, "parallel_worker") == 0
+        || strcmp(type, "unknown") == 0)
+        return 0;   /* foreground */
+    return PGWT_EVENT_FLAG_BACKGROUND;
+}
+
+static int pid_cat_cmp(const void *a, const void *b)
+{
+    uint32_t pa = ((const struct pgwt_pid_cat *)a)->pid;
+    uint32_t pb = ((const struct pgwt_pid_cat *)b)->pid;
+    return (pa > pb) - (pa < pb);
+}
+
+/* Build the sorted pid → category-flag table from the loaded bm_map. */
+static void server_build_pid_cats(struct pgwt_server *srv)
+{
+    free(srv->pid_cats);
+    srv->pid_cats = NULL;
+    srv->n_pid_cats = 0;
+    if (srv->bm_count <= 0 || !srv->bm_map)
+        return;
+    srv->pid_cats = calloc((size_t)srv->bm_count, sizeof(*srv->pid_cats));
+    if (!srv->pid_cats)
+        return;
+    int n = 0;
+    for (int i = 0; i < srv->bm_capacity && n < srv->bm_count; i++) {
+        if (srv->bm_map[i].pid == 0)
+            continue;
+        srv->pid_cats[n].pid  = srv->bm_map[i].pid;
+        srv->pid_cats[n].flag = bm_type_to_cat_flag(srv->bm_map[i].type);
+        n++;
+    }
+    qsort(srv->pid_cats, (size_t)n, sizeof(*srv->pid_cats), pid_cat_cmp);
+    srv->n_pid_cats = n;
 }
 
 /* ── Event caching + on-demand loading ────────────────────── */
@@ -1352,6 +1402,23 @@ server_load_events_fi(struct pgwt_server *srv,
                     continue;   /* exact data is authoritative here */
                 has_samples = 1;
             } else {
+                /* T2 backstop (study defect 2): an EXIT record whose closing
+                 * interval lies OUTSIDE exact coverage in a generation that
+                 * has sampled coverage is a phantom — pre-fix daemons
+                 * "closed" sampled-tier seed entries at process exit,
+                 * back-filling the backend's whole sampled lifetime as one
+                 * interval (usually CPU) that the SAMPLES stream already
+                 * covers. The producer is fixed (wp_live gate in BPF); this
+                 * drop keeps already-recorded traces honest. Real full-mode
+                 * exit intervals lie inside exact coverage and are kept. */
+                if (events[i].new_event == PGWT_EVENT_EXIT
+                    && gc && gc->n_sampled > 0) {
+                    uint64_t mid = events[i].timestamp_ns
+                                 - events[i].duration_ns / 2;
+                    if (!(gc->n_exact > 0 &&
+                          spans_contain(gc->exact, gc->n_exact, mid)))
+                        continue;   /* phantom exit interval */
+                }
                 has_transitions = 1;
             }
             events[kept] = events[i];
@@ -1361,6 +1428,12 @@ server_load_events_fi(struct pgwt_server *srv,
         }
     }
     total = kept;
+
+    /* T2: annotate the merged window with categories (pid types from
+     * backends.jsonl) and the PLAN/EXEC/CMD marker windows; classify exact
+     * we==0 intervals against the command gate. One pass feeding every raw
+     * estimator (docs/AAS_SEMANTICS_DECISION.md). */
+    pgwt_tag_events(events, total, srv->pid_cats, srv->n_pid_cats);
 
     if (info) {
         info->has_transitions = has_transitions;
@@ -1386,6 +1459,9 @@ static void server_destroy(struct pgwt_server *srv)
     qt_map_clear(srv);
     free(srv->bm_map);
     srv->bm_map = NULL;
+    free(srv->pid_cats);
+    srv->pid_cats = NULL;
+    srv->n_pid_cats = 0;
 }
 
 /* ── Server init ──────────────────────────────────────────── */
@@ -1424,6 +1500,7 @@ static int server_init(struct pgwt_server *srv, const char *trace_dir)
 
     server_load_query_texts(srv);
     server_load_backends(srv);
+    server_build_pid_cats(srv);
 
     return 0;
 }
@@ -1517,6 +1594,7 @@ static void handle_info(struct pgwt_server *srv, struct pgwt_request *req)
     srv->bm_capacity = 0;
     srv->bm_count = 0;
     server_load_backends(srv);
+    server_build_pid_cats(srv);
 
     cJSON *root = cJSON_CreateObject();
     cJSON_AddNumberToObject(root, "id", (double)req->id);
@@ -1601,6 +1679,16 @@ static void handle_aas(struct pgwt_server *srv, struct pgwt_request *req)
             for (int c = 0; c < PGWT_NUM_CLASSES; c++)
                 cJSON_AddNumberToObject(b, pgwt_class_names[c],
                                         aas.buckets[i].class_aas[c]);
+            /* T2 (additive): the same AAS decomposed by category.
+             * io_worker appears ONLY here — excluded from the class AAS
+             * above and from max_aas. Raw path only (summaries carry no
+             * category data). */
+            if (!from_summaries) {
+                cJSON *cat = cJSON_AddObjectToObject(b, "cat");
+                for (int c = 0; c < PGWT_NUM_CATS; c++)
+                    cJSON_AddNumberToObject(cat, pgwt_cat_names[c],
+                                            aas.buckets[i].cat_aas[c]);
+            }
             cJSON_AddItemToArray(buckets_arr, b);
         }
     }
@@ -1655,6 +1743,24 @@ static void handle_time_model(struct pgwt_server *srv, struct pgwt_request *req)
     cJSON_AddNumberToObject(root, "idle_time_ms", tm.idle_time_ms);
     cJSON_AddNumberToObject(root, "aas", tm.aas);
     cJSON_AddNumberToObject(root, "wall_ms", tm.wall_ms);
+
+    /* T2 (additive): category decomposition + io_worker utilization. Raw
+     * path only — summaries carry no category data. cat "io_worker" ms is
+     * OUTSIDE DB Time (utilization, not load). */
+    if (!from_summaries) {
+        cJSON *cats = cJSON_AddArrayToObject(root, "categories");
+        for (int c = 0; c < PGWT_NUM_CATS; c++) {
+            cJSON *r = cJSON_CreateObject();
+            cJSON_AddStringToObject(r, "name", pgwt_cat_names[c]);
+            cJSON_AddNumberToObject(r, "ms", tm.cat_ms[c]);
+            cJSON_AddNumberToObject(r, "aas",
+                                    tm.wall_ms > 0 ? tm.cat_ms[c] / tm.wall_ms
+                                                   : 0.0);
+            cJSON_AddItemToArray(cats, r);
+        }
+        cJSON_AddNumberToObject(root, "io_worker_busy_pct",
+                                tm.io_worker_busy_pct);
+    }
     emit_json(root);
 
     free(tm.rows);

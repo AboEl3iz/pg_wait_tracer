@@ -32,7 +32,21 @@ typedef uint64_t u64;
 /* Per-PID state in state_map */
 struct pgwt_pid_state {
     u32 last_event;     /* previous wait_event_info value (0 = on CPU) */
-    u32 _pad;           /* alignment */
+    /* wp_live: 1 while a LIVE hardware watchpoint maintains last_event /
+     * last_ts for this pid (full mode, or tiered while escalated). 0 for
+     * sampled-tier seeds, whose entries only carry query_id/cmd_open — their
+     * last_event/last_ts are NOT interval state. on_exit must only close an
+     * interval when wp_live is set: closing a seed entry fabricated a
+     * phantom full-window "CPU" interval per disconnect (T2 study defect 2:
+     * 4 clients x 120 s of phantom CPU in a trace whose sampler saw 0.017
+     * AAS). */
+    u16 wp_live;
+    /* cmd_open: 1 while a client backend is inside a command — the same
+     * window as pg_stat_activity state='active' (query message received ->
+     * command complete, incl. parse/plan/execute/commit). Maintained by the
+     * on_report_activity uprobe; read by the sampler to gate on-CPU (we==0)
+     * samples for client backends (docs/AAS_SEMANTICS_DECISION.md). */
+    u16 cmd_open;
     u64 last_ts;        /* ktime_ns of last transition */
     u64 last_query_id;  /* query_id set by on_report_query_id uprobe */
     u64 be_entry_ptr;   /* cached PgBackendStatus* (avoids 1 probe_read per event) */
@@ -67,12 +81,27 @@ struct pgwt_trace_event {
     u64 query_id;       /* active query during old_event */
 };
 
-/* flags bits — set by the trace reader, never on the wire/ringbuf.
- * SAMPLE marks a record decoded from a SAMPLES block: it is a point
- * observation (new_event = sampled event; old_event = 0; duration_ns = 0),
- * not a transition interval. A3's compute must treat it as worth one
- * sample_period_ns, not as an interval duration. */
-#define PGWT_EVENT_FLAG_SAMPLE  0x1U
+/* flags bits — NEVER persisted to the trace file (neither block layout
+ * encodes a flags column). Two producers annotate in memory:
+ *
+ *   - the trace reader sets SAMPLE on records decoded from a SAMPLES block:
+ *     a point observation (new_event = sampled event; old_event = 0;
+ *     duration_ns = 0), worth one sample_period_ns, never an interval;
+ *   - BPF/on_watchpoint sets CMD_OPEN on ringbuf transition events emitted
+ *     while the backend's command-open gate was set, so the LIVE accumulator
+ *     can classify we==0 intervals without a marker sweep (the offline
+ *     paths reconstruct the same gate from CMD_START/CMD_END markers);
+ *   - the sampler/server annotate CATEGORY bits (process-type driven) so
+ *     accumulation and the anomaly engine can apply the decomposed AAS
+ *     model (docs/AAS_SEMANTICS_DECISION.md) without a registry lookup per
+ *     consumer. */
+#define PGWT_EVENT_FLAG_SAMPLE     0x1U
+#define PGWT_EVENT_FLAG_CMD_OPEN   0x2U   /* command open at emission */
+#define PGWT_EVENT_FLAG_IO_WORKER  0x4U   /* pid is an io_worker (excluded from AAS/DB Time) */
+#define PGWT_EVENT_FLAG_MAINT      0x8U   /* pid is an autovacuum worker */
+#define PGWT_EVENT_FLAG_BACKGROUND 0x10U  /* pid is another aux process */
+#define PGWT_EVENT_FLAG_PLAN       0x20U  /* inside a PLAN marker window */
+#define PGWT_EVENT_FLAG_EXEC       0x40U  /* inside an EXEC marker window */
 
 #define PGWT_EVENT_EXIT  0xFFFFFFFFU  /* sentinel new_event for process exit */
 
@@ -98,7 +127,19 @@ struct pgwt_trace_event {
 #define PGWT_MARKER_ESCALATE_START 0xFFFFFFF4U  /* full-fidelity window opened */
 #define PGWT_MARKER_ESCALATE_END   0xFFFFFFF5U  /* full-fidelity window closed */
 
-#define PGWT_IS_MARKER(e) ((e) >= 0xFFFFFFF0U && (e) <= 0xFFFFFFF5U)
+/* Command-boundary markers (T2). Emitted by the on_report_activity uprobe
+ * (pgstat_report_activity state transitions) while a watchpoint is live for
+ * the pid, so the exact tier records the same command-open window the
+ * sampled tier gates on (pg_stat_activity state='active' semantics). The
+ * compute layer uses them to classify we==0 (on-CPU) intervals: in-command
+ * portions are CPU (foreground), the remainder is idle post-command time —
+ * keeping AAS continuous across tier switches. Same shape as the query
+ * markers: old_event = new_event = marker, duration_ns = 0, query_id = the
+ * pid's current query_id at the boundary. */
+#define PGWT_MARKER_CMD_START      0xFFFFFFF6U  /* command opened (state -> active) */
+#define PGWT_MARKER_CMD_END        0xFFFFFFF7U  /* command closed (state -> idle/idle-in-txn) */
+
+#define PGWT_IS_MARKER(e) ((e) >= 0xFFFFFFF0U && (e) <= 0xFFFFFFF7U)
 
 /* Pack/unpack the escalation marker payload carried in query_id. */
 #define PGWT_ESC_PACK(secs, reason) \
@@ -146,6 +187,14 @@ struct pgwt_query_text_event {
 
 /* Client:ClientRead — idle between queries (like Oracle's SQL*Net message from client) */
 #define PG_WAIT_CLIENT_READ  ((PG_WAIT_CLIENT << 24) | 0x000000)
+
+/* Synthetic id for we==0 (on-CPU) exact intervals classified OUTSIDE a
+ * command window (T2 decomposed AAS): post/between-command time is idle per
+ * docs/AAS_SEMANTICS_DECISION.md. Activity class => excluded from load
+ * (pgwt_is_idle_event) and hidden from event lists (pgwt_is_hidden_event)
+ * exactly like other instrumented idle states. NEVER written to a trace —
+ * assigned by the compute-side tagging pass (pgwt_tag_events) only. */
+#define PGWT_WEI_NONCMD_CPU  (((uint32_t)PG_WAIT_ACTIVITY << 24) | 0x00FFFFFFU)
 
 /* ── wait_event_info reading classification (CAP-2/3/5) ─────────
  * A reading from a resolved wait_event_info address falls in one of three

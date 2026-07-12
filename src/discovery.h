@@ -36,6 +36,14 @@ uint64_t pgwt_find_load_base_in_maps(const char *maps_path,
 uint64_t pgwt_resolve_symbol(const char *binary, const char *symbol,
                              pid_t pid);
 
+/* Translate an ELF virtual address (a symbol's st_value) to the FILE offset
+ * a uprobe attach needs, via the PT_LOAD program header containing it:
+ * offset = vaddr - p_vaddr + p_offset. Correct for ET_EXEC and ET_DYN alike.
+ * Replaces the non-PIE `va - 0x400000` heuristic that silently attached
+ * uprobes to dead bytes on PIE builds (T2 study defect 1 / PR #24 class).
+ * Returns 0 if no PT_LOAD's file-backed range contains the vaddr. */
+uint64_t pgwt_vaddr_to_file_offset(const char *binary, uint64_t vaddr);
+
 /* Is addr inside a MAP_SHARED mapping of pid? 1 = shared, 0 = private or
  * not mapped, -1 = maps unreadable. The sampler may only BATCH-read
  * addresses that are shared (SMP-2): a process-local address mapped at the

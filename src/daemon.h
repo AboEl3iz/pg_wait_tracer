@@ -45,6 +45,14 @@ struct pgwt_counters {
     uint64_t state_map_full_total;     /* userspace state_map inserts failed (map full, CAP-1) */
     uint64_t invalid_wait_reads_total; /* wait_event_info reads with a garbage class byte (CAP-2/5) */
     uint64_t sampler_ticks_missed_total; /* sampler timer expirations coalesced/missed (SMP-3) */
+
+    /* T2 decomposed-AAS observability (docs/AAS_SEMANTICS_DECISION.md). */
+    uint64_t noncmd_cpu_samples_total; /* client we==0 readings outside a command (not recorded) */
+    uint64_t io_worker_samples_total;  /* io_worker readings taken (excluded from AAS) */
+    uint64_t io_worker_busy_total;     /* ... of which busy (on-CPU or a real wait) */
+    uint64_t prev_io_worker_samples;   /* snapshots at previous display tick */
+    uint64_t prev_io_worker_busy;
+    double   io_worker_busy_pct;       /* busy% over the last display interval */
 };
 
 /* View modes */
@@ -151,6 +159,11 @@ struct pgwt_daemon {
     int         anomaly_cooldown_s;      /* --anomaly-cooldown-s (<0 = default) */
     int         anomaly_window_s;        /* --anomaly-window-s: per-trigger
                                           * escalation duration (<=0 = default) */
+    /* T2: the pgstat_report_activity uprobe attached and the BackendState
+     * layout is known — the command-open gate is live. When false, we==0
+     * classification falls back to the pre-T2 behavior (all exact CPU counts
+     * as CPU) instead of silently mislabeling everything idle. */
+    bool        cmd_gate_active;
     uint32_t    lightweight_mode;        /* 1 = BPF accumulator only (no ringbuf) */
     uint32_t    skip_query_id;          /* 1 = skip query_id reads in BPF */
     uint32_t    skip_usdt;             /* 1 = skip USDT query lifecycle probes */

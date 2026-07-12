@@ -124,24 +124,74 @@ int pgwt_sampler_read_targets(const struct pgwt_sample_target *targets, int n,
     return got;
 }
 
+/* T2 category flag for a backend type (docs/AAS_SEMANTICS_DECISION.md).
+ * Foreground (client, parallel worker) carries no flag; autovacuum workers
+ * are maintenance; io_workers are their own excluded-from-AAS class; every
+ * other aux process is background. UNKNOWN is treated as foreground/client
+ * (conservative: its CPU stays command-gated, its waits count as before). */
+uint32_t pgwt_backend_type_flag(enum pgwt_backend_type bt)
+{
+    switch (bt) {
+    case PGWT_BT_CLIENT:
+    case PGWT_BT_PARALLEL_WORKER:
+    case PGWT_BT_UNKNOWN:
+        return 0;                              /* foreground */
+    case PGWT_BT_AUTOVAC_WORKER:
+        return PGWT_EVENT_FLAG_MAINT;          /* maintenance */
+    case PGWT_BT_IO_WORKER:
+        return PGWT_EVENT_FLAG_IO_WORKER;      /* excluded from AAS/DB Time */
+    default:
+        return PGWT_EVENT_FLAG_BACKGROUND;     /* checkpointer, bgwriter, … */
+    }
+}
+
+/* T2 on-CPU (we==0) recording policy. Client backends (and UNKNOWN, which
+ * cannot prove otherwise) record CPU only inside a command — the
+ * pg_stat_activity state='active' window — because ungated we==0 counting
+ * measured ~3x true activity on chatty OLTP (between-command bookkeeping
+ * scales with transaction rate, not with work). Background types' parked
+ * states are instrumented Activity-class waits, so we==0 always means
+ * working; parallel workers exist only inside a query. */
+int pgwt_cpu_sample_recordable(enum pgwt_backend_type bt, int cmd_open)
+{
+    switch (bt) {
+    case PGWT_BT_CLIENT:
+    case PGWT_BT_UNKNOWN:
+        return cmd_open ? 1 : 0;
+    case PGWT_BT_LOGGER:
+        return 0;   /* not a PG-work process; never sampled as active */
+    default:
+        return 1;   /* background, maintenance, parallel worker, io_worker */
+    }
+}
+
 int pgwt_sampler_build_batch(const struct pgwt_sample_target *targets,
                              const uint32_t *vals, int n, uint64_t tick_ts,
                              struct pgwt_trace_event *out,
-                             uint64_t *invalid_reads)
+                             uint64_t *invalid_reads,
+                             uint64_t *noncmd_cpu_skipped)
 {
     int count = 0;
     for (int i = 0; i < n; i++) {
         uint32_t we = vals[i];
-        /* event 0 == on CPU: not a wait, no sample to record (ASH counts
-         * the active session via its non-idle waits and CPU separately;
-         * A3 derives CPU from coverage, not from on-CPU samples). */
-        if (we == 0)
-            continue;
 
-        /* CAP-2/5 backstop (all PG versions, every tick): a value with an
-         * unknown class byte is garbage from a wrong offset/address — it
-         * must NEVER be recorded as data. Count it so the daemon screams. */
-        if (pgwt_classify_wei(we) == PGWT_WEI_GARBAGE) {
+        /* event 0 == on CPU. T2 (AAS-1): a session on CPU IS an active
+         * session — record it as a first-class CPU sample, gated by the
+         * per-type policy above. (The old sampler skipped all we==0 and no
+         * coverage-derived CPU existed anywhere: a pure CPU storm produced
+         * AAS ~ 0 and the anomaly engine was blind to it.) */
+        if (we == 0) {
+            if (!pgwt_cpu_sample_recordable(targets[i].backend_type,
+                                            targets[i].cmd_open)) {
+                if (noncmd_cpu_skipped)
+                    (*noncmd_cpu_skipped)++;
+                continue;
+            }
+        } else if (pgwt_classify_wei(we) == PGWT_WEI_GARBAGE) {
+            /* CAP-2/5 backstop (all PG versions, every tick): a value with
+             * an unknown class byte is garbage from a wrong offset/address —
+             * it must NEVER be recorded as data. Count it so the daemon
+             * screams. */
             if (invalid_reads)
                 (*invalid_reads)++;
             continue;
@@ -151,8 +201,11 @@ int pgwt_sampler_build_batch(const struct pgwt_sample_target *targets,
         e->timestamp_ns = tick_ts;
         e->pid          = (uint32_t)targets[i].pid;
         e->old_event    = 0;       /* samples carry no previous state */
-        e->new_event    = we;      /* the sampled wait event */
-        e->flags        = 0;       /* SAMPLE flag is set by the reader */
+        e->new_event    = we;      /* the sampled wait event (0 = CPU) */
+        /* In-memory category tag (never persisted — the SAMPLES layout has
+         * no flags column; offline consumers re-derive the category from
+         * backends.jsonl). The SAMPLE flag itself is set by the reader. */
+        e->flags        = pgwt_backend_type_flag(targets[i].backend_type);
         e->duration_ns  = 0;       /* samples carry no duration */
         e->query_id     = targets[i].query_id;
     }
@@ -218,20 +271,27 @@ void pgwt_qid_index_sort(struct pgwt_qid_entry *entries, int n)
     qsort(entries, (size_t)n, sizeof(*entries), qid_entry_cmp);
 }
 
-uint64_t pgwt_qid_index_lookup(const struct pgwt_qid_entry *entries, int n,
-                               uint32_t pid)
+const struct pgwt_qid_entry *
+pgwt_qid_index_get(const struct pgwt_qid_entry *entries, int n, uint32_t pid)
 {
     int lo = 0, hi = n - 1;
     while (lo <= hi) {
         int mid = lo + (hi - lo) / 2;
         if (entries[mid].pid == pid)
-            return entries[mid].query_id;
+            return &entries[mid];
         if (entries[mid].pid < pid)
             lo = mid + 1;
         else
             hi = mid - 1;
     }
-    return 0;
+    return NULL;
+}
+
+uint64_t pgwt_qid_index_lookup(const struct pgwt_qid_entry *entries, int n,
+                               uint32_t pid)
+{
+    const struct pgwt_qid_entry *e = pgwt_qid_index_get(entries, n, pid);
+    return e ? e->query_id : 0;
 }
 
 /* ── Daemon-side provider hooks (need the BPF skeleton) ───────────────── */
@@ -257,21 +317,25 @@ static uint64_t mono_ns(void)
     return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 }
 
-/* Read pid -> query_id from the BPF state_map, maintained by the
- * on_report_query_id uprobe. Returns 0 if unknown. Per-pid fallback for
+/* Read pid -> {query_id, cmd_open} from the BPF state_map, maintained by
+ * the on_report_query_id / on_report_activity uprobes. Per-pid fallback for
  * kernels without BPF_MAP_LOOKUP_BATCH (SMP-4). */
-static uint64_t lookup_query_id(struct pgwt_daemon *d, pid_t pid)
+static void lookup_pid_state(struct pgwt_daemon *d, pid_t pid,
+                             uint64_t *qid, int *cmd_open)
 {
+    *qid = 0;
+    *cmd_open = 0;
     if (!d->skel)
-        return 0;
+        return;
     int fd = bpf_map__fd(d->skel->maps.state_map);
     if (fd < 0)
-        return 0;
+        return;
     uint32_t key = (uint32_t)pid;
     struct pgwt_pid_state st;
-    if (bpf_map_lookup_elem(fd, &key, &st) == 0)
-        return st.last_query_id;
-    return 0;
+    if (bpf_map_lookup_elem(fd, &key, &st) == 0) {
+        *qid = st.last_query_id;
+        *cmd_open = st.cmd_open;
+    }
 }
 
 /* SMP-4: dump the whole state_map in (at most) a few BPF_MAP_LOOKUP_BATCH
@@ -321,6 +385,7 @@ static int dump_qid_index(struct pgwt_daemon *d, struct pgwt_sampler *s,
     for (int i = 0; i < total; i++) {
         out[i].pid = s->qid_keys[i];
         out[i].query_id = s->qid_vals[i].last_query_id;
+        out[i].cmd_open = s->qid_vals[i].cmd_open;
     }
     pgwt_qid_index_sort(out, total);
     return total;
@@ -443,8 +508,9 @@ static void pgwt_sampler_accumulate(struct pgwt_daemon *d,
         return;
 
     for (int i = 0; i < count; i++) {
-        uint32_t we  = samples[i].new_event;   /* sampled wait event */
+        uint32_t we  = samples[i].new_event;   /* sampled wait event (0 = CPU) */
         uint64_t dur = period_ns;              /* ASH weight per sample */
+        int io_worker = (samples[i].flags & PGWT_EVENT_FLAG_IO_WORKER) != 0;
 
         if (PGWT_IS_MARKER(we))
             continue;
@@ -462,9 +528,16 @@ static void pgwt_sampler_accumulate(struct pgwt_daemon *d,
                 if (bucket < HISTOGRAM_BUCKETS)
                     es->histogram[bucket]++;
             }
-            if (!pgwt_is_idle_event(we)) {
-                pa->wait_time_ns += dur;
-                pa->db_time_ns   += dur;
+            /* io_worker time never enters DB Time / AAS (T2): the event
+             * stats above keep it VISIBLE, the load accounting skips it. */
+            if (!io_worker) {
+                if (we == 0) {
+                    pa->cpu_time_ns += dur;   /* first-class CPU sample */
+                    pa->db_time_ns  += dur;
+                } else if (!pgwt_is_idle_event(we)) {
+                    pa->wait_time_ns += dur;
+                    pa->db_time_ns   += dur;
+                }
             }
         }
 
@@ -480,11 +553,12 @@ static void pgwt_sampler_accumulate(struct pgwt_daemon *d,
                 se->histogram[bucket]++;
         }
 
-        /* Time model by class */
-        pgwt_update_time_model(&acc->tm, we, dur);
+        /* Time model by class (io_worker time excluded from DB Time) */
+        if (!io_worker)
+            pgwt_update_time_model(&acc->tm, we, dur);
 
-        /* Query attribution */
-        if (samples[i].query_id != 0) {
+        /* Query attribution (io_workers are structurally query-less) */
+        if (samples[i].query_id != 0 && !io_worker) {
             struct pgwt_query_event_stats *qe =
                 pgwt_get_or_create_query_event(acc, samples[i].query_id, we);
             if (qe) {
@@ -498,8 +572,9 @@ static void pgwt_sampler_accumulate(struct pgwt_daemon *d,
 }
 
 /* One sampling tick. Build the target list from the live registry, read all
- * wait_event_info (shared-memory batch + per-pid fallbacks), encode non-CPU
- * readings, and push a SAMPLES block. Called from the daemon timer. */
+ * wait_event_info (shared-memory batch + per-pid fallbacks), encode wait
+ * readings AND policy-gated on-CPU readings (T2: we==0 is a first-class CPU
+ * sample), and push a SAMPLES block. Called from the daemon timer. */
 int pgwt_sampler_poll(struct pgwt_daemon *d)
 {
     struct pgwt_sampler *s = d->sampler;
@@ -558,6 +633,18 @@ int pgwt_sampler_poll(struct pgwt_daemon *d)
                 seed_state_entry(d, be->pid, be->wp_addr);
             }
         }
+        /* T2: classify the process ONCE it is far enough through init to
+         * have set its title (wp_addr resolved implies init done). The
+         * sampled-tier fork path never parsed cmdline at all, so every
+         * forked backend read as type 0 == client — io_workers, autovacuum
+         * and parallel workers were unclassifiable. */
+        if (!be->meta_parsed) {
+            if (pgwt_parse_cmdline(be->pid, &be->meta) == 0) {
+                be->meta_parsed = true;
+                if (d->backend_meta)
+                    pgwt_bm_write(d->backend_meta, be->pid, &be->meta);
+            }
+        }
         /* SMP-2: classify the address — only verified-shared addresses may
          * be batched through a foreign pid. */
         if (be->wp_addr_shared < 0)
@@ -566,9 +653,20 @@ int pgwt_sampler_poll(struct pgwt_daemon *d)
         targets[n].pid             = be->pid;
         targets[n].wait_event_addr = be->wp_addr;
         targets[n].is_shared       = be->wp_addr_shared;
-        targets[n].query_id        = (qidx_n >= 0)
-            ? pgwt_qid_index_lookup(qidx_buf, qidx_n, (uint32_t)be->pid)
-            : lookup_query_id(d, be->pid);
+        targets[n].backend_type    = be->meta_parsed ? be->meta.backend_type
+                                                     : PGWT_BT_UNKNOWN;
+        if (qidx_n >= 0) {
+            const struct pgwt_qid_entry *qe =
+                pgwt_qid_index_get(qidx_buf, qidx_n, (uint32_t)be->pid);
+            targets[n].query_id = qe ? qe->query_id : 0;
+            targets[n].cmd_open = qe ? qe->cmd_open : 0;
+        } else {
+            uint64_t qid = 0;
+            int cmd_open = 0;
+            lookup_pid_state(d, be->pid, &qid, &cmd_open);
+            targets[n].query_id = qid;
+            targets[n].cmd_open = cmd_open;
+        }
         n++;
     }
     if (n == 0)
@@ -604,10 +702,26 @@ int pgwt_sampler_poll(struct pgwt_daemon *d)
         break;
     }
 
+    /* io_worker utilization (T2): io_workers are EXCLUDED from AAS/DB Time
+     * (their busy time is a shadow copy of the requesting backends'
+     * AioIoCompletion waits — docs/AAS_SEMANTICS_DECISION.md) but their
+     * busy fraction is a genuine capacity signal. busy = any reading that
+     * is not an instrumented idle wait (IoWorkerMain) — i.e. on-CPU or a
+     * real wait like IO:DataFileRead. */
+    for (int i = 0; i < n; i++) {
+        if (targets[i].backend_type != PGWT_BT_IO_WORKER)
+            continue;
+        d->counters.io_worker_samples_total++;
+        uint32_t we = s->read_vals[i];
+        if (we == 0 || !pgwt_is_idle_event(we))
+            d->counters.io_worker_busy_total++;
+    }
+
     uint64_t invalid_before = d->counters.invalid_wait_reads_total;
     int count = pgwt_sampler_build_batch(targets, s->read_vals, n, tick_ts,
                                          s->samples,
-                                         &d->counters.invalid_wait_reads_total);
+                                         &d->counters.invalid_wait_reads_total,
+                                         &d->counters.noncmd_cpu_samples_total);
     if (d->counters.invalid_wait_reads_total != invalid_before
         && !d->invalid_wait_reads_logged) {
         d->invalid_wait_reads_logged = true;

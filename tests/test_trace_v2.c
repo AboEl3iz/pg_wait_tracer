@@ -63,7 +63,11 @@ static void test_mixed_roundtrip(void)
         /* Samples come after the transitions, sorted ascending. */
         samp[i].timestamp_ns = 2000000ULL + (uint64_t)i * SAMPLE_PERIOD;
         samp[i].pid = 2000 + (i % 5);
-        samp[i].new_event = 0x01000000U + (uint32_t)i;  /* sampled event */
+        /* Every 7th sample is a first-class CPU sample (event id 0 — T2):
+         * id 0 must round-trip like any other id, distinguishable from a
+         * transition only by FLAG_SAMPLE. */
+        samp[i].new_event = (i % 7 == 0) ? 0
+                          : 0x01000000U + (uint32_t)i;  /* sampled event */
         /* old_event/duration deliberately set to nonzero garbage to prove
          * the writer ignores them and the reader returns them zeroed. */
         samp[i].old_event = 0xDEADBEEFU;

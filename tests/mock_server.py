@@ -98,6 +98,16 @@ def _make_aas_buckets():
             "activity": 0.0,
             "extension": round(0.9 + 0.05 * (i % 3), 4),
             "unknown": 0.0,
+            # T2 (additive): the same AAS decomposed by category.
+            # io_worker appears ONLY here, never in the class keys above.
+            "cat": {
+                "planning": 0.05,
+                "execution": round(2.0 + 0.4 * (i % 5), 4),
+                "command": 0.3,
+                "maintenance": 0.1,
+                "background": 0.05,
+                "io_worker": round(0.5 + 0.1 * (i % 3), 4),
+            },
         })
     return buckets
 
@@ -137,6 +147,17 @@ _CANNED["time_model"] = {
     "db_time_ms": 12500,
     "idle_time_ms": 45000,
     "aas": 3.47,
+    # T2 (additive): category decomposition + io_worker utilization
+    # (raw path; io_worker ms is OUTSIDE DB Time).
+    "categories": [
+        {"name": "planning",    "ms": 400,   "aas": 0.11},
+        {"name": "execution",   "ms": 9000,  "aas": 2.50},
+        {"name": "command",     "ms": 1600,  "aas": 0.44},
+        {"name": "maintenance", "ms": 900,   "aas": 0.25},
+        {"name": "background",  "ms": 600,   "aas": 0.17},
+        {"name": "io_worker",   "ms": 2400,  "aas": 0.67},
+    ],
+    "io_worker_busy_pct": 22.2,
     "rows": [
         {"indent": 0, "name": "DB Time",  "ms": 12500, "pct": 100.0, "aas": 3.47},
         {"indent": 1, "name": "CPU*",     "ms": 4800,  "pct": 38.4,  "aas": 1.33},
@@ -458,6 +479,11 @@ class DaemonState:
             "anomaly_dropped_budget_total": 1,
             "anomaly_dropped_cooldown_total": 0,
             "anomaly_baseline_aas": 1.85,
+            # T2 decomposed-AAS observability
+            "io_worker_busy_pct": 22.2,
+            "io_worker_samples_total": 18000,
+            "io_worker_busy_total": 4000,
+            "noncmd_cpu_samples_total": 120000,
         }
 
     def escalate(self, duration_s, reason):
