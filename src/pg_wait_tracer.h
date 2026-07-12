@@ -188,6 +188,14 @@ struct pgwt_query_text_event {
 /* Client:ClientRead — idle between queries (like Oracle's SQL*Net message from client) */
 #define PG_WAIT_CLIENT_READ  ((PG_WAIT_CLIENT << 24) | 0x000000)
 
+/* Synthetic id for we==0 (on-CPU) exact intervals classified OUTSIDE a
+ * command window (T2 decomposed AAS): post/between-command time is idle per
+ * docs/AAS_SEMANTICS_DECISION.md. Activity class => excluded from load
+ * (pgwt_is_idle_event) and hidden from event lists (pgwt_is_hidden_event)
+ * exactly like other instrumented idle states. NEVER written to a trace —
+ * assigned by the compute-side tagging pass (pgwt_tag_events) only. */
+#define PGWT_WEI_NONCMD_CPU  (((uint32_t)PG_WAIT_ACTIVITY << 24) | 0x00FFFFFFU)
+
 /* ── wait_event_info reading classification (CAP-2/3/5) ─────────
  * A reading from a resolved wait_event_info address falls in one of three
  * classes. Only a NON-ZERO reading with a known class byte PROVES the
