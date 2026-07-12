@@ -159,6 +159,15 @@ run_section "capture smoke: --mode tiered (live view + trace file)" \
 run_section "state_map full is loud (CAP-1, --mode tiered)" \
     python3 "$SCRIPT_DIR/test_state_map_loud.py" --pid "$PM_PID"
 
+# ── T2 item 0: the uprobes must actually FIRE (bpftool run_cnt). ──
+# Guards the PIE dead-offset class (study defect 1): attach "succeeds",
+# the probe never runs, attribution is silently zero. PG13 exercises the
+# standard_ExecutorStart route; every version exercises the T2
+# command-open gate probe (pgstat_report_activity).
+run_section "uprobes fire on this binary layout (T2, run_cnt > 0)" \
+    python3 "$SCRIPT_DIR/test_uprobe_fired.py" --pid "$PM_PID" \
+        ${PG_VERSION:+--pg-version "$PG_VERSION"}
+
 # ── Full mode: hard when watchpoints exist; loud skip when they don't ──
 if [[ "$WP" == "yes" ]]; then
     run_section "capture smoke: --mode full (live view + trace file)" \

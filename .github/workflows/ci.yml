@@ -198,8 +198,11 @@ jobs:
           [ "$V" = "16" ] && FLAGS="--expect-unsupported"
           # sudo strips the environment: pass PATH (psql/pgbench) and
           # GITHUB_STEP_SUMMARY (the loud watchpoint-skip note) through.
+          # BPFTOOL: the uprobe run_cnt assertion (T2) needs a working
+          # bpftool inside the sudo environment.
           sudo env "PATH=/usr/lib/postgresql/$V/bin:$PATH" \
             "GITHUB_STEP_SUMMARY=$GITHUB_STEP_SUMMARY" \
+            "BPFTOOL=$BPFTOOL" \
             tests/ci_smoke.sh --pg-version "$V" $FLAGS
 
   web-ui:

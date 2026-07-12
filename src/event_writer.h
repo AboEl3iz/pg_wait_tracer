@@ -29,7 +29,17 @@
  *                 This is what the A2 sampler writes. Each sample means
  *                 "at timestamp T, pid P was in event E"; A3 treats it as
  *                 a point observation worth `sample_period_ns`, never an
- *                 interval. */
+ *                 interval.
+ *
+ *                 Event id 0 (T2): a first-class CPU sample — "at T, pid P
+ *                 was on-CPU doing requested work". The capture side gates
+ *                 which we==0 readings are recorded (client backends only
+ *                 inside a command; background types always; see
+ *                 docs/AAS_SEMANTICS_DECISION.md), so consumers treat id 0
+ *                 exactly like any active sample. Pre-T2 writers never
+ *                 emitted id 0, so old traces read back unchanged; old
+ *                 readers decode id 0 as the CPU pseudo-event they already
+ *                 knew from transitions. No layout change. */
 enum pgwt_block_type {
     PGWT_BLOCK_TRANSITIONS = 0,
     PGWT_BLOCK_SAMPLES     = 1,
