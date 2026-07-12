@@ -40,6 +40,9 @@ static void usage(const char *prog)
         "Recording:\n"
         "  -T, --trace-dir <DIR>      Write raw trace files to DIR\n"
         "  -R, --trace-retention <H>  Keep trace files for H hours (default: 24)\n"
+        "      --retention-gb <G>     Also cap total trace-dir size at G GiB\n"
+        "                             (oldest archives deleted first; fractional\n"
+        "                             values allowed; default: no size cap)\n"
         "      --trace-group <GROUP>  Group for trace file access (default: dba)\n"
         "\n"
         "Replay (offline analysis — no root, no PostgreSQL needed):\n"
@@ -210,6 +213,7 @@ static enum pgwt_mode parse_mode(const char *s)
 #define OPT_ANOM_LOCK_FRAC  269
 #define OPT_ANOM_COOLDOWN   270
 #define OPT_ANOM_WINDOW     271
+#define OPT_RETENTION_GB    272
 
 static struct option long_opts[] = {
     {"pid",        required_argument, NULL, 'p'},
@@ -226,6 +230,7 @@ static struct option long_opts[] = {
     {"sort",            required_argument, NULL, 'S'},
     {"trace-dir",       required_argument, NULL, 'T'},
     {"trace-retention", required_argument, NULL, 'R'},
+    {"retention-gb",    required_argument, NULL, OPT_RETENTION_GB},
     {"replay",          no_argument,       NULL, OPT_REPLAY},
     {"from",            required_argument, NULL, OPT_FROM},
     {"to",              required_argument, NULL, OPT_TO},
@@ -306,6 +311,7 @@ int main(int argc, char **argv)
         case 'S': d->sort_mode = parse_sort(optarg); break;
         case 'T': d->trace_dir = optarg; break;
         case 'R': d->trace_retention = atoi(optarg); break;
+        case OPT_RETENTION_GB: d->trace_retention_gb = atof(optarg); break;
         case OPT_REPLAY: replay_mode = true; break;
         case OPT_FROM:   from_str = optarg; break;
         case OPT_TO:     to_str = optarg; break;

@@ -173,6 +173,7 @@ struct pgwt_daemon {
     /* Trace file recording */
     const char *trace_dir;                  /* NULL = disabled */
     int         trace_retention;            /* hours, default 24 */
+    double      trace_retention_gb;          /* size cap in GiB, 0 = off (DUR-3) */
     const char *trace_group;                /* group for trace files, default "dba" */
     struct pgwt_event_writer *event_writer;     /* NULL if disabled */
     struct pgwt_summary_writer *summary_writer; /* NULL if disabled */
