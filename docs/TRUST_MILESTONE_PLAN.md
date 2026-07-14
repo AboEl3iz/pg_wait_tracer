@@ -192,6 +192,50 @@ Each finding notes the phase that owns it.
   window(60 s) = 50% duty cycle on sustained incidents. Document the
   chosen semantics; fix SMP-3 makes the stall at least weighted.
 
+### ESC resolution (T3, branch t3-escalation-trust)
+
+All ESC-1..12 fixed / documented. Pure cores unit-tested
+(`tests/test_escalation_budget.c` = budget/ledger, extended
+`tests/test_anomaly.c` = lock floor + slow-release), integration in
+`test_escalation.sh` / `test_control.sh`, live in the capture-smoke
+escalation phase.
+
+- **ESC-1** — budget math moved to a pure, unit-tested core
+  (`src/escalation_budget.c`). An over-ask is **clamped** to the
+  remaining budget and the window's deadline is armed at `now + grant`,
+  so extend-every-second caps total full-fidelity time at *exactly* the
+  budget; `pgwt_escalation_check_budget()` (daemon timer) is the
+  mid-window backstop.
+- **ESC-2** — `flush_open_intervals()` writes each open wait as a final
+  transition (ts = de-escalation instant) *before* detach + END marker.
+- **ESC-3** — `pgwt_sampler_accumulate()` skips pids with a live
+  watchpoint while escalated; smoke-test live-view tolerance tightened
+  from 7 s back to 6 s.
+- **ESC-4** — lock rule needs BOTH `lock_fraction > F` AND lock-class
+  `AAS ≥ --anomaly-lock-min-aas` (default **2.0**).
+- **ESC-5** — ledger overflow coalesces the two oldest segments
+  (bills the gap, never under-bills); a window is never opened unbilled.
+- **ESC-6** — `--escalation-budget 0` = **deny-all** (honest `0`
+  remaining); `unlimited` (or `-1`) = no cap (`escalation_budget_
+  unlimited: true`, remaining = `-1` sentinel = ∞ in the UI).
+- **ESC-7** constants — baseline stays frozen while over threshold;
+  **slow learn-through** engages only after **15 min**
+  (`PGWT_ANOMALY_DEF_LEARN_THROUGH_MIN`) continuously-over, then learns
+  at **1/10** the normal EWMA rate
+  (`PGWT_ANOMALY_DEF_SLOW_RELEASE_DIV`). Short incidents never move the
+  bar; a real regime change is eventually adopted. Both pinned in tests.
+- **ESC-8** — near-trigger log rate-limited to reason-mask changes + a
+  60 s summary (with suppressed count); `anomaly_near_total` still
+  counts every one.
+- **ESC-9** — `metrics.tier` and `status.tier` share `daemon_tier_str()`
+  (a fixed EXACT provider reports `escalated`, never a bogus `sampled`).
+- **ESC-10** — control-socket liveness probe: a live daemon on the trace
+  dir makes a second daemon **refuse startup** (fatal, rc −2) instead of
+  stealing the socket.
+- **ESC-11/12** — documented in README: the ~50% duty cycle (cooldown
+  from fire start) and the weight-compensated `attach_all` stall bound
+  (SMP-3 keeps the accounting correct; only resolution dips).
+
 ## FID — Fidelity merge, summaries, views
 
 - **FID-1 🔴 (T1)** `src/server.c:554-567,713-722` — exact-wins

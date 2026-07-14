@@ -86,9 +86,19 @@ struct pgwt_anomaly {
     double aas_factor;        /* fire when aas > factor * baseline */
     int    aas_ticks;         /* consecutive ticks the AAS rule must hold */
     double lock_fraction;     /* fire when lock share > this */
+    double lock_min_aas;      /* ESC-4: AND lock-class AAS >= this (min-activity floor) */
     int    lock_ticks;        /* consecutive ticks the lock rule must hold */
     uint64_t cooldown_ns;     /* min gap between auto-escalations */
     int    escalation_s;      /* duration requested per auto-escalation */
+
+    /* ESC-7 baseline slow learn-through: after the AAS metric has been
+     * continuously over the multiplicative threshold for learn_through_ticks,
+     * the baseline resumes EWMA at 1/slow_release_div the normal rate, so a
+     * sustained legitimate regime change is eventually adopted (the rule stops
+     * re-firing forever) while a short incident (streak < learn_through_ticks)
+     * still cannot raise the bar. */
+    int    learn_through_ticks; /* consecutive over-ticks before learn-through */
+    int    slow_release_div;    /* EWMA rate divisor while learning through */
 
     /* Rolling-baseline (EWMA) state for the AAS rule. The baseline tracks the
      * NORMAL load; it is NOT updated while a metric is anomalous (so a long
@@ -105,6 +115,12 @@ struct pgwt_anomaly {
     /* Cooldown: monotonic ns of the last auto-escalation (0 = never). */
     uint64_t last_fire_ns;
 
+    /* ESC-8 near-trigger log rate-limit (daemon wrapper only): log on a change
+     * of the near reason mask + a periodic summary, not every tick. */
+    unsigned last_near_mask;    /* near_mask at the last emitted near-log */
+    uint64_t last_near_log_ns;  /* monotonic ns of the last near-log line */
+    uint64_t near_since_log;    /* near-triggers suppressed since the last line */
+
     /* Lifetime stats (control-socket metrics). */
     uint64_t fires_total;       /* auto-escalations actually requested */
     uint64_t near_total;        /* near-triggers logged */
@@ -116,9 +132,13 @@ struct pgwt_anomaly {
 #define PGWT_ANOMALY_DEF_AAS_FACTOR   3.0
 #define PGWT_ANOMALY_DEF_AAS_TICKS    3
 #define PGWT_ANOMALY_DEF_LOCK_FRAC    0.30
+#define PGWT_ANOMALY_DEF_LOCK_MIN_AAS 2.0   /* ESC-4: min lock-class AAS to fire */
 #define PGWT_ANOMALY_DEF_LOCK_TICKS   3
 #define PGWT_ANOMALY_DEF_COOLDOWN_S   120
 #define PGWT_ANOMALY_DEF_ESCALATE_S   60
+/* ESC-7 baseline slow learn-through (see struct comment). */
+#define PGWT_ANOMALY_DEF_LEARN_THROUGH_MIN 15  /* minutes continuously-over before learn-through */
+#define PGWT_ANOMALY_DEF_SLOW_RELEASE_DIV  10  /* learn at 1/10 the normal EWMA rate */
 
 /* Initialize rule state + config. enabled is true only for tiered mode.
  * sample_rate_hz tunes the EWMA so the baseline reacts over roughly a fixed

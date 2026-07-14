@@ -118,8 +118,10 @@ assert r['tier']=='sampled', r
 assert r['escalation_supported'] is True, r
 assert r['escalation_seconds_remaining']==0, r
 assert abs(r['escalation_budget_remaining_s']-$BUDGET) < 1.0, r
+# ESC-6: a finite budget is not unlimited.
+assert r.get('escalation_budget_unlimited') is False, r
 "
-check $? "status: tiered/sampled, full budget, supported"
+check $? "status: tiered/sampled, full budget, supported, not-unlimited"
 
 # ── escalate for 4s ───────────────────────────────────────────
 RESP=$(ctl '{"cmd":"escalate","duration_s":4,"reason":"manual test"}')
@@ -140,6 +142,11 @@ STATUS=$(ctl '{"cmd":"status"}')
 TIER=$(echo "$STATUS" | jget "['tier']")
 [[ "$TIER" == "escalated" ]]
 check $? "tier flipped to escalated (got: $TIER)"
+
+# ESC-9: metrics.tier must agree with status.tier even while escalated.
+MTIER=$(ctl '{"cmd":"metrics"}' | jget "['tier']")
+[[ "$MTIER" == "$TIER" ]]
+check $? "metrics.tier == status.tier while escalated (ESC-9; both '$TIER')"
 
 # ── window expires on its own ─────────────────────────────────
 sleep 6
@@ -169,10 +176,30 @@ TIER=$(ctl '{"cmd":"status"}' | jget "['tier']")
 [[ "$TIER" == "sampled" ]]
 check $? "tier sampled after manual deescalate (got: $TIER)"
 
-# ── budget exhaustion → deny ──────────────────────────────────
-# We've now spent ~4s (expired) + ~0-1s (deescalated) of the 10s budget.
-# Ask for a window larger than the remaining budget; it must be denied.
+# ── ESC-1 budget clamp: a request larger than the remaining budget is
+#    CLAMPED to what's left (not denied) so the window runs up to the cap. ──
+# We've spent ~4s (expired) + ~0-1s (deescalated) of the 10s budget, so a few
+# seconds remain. Ask for an hour; it must be granted but clamped to <= budget.
 RESP=$(ctl '{"cmd":"escalate","duration_s":3600,"reason":"greedy"}')
+echo "  clamp: $RESP"
+echo "$RESP" | python3 -c "
+import json,sys
+r=json.load(sys.stdin)
+assert r['ok'] is True, r                       # granted, not denied
+assert 0 < r['granted_s'] <= $BUDGET, r         # clamped to <= budget
+"
+check $? "over-ask escalate is CLAMPED to the remaining budget (ESC-1)"
+
+# Let this clamped window run to expiry so the budget is fully spent.
+sleep $(($BUDGET + 2))
+STATUS=$(ctl '{"cmd":"status"}')
+REM=$(echo "$STATUS" | jget "['escalation_budget_remaining_s']")
+python3 -c "import sys; sys.exit(0 if float('$REM') < 1.0 else 1)"
+check $? "budget fully spent after the clamped window expired (rem=$REM)"
+
+# ── budget exhaustion → deny ──────────────────────────────────
+# With ~0 budget left, a further escalate must now be DENIED with a reason.
+RESP=$(ctl '{"cmd":"escalate","duration_s":5,"reason":"exhausted"}')
 echo "  over-budget: $RESP"
 echo "$RESP" | python3 -c "
 import json,sys
@@ -181,7 +208,7 @@ assert r['ok'] is False, r
 assert 'budget' in r['error'].lower(), r
 assert 'budget_remaining_s' in r, r
 "
-check $? "escalate over budget is denied with a reason"
+check $? "escalate on an exhausted budget is denied with a reason"
 
 # denied_total counter moved
 DENIED=$(ctl '{"cmd":"metrics"}' | jget "['escalation_denied_total']")

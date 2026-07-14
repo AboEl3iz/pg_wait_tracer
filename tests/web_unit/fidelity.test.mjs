@@ -234,6 +234,26 @@ test('escalate control: zero budget → cannot escalate', () => {
     assert.equal(m.canEscalate, false);
 });
 
+test('escalate control: zero budget = deny-all → cannot escalate (ESC-6)', () => {
+    // 0 now means escalation DISABLED — the control must not offer escalate.
+    const m = buildEscalateControl({
+        escalation_supported: true, tier: 'sampled',
+        escalation_budget_remaining_s: 0, escalation_budget_unlimited: false,
+    });
+    assert.equal(m.canEscalate, false);
+    assert.equal(m.budgetUnlimited, false);
+});
+
+test('escalate control: unlimited budget → can escalate, ∞ budget (ESC-6)', () => {
+    const m = buildEscalateControl({
+        escalation_supported: true, tier: 'sampled',
+        escalation_budget_remaining_s: -1, escalation_budget_unlimited: true,
+    });
+    assert.equal(m.budgetUnlimited, true);
+    assert.equal(m.canEscalate, true);
+    assert.match(m.budgetText, /∞/);
+});
+
 test('escalate control: unsupported daemon → not supported (hide control)', () => {
     assert.equal(buildEscalateControl({}).supported, false);
     assert.equal(buildEscalateControl({ escalation_supported: false }).supported, false);

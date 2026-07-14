@@ -76,6 +76,10 @@ static void handle_timer(struct pgwt_daemon *d)
         }
     }
 
+    /* ESC-1: enforce the escalation budget mid-window (cheap no-op unless a
+     * budget-limited window is open and has reached its cap). */
+    pgwt_escalation_check_budget(d);
+
     /* In lightweight mode, read BPF accum_map into event_accum first */
     if (d->lightweight_mode)
         pgwt_read_accum_map(d);
@@ -763,11 +767,19 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
     d->running = true;
 
     /* Control socket at {trace_dir}/pgwt.sock (D4).
-     * Failure is non-fatal: tracing must not depend on the control plane. */
+     * Failure is non-fatal (tracing must not depend on the control plane) —
+     * EXCEPT a live-daemon conflict (ESC-10, rc == -2): another daemon already
+     * owns this trace dir, so starting a second one would corrupt the trace and
+     * steal the control plane. Refuse startup loudly. */
     if (d->trace_dir) {
         d->control = calloc(1, sizeof(*d->control));
         if (d->control) {
-            if (pgwt_control_init(d->control, d, d->epoll_fd) != 0) {
+            int crc = pgwt_control_init(d->control, d, d->epoll_fd);
+            if (crc == -2) {
+                free(d->control);
+                d->control = NULL;
+                goto fail;   /* live daemon present — fatal */
+            } else if (crc != 0) {
                 free(d->control);
                 d->control = NULL;
             } else if (d->verbose) {
@@ -796,6 +808,8 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
             d->anomaly.aas_ticks = d->anomaly_aas_ticks;
         if (d->anomaly_lock_fraction >= 0.0)
             d->anomaly.lock_fraction = d->anomaly_lock_fraction;
+        if (d->anomaly_lock_min_aas >= 0.0)
+            d->anomaly.lock_min_aas = d->anomaly_lock_min_aas;
         if (d->anomaly_cooldown_s >= 0)
             d->anomaly.cooldown_ns =
                 (uint64_t)d->anomaly_cooldown_s * 1000000000ULL;

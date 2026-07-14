@@ -66,14 +66,18 @@ static void usage(const char *prog)
         "                                   this build; ships in the extension track.\n"
         "      --sample-rate <HZ>     Sampling rate for sampled/tiered (1-1000, default 10)\n"
         "      --escalation-budget <S>  Tiered: full-fidelity seconds allowed per\n"
-        "                             rolling hour (default 300). Escalate via the\n"
-        "                             control socket: {\"cmd\":\"escalate\",\"duration_s\":N}.\n"
+        "                             rolling hour (default 300). 0 = escalation\n"
+        "                             DISABLED (deny all); 'unlimited' = no cap.\n"
+        "                             Escalate via the control socket:\n"
+        "                             {\"cmd\":\"escalate\",\"duration_s\":N}.\n"
         "\n"
         "Anomaly triggers (tiered mode — auto-escalate on the sampled stream):\n"
         "      --anomaly-aas-factor <K>   Fire when AAS > K*rolling_baseline (default 3.0)\n"
         "      --anomaly-aas-ticks <N>    ...sustained for N consecutive ticks (default 3)\n"
         "      --anomaly-lock-fraction <F>  Fire when Lock-class share of active\n"
         "                             samples > F (default 0.30), sustained N ticks\n"
+        "      --anomaly-lock-min-aas <A>  ...AND lock-class AAS >= A (default 2.0), so a\n"
+        "                             single backend's routine lock wait can't escalate\n"
         "      --anomaly-cooldown-s <S>   Min seconds between auto-escalations (default 120)\n"
         "      --anomaly-window-s <S>     Full-fidelity window length per auto-trigger (default 60)\n"
         "\n"
@@ -214,6 +218,7 @@ static enum pgwt_mode parse_mode(const char *s)
 #define OPT_ANOM_COOLDOWN   270
 #define OPT_ANOM_WINDOW     271
 #define OPT_RETENTION_GB    272
+#define OPT_ANOM_LOCK_MIN_AAS 273
 
 static struct option long_opts[] = {
     {"pid",        required_argument, NULL, 'p'},
@@ -245,6 +250,7 @@ static struct option long_opts[] = {
     {"anomaly-aas-factor",  required_argument, NULL, OPT_ANOM_AAS_FACTOR},
     {"anomaly-aas-ticks",   required_argument, NULL, OPT_ANOM_AAS_TICKS},
     {"anomaly-lock-fraction", required_argument, NULL, OPT_ANOM_LOCK_FRAC},
+    {"anomaly-lock-min-aas", required_argument, NULL, OPT_ANOM_LOCK_MIN_AAS},
     {"anomaly-cooldown-s",  required_argument, NULL, OPT_ANOM_COOLDOWN},
     {"anomaly-window-s",    required_argument, NULL, OPT_ANOM_WINDOW},
     {"quiet",           no_argument,       NULL, 'q'},
@@ -278,6 +284,7 @@ int main(int argc, char **argv)
     d->anomaly_aas_factor    = -1.0;
     d->anomaly_aas_ticks     = -1;
     d->anomaly_lock_fraction = -1.0;
+    d->anomaly_lock_min_aas  = -1.0;
     d->anomaly_cooldown_s    = -1;
 
     pid_t pm_pid = 0;
@@ -322,10 +329,18 @@ int main(int argc, char **argv)
         case OPT_SKIP_USDT:   d->skip_usdt = 1; break;
         case OPT_MODE:        d->mode = parse_mode(optarg); break;
         case OPT_SAMPLE_RATE: d->sample_rate_hz = atoi(optarg); break;
-        case OPT_ESC_BUDGET:  d->escalation_budget_s = atoi(optarg); break;
+        case OPT_ESC_BUDGET:
+            /* ESC-6: "unlimited" (or a negative value) = no cap; 0 = deny-all;
+             * >0 = seconds/rolling-hour. Stored as -1 for unlimited. */
+            if (strcasecmp(optarg, "unlimited") == 0)
+                d->escalation_budget_s = -1;
+            else
+                d->escalation_budget_s = atoi(optarg);
+            break;
         case OPT_ANOM_AAS_FACTOR: d->anomaly_aas_factor = atof(optarg); break;
         case OPT_ANOM_AAS_TICKS:  d->anomaly_aas_ticks = atoi(optarg); break;
         case OPT_ANOM_LOCK_FRAC:  d->anomaly_lock_fraction = atof(optarg); break;
+        case OPT_ANOM_LOCK_MIN_AAS: d->anomaly_lock_min_aas = atof(optarg); break;
         case OPT_ANOM_COOLDOWN:   d->anomaly_cooldown_s = atoi(optarg); break;
         case OPT_ANOM_WINDOW:     d->anomaly_window_s = atoi(optarg); break;
         case 'q': d->quiet = true; break;
@@ -404,11 +419,12 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* Validate: --escalation-budget (tiered only). 0 disables the limit
-     * (escalations always granted) — allowed for testing but warned. */
-    if (d->escalation_budget_s < 0) {
-        fprintf(stderr, "FATAL: --escalation-budget must be >= 0 (got %d)\n",
-                d->escalation_budget_s);
+    /* Validate: --escalation-budget (tiered only). ESC-6 semantics: >0 =
+     * seconds/rolling-hour; 0 = deny-all (escalation disabled); -1 =
+     * "unlimited" (parsed above). Anything below -1 is a typo. */
+    if (d->escalation_budget_s < -1) {
+        fprintf(stderr, "FATAL: --escalation-budget must be >= 0, or "
+                "'unlimited' (got %d)\n", d->escalation_budget_s);
         free(d);
         return 1;
     }
@@ -430,6 +446,12 @@ int main(int argc, char **argv)
         free(d);
         return 1;
     }
+    if (d->anomaly_lock_min_aas == 0.0) {
+        fprintf(stderr, "FATAL: --anomaly-lock-min-aas must be > 0 "
+                "(use --anomaly-lock-fraction alone to disable the floor)\n");
+        free(d);
+        return 1;
+    }
 
     /* Validate: any non-full mode is incompatible with --lightweight
      * (lightweight is a watchpoint-only BPF-accumulator mode). */
@@ -447,11 +469,19 @@ int main(int argc, char **argv)
      * escalation on demand via the control socket, bounded by
      * --escalation-budget per rolling hour. Use --mode full for always-on
      * exact watchpoint tracing. */
-    if (d->mode == PGWT_MODE_TIERED)
+    if (d->mode == PGWT_MODE_TIERED) {
+        char budstr[32];
+        if (d->escalation_budget_s < 0)
+            snprintf(budstr, sizeof(budstr), "unlimited");
+        else if (d->escalation_budget_s == 0)
+            snprintf(budstr, sizeof(budstr), "0 — escalation DISABLED");
+        else
+            snprintf(budstr, sizeof(budstr), "%ds/hour",
+                     d->escalation_budget_s);
         fprintf(stderr, "INFO: --mode tiered (default): sampler always-on; "
-                "on-demand full-fidelity escalation (budget %ds/hour). "
-                "Use --mode full for always-on exact tracing.\n",
-                d->escalation_budget_s);
+                "on-demand full-fidelity escalation (budget %s). "
+                "Use --mode full for always-on exact tracing.\n", budstr);
+    }
 
     /* Check root */
     if (geteuid() != 0) {

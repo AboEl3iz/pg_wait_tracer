@@ -258,6 +258,8 @@ export function buildMetricsPanel(metrics, status) {
     const droppedBudget = num(metrics.anomaly_dropped_budget_total);
     const droppedCooldown = num(metrics.anomaly_dropped_cooldown_total);
     const budgetRemaining = num(metrics.escalation_budget_remaining_s);
+    const budgetUnlimited = metrics.escalation_budget_unlimited === true ||
+                            budgetRemaining < 0;   /* ESC-6 */
     const remaining = num(metrics.escalation_seconds_remaining);
     const active = !!metrics.escalation_active;
     const baselineAas = num(metrics.anomaly_baseline_aas);
@@ -277,7 +279,8 @@ export function buildMetricsPanel(metrics, status) {
         { label: 'Anomaly dropped', value: fmtInt(droppedBudget + droppedCooldown),
           hint: droppedBudget + ' over-budget, ' + droppedCooldown + ' in cooldown' },
         { label: 'Baseline AAS', value: baselineAas != null ? baselineAas.toFixed(2) : '–' },
-        { label: 'Budget left', value: fmtSeconds(budgetRemaining) },
+        { label: 'Budget left',
+          value: budgetUnlimited ? '∞' : fmtSeconds(budgetRemaining) },
     ];
 
     return {
@@ -311,6 +314,11 @@ export function buildEscalateControl(status) {
     const escalated = status.tier === 'escalated';
     const remainingS = num(status.escalation_seconds_remaining);
     const budgetRemainingS = num(status.escalation_budget_remaining_s);
+    /* ESC-6: unlimited budget = no cap. It surfaces as the explicit flag (and,
+     * for older daemons, as a negative remaining sentinel). Escalation is
+     * always allowed; a budget of exactly 0 = deny-all (escalation disabled). */
+    const unlimited = status.escalation_budget_unlimited === true ||
+                      budgetRemainingS < 0;
     const reason = status.escalation_reason || (escalated ? 'manual' : 'none');
 
     return {
@@ -319,12 +327,13 @@ export function buildEscalateControl(status) {
         reason,
         remainingS,
         budgetRemainingS,
+        budgetUnlimited: unlimited,
         buttonLabel: escalated
             ? 'Escalated · ' + Math.ceil(remainingS) + 's left'
             : 'Escalate 60s',
-        canEscalate: supported && budgetRemainingS > 0,
+        canEscalate: supported && (unlimited || budgetRemainingS > 0),
         canDeescalate: supported && escalated,
-        budgetText: fmtSeconds(budgetRemainingS) + ' budget',
+        budgetText: (unlimited ? '∞' : fmtSeconds(budgetRemainingS)) + ' budget',
     };
 }
 

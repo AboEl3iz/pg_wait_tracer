@@ -15,6 +15,7 @@ test_event_reader
 test_trace_v2
 test_sampler
 test_anomaly
+test_escalation_budget
 test_coop
 test_concurrent_rw
 test_durability

@@ -84,6 +84,8 @@ sys.stdout.write(buf.decode().split("\n")[0])
 PYEOF
 }
 
+jget() { python3 -c "import json,sys; print(json.load(sys.stdin)$1)"; }
+
 # ── Start daemon ──────────────────────────────────────────────
 # Deliberately NO --mode: this also serves as the "default mode is tiered"
 # check. Started bare, the daemon must come up in tiered mode with the
@@ -153,6 +155,13 @@ for k in ('events_total', 'events_per_sec', 'lifecycle_events_total',
     assert isinstance(r[k], (int, float)), k
 "
 check $? "metrics: all counters present and numeric"
+
+# ── ESC-9: metrics.tier must agree with status.tier (never derive tier
+#    solely from escalation.active — that reported "sampled" in --mode full). ─
+STATUS_TIER=$(echo "$STATUS" | jget "['tier']")
+METRICS_TIER=$(echo "$METRICS" | jget "['tier']")
+[[ "$STATUS_TIER" == "$METRICS_TIER" ]]
+check $? "metrics.tier == status.tier (ESC-9; both '$STATUS_TIER')"
 
 # Tiered default: the always-on tier is the sampler, so it's samples_total
 # (not the watchpoint events_total) that moves. samples_total is part of the
@@ -241,6 +250,25 @@ check $? "concurrent clients + disconnect mid-request survived"
 
 kill -0 "$TRACER_PID" 2>/dev/null
 check $? "daemon still alive after client abuse"
+
+# ── ESC-10: a second daemon must REFUSE to steal a live control socket ─────
+# The old code unconditionally unlink()'d the socket, letting a second daemon
+# hijack a running daemon's control plane (and its trace dir). The liveness
+# probe must make the second daemon exit non-zero with a clear message while
+# the original daemon and its socket survive.
+SECOND_LOG=$(mktemp /tmp/pgwt_control_second_XXXXXX.log)
+"$TRACER" --daemon --pid "$PM_PID" -i 1 -T "$TRACE_DIR" -v \
+    >/dev/null 2>"$SECOND_LOG"
+SECOND_RC=$?
+[[ $SECOND_RC -ne 0 ]] && grep -qi "already running" "$SECOND_LOG"
+check $? "second daemon on the same trace dir refused (rc=$SECOND_RC, ESC-10)"
+# Original daemon + socket must be untouched.
+kill -0 "$TRACER_PID" 2>/dev/null && [[ -S "$SOCK" ]]
+check $? "original daemon + live socket survive the refused second start"
+ORIG_OK=$(ctl '{"cmd":"status"}' | jget "['ok']" 2>/dev/null)
+[[ "$ORIG_OK" == "True" ]]
+check $? "original daemon still answers on its control socket (ESC-10)"
+rm -f "$SECOND_LOG"
 
 # ── pgwt-server control proxy ─────────────────────────────────
 RESP=$(echo '{"id":7,"cmd":"control","request":{"cmd":"status"}}' | \

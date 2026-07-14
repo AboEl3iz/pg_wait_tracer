@@ -277,11 +277,13 @@ def server_query(trace_dir, cmd, extra=None):
 def assert_wait_events(events, source, sleep_hi=6000):
     """Deterministic-wait assertions, applied to live view or trace rows.
 
-    sleep_hi: live-view callers pass 7000 — in tiered mode the live
-    accumulator is fed by both the sampler and the exact stream, inflating
-    totals up to ~2x (the known ESC-3 double-count, owned by Phase T3;
-    observed 5710ms for a 3s sleep). Once T3 gates sampler accumulation
-    during exact coverage, tighten this back to 6000."""
+    sleep_hi: 6000 for every caller. Before T3, tiered live callers had to pass
+    7000 because the live accumulator was fed by BOTH the sampler and the exact
+    stream during an escalation window, inflating a 3s sleep up to ~5.7s (the
+    ESC-3 double-count). T3 gates the sampler's contribution for pids under a
+    live watchpoint (pgwt_sampler_accumulate), so the live view now matches the
+    post-hoc trace view within the same tolerance — this tightened bound is the
+    ESC-3 regression proof."""
     names = [e['name'] for e in events]
 
     sleep_ev = [e for e in events if e['name'] == 'Timeout:PgSleep']
@@ -334,7 +336,9 @@ def phase_live_system_event(pm_pid, mode):
     check(len(events) > 0,
           "live view shows at least one event" if events else
           f"live view shows at least one event (stderr tail: {err[-300:]!r})")
-    assert_wait_events(events, f"live/{mode}", sleep_hi=7000)
+    # ESC-3: the live view must now match the trace view within the tight
+    # tolerance (no sampler+exact double-count during escalation).
+    assert_wait_events(events, f"live/{mode}")
 
 
 def phase_live_query_event(pm_pid, mode):
@@ -549,15 +553,15 @@ def aas_bucket_total(bucket):
                if k not in ("t", "total", "cat") and isinstance(v, (int, float)))
 
 
-def ctl_query(trace_dir, cmd):
-    """One JSON request over the daemon control socket."""
+def ctl_request(trace_dir, obj):
+    """One arbitrary JSON request over the daemon control socket."""
     import socket
     path = os.path.join(trace_dir, "pgwt.sock")
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.settimeout(5)
     try:
         s.connect(path)
-        s.sendall((json.dumps({"cmd": cmd}) + "\n").encode())
+        s.sendall((json.dumps(obj) + "\n").encode())
         buf = b""
         while b"\n" not in buf:
             c = s.recv(4096)
@@ -567,6 +571,11 @@ def ctl_query(trace_dir, cmd):
         return json.loads(buf.decode().split("\n")[0])
     finally:
         s.close()
+
+
+def ctl_query(trace_dir, cmd):
+    """One JSON request over the daemon control socket."""
+    return ctl_request(trace_dir, {"cmd": cmd})
 
 
 def phase_sampled_aas_truth(pm_pid):
@@ -708,6 +717,88 @@ def phase_cpu_storm_escalation(pm_pid):
     subprocess.run(["rm", "-rf", trace_dir])
 
 
+def phase_escalation_billing(pm_pid):
+    """T3 (ESC-1/2): a MANUAL escalation window bills its full-fidelity time
+    honestly (budget drops by ~the window length), and a wait that is still
+    OPEN when the window closes is flushed into the trace exactly once (ESC-2)
+    instead of vanishing into an end-of-window hole."""
+    print("--- Phase 7: manual escalation billing + de-escalation flush ---")
+    trace_dir = tempfile.mkdtemp(prefix="pgwt_smoke_esc2_")
+    os.chmod(trace_dir, 0o755)
+
+    # A lock wait held OPEN across the whole phase (never released) so it is
+    # still in-flight at de-escalation — the exact case ESC-2 must not drop.
+    wl = Workload()
+    wl.open_sessions()
+
+    budget = 60
+    tracer = subprocess.Popen(
+        [TRACER, "--mode", "tiered", "--pid", str(pm_pid),
+         "-T", trace_dir, "--duration", "22", "--quiet", "--interval", "2",
+         "--escalation-budget", str(budget),
+         # Disable anomaly auto-escalation so the ONLY window is the manual one
+         # we drive (clean billing accounting).
+         "--anomaly-aas-factor", "1000000"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    time.sleep(3.0)   # BPF load + scan
+    try:
+        wl.fire(sleep_s=1)   # start the lock wait (waiter blocks, stays blocked)
+        time.sleep(1.0)
+
+        budget_before = ctl_query(trace_dir, "status").get(
+            "escalation_budget_remaining_s", budget)
+
+        # Manually escalate for 5s.
+        esc = ctl_request(trace_dir, {"cmd": "escalate", "duration_s": 5,
+                                      "reason": "manual"})
+        check(esc.get("ok") is True and esc.get("granted_s", 0) >= 4,
+              f"manual escalate granted a ~5s window (resp={esc})")
+        tier = ctl_query(trace_dir, "status").get("tier")
+        check(tier == "escalated",
+              f"tier flipped to escalated during the window (got {tier!r})")
+
+        time.sleep(3.0)   # capture exact transitions mid-window
+        # De-escalate WHILE the lock wait is still open (ESC-2 flush path).
+        deesc = ctl_request(trace_dir, {"cmd": "deescalate"})
+        check(deesc.get("ok") is True,
+              f"manual deescalate acknowledged (resp={deesc})")
+
+        m = ctl_query(trace_dir, "metrics")
+        budget_after = m.get("escalation_budget_remaining_s", budget)
+        windows = m.get("escalation_windows_total", 0)
+        spent = budget_before - budget_after
+        check(windows >= 1,
+              f"escalation_windows_total >= 1 (got {windows})")
+        # Billed time must be > 0 and no more than the window we ran (~3-5s),
+        # i.e. billing tracks the actual open window, never over-charges.
+        check(0.5 <= spent <= 6.0,
+              f"budget billed ~= window length: spent {spent:.1f}s of a "
+              f"~3-5s window [ESC-1 honest billing]")
+
+        _, stderr = tracer.communicate(timeout=40)
+        err = stderr.decode('utf-8', errors='replace')
+
+        # ESC-2: the lock wait, open across the window boundary, must be in the
+        # trace (the flush recorded its exact portion; without ESC-2 the
+        # end-of-window hole dropped it).
+        resp = server_query(trace_dir, "top_events")
+        events = [{'name': r.get('name'), 'count': r.get('count', 0),
+                   'total_ms': r.get('total_ms', 0.0)}
+                  for r in resp.get("rows", [])]
+        names = [e['name'] for e in events]
+        lock_ev = [e for e in events if e['name'] == 'Lock:relation']
+        check(len(lock_ev) > 0,
+              f"Lock:relation spanning the window boundary is in the trace "
+              f"(saw {names}) [ESC-2 flush]"
+              + ("" if lock_ev else f" (stderr tail: {err[-300:]!r})"))
+    except subprocess.TimeoutExpired:
+        tracer.kill()
+        tracer.communicate()
+    finally:
+        wl.stop()
+        subprocess.run(["rm", "-rf", trace_dir])
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--pid', type=int, help='Postmaster PID')
@@ -754,6 +845,8 @@ def main():
         # continuity checks (docs/AAS_SEMANTICS_DECISION.md).
         phase_sampled_aas_truth(pm_pid)
         phase_cpu_storm_escalation(pm_pid)
+        # T3: manual escalation billing (ESC-1) + de-escalation flush (ESC-2).
+        phase_escalation_billing(pm_pid)
 
     print(f"\n{tests_passed}/{tests_run} checks passed")
     sys.exit(0 if tests_failed == 0 else 1)
