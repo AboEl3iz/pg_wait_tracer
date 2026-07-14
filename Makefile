@@ -15,6 +15,14 @@ TARGET     = pg_wait_tracer
 ARCH       := $(shell uname -m | sed 's/x86_64/x86/' | sed 's/aarch64/arm64/')
 
 # ---------------------------------------------------------------------------
+# Build version (T7 / TST-11): every binary embeds the exact commit it was
+# built from. pgwt-server reports it in the `info` response; the daemon in
+# the control-socket `status`; the Go client (pgwt-client target) compares it
+# against the server and warns on skew. Overridable for reproducible builds.
+# ---------------------------------------------------------------------------
+PGWT_BUILD_VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo unknown)
+
+# ---------------------------------------------------------------------------
 # libbpf selection (Rocky 8 / RHEL 8 support)
 #
 # The BPF program and daemon use USDT support: the BPF-side header
@@ -75,6 +83,7 @@ BPF_CFLAGS = -g -O2 -target bpf -D__TARGET_ARCH_$(ARCH) \
              -I/usr/include/$(shell uname -m)-linux-gnu
 
 CFLAGS     = -g -O2 -Wall -Wextra -Wno-unused-parameter \
+             -DPGWT_BUILD_VERSION='"$(PGWT_BUILD_VERSION)"' \
              $(LIBBPF_INC) \
              -I$(INC_DIR) -I$(SRC_DIR)
 LDFLAGS    = $(LIBBPF_LIB) -lelf -lz -llz4
@@ -123,7 +132,7 @@ SERVER_SRCS = $(SRC_DIR)/server.c \
 SERVER_OBJS = $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/server_%.o,$(SERVER_SRCS))
 SERVER_LDFLAGS = -lz -llz4 -lm
 
-.PHONY: all clean test-asan test-valgrind bench
+.PHONY: all clean test-asan test-valgrind bench pgwt-client
 
 all: $(TARGET) pgwt-server
 
@@ -221,6 +230,17 @@ pgwt-server: $(SERVER_OBJS)
 	@echo "  LINK     $@"
 	@$(CC) $(CFLAGS) $^ -o $@ $(SERVER_LDFLAGS)
 	@echo "  DONE     $@"
+
+# Go investigation client (runs on the operator's laptop). The -X flag embeds
+# the same git-describe version the C binaries carry, so the client/server
+# version handshake (T7 / TST-11) compares like with like. Cross-compile with
+# e.g. GOOS=darwin GOARCH=arm64 make pgwt-client CLIENT_OUT=pgwt-darwin-arm64
+CLIENT_OUT ?= web/pgwt
+pgwt-client:
+	@echo "  GO       $(CLIENT_OUT) (version $(PGWT_BUILD_VERSION))"
+	@cd web && go build -ldflags "-X main.buildVersion=$(PGWT_BUILD_VERSION)" \
+		-o $(abspath $(CLIENT_OUT)) .
+	@echo "  DONE     $(CLIENT_OUT)"
 
 clean:
 	rm -rf $(BUILD_DIR) $(TARGET) pgwt-server

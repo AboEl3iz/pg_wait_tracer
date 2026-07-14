@@ -131,3 +131,43 @@ export function datetimeLocalUTCToNs(str) {
     if (isNaN(ms)) return null;
     return ms * 1e6;
 }
+
+// -- Version-skew banner text (T7 / TST-11) -----------------------------------
+//
+// Pure mirror of web/bridge.go:versionSkewWarning — the Go bridge warns on
+// stderr, this drives the UI banner. Returns null when the pair matches (no
+// banner). Warn, never refuse: a skewed Mac-client/Linux-server pair is the
+// normal deployment state, so the point is only visibility. `null` server
+// fields mean the server did not report them (a build predating the v0.13
+// handshake).
+export function versionSkew(clientVersion, clientProto, serverVersion, serverProto) {
+    if (serverVersion == null && serverProto == null) {
+        return {
+            level: 'warn',
+            short: 'server version unknown',
+            detail: 'The pgwt-server build predates the version handshake ' +
+                '(< v0.13). Client is ' + clientVersion + ' (protocol ' +
+                clientProto + '). Redeploy pgwt-server from the same checkout.',
+        };
+    }
+    if (serverProto !== clientProto) {
+        return {
+            level: 'error',
+            short: 'protocol mismatch',
+            detail: 'pgwt-server ' + (serverVersion || '?') + ' speaks protocol ' +
+                serverProto + ', this client (' + clientVersion + ') expects ' +
+                clientProto + '. Responses may be misinterpreted — update the ' +
+                'older side before trusting what you see.',
+        };
+    }
+    if (serverVersion !== clientVersion) {
+        return {
+            level: 'warn',
+            short: 'version skew',
+            detail: 'pgwt-server is ' + serverVersion + ', this client is ' +
+                clientVersion + ' (same protocol ' + clientProto + ' — safe, ' +
+                'but behavior/fixes may differ). Rebuild/redeploy to align.',
+        };
+    }
+    return null;
+}

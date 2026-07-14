@@ -8,7 +8,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-    nsToDatetimeLocalUTC, datetimeLocalUTCToNs, fmtTime,
+    nsToDatetimeLocalUTC, datetimeLocalUTCToNs, fmtTime, versionSkew,
 } from '../../web/static/lib/format.js';
 
 // 2026-03-15 12:34:56 UTC
@@ -37,4 +37,31 @@ test('datetimeLocalUTCToNs rejects garbage', () => {
 
 test('fmtTime renders HH:MM:SS in UTC', () => {
     assert.equal(fmtTime(NS), '12:34:56');
+});
+
+// -- Version-skew banner (T7 / TST-11) ---------------------------------------
+// Mirror of web/bridge.go:versionSkewWarning. Warn, never refuse.
+
+test('versionSkew returns null when client and server match exactly', () => {
+    assert.equal(versionSkew('v0.13', 1, 'v0.13', 1), null);
+});
+
+test('versionSkew warns (safe) when versions differ but protocol matches', () => {
+    const s = versionSkew('v0.13', 1, 'v0.12', 1);
+    assert.equal(s.level, 'warn');
+    assert.equal(s.short, 'version skew');
+    assert.match(s.detail, /v0\.12/);
+    assert.match(s.detail, /v0\.13/);
+});
+
+test('versionSkew errors on a protocol mismatch', () => {
+    const s = versionSkew('v0.14', 2, 'v0.13', 1);
+    assert.equal(s.level, 'error');
+    assert.equal(s.short, 'protocol mismatch');
+});
+
+test('versionSkew warns when the server predates the handshake (null fields)', () => {
+    const s = versionSkew('v0.13', 1, null, null);
+    assert.equal(s.level, 'warn');
+    assert.match(s.detail, /predates/);
 });

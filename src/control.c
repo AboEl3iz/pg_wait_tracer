@@ -99,7 +99,7 @@ static cJSON *build_status(const struct pgwt_daemon *d)
                             (double)(now_mono_ns() - d->start_ts) / 1e9);
     cJSON_AddNumberToObject(root, "backends", count_backends(d));
     cJSON_AddNumberToObject(root, "pg_pid", d->postmaster_pid);
-    cJSON_AddStringToObject(root, "version", PGWT_VERSION);
+    cJSON_AddStringToObject(root, "version", PGWT_BUILD_VERSION);
 
     /* Current capture tier and escalation state (A4). "tier" is what is being
      * captured right now: in tiered mode it flips between "sampled" (always-on
