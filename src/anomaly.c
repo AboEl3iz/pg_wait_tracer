@@ -65,9 +65,11 @@ void pgwt_anomaly_init(struct pgwt_anomaly *a, bool enabled,
     a->aas_factor    = PGWT_ANOMALY_DEF_AAS_FACTOR;
     a->aas_ticks     = PGWT_ANOMALY_DEF_AAS_TICKS;
     a->lock_fraction = PGWT_ANOMALY_DEF_LOCK_FRAC;
+    a->lock_min_aas  = PGWT_ANOMALY_DEF_LOCK_MIN_AAS;
     a->lock_ticks    = PGWT_ANOMALY_DEF_LOCK_TICKS;
     a->cooldown_ns   = (uint64_t)PGWT_ANOMALY_DEF_COOLDOWN_S * 1000000000ULL;
     a->escalation_s  = PGWT_ANOMALY_DEF_ESCALATE_S;
+    a->slow_release_div = PGWT_ANOMALY_DEF_SLOW_RELEASE_DIV;
 
     /* Baseline EWMA: pick alpha so the baseline has roughly a 60-second
      * memory regardless of tick rate. With one update per tick, a half-life
@@ -81,6 +83,13 @@ void pgwt_anomaly_init(struct pgwt_anomaly *a, bool enabled,
     a->warmup_needed   = 5 * hz;        /* ~5 seconds of normal data */
     a->baseline_aas    = 0.0;
     a->baseline_warmup = 0;
+
+    /* ESC-7: continuously-over duration before the baseline starts learning
+     * through a sustained regime change (in ticks at this rate). */
+    a->learn_through_ticks =
+        PGWT_ANOMALY_DEF_LEARN_THROUGH_MIN * 60 * hz;
+    if (a->slow_release_div <= 0)
+        a->slow_release_div = PGWT_ANOMALY_DEF_SLOW_RELEASE_DIV;
 }
 
 struct pgwt_anomaly_decision
@@ -113,8 +122,16 @@ pgwt_anomaly_eval(struct pgwt_anomaly *a, double aas, double lock_fraction,
         a->aas_over_streak = 0;
     bool aas_fire = aas_over && (a->aas_over_streak >= a->aas_ticks);
 
-    /* ── Lock-class fraction rule ──────────────────────────────────────── */
-    bool lock_over = (a->lock_fraction > 0.0) && (lock_fraction > a->lock_fraction);
+    /* ── Lock-class fraction rule (ESC-4: with a min-activity floor) ────── */
+    /* Fraction alone fires on a single backend's routine 300 ms row-lock wait
+     * (fraction 1.0 of 1 active session), duty-cycling the whole budget away
+     * on OLTP noise. Require BOTH a high lock share AND an absolute lock-class
+     * AAS floor (lock_aas = fraction * aas) so a lone waiter cannot trip it but
+     * a real convoy does — the lock analogue of the AAS rule's aas>=2 floor. */
+    double lock_aas = lock_fraction * aas;
+    bool lock_over = (a->lock_fraction > 0.0)
+                  && (lock_fraction > a->lock_fraction)
+                  && (lock_aas >= a->lock_min_aas);
     if (lock_over)
         a->lock_over_streak++;
     else
@@ -134,6 +151,15 @@ pgwt_anomaly_eval(struct pgwt_anomaly *a, double aas, double lock_fraction,
         a->baseline_aas += (aas - a->baseline_aas) / w;
     } else if (!aas_over) {
         a->baseline_aas += a->baseline_alpha * (aas - a->baseline_aas);
+    } else if (a->learn_through_ticks > 0
+               && a->aas_over_streak >= a->learn_through_ticks) {
+        /* ESC-7: the metric has been continuously over for the sustained-over
+         * horizon — treat it as a legitimate regime change and learn through
+         * at a reduced rate so the rule stops re-firing forever, without
+         * letting a short incident (streak below the horizon) move the bar. */
+        int div = a->slow_release_div > 0 ? a->slow_release_div : 1;
+        a->baseline_aas += (a->baseline_alpha / (double)div)
+                         * (aas - a->baseline_aas);
     }
     d.baseline = a->baseline_aas;
 
@@ -220,21 +246,44 @@ void pgwt_anomaly_tick(struct pgwt_daemon *d,
     char rb[32];
     switch (dec.action) {
     case PGWT_ANOMALY_NONE:
+        /* A quiet tick ends the near run; the next near-trigger, even with the
+         * same reason mask, is fresh news and logs immediately (ESC-8). */
+        a->last_near_mask = PGWT_NEAR_NONE;
         break;
 
-    case PGWT_ANOMALY_NEAR:
-        /* Log EVERY near-trigger so thresholds can be tuned from data. This is
-         * the observability requirement (D5.4): a metric crossed but cooldown
-         * / budget / sustain blocked the fire. */
-        fprintf(stderr,
-                "INFO: anomaly near-trigger: aas=%.1f baseline=%.2f "
-                "lock_frac=%.2f%s%s%s%s\n",
-                dec.aas, dec.baseline, dec.lock_fraction,
-                (dec.near_mask & PGWT_NEAR_AAS_SUSTAIN) ? " [aas-sustain]" : "",
-                (dec.near_mask & PGWT_NEAR_LOCK_SUSTAIN) ? " [lock-sustain]" : "",
-                (dec.near_mask & PGWT_NEAR_COOLDOWN) ? " [cooldown]" : "",
-                (dec.near_mask & PGWT_NEAR_BASELINE) ? " [baseline-warmup]" : "");
+    case PGWT_ANOMALY_NEAR: {
+        /* ESC-8: near-triggers can recur every tick (up to 10 lines/s) — that
+         * floods the log while telling the operator nothing new. Rate-limit to
+         * one line per CHANGE of the near reason mask, plus a periodic summary
+         * (with a suppressed-count) at most once a minute, so the tuning value
+         * of the data is kept (near_total already counts every one for the
+         * control socket) without the flood. */
+        const uint64_t NEAR_SUMMARY_NS = 60ULL * 1000000000ULL;
+        bool mask_changed = (dec.near_mask != a->last_near_mask);
+        bool summary_due = (a->last_near_log_ns == 0)
+                        || (now - a->last_near_log_ns >= NEAR_SUMMARY_NS);
+        if (mask_changed || summary_due) {
+            char since[48] = "";
+            if (a->near_since_log > 0)
+                snprintf(since, sizeof(since), " (+%llu suppressed)",
+                         (unsigned long long)a->near_since_log);
+            fprintf(stderr,
+                    "INFO: anomaly near-trigger: aas=%.1f baseline=%.2f "
+                    "lock_frac=%.2f%s%s%s%s%s\n",
+                    dec.aas, dec.baseline, dec.lock_fraction,
+                    (dec.near_mask & PGWT_NEAR_AAS_SUSTAIN) ? " [aas-sustain]" : "",
+                    (dec.near_mask & PGWT_NEAR_LOCK_SUSTAIN) ? " [lock-sustain]" : "",
+                    (dec.near_mask & PGWT_NEAR_COOLDOWN) ? " [cooldown]" : "",
+                    (dec.near_mask & PGWT_NEAR_BASELINE) ? " [baseline-warmup]" : "",
+                    since);
+            a->last_near_mask = dec.near_mask;
+            a->last_near_log_ns = now;
+            a->near_since_log = 0;
+        } else {
+            a->near_since_log++;
+        }
         break;
+    }
 
     case PGWT_ANOMALY_FIRE: {
         int granted = 0;

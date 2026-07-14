@@ -7,9 +7,11 @@
  * overlap at read time.
  */
 #include "escalation.h"
+#include "escalation_budget.h"
 #include "daemon.h"
 #include "backend.h"
 #include "event_writer.h"
+#include "summary_writer.h"
 #include "perf_event.h"
 
 #include <stdio.h>
@@ -58,43 +60,23 @@ static void write_marker(struct pgwt_daemon *d, uint32_t marker_type,
 }
 
 /* ── Budget accounting (rolling hour) ─────────────────────────────────── */
-
-/* Sum full-fidelity ns consumed within [now - rolling_window, now], clamping
- * each segment to that window. The currently-open segment (end_ns == 0) is
- * counted up to now. Stale segments are pruned (compacted) as a side effect. */
-static uint64_t budget_consumed_ns(struct pgwt_escalation *e, uint64_t now)
-{
-    uint64_t window_start = (now > e->rolling_window_ns)
-                          ? now - e->rolling_window_ns : 0;
-    uint64_t consumed = 0;
-    int w = 0;
-    for (int i = 0; i < e->ledger_count; i++) {
-        uint64_t s = e->ledger[i].start_ns;
-        uint64_t en = e->ledger[i].end_ns ? e->ledger[i].end_ns : now;
-        if (en <= window_start)
-            continue;   /* entirely stale — drop */
-        if (s < window_start)
-            s = window_start;
-        if (en > s)
-            consumed += en - s;
-        /* keep this (still partly in-window) segment */
-        e->ledger[w++] = e->ledger[i];
-    }
-    e->ledger_count = w;
-    return consumed;
-}
+/* The pure ledger/decision core lives in escalation_budget.c (unit-tested);
+ * this file only wires it to the BPF-attaching escalation lifecycle. */
 
 double pgwt_escalation_budget_remaining_s(const struct pgwt_daemon *d)
 {
     const struct pgwt_escalation *e = &d->escalation;
-    if (!e->enabled || e->budget_ns == 0)
+    if (!e->enabled)
         return 0;
-    /* const-correct: budget_consumed_ns prunes, so cast away const. */
-    uint64_t consumed = budget_consumed_ns((struct pgwt_escalation *)e,
-                                           mono_ns());
-    if (consumed >= e->budget_ns)
-        return 0;
-    return (double)(e->budget_ns - consumed) / 1e9;
+    /* ESC-6: report the TRUTH for every budget mode. Unlimited surfaces as
+     * -1 (the "no cap" sentinel the UI renders as ∞); deny-all (budget 0)
+     * reports a genuine 0; a finite budget reports the real remaining. */
+    if (e->budget_unlimited)
+        return -1.0;
+    /* const-correct: the consumed helper prunes, so cast away const. */
+    uint64_t rem = pgwt_esc_budget_remaining_ns((struct pgwt_escalation *)e,
+                                                mono_ns());
+    return (double)rem / 1e9;
 }
 
 double pgwt_escalation_remaining_s(const struct pgwt_daemon *d)
@@ -178,6 +160,56 @@ static void detach_all(struct pgwt_daemon *d)
     }
 }
 
+/* ── De-escalation flush (ESC-2) ──────────────────────────────────────── */
+
+/* Before detach_all() resets the state_map, flush every OPEN wait interval as
+ * a final transition so a wait that spans the window end is recorded exactly
+ * once (its exact portion up to the de-escalation instant) instead of being
+ * silently dropped — the interval carried no TRANSITIONS record yet (the
+ * watchpoint only emits on the wait's END), while the END marker extends the
+ * exact-wins range so the covering samples were discarded too. We synthesize
+ * the transition userspace-side (same path as the window markers): timestamp =
+ * now (the wait-end instant), old_event = the open event, duration = now -
+ * last_ts. It lands inside the marker-covered range, closing the end-of-window
+ * hole on exactly the long waits the window exists to capture. */
+static void flush_open_intervals(struct pgwt_daemon *d, uint64_t now)
+{
+    if (!d->event_writer)
+        return;   /* nothing to flush into — no trace recording */
+    int state_fd = d->skel ? bpf_map__fd(d->skel->maps.state_map) : -1;
+    if (state_fd < 0)
+        return;
+
+    for (int i = 0; i < d->backends.count; i++) {
+        struct pgwt_backend *be = &d->backends.entries[i];
+        if (!be->is_alive || be->pid <= 0 || be->wp_fd < 0)
+            continue;
+        uint32_t key = (uint32_t)be->pid;
+        struct pgwt_pid_state st;
+        if (bpf_map_lookup_elem(state_fd, &key, &st) != 0)
+            continue;
+        if (!st.wp_live)
+            continue;               /* a seed entry — no interval to close */
+        if (now <= st.last_ts)
+            continue;               /* zero/negative duration — nothing open */
+        uint32_t we = st.last_event;
+        if (PGWT_IS_MARKER(we))
+            continue;               /* never a real wait */
+        struct pgwt_trace_event ev = {
+            .timestamp_ns = now,
+            .pid          = (uint32_t)be->pid,
+            .old_event    = we,     /* the interval that was open ends here */
+            .new_event    = we,
+            .flags        = st.cmd_open ? PGWT_EVENT_FLAG_CMD_OPEN : 0,
+            .duration_ns  = now - st.last_ts,
+            .query_id     = st.last_query_id,
+        };
+        pgwt_writer_push_event(d->event_writer, &ev);
+        if (d->summary_writer)
+            pgwt_summary_push_event(d->summary_writer, &ev);
+    }
+}
+
 /* ── Public API ───────────────────────────────────────────────────────── */
 
 int pgwt_escalation_init(struct pgwt_daemon *d, int budget_s)
@@ -186,7 +218,15 @@ int pgwt_escalation_init(struct pgwt_daemon *d, int budget_s)
     memset(e, 0, sizeof(*e));
     e->timer_fd = -1;
     e->rolling_window_ns = 3600ULL * 1000000000ULL;   /* per rolling hour */
-    e->budget_ns = (budget_s > 0 ? (uint64_t)budget_s : 0) * 1000000000ULL;
+    /* ESC-6 budget semantics: >0 = seconds/hour cap; 0 = deny-all (escalation
+     * disabled); <0 = unlimited (no cap). */
+    if (budget_s < 0) {
+        e->budget_unlimited = true;
+        e->budget_ns = 0;
+    } else {
+        e->budget_unlimited = false;
+        e->budget_ns = (uint64_t)budget_s * 1000000000ULL;
+    }
     e->enabled = (d->mode == PGWT_MODE_TIERED);
 
     if (!e->enabled)
@@ -255,30 +295,21 @@ int pgwt_escalate(struct pgwt_daemon *d, int duration_s, int reason,
     uint64_t now = mono_ns();
     uint64_t want_ns = (uint64_t)duration_s * 1000000000ULL;
 
-    /* Budget check: would the requested window push consumed past budget?
-     * The currently-open segment is already counted in budget_consumed_ns,
-     * so for an extension we only charge the additional time past the current
-     * deadline. */
-    if (e->budget_ns > 0) {
-        uint64_t consumed = budget_consumed_ns(e, now);
-        uint64_t additional;
-        if (e->active && e->window_deadline_ns > now) {
-            uint64_t new_deadline = now + want_ns;
-            additional = (new_deadline > e->window_deadline_ns)
-                       ? (new_deadline - e->window_deadline_ns) : 0;
-        } else {
-            additional = want_ns;
-        }
-        if (consumed + additional > e->budget_ns) {
-            e->denied_total++;
-            if (why) *why = "escalation budget exhausted for this hour";
-            return -1;
-        }
+    /* ESC-1: budget decision on the committed-remainder-aware core. The grant
+     * is CLAMPED to the remaining budget: the currently-open segment is
+     * already folded into consumed, so the deadline we arm at now+grant makes
+     * the window's total full-fidelity time land at exactly the budget no
+     * matter how many times it is extended (the extend-every-second attack). */
+    uint64_t grant_ns = want_ns;
+    if (pgwt_esc_budget_decide(e, now, want_ns, &grant_ns, why) != 0) {
+        e->denied_total++;
+        return -1;
     }
 
     if (e->active) {
-        /* Already escalated: extend the deadline if the new one is later. */
-        uint64_t new_deadline = now + want_ns;
+        /* Already escalated: extend the deadline to the budget-clamped grant
+         * if it is later than the current one (never shorten a live window). */
+        uint64_t new_deadline = now + grant_ns;
         if (new_deadline > e->window_deadline_ns)
             arm_deadline(e, new_deadline);
         if (granted_s)
@@ -288,29 +319,26 @@ int pgwt_escalate(struct pgwt_daemon *d, int duration_s, int reason,
     }
 
     /* Fresh escalation: attach watchpoints across the registry, open a
-     * ledger segment, arm the deadline, and mark the trace. */
+     * ledger segment, arm the (budget-clamped) deadline, and mark the trace. */
     int n = attach_all(d);
     e->active = true;
     e->window_start_ns = now;
     e->window_reason = reason;
     e->windows_total++;
 
-    if (e->ledger_count < PGWT_ESC_LEDGER_MAX) {
-        e->ledger[e->ledger_count].start_ns = now;
-        e->ledger[e->ledger_count].end_ns = 0;
-        e->ledger_count++;
-    }
+    pgwt_esc_ledger_open(e, now);   /* ESC-5: never opens an unbilled window */
 
-    arm_deadline(e, now + want_ns);
-    write_marker(d, PGWT_MARKER_ESCALATE_START, want_ns, reason);
+    arm_deadline(e, now + grant_ns);
+    write_marker(d, PGWT_MARKER_ESCALATE_START, grant_ns, reason);
 
+    int granted = (int)((grant_ns + 999999999ULL) / 1000000000ULL);
     if (d->verbose)
         fprintf(stderr,
                 "INFO: escalated to full fidelity for %ds (reason %d, "
-                "%d watchpoints attached)\n", duration_s, reason, n);
+                "%d watchpoints attached)\n", granted, reason, n);
 
     if (granted_s)
-        *granted_s = duration_s;
+        *granted_s = granted;
     return 0;
 }
 
@@ -326,16 +354,17 @@ void pgwt_deescalate(struct pgwt_daemon *d, int reason)
     if (d->event_rb)
         ring_buffer__consume(d->event_rb);
 
+    /* ESC-2: flush open wait intervals as final transitions BEFORE detach_all
+     * wipes them, and before the END marker closes the exact-wins range — so a
+     * wait spanning the window boundary is recorded exactly once (its exact
+     * portion), not dropped into an end-of-window hole. */
+    flush_open_intervals(d, now);
+
     detach_all(d);
     e->active = false;
 
     /* Close the open ledger segment so budget accounting is exact. */
-    for (int i = e->ledger_count - 1; i >= 0; i--) {
-        if (e->ledger[i].end_ns == 0) {
-            e->ledger[i].end_ns = now;
-            break;
-        }
-    }
+    pgwt_esc_ledger_close(e, now);
 
     /* Disarm the deadline timer. */
     struct itimerspec its = {0};
@@ -360,4 +389,19 @@ void pgwt_escalation_on_timer(struct pgwt_daemon *d)
 
     if (e->active && mono_ns() >= e->window_deadline_ns)
         pgwt_deescalate(d, PGWT_ESC_REASON_EXPIRED);
+}
+
+void pgwt_escalation_check_budget(struct pgwt_daemon *d)
+{
+    struct pgwt_escalation *e = &d->escalation;
+    if (!e->active)
+        return;
+    /* ESC-1 mid-window clamp: the budget-clamped deadline normally closes the
+     * window on time, but a rolling-hour accounting change (an older segment
+     * aging in/out) can push cumulative consumption to the budget mid-flight —
+     * close now rather than run over. */
+    if (pgwt_esc_budget_over(e, mono_ns())) {
+        e->budget_closed_total++;
+        pgwt_deescalate(d, PGWT_ESC_REASON_BUDGET);
+    }
 }

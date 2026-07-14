@@ -156,6 +156,7 @@ struct pgwt_daemon {
     double      anomaly_aas_factor;      /* --anomaly-aas-factor (<=0 = default) */
     int         anomaly_aas_ticks;       /* --anomaly-aas-ticks (<=0 = default) */
     double      anomaly_lock_fraction;   /* --anomaly-lock-fraction (<0 = default) */
+    double      anomaly_lock_min_aas;    /* --anomaly-lock-min-aas (<0 = default, ESC-4) */
     int         anomaly_cooldown_s;      /* --anomaly-cooldown-s (<0 = default) */
     int         anomaly_window_s;        /* --anomaly-window-s: per-trigger
                                           * escalation duration (<=0 = default) */

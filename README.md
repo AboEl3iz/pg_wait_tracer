@@ -171,14 +171,45 @@ A full-fidelity window can be opened two ways:
   AAS exceeding a multiple of its rolling baseline (`--anomaly-aas-factor`,
   default 3.0× sustained `--anomaly-aas-ticks` ticks, default 3), or the
   Lock-class share of active samples exceeding `--anomaly-lock-fraction`
-  (default 0.30). A cooldown (`--anomaly-cooldown-s`, default 120) prevents
-  flapping.
+  (default 0.30) **and** the absolute Lock-class AAS exceeding
+  `--anomaly-lock-min-aas` (default 2.0). The lock floor stops a single
+  backend's routine row-lock wait — a lock-fraction of 1.0 over an AAS of 1 —
+  from burning a whole window on OLTP noise; a genuine lock convoy still fires.
+  A cooldown (`--anomaly-cooldown-s`, default 120) prevents flapping.
+
+The rolling AAS baseline is **frozen while a metric is anomalous** so a
+sustained incident cannot silently raise the bar and silence the rule. To keep
+a *legitimate* load regime change from re-firing forever, the baseline resumes
+learning — at 1/10 the normal EWMA rate — only after the metric has stayed
+continuously over the threshold for **15 minutes** (the "slow learn-through"):
+short incidents never move the bar, a real new normal is eventually adopted.
 
 Every window is bounded: per-window length is set by the request (or
 `--anomaly-window-s`, default 60, for auto-triggers), and total escalation time
-is capped by `--escalation-budget` (default 300s per rolling hour). When the
-budget is exhausted, further escalations are denied (and counted in the
-self-metrics).
+is capped by `--escalation-budget` per rolling hour:
+
+- **`300`** *(default)* — 300 full-fidelity seconds per rolling hour. A request
+  larger than the remaining budget is **clamped** to what's left (the window
+  runs up to the cap), and mid-window enforcement closes a window the instant
+  cumulative consumption reaches the budget, so worst-case full-fidelity time
+  per hour never exceeds the budget even under adversarial repeated extensions.
+- **`0`** — escalation **disabled** (every escalate request is denied). The
+  self-metrics honestly report `0` budget remaining.
+- **`unlimited`** — no cap (the old `0` behavior). Reported as
+  `escalation_budget_unlimited: true`.
+
+When the budget is exhausted, further escalations are denied (and counted in the
+self-metrics). Note the duty-cycle floor: the cooldown is measured from the
+*start* of each auto-escalation, so a sustained incident re-fires every
+`--anomaly-cooldown-s` (default 120s) for a `--anomaly-window-s` (default 60s)
+window — a **50% full-fidelity duty cycle** on a persistent incident, and still
+bounded above by the budget (which will curtail it sooner). Widen the cooldown
+or shrink the window to lower the duty cycle; the sampled tier keeps full
+coverage throughout regardless. On very high backend counts the synchronous
+watchpoint `attach_all` at escalation start can briefly stall the sampler; the
+lost ticks are weight-compensated (each tick is billed by measured elapsed
+time), so the accounting stays correct — only time resolution dips for that
+instant.
 
 ```bash
 # Open a 120s full-fidelity window on a running daemon via the control socket
@@ -445,7 +476,7 @@ per interval, no screen clearing).
 |------|-------|---------|-------------|
 | `--mode <MODE>` | — | `tiered` | Capture tier: `tiered` (always-on sampler + on-demand escalation), `sampled`, `full` (exact watchpoints), `coop` (stub). See [Capture Tiers](#capture-tiers---mode) |
 | `--sample-rate <HZ>` | — | `10` | Sampling rate for `sampled`/`tiered` (1-1000 Hz) |
-| `--escalation-budget <S>` | — | `300` | `tiered`: full-fidelity seconds allowed per rolling hour (0 disables the limit) |
+| `--escalation-budget <S>` | — | `300` | `tiered`: full-fidelity seconds allowed per rolling hour. `0` = escalation **disabled** (deny all); `unlimited` = no cap. Over-budget requests are clamped to the remainder; enforced mid-window. |
 
 ### Anomaly Triggers (tiered mode)
 
@@ -457,6 +488,7 @@ Auto-escalation rules evaluated on the sampled stream. Ignored outside
 | `--anomaly-aas-factor <K>` | — | `3.0` | Fire when AAS > K × rolling baseline |
 | `--anomaly-aas-ticks <N>` | — | `3` | ...sustained for N consecutive ticks |
 | `--anomaly-lock-fraction <F>` | — | `0.30` | Fire when Lock-class share of active samples > F (sustained N ticks) |
+| `--anomaly-lock-min-aas <A>` | — | `2.0` | ...**and** absolute Lock-class AAS ≥ A (min-activity floor: a lone lock waiter can't escalate) |
 | `--anomaly-cooldown-s <S>` | — | `120` | Minimum seconds between auto-escalations |
 | `--anomaly-window-s <S>` | — | `60` | Full-fidelity window length per auto-trigger |
 

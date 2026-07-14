@@ -439,6 +439,8 @@ class DaemonState:
             "escalation_supported": True,
             "escalation_seconds_remaining": self.seconds_remaining,
             "escalation_budget_remaining_s": self.budget_remaining_s,
+            # ESC-6: unlimited surfaces as budget_remaining_s == -1 + this flag.
+            "escalation_budget_unlimited": self.budget_remaining_s < 0,
             "escalation_reason": self.reason if self.tier == "escalated" else "none",
             # Sampler read health (T4/SMP-1): false + reason means the sampler
             # cannot read backend memory — "blind", not "idle".
@@ -472,8 +474,10 @@ class DaemonState:
             "escalation_active": self.tier == "escalated",
             "escalation_seconds_remaining": self.seconds_remaining,
             "escalation_budget_remaining_s": self.budget_remaining_s,
+            "escalation_budget_unlimited": self.budget_remaining_s < 0,
             "escalation_windows_total": self.windows_total,
             "escalation_denied_total": self.denied_total,
+            "escalation_budget_closed_total": 0,
             "anomaly_fires_total": 2,
             "anomaly_near_total": 5,
             "anomaly_dropped_budget_total": 1,

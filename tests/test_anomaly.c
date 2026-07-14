@@ -351,6 +351,111 @@ static void test_cpu_storm_fires(void)
     }
 }
 
+/* ── Test 10: ESC-4 — lock rule needs a min-activity floor ─────────────── */
+/* A single backend's routine 300 ms row-lock wait is lock_fraction 1.0 of an
+ * AAS of 1 — the old rule fired and burned a 60 s window on OLTP noise. The
+ * min-activity floor (lock-class AAS >= lock_min_aas) must veto that while
+ * still firing on a genuine lock convoy. */
+static void test_lock_min_activity(void)
+{
+    printf("--- ESC-4: lock rule requires a minimum lock-class AAS ---\n");
+    struct pgwt_anomaly a;
+    pgwt_anomaly_init(&a, true, 10);
+    a.aas_factor    = 0.0;         /* isolate the lock rule */
+    a.lock_fraction = 0.30;
+    a.lock_min_aas  = 2.0;         /* default floor */
+    a.lock_ticks    = 3;
+    uint64_t clk = TICK_NS;
+    warm_baseline(&a, 1.0, &clk);
+
+    /* Lone backend fully blocked on a lock: fraction 1.0 but lock-AAS = 1.0
+     * (1 * 1.0) < 2.0 → must NEVER fire, however long it lasts. */
+    int fires = 0;
+    feed(&a, 1.0, 1.0, 100, &clk, &fires);
+    CHECK(fires == 0, "single-backend lock wait fired %d times (must be 0)",
+          fires);
+    CHECK(a.lock_over_streak == 0,
+          "min-activity floor keeps lock_over_streak at 0 (got %d)",
+          a.lock_over_streak);
+
+    /* A real convoy: AAS 6, lock share 0.7 → lock-AAS 4.2 >= 2.0 AND share
+     * 0.7 > 0.30 → fires after the sustain count. */
+    struct pgwt_anomaly b;
+    pgwt_anomaly_init(&b, true, 10);
+    b.aas_factor    = 0.0;
+    b.lock_fraction = 0.30;
+    b.lock_min_aas  = 2.0;
+    b.lock_ticks    = 3;
+    clk = TICK_NS;
+    warm_baseline(&b, 1.0, &clk);
+    int convoy_fires = 0;
+    feed(&b, 6.0, 0.7, 5, &clk, &convoy_fires);
+    CHECK(convoy_fires >= 1, "a real lock convoy MUST fire (got %d)",
+          convoy_fires);
+
+    /* Boundary: exactly at the floor (lock-AAS == 2.0) fires; just under does
+     * not. AAS 4, share 0.5 => lock-AAS 2.0 (>= floor). */
+    struct pgwt_anomaly c;
+    pgwt_anomaly_init(&c, true, 10);
+    c.aas_factor = 0.0; c.lock_fraction = 0.30; c.lock_min_aas = 2.0;
+    c.lock_ticks = 2;
+    clk = TICK_NS;
+    warm_baseline(&c, 1.0, &clk);
+    int at_floor = 0;
+    feed(&c, 4.0, 0.5, 4, &clk, &at_floor);
+    CHECK(at_floor >= 1, "lock-AAS exactly at the floor fires (got %d)",
+          at_floor);
+}
+
+/* ── Test 11: ESC-7 — short incident protected, sustained regime learned ─ */
+static void test_baseline_learn_through(void)
+{
+    printf("--- ESC-7: short incident protected; sustained regime learned ---\n");
+
+    /* Property 1 (incident protection preserved): a burst well under the
+     * learn-through horizon must NOT move the baseline. */
+    struct pgwt_anomaly a;
+    pgwt_anomaly_init(&a, true, 10);
+    a.aas_factor = 3.0;
+    a.aas_ticks  = 3;
+    /* Shrink the horizon so the test is fast but still >> the incident. */
+    a.learn_through_ticks = 2000;   /* 200 s at 10 Hz */
+    uint64_t clk = TICK_NS;
+    warm_baseline(&a, 2.0, &clk);
+    double base0 = a.baseline_aas;
+    feed(&a, 20.0, 0.0, 300, &clk, NULL);   /* 30 s incident << 200 s horizon */
+    CHECK(a.baseline_aas < base0 + 1.0,
+          "short incident must not raise baseline (%.2f -> %.2f)",
+          base0, a.baseline_aas);
+
+    /* Property 2 (learn-through): a regime change sustained PAST the horizon
+     * must eventually be adopted so the rule stops re-firing forever. */
+    struct pgwt_anomaly b;
+    pgwt_anomaly_init(&b, true, 10);
+    b.aas_factor = 3.0;
+    b.aas_ticks  = 3;
+    b.learn_through_ticks = 2000;
+    b.slow_release_div    = 10;
+    clk = TICK_NS;
+    warm_baseline(&b, 2.0, &clk);
+    double base_start = b.baseline_aas;
+    /* Hold AAS=20 for well past the horizon + enough slow-EWMA memory to climb.
+     * Slow alpha = (1/600)/10; ~2000+ extra ticks after the horizon lets the
+     * baseline move a meaningful fraction toward 20. */
+    feed(&b, 20.0, 0.0, 2000, &clk, NULL);   /* reach the horizon (no move) */
+    double base_at_horizon = b.baseline_aas;
+    CHECK(base_at_horizon < base_start + 1.0,
+          "baseline still protected right up to the horizon (%.2f)",
+          base_at_horizon);
+    feed(&b, 20.0, 0.0, 30000, &clk, NULL);  /* learn through past the horizon */
+    CHECK(b.baseline_aas > base_at_horizon + 2.0,
+          "sustained regime change IS learned through (%.2f -> %.2f, toward 20)",
+          base_at_horizon, b.baseline_aas);
+    CHECK(b.baseline_aas < 20.0,
+          "learn-through is SLOW, not instant (baseline %.2f still < 20)",
+          b.baseline_aas);
+}
+
 /* ── Test 9: AAS + lock can fire together (combined fired_mask) ────────── */
 static void test_combined_fire(void)
 {
@@ -384,6 +489,8 @@ int main(void)
     test_budget_boundary();
     test_metrics_from_batch();
     test_cpu_storm_fires();
+    test_lock_min_activity();
+    test_baseline_learn_through();
     test_combined_fire();
 
     printf("\n%d/%d checks passed\n", tests_passed, tests_run);

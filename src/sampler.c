@@ -507,6 +507,16 @@ static void pgwt_sampler_accumulate(struct pgwt_daemon *d,
     if (!acc)
         return;
 
+    /* ESC-3: while escalated, the exact ringbuf ALSO feeds d->event_accum for
+     * every pid with a live watchpoint. Folding the sampler's estimate in on
+     * top double-counts the live --view (measured ~1.9x). Gate the sampler's
+     * contribution for exactly those covered pids — the live-path analogue of
+     * the offline marker-based exact-wins merge. Freshly-forked backends not
+     * yet watchpointed (wp_fd < 0) still have the sampler as their only source,
+     * so they keep accumulating. The on-disk SAMPLES are untouched; the offline
+     * merge de-dupes them via the escalation markers (FID-1). */
+    bool escalated = d->escalation.active;
+
     for (int i = 0; i < count; i++) {
         uint32_t we  = samples[i].new_event;   /* sampled wait event (0 = CPU) */
         uint64_t dur = period_ns;              /* ASH weight per sample */
@@ -514,6 +524,13 @@ static void pgwt_sampler_accumulate(struct pgwt_daemon *d,
 
         if (PGWT_IS_MARKER(we))
             continue;
+
+        if (escalated) {
+            struct pgwt_backend *be =
+                pgwt_find_backend(&d->backends, (pid_t)samples[i].pid);
+            if (be && be->wp_fd >= 0)
+                continue;   /* exact ringbuf owns this pid's live accumulation */
+        }
 
         /* Per-PID accumulation */
         struct pgwt_pid_accum *pa = pgwt_get_or_create_pid(acc, samples[i].pid);

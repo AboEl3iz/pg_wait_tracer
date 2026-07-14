@@ -11,7 +11,8 @@ BUILD     = ../build
 LIBBPF_LIB ?= -lbpf
 
 TESTS     = test_wait_event test_cmdline test_event_writer test_event_reader \
-            test_trace_v2 test_sampler test_anomaly test_coop test_bucket \
+            test_trace_v2 test_sampler test_anomaly test_escalation_budget \
+            test_coop test_bucket \
             test_pg13_resolve test_discovery_pie test_discovery_nopie \
             test_replay_fidelity test_durability test_query_text \
             gen_test_traces gen_bench_traces test_concurrent_rw cross_validate \
@@ -92,6 +93,13 @@ test_sampler: test_sampler.c ../src/sampler.c
 # skeleton, no escalation engine, runnable in CI's server-only jobs.
 test_anomaly: test_anomaly.c ../src/anomaly.c
 	$(CC) $(CFLAGS) -DPGWT_SERVER -o $@ $^
+
+# test_escalation_budget: pure rolling-hour budget core (ESC-1/5/6). Compiles
+# escalation_budget.c directly — it is BPF-free and daemon-free (depends only
+# on escalation.h), so no skeleton, no bpftool: runnable in CI's server-only
+# jobs like test_sampler / test_anomaly.
+test_escalation_budget: test_escalation_budget.c ../src/escalation_budget.c
+	$(CC) $(CFLAGS) -o $@ $^
 
 # test_coop: cooperative provider stub (A6 interface freeze) — registers,
 # advertises EXACT fidelity, start() returns the clean "not available" status.

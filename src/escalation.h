@@ -56,7 +56,8 @@ struct pgwt_escalation {
     int       window_reason;      /* enum pgwt_escalation_reason of active window */
 
     /* Budget: full-fidelity seconds allowed per rolling hour. */
-    uint64_t  budget_ns;          /* --escalation-budget converted to ns */
+    uint64_t  budget_ns;          /* --escalation-budget converted to ns (0 = deny-all) */
+    bool      budget_unlimited;   /* --escalation-budget unlimited/-1: no cap (ESC-6) */
     uint64_t  rolling_window_ns;  /* the "per hour" window (3600s) */
 
     /* Ledger of closed (and the one open) segments for rolling accounting. */
@@ -66,6 +67,7 @@ struct pgwt_escalation {
     /* Lifetime stats (control-socket metrics). */
     uint64_t  windows_total;      /* escalation windows opened */
     uint64_t  denied_total;       /* manual escalates denied (over budget) */
+    uint64_t  budget_closed_total;/* windows closed mid-flight by the budget clamp (ESC-1) */
 };
 
 /* Initialize the escalation engine. budget_s is --escalation-budget (full
@@ -92,6 +94,11 @@ void pgwt_deescalate(struct pgwt_daemon *d, int reason);
 
 /* Called when the deadline timerfd fires: closes the window if expired. */
 void pgwt_escalation_on_timer(struct pgwt_daemon *d);
+
+/* Mid-window budget enforcement (ESC-1): if an active window's rolling-hour
+ * consumption has reached the budget, de-escalate now. Cheap no-op when not
+ * escalated / unlimited. Called from the daemon's periodic timer. */
+void pgwt_escalation_check_budget(struct pgwt_daemon *d);
 
 /* True if fd belongs to the escalation deadline timer (drives dispatch). */
 bool pgwt_escalation_is_timer_fd(const struct pgwt_daemon *d, int fd);

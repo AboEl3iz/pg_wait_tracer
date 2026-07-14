@@ -157,6 +157,7 @@ enum pgwt_escalation_reason {
     PGWT_ESC_REASON_EXPIRED  = 2,  /* window reached its deadline (close) */
     PGWT_ESC_REASON_REQUEST  = 3,  /* explicit deescalate request (close) */
     PGWT_ESC_REASON_SHUTDOWN = 4,  /* daemon stopping (close) */
+    PGWT_ESC_REASON_BUDGET   = 5,  /* rolling-hour budget reached (mid-window close, ESC-1) */
 };
 
 /* ── Query Text Event (lifecycle ringbuf) ─────────────────── */

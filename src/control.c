@@ -48,8 +48,22 @@ static const char *esc_reason_str(int reason)
     case PGWT_ESC_REASON_EXPIRED:  return "expired";
     case PGWT_ESC_REASON_REQUEST:  return "request";
     case PGWT_ESC_REASON_SHUTDOWN: return "shutdown";
+    case PGWT_ESC_REASON_BUDGET:   return "budget";
     default:                       return "unknown";
     }
+}
+
+/* The capture tier being recorded RIGHT NOW, honest for every mode (ESC-9):
+ * tiered flips sampled/escalated; a fixed EXACT-fidelity provider (--mode full)
+ * is always "escalated" (full fidelity); everything else is "sampled". Shared
+ * by status and metrics so they can never disagree. */
+static const char *daemon_tier_str(const struct pgwt_daemon *d)
+{
+    if (d->escalation.enabled)
+        return d->escalation.active ? "escalated" : "sampled";
+    if (d->provider && d->provider->fidelity == PGWT_FIDELITY_EXACT)
+        return "escalated";   /* full mode: always full fidelity */
+    return "sampled";
 }
 
 /* Count live tracked backends */
@@ -91,20 +105,16 @@ static cJSON *build_status(const struct pgwt_daemon *d)
      * captured right now: in tiered mode it flips between "sampled" (always-on
      * baseline) and "escalated" (full-fidelity window open); for full/sampled
      * it mirrors the fixed provider fidelity. */
-    const char *tier;
-    if (d->escalation.enabled)
-        tier = d->escalation.active ? "escalated" : "sampled";
-    else if (d->provider &&
-             d->provider->fidelity == PGWT_FIDELITY_EXACT)
-        tier = "escalated";   /* full mode: always full fidelity */
-    else
-        tier = "sampled";
-    cJSON_AddStringToObject(root, "tier", tier);
+    cJSON_AddStringToObject(root, "tier", daemon_tier_str(d));
     cJSON_AddBoolToObject(root, "escalation_supported", d->escalation.enabled);
     cJSON_AddNumberToObject(root, "escalation_seconds_remaining",
                             pgwt_escalation_remaining_s(d));
     cJSON_AddNumberToObject(root, "escalation_budget_remaining_s",
                             pgwt_escalation_budget_remaining_s(d));
+    /* ESC-6: report the budget mode truthfully. unlimited => remaining is the
+     * -1 sentinel; this flag disambiguates it from a finite budget. */
+    cJSON_AddBoolToObject(root, "escalation_budget_unlimited",
+                          d->escalation.budget_unlimited);
     /* Reason of the currently-open window (so the UI can annotate manual vs
      * anomaly escalations distinctly). "none" while not escalated. */
     cJSON_AddStringToObject(root, "escalation_reason",
@@ -207,18 +217,23 @@ static cJSON *build_metrics(const struct pgwt_daemon *d)
     cjson_add_uint64(root, "trace_bytes_written_total",
                      d->event_writer ? d->event_writer->total_bytes_written : 0);
 
-    /* Escalation accounting (A4). 0/false when not in tiered mode. */
-    cJSON_AddStringToObject(root, "tier",
-                            d->escalation.active ? "escalated" : "sampled");
+    /* Escalation accounting (A4). ESC-9: tier is derived the SAME way as
+     * status — a fixed EXACT provider (--mode full) reports "escalated", never
+     * a bogus "sampled". */
+    cJSON_AddStringToObject(root, "tier", daemon_tier_str(d));
     cJSON_AddBoolToObject(root, "escalation_active", d->escalation.active);
     cJSON_AddNumberToObject(root, "escalation_seconds_remaining",
                             pgwt_escalation_remaining_s(d));
     cJSON_AddNumberToObject(root, "escalation_budget_remaining_s",
                             pgwt_escalation_budget_remaining_s(d));
+    cJSON_AddBoolToObject(root, "escalation_budget_unlimited",
+                          d->escalation.budget_unlimited);
     cjson_add_uint64(root, "escalation_windows_total",
                      d->escalation.windows_total);
     cjson_add_uint64(root, "escalation_denied_total",
                      d->escalation.denied_total);
+    cjson_add_uint64(root, "escalation_budget_closed_total",
+                     d->escalation.budget_closed_total);
 
     /* Anomaly-trigger accounting (A5). 0 when not in tiered mode. */
     cjson_add_uint64(root, "anomaly_fires_total", d->anomaly.fires_total);
@@ -466,8 +481,40 @@ int pgwt_control_init(struct pgwt_control *c, struct pgwt_daemon *d,
         return -1;
     }
 
-    /* Unlink stale socket from a previous (crashed) daemon */
-    unlink(c->sock_path);
+    /* ESC-10: a plain unlink() lets a second daemon steal a LIVE daemon's
+     * control plane (and race for the same trace dir). Liveness-probe first:
+     * try to connect to the existing socket. If a daemon answers, refuse
+     * startup loudly; only unlink a socket that is stale (connect refused) or a
+     * non-socket path. */
+    {
+        struct stat sb;
+        if (lstat(c->sock_path, &sb) == 0) {
+            if (S_ISSOCK(sb.st_mode)) {
+                int probe = socket(AF_UNIX,
+                                   SOCK_STREAM | SOCK_CLOEXEC, 0);
+                if (probe >= 0) {
+                    struct sockaddr_un pa;
+                    memset(&pa, 0, sizeof(pa));
+                    pa.sun_family = AF_UNIX;
+                    memcpy(pa.sun_path, c->sock_path, (size_t)n + 1);
+                    int crc = connect(probe, (struct sockaddr *)&pa,
+                                      sizeof(pa));
+                    close(probe);
+                    if (crc == 0) {
+                        fprintf(stderr,
+                                "FATAL: another pg_wait_tracer daemon is "
+                                "already running on %s\n"
+                                "  Refusing to steal its control socket. Stop "
+                                "it first, or use a different --trace-dir.\n",
+                                c->sock_path);
+                        return -2;   /* live-daemon conflict: fatal (ESC-10) */
+                    }
+                }
+            }
+            /* Stale socket (or non-socket file) from a crashed daemon. */
+            unlink(c->sock_path);
+        }
+    }
 
     int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (fd < 0) {
