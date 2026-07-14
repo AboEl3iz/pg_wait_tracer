@@ -1,6 +1,6 @@
 # Trust Milestone (Track T) — Correctness & Honesty Hardening
 
-Status: 🔄 IN PROGRESS — T0/T1/T2/T4/T5/T6/T7 ✅ merged; T3 ⬜ in flight
+Status: 🔄 IN PROGRESS — all phases T0–T7 ✅ merged; close-out pending (EL8/EL9 live runs + v0.13)
 Date: 2026-07-06
 Origin: five-perspective adversarial code review of master @ fd21630
 (capture core, tiered orchestration, data path/format, client/UI,
@@ -503,7 +503,7 @@ unit tests for CPU-storm trigger.
 Acceptance: a `SELECT`-storm CPU incident raises sampled AAS and can
 trigger escalation; AAS shows no step artifact at tier switches.
 
-### Phase T3 ⬜ — Escalation budget & trigger quality (in flight)
+### Phase T3 ✅ — Escalation budget & trigger quality
 Owns: ESC-1..12. Depends on T2 (anomaly metrics shape settles there).
 Scope: extension charge = committed-remainder-aware + mid-window
 budget clamp (ESC-1); de-escalation flushes open intervals as final
@@ -617,7 +617,7 @@ Pair 2:  T1 ✅ (merge/summaries) ∥  T4 ✅ (capture/sampler hardening)
 Gate  :  T2 ✅ decision (AAS semantics + io_worker — signed off,
          PG18 io_worker run done: docs/T2_IOWORKER_STUDY.md)
 Pair 3:  T2 ✅ (AAS impl)        ∥  T5 ✅ (durability)
-Pair 4:  T3 ⬜ (escalation)      ∥  T7 ✅ (release eng)
+Pair 4:  T3 ✅ (escalation)      ∥  T7 ✅ (release eng)
 ```
 
 - T0 first, non-negotiable — it is the net every other phase is
@@ -635,12 +635,12 @@ Pair 4:  T3 ⬜ (escalation)      ∥  T7 ✅ (release eng)
 2. 🔄 Adversarial synthetic-trace tests prove: no double counting across
    escalation boundaries (trace AND live view), correct fidelity
    labels on every response path (T1 ✅), budget mathematically bounded
-   (T3 ⬜ — the budget half lands with T3).
+   (T3 ✅).
 3. ✅ A CPU-storm incident is detectable (sampled AAS includes on-CPU;
    anomaly engine fires on it) (T2).
 4. 🔄 No known silent-wrong-data path: every degraded state is visible in
    logs + control-socket status + UI. Capture/sampler (T4 ✅), transport
-   (T6 ✅) done; escalation-billing honesty rides with T3 ⬜.
+   (T6 ✅) done; escalation-billing honesty done (T3 ✅).
 5. ✅ Daemon crash/restart loses at most the unflushed tail (T5).
 6. ⬜ PENDING (milestone close-out): `run_all.sh --require-live` green
    twice consecutively on EL9 and EL8 boxes with zero live-section skips
