@@ -1,0 +1,117 @@
+# Changelog
+
+All notable changes to pg_wait_tracer. Entries are reconstructed from the git
+tag history for released versions; the Unreleased section tracks work merged to
+`master` since the last tag. The client (Go) and server/daemon (C) share one
+version — a build embeds `git describe` at compile time and the client warns on
+client/server skew (see `RELEASING.md`).
+
+The format loosely follows [Keep a Changelog](https://keepachangelog.com/).
+
+## [Unreleased]
+
+The **Trust Milestone** (Track T, `docs/TRUST_MILESTONE_PLAN.md`) — a
+correctness-and-honesty hardening pass after a five-perspective adversarial
+review found that every one of the tool's honesty guarantees was violated by at
+least one code path, and that CI never executed the capture slice where all four
+field escapes lived. Merged so far:
+
+- **T0 — real-PG CI safety net.** A capture-smoke CI job installs PostgreSQL
+  (PGDG, matrix PG 13/16/17/18), runs the real BPF capture path against it, and
+  goes red if capture silently records nothing. `/proc/maps` + PIE/non-PIE ELF
+  fixtures unit-test load-base and symbol resolution (the #24 class). `run_all.sh`
+  gained `--require-live` (an all-skip run can no longer pass) and a single
+  shared unit-test list; the overhead gate runs `--quick` with a tracked CSV
+  trend.
+- **T1 — fidelity merge & summary honesty.** Escalation markers are now the
+  exact-wins coverage authority (no more double-counting long waits across an
+  escalation boundary); the summary fast path is coverage-aware and never
+  hardcodes a `"fidelity":"exact"` label over sampled data; markers are filtered
+  from every aggregation; latency columns are gated under sampled fidelity;
+  `--replay` is fidelity-aware; the merge runs in one clock domain.
+- **T2 — AAS semantics.** One decomposed active-session model across all paths:
+  on-CPU samples are first-class (a pure CPU storm now raises AAS and can trigger
+  escalation), category decomposition (plan/exec/command/maintenance/background),
+  io_workers excluded from AAS and surfaced as a utilization metric. Fixes the
+  PIE uprobe attach-offset defect (silently dead uprobes) and an exit-record
+  phantom-CPU artifact. Decisions in `docs/AAS_SEMANTICS_DECISION.md` and
+  `docs/T2_IOWORKER_STUDY.md`.
+- **T4 — capture & sampler hardening.** The BPF `state_map` is sized to the
+  registry with checked inserts and a `state_map_full` counter (no more silent
+  under-count above 512 backends); strict offset validation refuses to attach on
+  a mismatched layout instead of tracing garbage; load-base resolution matches
+  the exact binary path (not a substring); `execve` replaces `popen`; a total
+  sampler read failure is loud in logs and control-socket status.
+- **T5 — durability & retention.** The writer never truncates — it recovers and
+  renames aside an existing `current.trace`/`current.summary` on startup;
+  archive renames are collision-safe; retention gained a size cap and orphan
+  cleanup; `query_texts.jsonl` is append-only with dedup-on-load; the on-disk
+  format and its durability policy are specified in `docs/TRACE_FORMAT.md`.
+- **T6 — client transport trust.** The transport rejects error envelopes as
+  failures (a dead SSH pipe now shows a degraded-transport state, not "No data"
+  under a green pill); request ids are namespaced per WebSocket connection (two
+  tabs never exchange data); the bridge respawns SSH with backoff + keepalives;
+  init is idempotent across reconnects; tooltip SQL is escaped; times are labeled
+  UTC; the WS is gated by a per-session token.
+- **T7 — release engineering & matrix.** A nightly containerized matrix
+  (rockylinux:8 / rockylinux:9 / ubuntu:24.04) builds, unit-tests, and runs the
+  capture smoke on each distro — EL8 exercising the static libbpf/bpftool
+  bundling path that gating CI never compiled. A committed golden trace fixture
+  pins on-disk format compatibility (decode + checksum in CI). A client/server
+  **version handshake** makes deployment skew visible (server reports its
+  version + protocol in `info`; the client warns loudly, never refuses). Added
+  `RELEASING.md` and this changelog; removed stale build artifacts from git.
+
+In flight (not yet merged): **T3 — escalation budget & trigger quality**
+(ESC-1..12): committed-remainder-aware extension charging with a mid-window
+budget clamp, de-escalation flushing open intervals, live-accumulator dedup
+during escalation, and a minimum-activity guard on the lock rule.
+
+## [0.12] — 2026-06-21
+
+PostgreSQL 13 support and tiered-capture correctness fixes.
+
+- PG13 wait-event capture via `MyProc` resolution + a runtime offset-validation
+  guard that refuses to attach on a wrong offset, plus PG13 wait-event name
+  tables (PR #27).
+- PG13 query attribution through `pg_stat_statements` — the `standard_ExecutorStart`
+  uprobe and query-text capture, with pgss gating (PRs #28, #31).
+- Sampled mode feeds the live accumulator, so `--view` shows captured waits in
+  the default tiered mode (PR #30, a field-reported gap).
+- README/INSTALL reframed around tiered capture, escalation, the control socket,
+  and the corrected OS + PostgreSQL support matrix (PR #29).
+
+## [0.11] — 2026-06-19
+
+Rocky 8 / RHEL 8 support and idle-event honesty.
+
+- Rocky 8 / RHEL 8 build and runtime support: on EL8 (libbpf 0.5.0, pre-USDT)
+  the Makefile builds a pinned libbpf + bpftool from source and links libbpf
+  statically; handles the non-PIE PGDG postgres binary (PR #24 — the load-base
+  resolution the later #24-class fixtures guard).
+- Idle-but-visible events (e.g. `Client:ClientRead`) render `—` for %DB instead
+  of a bogus bar; non-idle %DB sums to ~100% (PR #25).
+- Live-suite cleanup: `bc`-free overhead math, de-flaked `test_cross_validate`
+  and `test_client_wait` (PR #26).
+
+## [0.10] — 2026-06-18
+
+Tiered capture becomes the default.
+
+- Tiered mode (always-on low-overhead sampler with on-demand full-fidelity
+  escalation) is now the default capture mode, justified by a
+  cross-validation test (PR #23).
+- Anomaly-triggered escalation: an AAS-vs-baseline + lock-fraction rules engine
+  opens bounded full-fidelity windows automatically (PR #19, A5).
+- Fidelity-aware UI: sampled shading, the escalate control, unavailable panels,
+  and a daemon self-metrics panel, wired through the control socket (PR #21, B5).
+- A6 cooperative-provider interface stub (PR #20); B3 pure-builder view
+  migration completed and legacy adapters removed (PRs #17, #18).
+- B4 visual-regression snapshot suite with CI-generated baselines (PR #22).
+
+## [0.1] – [0.9]
+
+Pre-history: the initial BPF wait-event tracer, the on-disk trace format v2,
+the pgwt-server replay engine, the web investigation UI, and the REWORK_PLAN
+architecture (per-task watchpoints, tiered capture, read-time exact-wins merge,
+pure-builder UI). See the git tag history for detail.

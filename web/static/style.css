@@ -32,6 +32,17 @@ h1 { font-size: 18px; font-weight: 600; color: #fff; }
 /* Degraded transport (UI-1): the WS may be open but the server behind the
    bridge is unreachable — visually distinct from both connected and error. */
 .status.degraded   { background: #4a1515; color: #ff8a80; animation: pgwt-degraded-pulse 1.6s ease-in-out infinite; }
+/* Version-skew banner (T7 / TST-11): client/server build or protocol differ.
+   .warn = versions differ, same protocol (safe); .error = protocol mismatch. */
+.version-skew {
+  font-size: 12px;
+  padding: 3px 10px;
+  border-radius: 12px;
+  font-weight: 500;
+  cursor: help;
+}
+.version-skew.warn  { background: #3d3200; color: #ffd700; }
+.version-skew.error { background: #3d1a1a; color: #f44336; }
 @keyframes pgwt-degraded-pulse {
   0%, 100% { opacity: 1; }
   50%      { opacity: 0.55; }

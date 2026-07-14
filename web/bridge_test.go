@@ -26,6 +26,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -455,4 +456,118 @@ func TestServerEmitsIDFirstInvariant(t *testing.T) {
 			t.Errorf("response id %d != request id %d for %q", id, wantID, req)
 		}
 	}
+}
+
+// ── Version handshake (T7 / TST-11) ─────────────────────────────────────────
+
+// versionSkewWarning is a pure function: exhaustively pin every branch of the
+// warn-on-mismatch matrix (warn, never refuse — skew is the normal state).
+func TestVersionSkewWarning(t *testing.T) {
+	cases := []struct {
+		name         string
+		cliVer       string
+		cliProto     int
+		srvVer       string
+		srvProto     int
+		wantWarn     bool
+		wantContains string
+	}{
+		{"exact match", "v0.13", 1, "v0.13", 1, false, ""},
+		{"version skew, same protocol", "v0.13", 1, "v0.12", 1, true, "version skew"},
+		{"protocol skew", "v0.14", 2, "v0.13", 1, true, "PROTOCOL skew"},
+		{"server predates handshake", "v0.13", 1, "", -1, true, "did not report a version"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := versionSkewWarning(c.cliVer, c.cliProto, c.srvVer, c.srvProto)
+			if (got != "") != c.wantWarn {
+				t.Fatalf("warn=%q, wantWarn=%v", got, c.wantWarn)
+			}
+			if c.wantContains != "" && !strings.Contains(got, c.wantContains) {
+				t.Errorf("warning %q missing %q", got, c.wantContains)
+			}
+		})
+	}
+}
+
+// The real server must report server_version + protocol in `info` so the
+// handshake has something to compare against. Pins the C-side surface
+// (src/server.c handle_info) that the client warning path depends on.
+func TestServerInfoReportsVersionAndProtocol(t *testing.T) {
+	srv, _, _ := testBridge(t, "tok123")
+	conn := dial(t, srv, "tok123")
+	m := roundTrip(t, conn, `{"id":1,"cmd":"info"}`)
+	if _, ok := m["server_version"]; !ok {
+		t.Errorf("info response missing server_version: %v", m)
+	}
+	var proto int
+	if raw, ok := m["protocol"]; !ok {
+		t.Errorf("info response missing protocol: %v", m)
+	} else if err := json.Unmarshal(raw, &proto); err != nil {
+		t.Errorf("protocol not a number: %s", raw)
+	} else if proto != protocolRev {
+		t.Errorf("server protocol %d != client protocolRev %d", proto, protocolRev)
+	}
+}
+
+// End-to-end: a bridge armed with a client version different from the server's
+// build logs a loud WARNING exactly once (deduped across the respawn that a
+// real deployment would see). Drives the actual checkServerVersion path.
+func TestBridgeLogsVersionSkew(t *testing.T) {
+	serverBin, traceDir := requireIntegration(t)
+	procCh := make(chan *exec.Cmd, 8)
+	b := NewBridge(func() *exec.Cmd {
+		cmd := exec.Command(serverBin, traceDir)
+		procCh <- cmd
+		return cmd
+	}, "")
+	// A version the server certainly is not.
+	b.clientVersion = "v0.0-client-skew-test"
+
+	var logBuf strings.Builder
+	var logMu sync.Mutex
+	origWriter := log.Writer()
+	log.SetOutput(&syncWriter{w: &logBuf, mu: &logMu})
+	defer log.SetOutput(origWriter)
+
+	if err := b.Start(); err != nil {
+		t.Fatalf("bridge start: %v", err)
+	}
+	defer b.Close()
+
+	// checkServerVersion runs in a goroutine from Start(); poll for the warn.
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		logMu.Lock()
+		s := logBuf.String()
+		logMu.Unlock()
+		if strings.Contains(s, "version skew") && strings.Contains(s, "WARNING") {
+			// Also assert the dedupe: a second manual check must not re-log.
+			before := strings.Count(s, "version skew")
+			b.checkServerVersion()
+			time.Sleep(200 * time.Millisecond)
+			logMu.Lock()
+			after := strings.Count(logBuf.String(), "version skew")
+			logMu.Unlock()
+			if after != before {
+				t.Errorf("identical skew warning logged again (%d -> %d): not deduped",
+					before, after)
+			}
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("expected a version-skew WARNING in the log, got:\n%s", logBuf.String())
+}
+
+// syncWriter serializes concurrent log writes into a buffer for assertions.
+type syncWriter struct {
+	w  *strings.Builder
+	mu *sync.Mutex
+}
+
+func (s *syncWriter) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.w.Write(p)
 }

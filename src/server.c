@@ -1681,6 +1681,13 @@ static void handle_info(struct pgwt_server *srv, struct pgwt_request *req)
     cJSON_AddNumberToObject(root, "num_events", (double)srv->total_events);
     cJSON_AddNumberToObject(root, "num_cpus", srv->num_cpus);
 
+    /* Version handshake (T7 / TST-11): the client compares these against its
+     * own build version / protocol revision and warns loudly on skew (a
+     * mismatched Mac-client/Linux-server pair is the normal deployment
+     * state — the point is visibility, never refusal). */
+    cJSON_AddStringToObject(root, "server_version", PGWT_BUILD_VERSION);
+    cJSON_AddNumberToObject(root, "protocol", PGWT_PROTOCOL_REV);
+
     /* Server wall clock — client uses this as "now" for relative time ranges */
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);

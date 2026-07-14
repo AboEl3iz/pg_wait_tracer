@@ -14,10 +14,50 @@ import (
 	"os/exec"
 	"os/signal"
 	"runtime"
+	"runtime/debug"
 )
 
 //go:embed static
 var staticFiles embed.FS
+
+// Version handshake (Trust Milestone T7 / TST-11). A skewed client/server
+// pair (client rebuilt on the laptop, server deployed weeks ago — or vice
+// versa) is the NORMAL deployment state; the handshake makes the skew VISIBLE
+// (bridge log + UI banner) without refusing to work.
+//
+// buildVersion is embedded at build time via `make pgwt-client`
+// (-ldflags "-X main.buildVersion=$(git describe ...)") so it matches the
+// version string the C binaries embed. protocolRev must stay in sync with
+// PGWT_PROTOCOL_REV in src/pg_wait_tracer.h (and tests/mock_server.py).
+var buildVersion = "dev"
+
+const protocolRev = 1
+
+// clientVersion resolves the version to report: the linker-embedded one, or
+// (for plain `go build` without ldflags) the VCS revision Go stamps into the
+// binary, or "dev" when neither exists.
+func clientVersion() string {
+	if buildVersion != "dev" {
+		return buildVersion
+	}
+	if info, ok := debug.ReadBuildInfo(); ok {
+		rev, dirty := "", ""
+		for _, s := range info.Settings {
+			switch s.Key {
+			case "vcs.revision":
+				rev = s.Value
+			case "vcs.modified":
+				if s.Value == "true" {
+					dirty = "-dirty"
+				}
+			}
+		}
+		if len(rev) >= 7 {
+			return "dev-" + rev[:7] + dirty
+		}
+	}
+	return "dev"
+}
 
 func main() {
 	port := flag.Int("port", 8384, "local HTTP port")
@@ -58,8 +98,12 @@ func main() {
 	token := newSessionToken()
 
 	// Spawn SSH → pgwt-server on remote host (supervised: respawns with
-	// backoff if the SSH session or the server dies — UI-3).
-	bridge := NewSSHBridge(host, *serverPath, *traceDir, token)
+	// backoff if the SSH session or the server dies — UI-3). The bridge also
+	// runs the version handshake against every (re)spawned server and warns
+	// on stderr when the pair is skewed (T7 / TST-11).
+	version := clientVersion()
+	log.Printf("pgwt %s (protocol %d)", version, protocolRev)
+	bridge := NewSSHBridge(host, *serverPath, *traceDir, token, version)
 	if err := bridge.Start(); err != nil {
 		log.Fatalf("Failed to start: %v", err)
 	}
@@ -69,11 +113,18 @@ func main() {
 	// WebSocket endpoint (token-gated).
 	http.HandleFunc("/ws", bridge.HandleWebSocket)
 
-	// Session token endpoint: same-origin readable only (no CORS headers).
+	// Session endpoint: same-origin readable only (no CORS headers). Besides
+	// the WS token it reports the client's build version + protocol revision
+	// so the UI can compare them against the server's `info` response and
+	// show a version-skew banner (T7 / TST-11).
 	http.HandleFunc("/session", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Cache-Control", "no-store")
-		json.NewEncoder(w).Encode(map[string]string{"token": token})
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"token":          token,
+			"client_version": version,
+			"protocol":       protocolRev,
+		})
 	})
 
 	// Serve embedded static files.

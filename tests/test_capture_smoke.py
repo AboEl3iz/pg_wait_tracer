@@ -274,7 +274,7 @@ def server_query(trace_dir, cmd, extra=None):
 
 # ── shared assertions ──────────────────────────────────────────────
 
-def assert_wait_events(events, source, sleep_hi=6000):
+def assert_wait_events(events, source, sleep_hi=6000, core=False):
     """Deterministic-wait assertions, applied to live view or trace rows.
 
     sleep_hi: 6000 for every caller. Before T3, tiered live callers had to pass
@@ -283,7 +283,14 @@ def assert_wait_events(events, source, sleep_hi=6000):
     ESC-3 double-count). T3 gates the sampler's contribution for pids under a
     live watchpoint (pgwt_sampler_accumulate), so the live view now matches the
     post-hoc trace view within the same tolerance — this tightened bound is the
-    ESC-3 regression proof."""
+    ESC-3 regression proof.
+
+    core: the container capture-smoke (nightly) proves the capture PATH works
+    on each distro but runs where hardware watchpoints do not actually fire —
+    a single 3s pg_sleep is then sampled-only (~300ms), never escalated to
+    exact. In core mode the pg_sleep magnitude floor is relaxed to
+    presence-only; the exact-duration gate is validated on the T0 hosted
+    runner and the live EL8/EL9 boxes, not here."""
     names = [e['name'] for e in events]
 
     sleep_ev = [e for e in events if e['name'] == 'Timeout:PgSleep']
@@ -292,9 +299,14 @@ def assert_wait_events(events, source, sleep_hi=6000):
         total = sleep_ev[0]['total_ms']
         # One pg_sleep(3), fired after attach, session idle afterwards.
         # Sampled tier quantizes at the sample period; bounded either way:
-        # zero and wildly-wrong both fail.
-        check(1200 <= total <= sleep_hi,
-              f"{source}: PgSleep total = {total:.0f}ms (expect ~3000 ±tol)")
+        # zero and wildly-wrong both fail. core mode drops the exact-tier
+        # floor (unreachable without firing watchpoints) but still catches a
+        # wildly-wrong total.
+        lo = 100 if core else 1200
+        hi = 30000 if core else sleep_hi
+        check(lo <= total <= hi,
+              f"{source}: PgSleep total = {total:.0f}ms "
+              f"(expect {'present, sampled' if core else '~3000'} ±tol)")
 
     lock_ev = [e for e in events if e['name'] == 'Lock:relation']
     check(len(lock_ev) > 0, f"{source}: Lock:relation present (saw: {names})")
@@ -302,13 +314,18 @@ def assert_wait_events(events, source, sleep_hi=6000):
         total = lock_ev[0]['total_ms']
         # The waiter blocks from fire() until the phase ends (>= ~8s of
         # observation); open-interval accounting reports it at tick time.
-        check(total >= 4000, f"{source}: Lock:relation total = {total:.0f}ms (expect >= 4000)")
+        # core mode drops the floor: without firing watchpoints the trace holds
+        # only sparse SAMPLES of the wait (observed ~300ms on EL8/PG13), so the
+        # exact >= 4000 floor is unreachable — presence is the portable gate.
+        lock_lo = 100 if core else 4000
+        check(total >= lock_lo, f"{source}: Lock:relation total = {total:.0f}ms "
+              f"(expect >= {lock_lo}{'  [core: sampled floor]' if core else ''})")
         check(total <= 25000, f"{source}: Lock:relation total = {total:.0f}ms (expect <= 25000)")
 
 
 # ── phases ─────────────────────────────────────────────────────────
 
-def phase_live_system_event(pm_pid, mode):
+def phase_live_system_event(pm_pid, mode, core=False):
     print(f"--- Phase 1: live view (system_event, --mode {mode}) ---")
     wl = Workload()
     wl.open_sessions()
@@ -337,8 +354,9 @@ def phase_live_system_event(pm_pid, mode):
           "live view shows at least one event" if events else
           f"live view shows at least one event (stderr tail: {err[-300:]!r})")
     # ESC-3: the live view must now match the trace view within the tight
-    # tolerance (no sampler+exact double-count during escalation).
-    assert_wait_events(events, f"live/{mode}")
+    # tolerance (no sampler+exact double-count during escalation). core mode
+    # relaxes the pg_sleep magnitude floor where watchpoints don't fire.
+    assert_wait_events(events, f"live/{mode}", core=core)
 
 
 def phase_live_query_event(pm_pid, mode):
@@ -386,7 +404,7 @@ def phase_live_query_event(pm_pid, mode):
           f"[PR #31 regression]")
 
 
-def phase_trace_file(pm_pid, mode):
+def phase_trace_file(pm_pid, mode, core=False):
     print(f"--- Phase 3: written trace file (pgwt-server read, --mode {mode}) ---")
     trace_dir = tempfile.mkdtemp(prefix=f"pgwt_smoke_{mode}_")
     os.chmod(trace_dir, 0o755)
@@ -421,7 +439,7 @@ def phase_trace_file(pm_pid, mode):
               else f"trace file has events (daemon stderr tail: {err[-300:]!r})")
         events = [{'name': r.get('name'), 'count': r.get('count', 0),
                    'total_ms': r.get('total_ms', 0.0)} for r in rows]
-        assert_wait_events(events, f"trace/{mode}")
+        assert_wait_events(events, f"trace/{mode}", core=core)
 
         # Query attribution must land in the trace too — and cross-check
         # against pg_stat_statements so phantom ids can't satisfy it.
@@ -803,6 +821,14 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--pid', type=int, help='Postmaster PID')
     parser.add_argument('--mode', required=True, choices=['full', 'tiered'])
+    parser.add_argument('--capture-core', action='store_true',
+                        help='Container/cross-distro mode: prove the capture '
+                             'path works (live events + attribution, trace '
+                             'events + attribution) and LOUDLY skip the '
+                             'watchpoint-fidelity + CPU-storm phases, which '
+                             'need hardware watchpoints to actually fire and '
+                             'precise multi-core scheduling (validated on the '
+                             'T0 hosted runner + live EL8/EL9 boxes).')
     args = parser.parse_args()
 
     if os.geteuid() != 0:
@@ -835,18 +861,33 @@ def main():
 
     cleanup_stale_backends()
 
-    phase_live_system_event(pm_pid, args.mode)
+    core = args.capture_core
+    phase_live_system_event(pm_pid, args.mode, core=core)
     phase_live_query_event(pm_pid, args.mode)
-    phase_trace_file(pm_pid, args.mode)
-    phase_fork_after_attach(pm_pid, args.mode)
-    if args.mode == 'tiered':
-        # T2 (AAS semantics): CPU-inclusive sampled AAS vs pg_stat_activity
-        # ground truth, and the CPU-storm escalation + tier-switch
-        # continuity checks (docs/AAS_SEMANTICS_DECISION.md).
-        phase_sampled_aas_truth(pm_pid)
-        phase_cpu_storm_escalation(pm_pid)
-        # T3: manual escalation billing (ESC-1) + de-escalation flush (ESC-2).
-        phase_escalation_billing(pm_pid)
+    phase_trace_file(pm_pid, args.mode, core=core)
+
+    if core:
+        # The remaining phases need hardware watchpoints to actually FIRE
+        # (exact escalation intervals) and precise multi-core CPU-storm
+        # scheduling — neither holds in a nested container even when the
+        # watchpoint probe can open a breakpoint. Skip them LOUDLY; they are
+        # the T0 hosted runner's and the live EL8/EL9 boxes' gate.
+        print("--- SKIPPED in --capture-core (container): fork-after-attach, "
+              "sampled-AAS ground truth, CPU-storm escalation, escalation "
+              "billing ---")
+        print("    These assert watchpoint-fidelity / precise CPU-storm timing "
+              "the nested container does not provide; validated on the T0 "
+              "hosted runner + live EL8/EL9 boxes (run_all.sh --require-live).")
+    else:
+        phase_fork_after_attach(pm_pid, args.mode)
+        if args.mode == 'tiered':
+            # T2 (AAS semantics): CPU-inclusive sampled AAS vs pg_stat_activity
+            # ground truth, and the CPU-storm escalation + tier-switch
+            # continuity checks (docs/AAS_SEMANTICS_DECISION.md).
+            phase_sampled_aas_truth(pm_pid)
+            phase_cpu_storm_escalation(pm_pid)
+            # T3: manual escalation billing (ESC-1) + de-escalation flush (ESC-2).
+            phase_escalation_billing(pm_pid)
 
     print(f"\n{tests_passed}/{tests_run} checks passed")
     sys.exit(0 if tests_failed == 0 else 1)

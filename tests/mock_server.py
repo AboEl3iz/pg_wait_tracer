@@ -134,12 +134,23 @@ def _aas_event_series():
 
 _CANNED = {}
 
+# Protocol revision the mock speaks — mirrors PGWT_PROTOCOL_REV in
+# src/pg_wait_tracer.h. test_protocol_drift.py enforces that the real server's
+# `info` response carries the same (server_version + protocol) shape.
+PROTOCOL_REV = 1
+
 _CANNED["info"] = {
     "from_ns": _FROM_NS,
     "to_ns": _TO_NS,
     "now_ns": _TO_NS,
     "num_cpus": 4,
     "num_events": 1_250_000,
+    # Version handshake (T7 / TST-11): the real server reports these so the
+    # client can warn on skew. Canned value differs from the real fixture's
+    # git-describe string — protocol-drift compares SHAPE (string/number), not
+    # values, so that is fine.
+    "server_version": "v0.0-mock",
+    "protocol": PROTOCOL_REV,
 }
 
 _CANNED["time_model"] = {

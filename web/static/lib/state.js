@@ -23,6 +23,9 @@ export class ServerInfo {
         this.nowNs = 0;       // server wall clock (live anchor)
         this.numCpus = 0;
         this.numEvents = 0;
+        // Version handshake (T7 / TST-11): the server reports these in `info`.
+        this.serverVersion = null;
+        this.protocol = null;
     }
 
     update(info) {
@@ -32,6 +35,8 @@ export class ServerInfo {
         this.nowNs = info.now_ns || info.to_ns || this.nowNs;
         if (info.num_cpus != null) this.numCpus = info.num_cpus;
         if (info.num_events != null) this.numEvents = info.num_events;
+        if (info.server_version != null) this.serverVersion = info.server_version;
+        if (info.protocol != null) this.protocol = info.protocol;
     }
 }
 

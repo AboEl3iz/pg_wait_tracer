@@ -20,7 +20,7 @@ import { ViewManager } from './lib/view-manager.js';
 import { mountTable } from './lib/table.js';
 import {
     classColor, fmtTime, fmtDuration, esc,
-    nsToDatetimeLocalUTC, datetimeLocalUTCToNs,
+    nsToDatetimeLocalUTC, datetimeLocalUTCToNs, versionSkew,
 } from './lib/format.js';
 import { controlStatus, controlMetrics, ControlUnavailable } from './lib/control.js';
 import { mountEscalateControl, mountMetricsPanel } from './lib/panels.js';
@@ -74,6 +74,13 @@ let uiInitialized = false;
 // NOW (never to stale data).
 const degraded = { active: false, reason: null };
 let recoverId = 0;
+
+// Version handshake (T7 / TST-11). The Go client reports its build version +
+// protocol via /session; the server reports its own in `info`. On skew we show
+// a banner (warn, never refuse — a skewed pair is the normal deployment state).
+// Against the mock server (no /session) these stay null and no banner shows.
+let clientVersion = null;
+let clientProtocol = null;
 
 // Auto-refresh (live mode) bookkeeping.
 let autoRefreshId = 0;
@@ -132,6 +139,12 @@ async function fetchSessionToken() {
         const r = await fetch('/session');
         if (!r.ok) return null;
         const j = await r.json();
+        if (j) {
+            // T7 / TST-11: the Go client reports its own build version +
+            // protocol here so we can compare against the server's `info`.
+            if (j.client_version != null) clientVersion = j.client_version;
+            if (j.protocol != null) clientProtocol = j.protocol;
+        }
         return (j && j.token) || null;
     } catch (e) {
         return null;
@@ -180,6 +193,7 @@ async function onConnected() {
     try {
         const info = await transport.send('info');
         server.update(info);
+        renderVersionSkew();
 
         if (!uiInitialized) {
             timeRange.initDefault();
@@ -460,6 +474,22 @@ function setStatus(text, cls) {
     const el = document.getElementById('status');
     el.textContent = text;
     el.className = 'status ' + cls;
+}
+
+/* T7 / TST-11: reflect any client/server version skew in the header banner.
+ * No-op when the client version is unknown (mock server / plain browser load
+ * with no /session endpoint). */
+function renderVersionSkew() {
+    const el = document.getElementById('version-skew');
+    if (!el) return;
+    if (clientVersion == null) { el.style.display = 'none'; return; }
+    const skew = versionSkew(clientVersion, clientProtocol,
+                             server.serverVersion, server.protocol);
+    if (!skew) { el.style.display = 'none'; return; }
+    el.style.display = '';
+    el.textContent = '⚠ ' + skew.short;
+    el.title = skew.detail;
+    el.className = 'version-skew ' + skew.level;
 }
 
 function updateTimeRange() {

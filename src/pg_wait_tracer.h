@@ -12,8 +12,25 @@ typedef uint32_t u32;
 typedef uint64_t u64;
 #endif
 
-/* ── Version ──────────────────────────────────────────────── */
-#define PGWT_VERSION         "0.8.0"
+/* ── Version (T7 / TST-11) ────────────────────────────────── */
+/* Build version: the Makefile injects `git describe --tags --always --dirty`
+ * as -DPGWT_BUILD_VERSION="..." so every binary reports exactly the commit it
+ * was built from. The fallback covers direct compiles (unit tests build some
+ * src/*.c without the top-level Makefile) — a shipped binary is always built
+ * by make and never reports it. */
+#ifndef PGWT_BUILD_VERSION
+#define PGWT_BUILD_VERSION   "unknown"
+#endif
+
+/* Client/server protocol revision (the JSON-line command surface pgwt-server
+ * speaks and the Go client consumes). A skewed Mac-client/Linux-server pair
+ * is the NORMAL deployment state, so the server reports this in every `info`
+ * response and the client warns loudly on mismatch — warn, never refuse.
+ * Bump ONLY on a breaking protocol change (renamed/retyped fields, changed
+ * command semantics); additive fields do not bump it. Keep in sync with
+ * `protocolRev` in web/main.go and PROTOCOL_REV in tests/mock_server.py
+ * (tests/test_protocol_drift.py enforces the mock side). */
+#define PGWT_PROTOCOL_REV    1
 
 /* ── Histogram ────────────────────────────────────────────── */
 #define HISTOGRAM_BUCKETS    16

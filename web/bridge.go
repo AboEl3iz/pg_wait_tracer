@@ -78,6 +78,13 @@ type Bridge struct {
 	// token is the per-session WS auth token (UI-12); empty disables the check
 	// (never in production — main.go always sets one).
 	token string
+	// clientVersion enables the version handshake (T7 / TST-11): after every
+	// (re)spawn the bridge asks the upstream server for its version and warns
+	// on stderr when the pair is skewed. Empty disables the check (unit tests
+	// that don't care). Warn, never refuse: skew is the normal state.
+	clientVersion string
+	warnMu        sync.Mutex
+	warned        map[string]bool // dedupe identical skew warnings across respawns
 
 	upgrader websocket.Upgrader
 
@@ -104,6 +111,7 @@ func NewBridge(factory func() *exec.Cmd, token string) *Bridge {
 		token:    token,
 		upgrader: newUpgrader(token),
 		pending:  make(map[int64]chan []byte),
+		warned:   make(map[string]bool),
 		done:     make(chan struct{}),
 	}
 }
@@ -111,15 +119,18 @@ func NewBridge(factory func() *exec.Cmd, token string) *Bridge {
 // NewSSHBridge builds the production factory: ssh to host, run pgwt-server.
 // BatchMode prevents interactive password prompts on respawn (a respawn loop
 // must never block on a tty); ServerAlive* makes a silently-dead SSH session
-// fail within ~30 s instead of hanging forever (UI-3).
-func NewSSHBridge(host, serverPath, traceDir, token string) *Bridge {
-	return NewBridge(func() *exec.Cmd {
+// fail within ~30 s instead of hanging forever (UI-3). clientVersion arms the
+// version handshake against every spawned server (T7 / TST-11).
+func NewSSHBridge(host, serverPath, traceDir, token, clientVersion string) *Bridge {
+	b := NewBridge(func() *exec.Cmd {
 		return exec.Command("ssh",
 			"-o", "BatchMode=yes",
 			"-o", "ServerAliveInterval=15",
 			"-o", "ServerAliveCountMax=2",
 			host, serverPath, traceDir)
 	}, token)
+	b.clientVersion = clientVersion
+	return b
 }
 
 // Start spawns the upstream once (synchronously, so startup errors are
@@ -130,6 +141,7 @@ func (b *Bridge) Start() error {
 		return err
 	}
 	go b.supervise(stdout)
+	go b.checkServerVersion()
 	return nil
 }
 
@@ -215,7 +227,121 @@ func (b *Bridge) supervise(stdout *bufio.Reader) {
 			continue
 		}
 		log.Printf("server connection re-established")
+		// Re-run the handshake: a respawn may have connected to an upgraded
+		// (or downgraded) server binary. Identical warnings are deduped.
+		go b.checkServerVersion()
 	}
+}
+
+// ── Version handshake (T7 / TST-11) ─────────────────────────────────────────
+
+// checkServerVersion asks the upstream server for its version (the `info`
+// response carries server_version + protocol since v0.13) and logs a LOUD
+// warning on stderr when it differs from this client's build. Warn, never
+// refuse — a skewed pair is the normal deployment state; the point is that
+// the operator can see it. No-op when the bridge has no client version set.
+func (b *Bridge) checkServerVersion() {
+	if b.clientVersion == "" {
+		return
+	}
+	line, err := b.roundTrip([]byte(`,"cmd":"info"}`), 10*time.Second)
+	if err != nil {
+		// The supervisor owns connection-failure reporting; a handshake that
+		// cannot complete is not separately alarming.
+		return
+	}
+	var resp struct {
+		ServerVersion *string `json:"server_version"`
+		Protocol      *int    `json:"protocol"`
+	}
+	if err := json.Unmarshal(line, &resp); err != nil {
+		return
+	}
+	sv, sp := "", -1
+	if resp.ServerVersion != nil {
+		sv = *resp.ServerVersion
+	}
+	if resp.Protocol != nil {
+		sp = *resp.Protocol
+	}
+	if warn := versionSkewWarning(b.clientVersion, protocolRev, sv, sp); warn != "" {
+		b.warnMu.Lock()
+		seen := b.warned[warn]
+		b.warned[warn] = true
+		b.warnMu.Unlock()
+		if !seen {
+			log.Printf("WARNING: %s", warn)
+		}
+	}
+}
+
+// roundTrip sends one bridge-originated request upstream (`tail` is the JSON
+// after the id, e.g. `,"cmd":"info"}`) and waits for its response line.
+func (b *Bridge) roundTrip(tail []byte, timeout time.Duration) ([]byte, error) {
+	b.mu.Lock()
+	up, stdin := b.up, b.stdin
+	b.mu.Unlock()
+	if !up {
+		return nil, fmt.Errorf("upstream down")
+	}
+
+	ch := make(chan []byte, 1)
+	b.pendMu.Lock()
+	b.nextID++
+	id := b.nextID
+	b.pending[id] = ch
+	b.pendMu.Unlock()
+
+	msg := append([]byte(`{"id":`+strconv.FormatInt(id, 10)), tail...)
+	b.mu.Lock()
+	_, werr := fmt.Fprintf(stdin, "%s\n", msg)
+	b.mu.Unlock()
+	if werr != nil {
+		b.pendMu.Lock()
+		delete(b.pending, id)
+		b.pendMu.Unlock()
+		return nil, werr
+	}
+
+	select {
+	case line, ok := <-ch:
+		if !ok {
+			return nil, fmt.Errorf("upstream died mid-request")
+		}
+		return line, nil
+	case <-time.After(timeout):
+		b.pendMu.Lock()
+		delete(b.pending, id)
+		b.pendMu.Unlock()
+		return nil, fmt.Errorf("timeout")
+	}
+}
+
+// versionSkewWarning compares client and server versions and returns a
+// human-readable warning, or "" when they match. serverVersion=="" /
+// serverProto==-1 mean the server did not report them (pre-v0.13 build).
+// Pure function — unit-tested directly.
+func versionSkewWarning(clientVersion string, clientProto int,
+	serverVersion string, serverProto int) string {
+	if serverVersion == "" && serverProto == -1 {
+		return fmt.Sprintf("version skew: pgwt-server did not report a version "+
+			"(build predates the v0.13 handshake); this client is %s (protocol %d). "+
+			"Rebuild/redeploy pgwt-server from the same checkout.",
+			clientVersion, clientProto)
+	}
+	if serverProto != clientProto {
+		return fmt.Sprintf("PROTOCOL skew: pgwt-server %s speaks protocol %d, "+
+			"this client %s expects %d — responses may be misinterpreted. "+
+			"Update the older side before trusting what you see.",
+			serverVersion, serverProto, clientVersion, clientProto)
+	}
+	if serverVersion != clientVersion {
+		return fmt.Sprintf("version skew: pgwt-server is %s, this client is %s "+
+			"(same protocol %d — safe, but behavior/fixes may differ). "+
+			"Rebuild/redeploy from the same checkout to align.",
+			serverVersion, clientVersion, clientProto)
+	}
+	return ""
 }
 
 // readLoop dispatches upstream JSON lines to pending channels. Returns when

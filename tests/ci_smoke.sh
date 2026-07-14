@@ -26,12 +26,23 @@ source "$SCRIPT_DIR/testutil.sh"
 PM_PID=""
 PG_VERSION=""
 EXPECT_UNSUPPORTED=0
+# --core: cross-distro CONTAINER mode (the nightly matrix). Proves the capture
+# path works on each distro — the daemon attaches, records real wait events, and
+# attributes query ids, live AND to a trace file — and LOUDLY skips the sections
+# that need hardware watchpoints to actually FIRE or precise multi-core timing:
+# full-mode exactness, deterministic accuracy, the state_map-full loudness, and
+# the CPU-storm AAS/escalation. Those are gated on the T0 hosted runner and the
+# live EL8/EL9 boxes (run_all.sh --require-live), where watchpoints fire and the
+# scheduler is not a nested hypervisor. Default (no --core) is unchanged: the
+# full battery, exactly as the T0 CI job runs it.
+CORE=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --pid) PM_PID="$2"; shift 2 ;;
         --pg-version) PG_VERSION="$2"; shift 2 ;;
         --expect-unsupported) EXPECT_UNSUPPORTED=1; shift ;;
-        *) echo "Usage: $0 [--pid POSTMASTER_PID] [--pg-version N] [--expect-unsupported]"; exit 1 ;;
+        --core) CORE=1; shift ;;
+        *) echo "Usage: $0 [--pid POSTMASTER_PID] [--pg-version N] [--expect-unsupported] [--core]"; exit 1 ;;
     esac
 done
 
@@ -150,37 +161,59 @@ run_section() {
 }
 
 # ── Tiered mode: the shipped default — always a hard requirement ───
+# --core (container matrix) relaxes the exact-duration magnitude to
+# presence-only, since a nested container's watchpoints do not fire.
 run_section "capture smoke: --mode tiered (live view + trace file)" \
-    python3 "$SCRIPT_DIR/test_capture_smoke.py" --mode tiered --pid "$PM_PID"
-
-# ── T4/CAP-1: a full state_map must be loud (metrics + ERROR log). ──
-# Uses the PGWT_STATE_MAP_ENTRIES test hook to shrink the map, so the
-# loud path is proven with ~10 connections instead of >1024.
-run_section "state_map full is loud (CAP-1, --mode tiered)" \
-    python3 "$SCRIPT_DIR/test_state_map_loud.py" --pid "$PM_PID"
+    python3 "$SCRIPT_DIR/test_capture_smoke.py" --mode tiered --pid "$PM_PID" \
+        $([[ $CORE -eq 1 ]] && echo --capture-core)
 
 # ── T2 item 0: the uprobes must actually FIRE (bpftool run_cnt). ──
 # Guards the PIE dead-offset class (study defect 1): attach "succeeds",
 # the probe never runs, attribution is silently zero. PG13 exercises the
 # standard_ExecutorStart route; every version exercises the T2
-# command-open gate probe (pgstat_report_activity).
+# command-open gate probe (pgstat_report_activity). This is a portable,
+# watchpoint-independent capture check — runs in --core too.
 run_section "uprobes fire on this binary layout (T2, run_cnt > 0)" \
     python3 "$SCRIPT_DIR/test_uprobe_fired.py" --pid "$PM_PID" \
         ${PG_VERSION:+--pg-version "$PG_VERSION"}
 
-# ── Full mode: hard when watchpoints exist; loud skip when they don't ──
-if [[ "$WP" == "yes" ]]; then
-    run_section "capture smoke: --mode full (live view + trace file)" \
-        python3 "$SCRIPT_DIR/test_capture_smoke.py" --mode full --pid "$PM_PID"
-    run_section "deterministic accuracy: exact counts/durations (--mode full)" \
-        python3 "$SCRIPT_DIR/test_deterministic.py" --pid "$PM_PID"
+if [[ $CORE -eq 1 ]]; then
+    # Container matrix: the daemon attaches, records real attributed events
+    # live + to disk (asserted above), and its uprobes fire on this distro's
+    # binary layout. The watchpoint-fidelity / precise-scheduling sections are
+    # skipped LOUDLY — they are gated on the T0 hosted runner and the live
+    # EL8/EL9 boxes.
+    summary "### NOTE (--core, container matrix): watchpoint-fidelity sections SKIPPED"
+    summary "Skipped here: --mode full exactness, deterministic accuracy, the"
+    summary "state_map-full loudness (CAP-1), and CPU-storm AAS/escalation."
+    summary "They need hardware watchpoints to actually FIRE and precise"
+    summary "multi-core scheduling, which a nested privileged container does"
+    summary "not provide (the probe can OPEN a breakpoint that never traps)."
+    summary "The core capture proof above — build, BPF attach, real attributed"
+    summary "events live + on disk, uprobes firing — is the portable gate; the"
+    summary "watchpoint sections run on the T0 hosted runner + live EL8/EL9"
+    summary "boxes (run_all.sh --require-live)."
 else
-    summary "### WARNING: full-mode watchpoint assertions SKIPPED"
-    summary "perf hardware breakpoints are unavailable in this environment"
-    summary "(probe: perf_event_open(PERF_TYPE_BREAKPOINT) failed — see log)."
-    summary "Tiered/sampled assertions above remain the hard gate; full-mode"
-    summary "exactness is validated on real hardware via tests/run_all.sh"
-    summary "--require-live (Trust Milestone standing rule)."
+    # ── T4/CAP-1: a full state_map must be loud (metrics + ERROR log). ──
+    # Uses the PGWT_STATE_MAP_ENTRIES test hook to shrink the map, so the
+    # loud path is proven with ~10 connections instead of >1024.
+    run_section "state_map full is loud (CAP-1, --mode tiered)" \
+        python3 "$SCRIPT_DIR/test_state_map_loud.py" --pid "$PM_PID"
+
+    # ── Full mode: hard when watchpoints exist; loud skip when they don't ──
+    if [[ "$WP" == "yes" ]]; then
+        run_section "capture smoke: --mode full (live view + trace file)" \
+            python3 "$SCRIPT_DIR/test_capture_smoke.py" --mode full --pid "$PM_PID"
+        run_section "deterministic accuracy: exact counts/durations (--mode full)" \
+            python3 "$SCRIPT_DIR/test_deterministic.py" --pid "$PM_PID"
+    else
+        summary "### WARNING: full-mode watchpoint assertions SKIPPED"
+        summary "perf hardware breakpoints are unavailable in this environment"
+        summary "(probe: perf_event_open(PERF_TYPE_BREAKPOINT) failed — see log)."
+        summary "Tiered/sampled assertions above remain the hard gate; full-mode"
+        summary "exactness is validated on real hardware via tests/run_all.sh"
+        summary "--require-live (Trust Milestone standing rule)."
+    fi
 fi
 
 echo ""

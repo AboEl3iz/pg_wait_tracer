@@ -15,6 +15,7 @@ TESTS     = test_wait_event test_cmdline test_event_writer test_event_reader \
             test_coop test_bucket \
             test_pg13_resolve test_discovery_pie test_discovery_nopie \
             test_replay_fidelity test_durability test_query_text \
+            test_golden_fixture \
             gen_test_traces gen_bench_traces test_concurrent_rw cross_validate \
             dump_markers
 
@@ -65,8 +66,12 @@ test_pg13_resolve: test_pg13_resolve.c ../src/discovery.c ../src/spawn.c \
 # each build asserts (via the ELF header) that the flag actually took effect.
 # Compiles discovery.c directly (BPF-free, needs libelf) — same pattern as
 # test_pg13_resolve.
+# Compile wait_event.c + cJSON.c FROM SOURCE (not the prebuilt $(BUILD)/*.o):
+# the -pie build must link only -fPIE objects, but the main build's objects
+# default to non-PIE on EL toolchains (R_X86_64_32S relocations), which fails
+# the `-pie` link. Building them here inherits this target's -fPIE/-fno-pie.
 DISCOVERY_TEST_DEPS = test_discovery.c ../src/discovery.c ../src/spawn.c \
-                      $(BUILD)/wait_event.o $(BUILD)/cJSON.o
+                      ../src/wait_event.c ../src/cJSON.c
 
 test_discovery_pie: $(DISCOVERY_TEST_DEPS)
 	$(CC) $(CFLAGS) -DPGWT_TEST_EXPECT_PIE=1 -fPIE -pie -o $@ $^ -lelf -lz
@@ -140,6 +145,15 @@ test_durability: test_durability.c $(BUILD)/server_event_writer.o \
 # directly (BPF-free).
 test_query_text: test_query_text.c ../src/query_text.c
 	$(CC) $(CFLAGS) -o $@ $^
+
+# test_golden_fixture: T7/TST-10 — decode the COMMITTED golden trace bytes
+# (tests/fixtures/golden/rev<N>/) and checksum the event stream, pinning
+# on-disk format compatibility across future changes. Server build (no BPF
+# skeleton) — reader/writer are BPF-free. Runs from tests/ (relative fixture
+# path); run_all.sh and CI cd here first.
+test_golden_fixture: test_golden_fixture.c $(BUILD)/server_event_reader.o \
+                     $(BUILD)/server_event_writer.o
+	$(CC) $(CFLAGS) -DPGWT_SERVER -o $@ $^ -llz4 -lz
 
 # Server-build objects for gen_test_traces
 SERVER_OBJS = $(BUILD)/server_event_writer.o $(BUILD)/server_summary_writer.o \

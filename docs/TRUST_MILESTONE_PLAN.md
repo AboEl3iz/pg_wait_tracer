@@ -1,6 +1,6 @@
 # Trust Milestone (Track T) — Correctness & Honesty Hardening
 
-Status: ⬜ PLANNED
+Status: 🔄 IN PROGRESS — T0/T1/T2/T4/T5/T6/T7 ✅ merged; T3 ⬜ in flight
 Date: 2026-07-06
 Origin: five-perspective adversarial code review of master @ fd21630
 (capture core, tiered orchestration, data path/format, client/UI,
@@ -419,7 +419,7 @@ Each phase: branch + PR, reproduce-first, fix + regression test,
 green CI (including the new T0 job once it lands) + green live run
 where capture behavior changed.
 
-### Phase T0 — Safety net: real-PG CI + gate hardening
+### Phase T0 ✅ — Safety net: real-PG CI + gate hardening
 Owns: TST-1..8 (TST-5 partially), groundwork for everything else.
 Scope:
 - **CI capture-smoke job**: install PGDG PostgreSQL on the runner,
@@ -446,7 +446,7 @@ Acceptance: CI red if capture silently records nothing on any matrix
 cell; a deliberate load-base regression fails a unit test in
 milliseconds; `run_all.sh --require-live` cannot pass vacuously.
 
-### Phase T1 — Fidelity merge & summary honesty
+### Phase T1 ✅ — Fidelity merge & summary honesty
 Owns: FID-1..5, FID-7.
 Scope: escalation markers become the exact-wins coverage authority
 (FID-1/6); `should_use_summaries` becomes coverage-aware and never
@@ -464,7 +464,7 @@ Acceptance: the two headline claims of the rework ("no double count",
 "never a silent empty result") hold under adversarial synthetic
 traces, enforced by CI.
 
-### Phase T2 — AAS semantics: one definition, all paths (DECISION GATE)
+### Phase T2 ✅ — AAS semantics: one definition, all paths (DECISION GATE)
 Owns: AAS-1, SMP-5; folds in the io_worker open question
 (REWORK_PLAN risk #6).
 **GATE PASSED (2026-07-12).** Empirical study: docs/T2_IOWORKER_STUDY.md;
@@ -503,7 +503,7 @@ unit tests for CPU-storm trigger.
 Acceptance: a `SELECT`-storm CPU incident raises sampled AAS and can
 trigger escalation; AAS shows no step artifact at tier switches.
 
-### Phase T3 — Escalation budget & trigger quality
+### Phase T3 ⬜ — Escalation budget & trigger quality (in flight)
 Owns: ESC-1..12. Depends on T2 (anomaly metrics shape settles there).
 Scope: extension charge = committed-remainder-aware + mid-window
 budget clamp (ESC-1); de-escalation flushes open intervals as final
@@ -525,7 +525,7 @@ Acceptance: worst-case full-fidelity seconds per hour ≤ configured
 budget under adversarial requests — provable by test; live view during
 escalation matches post-hoc trace view within tolerance.
 
-### Phase T4 — Capture & sampler hardening (silent-wrong-data class)
+### Phase T4 ✅ — Capture & sampler hardening (silent-wrong-data class)
 Owns: CAP-1..12, SMP-1..4.
 Scope: state_map sized to registry capacity + checked inserts +
 `state_map_full` counter surfaced in metrics (CAP-1); strict
@@ -550,7 +550,7 @@ simulation → loud.
 Acceptance: no known path where the daemon records wrong-or-nothing
 without a loud signal (log + control-socket health + metric).
 
-### Phase T5 — Durability & retention
+### Phase T5 ✅ — Durability & retention
 Owns: DUR-1..10.
 Scope: never truncate — recover/rename-aside `current.trace`/
 `current.summary` on startup (DUR-1); collision-safe archive renames
@@ -568,7 +568,7 @@ cap; golden-fixture decode test (with T7's fixture).
 Acceptance: a daemon crash loses at most the unflushed tail, never a
 committed hour; disk usage provably bounded.
 
-### Phase T6 — Client transport trust
+### Phase T6 ✅ — Client transport trust
 Owns: UI-1..13. Independent of T1–T5 (client-only) — pairs with T0.
 Scope: transport rejects `.error` envelopes + visible degraded state
 distinct from "no data" (UI-1); per-connection id namespacing in
@@ -589,7 +589,7 @@ Acceptance: SSH/server death is visibly distinguishable from an idle
 database within one refresh interval, and recovers without a page
 reload; two tabs never exchange data.
 
-### Phase T7 — Release engineering & matrix
+### Phase T7 ✅ — Release engineering & matrix
 Owns: TST-9..12, repo hygiene.
 Scope: nightly containerized matrix workflow (rockylinux:8 — also
 covers the static-libbpf build path, rockylinux:9, ubuntu:24.04; build
@@ -612,12 +612,12 @@ Pairs (one PR per phase; the two phases of a pair are file-disjoint by
 construction and can be developed in parallel):
 
 ```
-Pair 1:  T0 (CI/tests)        ∥  T6 (client/bridge)
-Pair 2:  T1 (merge/summaries) ∥  T4 (capture/sampler hardening)
-Gate  :  T2 decision (AAS semantics + io_worker — explicit sign-off,
-         needs one PG18 empirical run for the io_worker part)
-Pair 3:  T2 (AAS impl)        ∥  T5 (durability)
-Pair 4:  T3 (escalation)      ∥  T7 (release eng)
+Pair 1:  T0 ✅ (CI/tests)        ∥  T6 ✅ (client/bridge)
+Pair 2:  T1 ✅ (merge/summaries) ∥  T4 ✅ (capture/sampler hardening)
+Gate  :  T2 ✅ decision (AAS semantics + io_worker — signed off,
+         PG18 io_worker run done: docs/T2_IOWORKER_STUDY.md)
+Pair 3:  T2 ✅ (AAS impl)        ∥  T5 ✅ (durability)
+Pair 4:  T3 ⬜ (escalation)      ∥  T7 ✅ (release eng)
 ```
 
 - T0 first, non-negotiable — it is the net every other phase is
@@ -629,19 +629,25 @@ Pair 4:  T3 (escalation)      ∥  T7 (release eng)
 
 # Definition of done (milestone)
 
-1. CI includes a real-PG capture smoke job, matrix PG 13/16/17/18,
-   green.
-2. Adversarial synthetic-trace tests prove: no double counting across
+1. ✅ CI includes a real-PG capture smoke job, matrix PG 13/16/17/18,
+   green (T0). The nightly containerized matrix (T7) additionally
+   exercises EL8/EL9/Ubuntu cells.
+2. 🔄 Adversarial synthetic-trace tests prove: no double counting across
    escalation boundaries (trace AND live view), correct fidelity
-   labels on every response path, budget mathematically bounded.
-3. A CPU-storm incident is detectable (sampled AAS includes on-CPU;
-   anomaly engine fires on it).
-4. No known silent-wrong-data path: every degraded state is visible in
-   logs + control-socket status + UI.
-5. Daemon crash/restart loses at most the unflushed tail.
-6. `run_all.sh --require-live` green twice consecutively on EL9 and
-   EL8 boxes (the EL8 cell re-validated for the first time since #24).
-7. `RELEASING.md` exists and v0.13 ships through it.
+   labels on every response path (T1 ✅), budget mathematically bounded
+   (T3 ⬜ — the budget half lands with T3).
+3. ✅ A CPU-storm incident is detectable (sampled AAS includes on-CPU;
+   anomaly engine fires on it) (T2).
+4. 🔄 No known silent-wrong-data path: every degraded state is visible in
+   logs + control-socket status + UI. Capture/sampler (T4 ✅), transport
+   (T6 ✅) done; escalation-billing honesty rides with T3 ⬜.
+5. ✅ Daemon crash/restart loses at most the unflushed tail (T5).
+6. ⬜ PENDING (milestone close-out): `run_all.sh --require-live` green
+   twice consecutively on EL9 and EL8 boxes with zero live-section skips
+   (the EL8 cell re-validated for the first time since #24). Procedure in
+   `RELEASING.md` step 4.
+7. ⬜ PENDING (milestone close-out): `RELEASING.md` exists (T7 ✅) and
+   v0.13 ships through it (executes after T3 merges).
 
 # Explicitly parked / resumed after Track T
 

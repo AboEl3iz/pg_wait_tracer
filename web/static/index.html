@@ -16,6 +16,11 @@
   <div class="header-left">
     <h1>pgwt</h1>
     <span id="status" class="status connecting">Connecting...</span>
+    <!-- Version-skew banner (T7 / TST-11): shown when the client build and the
+         remote pgwt-server report different versions/protocol. Warn, never
+         refuse — a skewed pair is the normal deployment state. -->
+    <span id="version-skew" class="version-skew" style="display:none"
+          title=""></span>
   </div>
   <div class="header-right">
     <!-- Escalate control (B5): visible only when the daemon supports tiered
