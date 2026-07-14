@@ -212,8 +212,14 @@ jobs:
       - name: Run C unit tests (incl. golden-fixture decode — TST-10)
         run: make -C tests check
 
-      # ── Real-PG capture smoke (tiered hard; full if watchpoints exist) ────
-      - name: Run capture smoke (PG ${{ matrix.pg }})
+      # ── Real-PG capture smoke (--core: portable capture proof) ────────────
+      # --core asserts the daemon attaches, records real attributed events
+      # live + to a trace file, and its uprobes fire on this distro's binary
+      # layout. It skips LOUDLY the watchpoint-fidelity + CPU-storm sections:
+      # a nested privileged container can open a hardware breakpoint that never
+      # actually traps, so exact escalation and CPU-storm scheduling do not hold
+      # here — those run on the T0 hosted runner + live EL8/EL9 boxes.
+      - name: Run capture smoke (PG ${{ matrix.pg }}, --core)
         run: |
           V=${{ matrix.pg }}
           # sudo strips the env: pass PATH (psql/pgbench), the job-summary sink,
@@ -221,7 +227,7 @@ jobs:
           sudo env "PATH=$PATH" \
             "GITHUB_STEP_SUMMARY=$GITHUB_STEP_SUMMARY" \
             ${BPFTOOL:+BPFTOOL=$BPFTOOL} \
-            tests/ci_smoke.sh --pg-version "$V"
+            tests/ci_smoke.sh --pg-version "$V" --core
 
       - name: Capture PostgreSQL log on failure
         if: failure()

@@ -66,8 +66,12 @@ test_pg13_resolve: test_pg13_resolve.c ../src/discovery.c ../src/spawn.c \
 # each build asserts (via the ELF header) that the flag actually took effect.
 # Compiles discovery.c directly (BPF-free, needs libelf) — same pattern as
 # test_pg13_resolve.
+# Compile wait_event.c + cJSON.c FROM SOURCE (not the prebuilt $(BUILD)/*.o):
+# the -pie build must link only -fPIE objects, but the main build's objects
+# default to non-PIE on EL toolchains (R_X86_64_32S relocations), which fails
+# the `-pie` link. Building them here inherits this target's -fPIE/-fno-pie.
 DISCOVERY_TEST_DEPS = test_discovery.c ../src/discovery.c ../src/spawn.c \
-                      $(BUILD)/wait_event.o $(BUILD)/cJSON.o
+                      ../src/wait_event.c ../src/cJSON.c
 
 test_discovery_pie: $(DISCOVERY_TEST_DEPS)
 	$(CC) $(CFLAGS) -DPGWT_TEST_EXPECT_PIE=1 -fPIE -pie -o $@ $^ -lelf -lz
