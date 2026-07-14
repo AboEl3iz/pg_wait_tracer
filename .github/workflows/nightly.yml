@@ -29,6 +29,11 @@ on:
     # 03:17 UTC daily (off the hour to avoid the Actions cron stampede).
     - cron: "17 3 * * *"
   workflow_dispatch:
+  # TEMPORARY (removed before merge): a brand-new workflow_dispatch workflow is
+  # only registered once it lands on the default branch, so validate the matrix
+  # pre-merge by running it on pushes to this branch. Identical job steps.
+  push:
+    branches: [t7-release-eng]
 
 # A new nightly (or manual kick) supersedes an in-flight one.
 concurrency:
