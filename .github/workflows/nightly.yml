@@ -109,6 +109,13 @@ jobs:
           dnf install -y gcc clang llvm make tar git python3 sudo procps-ng \
             findutils diffutils which \
             elfutils-libelf-devel zlib-devel lz4-devel bpftool libbpf-devel
+          # EL8's default python3 is 3.6, which lacks
+          # subprocess.run(capture_output=) (3.7+) the smoke tests use. Install
+          # python3.11 and make python3 resolve to it (EL9 ships 3.9 — fine —
+          # but the symlink is harmless there too).
+          dnf install -y python3.11
+          ln -sf "$(command -v python3.11)" /usr/local/bin/python3
+          python3 --version
           # PGDG repo.
           dnf install -y "https://download.postgresql.org/pub/repos/yum/reporpms/EL-$EL-x86_64/pgdg-redhat-repo-latest.noarch.rpm"
           # The EL AppStream 'postgresql' module masks the PGDG postgresqlNN
