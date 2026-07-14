@@ -1,0 +1,214 @@
+# Nightly containerized platform matrix (Trust Milestone T7: TST-9, TST-12).
+#
+# The gating CI (ci.yml) runs entirely on ubuntu-latest — one cell of a ~24-cell
+# support matrix (PG13/17/18 × EL8/EL9/Ubuntu × PIE/non-PIE). Every field escape
+# to date (#8, #24, #30, #31) lived in the capture/discovery slice, and the EL8
+# non-PIE + static-libbpf build path (the one that shipped the #24 platform) is
+# NEVER built in gating CI. This workflow exercises the real distro cells
+# nightly, inside privileged containers that share the host runner's kernel — so
+# BPF (BTF at /sys/kernel/btf/vmlinux) and, where the hypervisor allows it,
+# hardware watchpoints work exactly as in the ci.yml capture-smoke job.
+#
+# Per cell (rockylinux:8 / rockylinux:9 / ubuntu:24.04):
+#   1. full build from source — EL8 has libbpf 0.5.0 (pre-USDT), so its build
+#      exercises the Makefile's static libbpf + bpftool bundling path (TST-12),
+#      which gating CI never compiles.
+#   2. the shared C unit suite (make -C tests check → unit_tests.list).
+#   3. the real-PG capture smoke (tests/ci_smoke.sh): tiered/sampled is the hard
+#      gate; full-mode watchpoint assertions run when the probe finds hardware
+#      breakpoints and are skipped LOUDLY (job summary) when it does not — the
+#      established degrade-loudly pattern.
+#
+# Failure surfacing: this workflow is simply RED in the Actions tab (no external
+# alerting this phase). Kick it manually from the Actions tab (workflow_dispatch)
+# to validate a change before it becomes the scheduled run.
+name: nightly
+
+on:
+  schedule:
+    # 03:17 UTC daily (off the hour to avoid the Actions cron stampede).
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+# A new nightly (or manual kick) supersedes an in-flight one.
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  matrix:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # EL8: non-PIE PGDG postgres + the static libbpf/bpftool bundling
+          # path (libbpf 0.5.0 predates USDT). PG13 from the PGDG archive repo
+          # is the #24 platform — the one automated coverage has exercised
+          # exactly once ever.
+          - name: rocky8-pg13
+            container: rockylinux:8
+            family: el
+            el: 8
+            pg: 13
+          # EL9: PIE postgres, modern libbpf from CRB.
+          - name: rocky9-pg17
+            container: rockylinux:9
+            family: el
+            el: 9
+            pg: 17
+          # Ubuntu 24.04: PIE postgres via PGDG apt, newest supported PG.
+          - name: ubuntu2404-pg18
+            container: ubuntu:24.04
+            family: deb
+            pg: 18
+
+    container:
+      image: ${{ matrix.container }}
+      # Privileged + host kernel access: BPF needs BTF and map/prog syscalls;
+      # the capture path attaches uprobes/USDT and (where available) perf
+      # hardware breakpoints. The container shares the runner's kernel, so
+      # /sys/kernel/btf/vmlinux is the host's.
+      options: --privileged
+      volumes:
+        - /sys/kernel/btf:/sys/kernel/btf:ro
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── Build toolchain + PostgreSQL (per distro family) ──────────────────
+      - name: Install build deps + PostgreSQL (EL ${{ matrix.el }})
+        if: matrix.family == 'el'
+        run: |
+          set -ex
+          V=${{ matrix.pg }}
+          EL=${{ matrix.el }}
+          dnf install -y dnf-plugins-core glibc-langpack-en || dnf install -y dnf-plugins-core
+          # CRB (EL9) / PowerTools (EL8): libbpf-devel + build tooling live here.
+          if [ "$EL" = "8" ]; then
+            dnf config-manager --set-enabled powertools || dnf config-manager --set-enabled powertools
+          else
+            dnf config-manager --set-enabled crb
+          fi
+          # Core build tools + BPF toolchain + ELF/compression libs. git is
+          # required on EL8 (the Makefile clones pinned libbpf/bpftool). sudo &
+          # procps-ng (pgrep) & python3 for the tests; findutils for the runner.
+          dnf install -y gcc clang llvm make tar git python3 sudo procps-ng \
+            findutils diffutils which \
+            elfutils-libelf-devel zlib-devel lz4-devel bpftool libbpf-devel
+          # PGDG repo.
+          dnf install -y "https://download.postgresql.org/pub/repos/yum/reporpms/EL-$EL-x86_64/pgdg-redhat-repo-latest.noarch.rpm"
+          # PG13 is EOL and dropped from the live PGDG repo — use the archive
+          # repo (INSTALL.md documents this exact path).
+          if [ "$V" -lt 14 ]; then
+            REPO=/etc/yum.repos.d/pgdg-archive.repo
+            printf '[pgdg%s-archive]\n' "$V" > "$REPO"
+            printf 'name=PostgreSQL %s (PGDG archive)\n' "$V" >> "$REPO"
+            printf 'baseurl=https://yum-archive.postgresql.org/%s/redhat/rhel-%s-x86_64/\n' "$V" "$EL" >> "$REPO"
+            printf 'enabled=1\ngpgcheck=0\n' >> "$REPO"
+          fi
+          dnf install -y "postgresql$V-server" "postgresql$V-contrib"
+
+      - name: Initialize + start PostgreSQL ${{ matrix.pg }} (EL, no systemd)
+        if: matrix.family == 'el'
+        run: |
+          set -ex
+          V=${{ matrix.pg }}
+          BIN=/usr/pgsql-$V/bin
+          DATA=/var/lib/pgsql/$V/data
+          "$BIN/postgresql-$V-setup" initdb
+          # pg_stat_statements everywhere (PG13 query attribution needs it;
+          # PG14+ compute_query_id for st_query_id).
+          echo "shared_preload_libraries = 'pg_stat_statements'" >> "$DATA/postgresql.conf"
+          echo "port = 5432" >> "$DATA/postgresql.conf"
+          if [ "$V" -ge 14 ]; then
+            echo "compute_query_id = on" >> "$DATA/postgresql.conf"
+          fi
+          # Trust local auth so tests connect as postgres from root.
+          sed -i -E 's/(ident|peer|scram-sha-256|md5)$/trust/' "$DATA/pg_hba.conf"
+          sudo -u postgres "$BIN/pg_ctl" -D "$DATA" -l /tmp/pg.log -w start
+          sudo -u postgres "$BIN/psql" -c "CREATE EXTENSION IF NOT EXISTS pg_stat_statements"
+          sudo -u postgres "$BIN/psql" -tAc "SELECT version()"
+          echo "/usr/pgsql-$V/bin" >> "$GITHUB_PATH"
+
+      - name: Install build deps + PostgreSQL (Ubuntu)
+        if: matrix.family == 'deb'
+        run: |
+          set -ex
+          export DEBIAN_FRONTEND=noninteractive
+          V=${{ matrix.pg }}
+          apt-get update
+          apt-get install -y gcc clang llvm make git python3 sudo curl gnupg \
+            lsb-release ca-certificates procps \
+            libbpf-dev libelf-dev zlib1g-dev liblz4-dev linux-tools-common \
+            postgresql-common
+          # bpftool: the container has no matching linux-tools-$(uname -r); build
+          # a pinned bpftool from source (same fallback ci.yml uses).
+          if ! bpftool version >/dev/null 2>&1; then
+            git clone --depth 1 --branch v7.5.0 --recurse-submodules \
+              https://github.com/libbpf/bpftool.git /tmp/bpftool
+            make -C /tmp/bpftool/src -j"$(nproc)"
+            echo "BPFTOOL=/tmp/bpftool/src/bpftool" >> "$GITHUB_ENV"
+          fi
+          # PGDG apt.
+          yes | /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y || true
+          if ! apt-cache show "postgresql-$V" >/dev/null 2>&1; then
+            echo "deb https://apt-archive.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+              > /etc/apt/sources.list.d/pgdg-archive.list
+            apt-get update
+          fi
+          apt-get install -y "postgresql-$V" "postgresql-contrib-$V"
+
+      - name: Configure + start PostgreSQL ${{ matrix.pg }} (Ubuntu, no systemd)
+        if: matrix.family == 'deb'
+        run: |
+          set -ex
+          V=${{ matrix.pg }}
+          # The package auto-creates cluster "main"; (re)configure and start it
+          # via pg_ctlcluster (the Debian wrapper — works without systemd).
+          pg_ctlcluster "$V" main stop || true
+          pg_conftool "$V" main set port 5432
+          pg_conftool "$V" main set shared_preload_libraries pg_stat_statements
+          if [ "$V" -ge 14 ]; then
+            pg_conftool "$V" main set compute_query_id on
+          fi
+          sed -i -E 's/(ident|peer|scram-sha-256|md5)$/trust/' \
+            "/etc/postgresql/$V/main/pg_hba.conf"
+          pg_ctlcluster "$V" main start
+          sudo -u postgres psql -c "CREATE EXTENSION IF NOT EXISTS pg_stat_statements"
+          sudo -u postgres psql -tAc "SELECT version()"
+          echo "/usr/lib/postgresql/$V/bin" >> "$GITHUB_PATH"
+
+      # ── Build (EL8 exercises the static libbpf/bpftool bundling path) ─────
+      - name: Verify BTF is visible from the container
+        run: test -r /sys/kernel/btf/vmlinux
+
+      - name: Build (BPF tracer + pgwt-server)
+        run: make
+
+      - name: Build C unit tests
+        run: make -C tests
+
+      # ── Shared C unit suite (unit_tests.list) ─────────────────────────────
+      - name: Run C unit tests (incl. golden-fixture decode — TST-10)
+        run: make -C tests check
+
+      # ── Real-PG capture smoke (tiered hard; full if watchpoints exist) ────
+      - name: Run capture smoke (PG ${{ matrix.pg }})
+        run: |
+          V=${{ matrix.pg }}
+          # sudo strips the env: pass PATH (psql/pgbench), the job-summary sink,
+          # and BPFTOOL (the uprobe run_cnt assertion needs a working bpftool).
+          sudo env "PATH=$PATH" \
+            "GITHUB_STEP_SUMMARY=$GITHUB_STEP_SUMMARY" \
+            ${BPFTOOL:+BPFTOOL=$BPFTOOL} \
+            tests/ci_smoke.sh --pg-version "$V"
+
+      - name: Capture PostgreSQL log on failure
+        if: failure()
+        run: |
+          echo "=== PostgreSQL log ==="
+          cat /tmp/pg.log 2>/dev/null || \
+            cat /var/log/postgresql/postgresql-${{ matrix.pg }}-main.log 2>/dev/null || \
+            echo "(no log found)"
