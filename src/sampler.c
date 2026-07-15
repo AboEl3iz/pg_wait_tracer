@@ -42,6 +42,70 @@ static int read_target_own_pid(const struct pgwt_sample_target *t,
     return ok;
 }
 
+/* Ground-truth command-gate + query_id read (T2, EL9 fix).
+ *
+ * on_report_activity / on_report_query_id maintain cmd_open and last_query_id
+ * in the BPF state_map by TRANSITION EDGE only — they fire once, at command
+ * start. A long command already in flight when the backend's state_map entry
+ * is created misses that single edge, so the entry's cmd_open/query_id stay 0
+ * for the ENTIRE command. This happens whenever the sampler starts tracking a
+ * backend mid-query: the "run a compute query, THEN attach the tracer" case
+ * (straddle at attach), or the sampled-tier new-backend seed race. Every
+ * on-CPU (we==0) sample of that command is then dropped by the build_batch
+ * gate — CPU* collapses to 0 — and the samples carry no query_id. The defect
+ * is latent in sampled/tiered mode on ALL platforms and PG versions; it
+ * surfaced first on EL9 because the manual repro ran a long straddling compute
+ * query (short/repeated queries re-fire the edge after the entry exists, so
+ * the bug hides).
+ *
+ * Reading the backend's OWN authoritative state is race-free:
+ *   cmd_open <- (debug_query_string != NULL): the executing-a-command window,
+ *               the same global the BPF query-text path reads. Resolved by
+ *               symbol for every PG version — no PgBackendStatus offset guess.
+ *               NULL between commands (verified: idle backend == NULL), so no
+ *               between-command CPU is counted (docs/AAS_SEMANTICS_DECISION.md
+ *               — the ~3x over-count the gate exists to prevent stays gone).
+ *   query_id <- PgBackendStatus.st_query_id (MyBEEntry -> +off): the field the
+ *               full-mode preseed already reads. Refreshed only while inside a
+ *               command (st_query_id can hold a stale id once idle) and only
+ *               when its offset is known (PG14+); PG13 keeps its B1 seed.
+ *
+ * Reads go against the target's OWN pid: both are process-LOCAL globals, so a
+ * foreign-pid read would return the reader's copy (SMP-2). *cmd_open /
+ * *query_id are left untouched on any read failure, so the caller keeps its
+ * edge-maintained fallback — this path never fabricates. */
+void pgwt_read_cmd_gate(pid_t pid, uint64_t dqs_addr, uint64_t be_entry_addr,
+                        int st_query_id_off, int *cmd_open, uint64_t *query_id)
+{
+    if (dqs_addr == 0)
+        return;   /* symbol unresolved — keep the edge-maintained fallback */
+
+    uint64_t dqs = 0;
+    struct iovec ld = { &dqs, sizeof(dqs) };
+    struct iovec rd = { (void *)(uintptr_t)dqs_addr, sizeof(dqs) };
+    if (process_vm_readv(pid, &ld, 1, &rd, 1, 0) != (ssize_t)sizeof(dqs))
+        return;   /* read failed — do not disturb the fallback */
+
+    int open_now = (dqs != 0) ? 1 : 0;
+    if (cmd_open)
+        *cmd_open = open_now;
+
+    if (open_now && query_id && be_entry_addr && st_query_id_off > 0) {
+        uint64_t be_ptr = 0;
+        struct iovec lb = { &be_ptr, sizeof(be_ptr) };
+        struct iovec rb = { (void *)(uintptr_t)be_entry_addr, sizeof(be_ptr) };
+        if (process_vm_readv(pid, &lb, 1, &rb, 1, 0) == (ssize_t)sizeof(be_ptr)
+            && be_ptr) {
+            uint64_t qid = 0;
+            struct iovec lq = { &qid, sizeof(qid) };
+            struct iovec rq = { (void *)(uintptr_t)(be_ptr + st_query_id_off),
+                                sizeof(qid) };
+            if (process_vm_readv(pid, &lq, 1, &rq, 1, 0) == (ssize_t)sizeof(qid))
+                *query_id = qid;
+        }
+    }
+}
+
 int pgwt_sampler_read_targets(const struct pgwt_sample_target *targets, int n,
                               uint32_t *out_vals, uint64_t *read_faults)
 {
@@ -732,6 +796,37 @@ int pgwt_sampler_poll(struct pgwt_daemon *d)
         uint32_t we = s->read_vals[i];
         if (we == 0 || !pgwt_is_idle_event(we))
             d->counters.io_worker_busy_total++;
+    }
+
+    /* T2 command-gate ground truth (EL9 fix). The state_map cmd_open the
+     * targets carry is transition-edge maintained: it is correct for a backend
+     * whose entry existed before its command began, but stuck at 0 for a
+     * command already in flight when the entry was created (attach straddle /
+     * new-backend seed race). That would drop the command's every on-CPU
+     * sample. Verify against the backend's OWN debug_query_string for exactly
+     * the samples at risk — an on-CPU (we==0) reading from a command-gated type
+     * (client/unknown) whose edge-gate is closed. This is the buggy set only;
+     * the common steady state (edge already open, or not on CPU) does zero
+     * extra reads. When ground truth says "in a command", also refresh the
+     * query_id the edge-uprobe likewise missed. */
+    if (d->debug_query_string_addr) {
+        for (int i = 0; i < n; i++) {
+            if (s->read_vals[i] != 0 || targets[i].cmd_open)
+                continue;   /* not on-CPU, or the edge already caught it */
+            if (targets[i].backend_type != PGWT_BT_CLIENT
+                && targets[i].backend_type != PGWT_BT_UNKNOWN)
+                continue;   /* only client/unknown CPU is command-gated */
+            int cg = 0;
+            uint64_t qg = targets[i].query_id;
+            pgwt_read_cmd_gate(targets[i].pid, d->debug_query_string_addr,
+                               d->my_be_entry_addr, d->st_query_id_offset,
+                               &cg, &qg);
+            if (cg) {
+                targets[i].cmd_open = 1;
+                targets[i].query_id = qg;
+                d->counters.cmd_gate_recovered_total++;
+            }
+        }
     }
 
     uint64_t invalid_before = d->counters.invalid_wait_reads_total;

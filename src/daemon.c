@@ -385,6 +385,9 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
         uint64_t dqs_addr = pgwt_find_symbol_offset(d->pg_binary_saved,
                                                      "debug_query_string");
         d->skel->rodata->debug_query_string_addr = dqs_addr;
+        /* Userspace copy: the sampler reads this global per-pid each tick as
+         * the race-free command-open gate (T2 fix, see sampler.c). */
+        d->debug_query_string_addr = dqs_addr;
         if (d->verbose && dqs_addr)
             fprintf(stderr, "INFO: debug_query_string at 0x%lx\n",
                     (unsigned long)dqs_addr);
