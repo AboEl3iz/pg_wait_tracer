@@ -596,19 +596,20 @@ def ctl_query(trace_dir, cmd):
     return ctl_request(trace_dir, {"cmd": cmd})
 
 
-def phase_sampled_cpu_straddle(pm_pid):
+def phase_cpu_straddle(pm_pid, mode):
     """Regression for the edge-vs-level command-gate bug (found in EL9 live
-    validation, latent on ALL platforms). The on_report_activity uprobe
-    sets cmd_open only at command START; a command already IN FLIGHT when
-    the sampler first tracks the backend misses that edge, so cmd_open
-    stays 0 for the whole command and every on-CPU sample is dropped —
-    CPU* collapses to 0. Ubuntu CI missed it because the other CPU phases
-    fire their work AFTER the tracer attaches (edge caught) and CpuStorm
-    uses short re-firing statements. This phase does the opposite: ONE
-    long compute statement is already running before the tracer starts,
-    then sampled CPU must still be counted (via the per-tick
-    debug_query_string ground-truth gate). Pre-fix this asserted ~0."""
-    print("--- Phase: sampled-mode CPU straddle (command in flight at attach) ---")
+    validation, latent on ALL platforms, BOTH tiers). The on_report_activity
+    uprobe sets cmd_open only at command START; a command already IN FLIGHT
+    when the tracer first seeds the backend misses that edge, so cmd_open
+    stays 0 for the whole command and every we==0 (CPU) reading is dropped
+    as non-command churn — CPU* collapses to 0 for that command. Ubuntu CI
+    missed it because the other CPU phases fire their work AFTER attach (edge
+    caught) and CpuStorm uses short re-firing statements. This phase does the
+    opposite: ONE long compute statement is already running before the tracer
+    starts. sampled tier is fixed by the per-tick debug_query_string gate;
+    exact tier by seeding cmd_open from debug_query_string at preseed. Pre-fix
+    both asserted CPU ~0."""
+    print(f"--- Phase: CPU straddle, --mode {mode} (command in flight at attach) ---")
     trace_dir = tempfile.mkdtemp(prefix="pgwt_smoke_straddle_")
     os.chmod(trace_dir, 0o755)
 
@@ -623,15 +624,15 @@ def phase_sampled_cpu_straddle(pm_pid):
     hog.stdin.flush()
     time.sleep(2.5)   # the command is now in flight; its start-edge is past
 
-    tracer = subprocess.Popen(
-        [TRACER, "--mode", "tiered", "--pid", str(pm_pid),
-         "-T", trace_dir, "--duration", "12", "--quiet",
-         "--interval", "5", "--anomaly-aas-factor", "1000000"],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    argv = [TRACER, "--mode", mode, "--pid", str(pm_pid),
+            "-T", trace_dir, "--duration", "12", "--quiet", "--interval", "5"]
+    if mode == "tiered":
+        argv += ["--anomaly-aas-factor", "1000000"]  # keep it pure sampled
+    tracer = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     try:
-        time.sleep(3.0)          # BPF load + scan finds the in-flight backend
+        time.sleep(3.0)          # BPF load + scan/attach finds the in-flight backend
         win_from = time.time_ns()
-        time.sleep(7.0)          # sampled window over the straddling command
+        time.sleep(7.0)          # window over the straddling command
         win_to = time.time_ns()
         _, stderr = tracer.communicate(timeout=40)
         err = stderr.decode('utf-8', errors='replace')
@@ -658,7 +659,7 @@ def phase_sampled_cpu_straddle(pm_pid):
         # The single straddling backend is ~1 CPU-active session the whole
         # window. Pre-fix (edge-only gate) this was ~0 — the exact defect.
         check(cpu_mean >= 0.5,
-              f"in-flight command's CPU is counted in sampled mode: "
+              f"in-flight command's CPU is counted (--mode {mode}): "
               f"cpu AAS = {cpu_mean:.2f} (edge-vs-level regression; pre-fix ~0)")
 
     subprocess.run(["rm", "-rf", trace_dir])
@@ -948,12 +949,14 @@ def main():
               "hosted runner + live EL8/EL9 boxes (run_all.sh --require-live).")
     else:
         phase_fork_after_attach(pm_pid, args.mode)
+        # CPU straddle (command in flight at attach) — both tiers; the fix is
+        # per-tick for sampled and preseed-seeded for exact.
+        phase_cpu_straddle(pm_pid, args.mode)
         if args.mode == 'tiered':
             # T2 (AAS semantics): CPU-inclusive sampled AAS vs pg_stat_activity
             # ground truth, and the CPU-storm escalation + tier-switch
             # continuity checks (docs/AAS_SEMANTICS_DECISION.md).
             phase_sampled_aas_truth(pm_pid)
-            phase_sampled_cpu_straddle(pm_pid)
             phase_cpu_storm_escalation(pm_pid)
             # T3: manual escalation billing (ESC-1) + de-escalation flush (ESC-2).
             phase_escalation_billing(pm_pid)

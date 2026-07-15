@@ -180,10 +180,28 @@ static int preseed_state_map(struct pgwt_daemon *d, pid_t pid, uint64_t addr,
             if (bpf_map_lookup_elem(state_fd, &k, &prev) == 0)
                 prev_cmd_open = prev.cmd_open;
         }
+        /* Straddle fix (exact tier): a backend already RUNNING a command when
+         * we first seed it missed the on_report_activity START edge, so its
+         * cmd_open would stay 0 and its we==0 (CPU) intervals would be
+         * mislabeled non-command churn and dropped — exact-tier CPU* collapses
+         * to 0 for that command (the full-mode analogue of the sampler
+         * straddle bug). Level-check the backend's own debug_query_string at
+         * seed time: non-NULL == inside a command (the pg_stat_activity
+         * state='active' window). This seeds the gate correctly from the first
+         * watchpoint fire; the emitted events then carry CMD_OPEN and the live
+         * accumulator counts the CPU. (mem_fd is already open on this backend;
+         * the read is against its own process-local global.) */
+        uint16_t seed_cmd_open = prev_cmd_open;
+        if (!seed_cmd_open && d->debug_query_string_addr) {
+            uint64_t dqs = 0;
+            if (pread(mem_fd, &dqs, sizeof(dqs),
+                      (off_t)d->debug_query_string_addr) == sizeof(dqs) && dqs)
+                seed_cmd_open = 1;
+        }
         struct pgwt_pid_state init_state = {
             .last_event = current_wei,
             .wp_live = 1,   /* a live watchpoint now owns last_event/last_ts */
-            .cmd_open = prev_cmd_open,
+            .cmd_open = seed_cmd_open,
             .last_ts = attach_ts,
             .last_query_id = current_qid,
             .wait_event_addr = addr,
