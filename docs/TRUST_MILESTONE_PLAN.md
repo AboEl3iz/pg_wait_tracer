@@ -1,6 +1,6 @@
 # Trust Milestone (Track T) — Correctness & Honesty Hardening
 
-Status: 🔄 IN PROGRESS — all phases T0–T7 ✅ merged; close-out pending (EL8/EL9 live runs + v0.13)
+Status: 🔄 IN PROGRESS — T0–T7 ✅ merged; EL9 close-out validation found one more gap → **T8 (docs/T8_MEASURED_CPU_PLAN.md) now gates v0.13**, then EL8/EL9 live runs
 Date: 2026-07-06
 Origin: five-perspective adversarial code review of master @ fd21630
 (capture core, tiered orchestration, data path/format, client/UI,
