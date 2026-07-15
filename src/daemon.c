@@ -380,16 +380,31 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
         }
     }
 
-    /* Resolve debug_query_string address for BPF query text capture */
+    /* Resolve debug_query_string to its RUNTIME virtual address.
+     *
+     * PIE fix (#24 class, T8 §4): the raw ELF st_value from
+     * pgwt_find_symbol_offset() is only the runtime VA on non-PIE (ET_EXEC)
+     * binaries. On PIE (ET_DYN) builds — every Ubuntu/Debian PGDG package and
+     * EL9 — the runtime VA is load_base + st_value, and load_base is the
+     * per-process ASLR slide. Both consumers of this address dereference it in
+     * a backend's address space: the BPF query-TEXT path via
+     * bpf_probe_read_user() (in-task, target runtime VA) and the userspace
+     * command-open gate via pread(mem_fd) / process_vm_readv (T2, sampler.c +
+     * preseed). The raw vaddr therefore read garbage on PIE, collapsing query
+     * text capture AND the straddle CPU gate. Resolve like every other global
+     * (MyProc/MyBEEntry): the postmaster shares its load base with every forked
+     * backend, so one resolution against postmaster_pid yields the VA valid in
+     * all of them. */
     if (d->pg_binary_saved) {
-        uint64_t dqs_addr = pgwt_find_symbol_offset(d->pg_binary_saved,
-                                                     "debug_query_string");
+        uint64_t dqs_addr = pgwt_resolve_symbol(d->pg_binary_saved,
+                                                 "debug_query_string",
+                                                 d->postmaster_pid);
         d->skel->rodata->debug_query_string_addr = dqs_addr;
         /* Userspace copy: the sampler reads this global per-pid each tick as
          * the race-free command-open gate (T2 fix, see sampler.c). */
         d->debug_query_string_addr = dqs_addr;
         if (d->verbose && dqs_addr)
-            fprintf(stderr, "INFO: debug_query_string at 0x%lx\n",
+            fprintf(stderr, "INFO: debug_query_string at 0x%lx (runtime VA)\n",
                     (unsigned long)dqs_addr);
     }
 
