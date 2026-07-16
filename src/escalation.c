@@ -10,6 +10,7 @@
 #include "escalation_budget.h"
 #include "daemon.h"
 #include "backend.h"
+#include "discovery.h"
 #include "event_writer.h"
 #include "summary_writer.h"
 #include "perf_event.h"
@@ -195,6 +196,22 @@ static void flush_open_intervals(struct pgwt_daemon *d, uint64_t now)
         uint32_t we = st.last_event;
         if (PGWT_IS_MARKER(we))
             continue;               /* never a real wait */
+        /* T8: close the open stretch with its MEASURED CPU. For an on-CPU
+         * stretch (we==0) this is the straddling command's CPU that the
+         * watchpoint never emitted (no wait boundary fired); for a wait it is
+         * ≈0 (the self-check). Read schedstat now and subtract the seeded base;
+         * a failed read leaves UNKNOWN so compute infers rather than records a
+         * false 0. */
+        uint64_t cpu_ns = PGWT_CPU_NS_UNKNOWN;
+        if (d->cpu_accounting) {
+            uint64_t sched_now = pgwt_read_sched_cpu_ns(be->pid);
+            if (sched_now == 0)
+                cpu_ns = PGWT_CPU_NS_UNKNOWN;
+            else if (st.last_cpu_ns && sched_now >= st.last_cpu_ns)
+                cpu_ns = sched_now - st.last_cpu_ns;
+            else
+                cpu_ns = 0;
+        }
         struct pgwt_trace_event ev = {
             .timestamp_ns = now,
             .pid          = (uint32_t)be->pid,
@@ -203,11 +220,25 @@ static void flush_open_intervals(struct pgwt_daemon *d, uint64_t now)
             .flags        = st.cmd_open ? PGWT_EVENT_FLAG_CMD_OPEN : 0,
             .duration_ns  = now - st.last_ts,
             .query_id     = st.last_query_id,
+            .cpu_ns       = cpu_ns,
         };
         pgwt_writer_push_event(d->event_writer, &ev);
         if (d->summary_writer)
             pgwt_summary_push_event(d->summary_writer, &ev);
     }
+}
+
+/* T8 symptom #2: flush open exact intervals at daemon shutdown. Full mode has
+ * no de-escalation path, so a command computing when capture ends (window
+ * close / daemon exit) emitted NOTHING — the on-CPU stretch was never closed
+ * (the watchpoint only fires at wait boundaries, and a pure-CPU command reaches
+ * none), leaving an EMPTY trace. This closes every open wp_live interval with
+ * its measured cpu_ns, exactly like de-escalation. Idempotent after
+ * pgwt_deescalate (which flushed + detached, so no wp_live entries remain);
+ * safe in any mode (a no-op when nothing is attached). */
+void pgwt_flush_open_intervals(struct pgwt_daemon *d)
+{
+    flush_open_intervals(d, mono_ns());
 }
 
 /* ── Public API ───────────────────────────────────────────────────────── */

@@ -1766,6 +1766,10 @@ static void handle_aas(struct pgwt_server *srv, struct pgwt_request *req)
             for (int c = 0; c < PGWT_NUM_CLASSES; c++)
                 cJSON_AddNumberToObject(b, pgwt_class_names[c],
                                         aas.buckets[i].class_aas[c]);
+            /* T8 (additive): measured off-CPU AAS, a stacked sibling of "cpu"
+             * (the measured on-CPU share). 0 where no measured cpu_ns exists
+             * (sampled/v2), so consumers can treat it as any other class key. */
+            cJSON_AddNumberToObject(b, "offcpu", aas.buckets[i].offcpu_aas);
             /* T2 (additive): the same AAS decomposed by category.
              * io_worker appears ONLY here — excluded from the class AAS
              * above and from max_aas. Raw path only (summaries carry no
@@ -1832,6 +1836,17 @@ static void handle_time_model(struct pgwt_server *srv, struct pgwt_request *req)
     cJSON_AddNumberToObject(root, "idle_time_ms", tm.idle_time_ms);
     cJSON_AddNumberToObject(root, "aas", tm.aas);
     cJSON_AddNumberToObject(root, "wall_ms", tm.wall_ms);
+
+    /* T8 (additive): measured-CPU decomposition + self-checks. has_measured_cpu
+     * gates whether Off-CPU* is present (v3 exact data) vs absent (sampled/v2).
+     * wait_gap_cpu_ms is the trace's own CPU-accounting proof (CPU measured
+     * during wait-labeled gaps — should be ≈0); cpu_clamped_ms counts CPU that
+     * exceeded a gap's wall (clock skew). */
+    cJSON_AddBoolToObject(root, "has_measured_cpu", tm.has_measured_cpu);
+    cJSON_AddNumberToObject(root, "cpu_ms", tm.cpu_ms);
+    cJSON_AddNumberToObject(root, "offcpu_ms", tm.offcpu_ms);
+    cJSON_AddNumberToObject(root, "wait_gap_cpu_ms", tm.wait_gap_cpu_ms);
+    cJSON_AddNumberToObject(root, "cpu_clamped_ms", tm.cpu_clamped_ms);
 
     /* T2 (additive): category decomposition + io_worker utilization. Raw
      * path only — summaries carry no category data. cat "io_worker" ms is

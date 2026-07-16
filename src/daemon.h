@@ -173,6 +173,15 @@ struct pgwt_daemon {
      * classification falls back to the pre-T2 behavior (all exact CPU counts
      * as CPU) instead of silently mislabeling everything idle. */
     bool        cmd_gate_active;
+    /* T8 measured CPU (docs/T8_MEASURED_CPU_PLAN.md §5.4). cpu_accounting: the
+     * exact tier measures per-interval CPU (BPF se.sum_exec_runtime deltas) and
+     * the trace carries real cpu_ns; when false the daemon runs legacy
+     * gap-inference and stamps the UNKNOWN sentinel. schedstat_ok: field 1 of
+     * /proc/<pid>/schedstat is readable, so the userspace seed/flush/live paths
+     * can read the same accumulator. The startup probe sets both (and reports
+     * the tier loudly + in control-socket status). */
+    bool        cpu_accounting;
+    bool        schedstat_ok;
     uint32_t    lightweight_mode;        /* 1 = BPF accumulator only (no ringbuf) */
     uint32_t    skip_query_id;          /* 1 = skip query_id reads in BPF */
     uint32_t    skip_usdt;             /* 1 = skip USDT query lifecycle probes */

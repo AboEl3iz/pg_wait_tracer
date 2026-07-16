@@ -205,6 +205,12 @@ static int preseed_state_map(struct pgwt_daemon *d, pid_t pid, uint64_t addr,
             .last_ts = attach_ts,
             .last_query_id = current_qid,
             .wait_event_addr = addr,
+            /* T8: seed the CPU base from this backend's schedstat (== the
+             * se.sum_exec_runtime the BPF reads), so the first watchpoint
+             * transition's cpu_ns delta is measured from attach — a command
+             * straddling attach then has its CPU counted from the seed instant
+             * rather than only from its first post-attach wait boundary. */
+            .last_cpu_ns = d->cpu_accounting ? pgwt_read_sched_cpu_ns(pid) : 0,
         };
         uint32_t pid_key = pid;
         /* BPF_ANY (not NOEXIST): on first full-mode attach this creates the

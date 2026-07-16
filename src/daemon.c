@@ -408,6 +408,31 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
                     (unsigned long)dqs_addr);
     }
 
+    /* T8 measured-CPU capability probe (docs/T8_MEASURED_CPU_PLAN.md §5.4).
+     * The exact tier already requires kernel BTF (the full-tier gate), so the
+     * BPF read of task_struct->se.sum_exec_runtime is available; the userspace
+     * seed/flush/live paths read the SAME accumulator via /proc/<pid>/schedstat
+     * field 1, which exists whenever CONFIG_SCHED_INFO is set (universal on
+     * RHEL and Ubuntu kernels). Probe it once on the daemon's own pid (it has
+     * accrued CPU by now, so a working schedstat returns > 0). When present:
+     * full measured mode. When absent: legacy gap-inference, reported LOUDLY —
+     * never silent. (The S1b perf_event PERF_COUNT_SW_TASK_CLOCK fallback for
+     * schedstat-less kernels is deferred; see the PR notes.) */
+    d->schedstat_ok = pgwt_read_sched_cpu_ns(getpid()) > 0;
+    d->cpu_accounting = d->schedstat_ok;
+    d->skel->rodata->cpu_accounting = d->cpu_accounting;
+    if (d->cpu_accounting) {
+        if (d->verbose)
+            fprintf(stderr, "INFO: CPU accounting: MEASURED "
+                    "(se.sum_exec_runtime via schedstat)\n");
+    } else {
+        fprintf(stderr, "WARN: CPU accounting: LEGACY gap-inference — "
+                "/proc/self/schedstat unavailable (CONFIG_SCHED_INFO off?). "
+                "Exact-tier CPU is inferred from wait gaps and includes "
+                "runqueue/throttle time; Off-CPU* is unavailable and trace "
+                "cpu_ns carries the UNKNOWN sentinel.\n");
+    }
+
     /* Load BPF programs (runs verifier) */
     err = pg_wait_tracer_bpf__load(d->skel);
     if (err) {
@@ -625,6 +650,10 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
             goto fail;
         }
         d->event_writer->verbose = d->verbose;
+        /* T8: write real cpu_ns only when the capability probe confirmed
+         * measured CPU; otherwise every TRANSITIONS record is stamped
+         * PGWT_CPU_NS_UNKNOWN so readers fall back to gap-inference. */
+        d->event_writer->cpu_measured = d->cpu_accounting;
         /* DUR-3: optional size cap on top of the hours-based retention. */
         if (d->trace_retention_gb > 0)
             d->event_writer->retention_bytes =
@@ -942,6 +971,13 @@ void pgwt_daemon_cleanup(struct pgwt_daemon *d)
     /* Close any open escalation window (detaches watchpoints, writes the END
      * marker) before the event writer is torn down. */
     pgwt_escalation_cleanup(d);
+
+    /* T8 symptom #2: flush open exact intervals (incl. the on-CPU stretch of a
+     * command straddling capture end) with their measured cpu_ns BEFORE the
+     * provider detaches watchpoints and the writer closes. In full mode this is
+     * the ONLY flush path (no de-escalation); in tiered mode a just-closed
+     * window already flushed+detached, so this is a no-op. */
+    pgwt_flush_open_intervals(d);
 
     /* Stop the active capture provider (detach/free its state). */
     if (d->provider && d->provider->stop)

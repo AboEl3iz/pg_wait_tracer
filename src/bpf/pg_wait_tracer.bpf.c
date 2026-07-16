@@ -240,7 +240,8 @@ static __always_inline u64 read_task_cpu_ns(void)
         return 0;
     if (!bpf_core_field_exists(t->se.sum_exec_runtime))
         return 0;
-    return BPF_CORE_READ(t, se, sum_exec_runtime);
+    /* se is an embedded struct, not a pointer — one accessor step. */
+    return BPF_CORE_READ(t, se.sum_exec_runtime);
 }
 
 /* Accumulate duration for a wait event into accum_map (PERCPU — no atomics). */

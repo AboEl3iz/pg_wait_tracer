@@ -92,6 +92,12 @@ int pgwt_escalate(struct pgwt_daemon *d, int duration_s, int reason,
 /* Detach now (idempotent). reason is recorded in the END marker. */
 void pgwt_deescalate(struct pgwt_daemon *d, int reason);
 
+/* T8: flush every OPEN exact interval (wait or on-CPU) as a final transition
+ * carrying its measured cpu_ns. Called at daemon shutdown so a command
+ * straddling capture end (esp. a pure-CPU command in --mode full, which fires
+ * no wait boundary) records its on-CPU stretch instead of vanishing. */
+void pgwt_flush_open_intervals(struct pgwt_daemon *d);
+
 /* Called when the deadline timerfd fires: closes the window if expired. */
 void pgwt_escalation_on_timer(struct pgwt_daemon *d);
 
