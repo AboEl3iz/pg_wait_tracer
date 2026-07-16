@@ -45,7 +45,8 @@ test_event_writer: test_event_writer.c $(BUILD)/event_writer.o
 	$(CC) $(CFLAGS) -o $@ $^ -llz4
 
 test_event_reader: test_event_reader.c $(BUILD)/event_reader.o $(BUILD)/event_writer.o \
-                   $(BUILD)/map_reader.o $(BUILD)/wait_event.o $(BUILD)/spawn.o $(BUILD)/cJSON.o
+                   $(BUILD)/map_reader.o $(BUILD)/wait_event.o $(BUILD)/spawn.o $(BUILD)/cJSON.o \
+                   $(BUILD)/discovery.o
 	$(CC) $(CFLAGS) -o $@ $^ -llz4 $(LIBBPF_LIB) -lelf -lz
 
 test_bucket: test_bucket.c
@@ -166,7 +167,8 @@ gen_bench_traces: gen_bench_traces.c $(SERVER_OBJS)
 	$(CC) $(CFLAGS) -DPGWT_SERVER -o $@ $^ -llz4
 
 test_concurrent_rw: test_concurrent_rw.c $(BUILD)/event_reader.o $(BUILD)/event_writer.o \
-                    $(BUILD)/map_reader.o $(BUILD)/wait_event.o $(BUILD)/spawn.o $(BUILD)/cJSON.o
+                    $(BUILD)/map_reader.o $(BUILD)/wait_event.o $(BUILD)/spawn.o $(BUILD)/cJSON.o \
+                    $(BUILD)/discovery.o
 	$(CC) $(CFLAGS) -o $@ $^ -llz4 $(LIBBPF_LIB) -lelf -lz
 
 # cross_validate: A4 sampled-vs-exact comparison tool. Server build

@@ -25,15 +25,24 @@ void pgwt_counters_add_cpu(struct pgwt_daemon *d, uint32_t we,
     if (cpu_ns == PGWT_CPU_NS_UNKNOWN || PGWT_IS_MARKER(we))
         return;
     if (we == 0) {
-        /* On-CPU gap: clamp measured CPU to the wall gap (clock skew shows up
-         * as cpu_ns > dur); the remainder is off-CPU/runqueue-unaccounted. */
-        uint64_t cpu = cpu_ns;
-        if (cpu > dur_ns) {
-            d->counters.cpu_clamped_ns_total += cpu - dur_ns;
-            cpu = dur_ns;
+        /* On-CPU gap. A stale EXACTLY-0 delta (two boundary reads inside one
+         * scheduler tick, so se.sum_exec_runtime did not advance) is a missing
+         * measurement for a RUNNING gap, not "0 CPU" — fall back to gap-
+         * inference (full gap as CPU), mirroring compute so the counter never
+         * under-reports a finely-fragmented on-CPU command. A nonzero delta
+         * splits: clamp to the wall gap (clock skew shows up as cpu_ns > dur),
+         * the remainder is off-CPU/runqueue-unaccounted. */
+        if (cpu_ns == 0) {
+            d->counters.cpu_ns_total += dur_ns;
+        } else {
+            uint64_t cpu = cpu_ns;
+            if (cpu > dur_ns) {
+                d->counters.cpu_clamped_ns_total += cpu - dur_ns;
+                cpu = dur_ns;
+            }
+            d->counters.cpu_ns_total += cpu;
+            d->counters.offcpu_ns_total += dur_ns - cpu;
         }
-        d->counters.cpu_ns_total += cpu;
-        d->counters.offcpu_ns_total += dur_ns - cpu;
     } else {
         /* Wait-labeled gap: measured CPU here should be ≈0 (a sleeping task
          * burns none) — the trace's own CPU-accounting self-check. */

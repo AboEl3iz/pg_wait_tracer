@@ -409,11 +409,19 @@ void pgwt_compute_aas(const struct pgwt_trace_event *events, int count,
         int class_idx = pgwt_wait_class_index(ev->old_event);
 
         /* T8: for an on-CPU record with measured cpu_ns, the fraction of the
-         * interval actually on a CPU. <0 marks "not a measured CPU record" (a
-         * wait, or sampled/v2 CPU with no measurement) → no split. */
+         * interval actually on a CPU. <0 marks "not a measured CPU record" →
+         * no split, the whole overlap is CPU (gap-inference). That covers a
+         * wait, sampled/v2 CPU (UNKNOWN), AND a measured EXACTLY-0 delta: the
+         * se.sum_exec_runtime accumulator only ticks at scheduler updates, so a
+         * we==0 gap shorter than a tick reads a stale 0 — which is a missing
+         * measurement, not "0% on CPU". Mislabeling a finely-fragmented
+         * on-CPU command as Off-CPU is exactly the CPU*→0 regression this
+         * guards. A genuine partial off-CPU stretch reads 0<cpu_ns<dur and
+         * still splits. (Mirror of the time_model fallback.) */
         double cpu_frac = -1.0;
         if (class_idx == PGWT_CLASS_CPU &&
-            ev->cpu_ns != PGWT_CPU_NS_UNKNOWN && ev->duration_ns > 0) {
+            ev->cpu_ns != PGWT_CPU_NS_UNKNOWN && ev->cpu_ns != 0 &&
+            ev->duration_ns > 0) {
             cpu_frac = (double)ev->cpu_ns / (double)ev->duration_ns;
             if (cpu_frac > 1.0) cpu_frac = 1.0;
         }
@@ -656,10 +664,22 @@ void pgwt_compute_time_model(const struct pgwt_trace_event *events, int count,
         db_time_ns += dur_ns;
         int cls_idx = pgwt_wait_class_index(ev->old_event);
         if (cls_idx == PGWT_CLASS_CPU) {
-            /* On-CPU gap. With measured cpu_ns (v3 exact), split into CPU* and
-             * Off-CPU*; without it (sampled/v2 UNKNOWN), the full gap is CPU*
-             * as before. CPU has no sub-events, so it never enters ev_ht. */
-            if (ev->cpu_ns != PGWT_CPU_NS_UNKNOWN) {
+            /* On-CPU gap. A MEASURED, nonzero cpu_ns (v3 exact) splits into
+             * CPU* and Off-CPU*. Two cases fall back to gap-inference (the full
+             * gap is CPU*, no Off-CPU split, exactly as pre-T8):
+             *   - UNKNOWN: sampled/v2/legacy — never measured.
+             *   - EXACTLY 0: `se.sum_exec_runtime` only advances at scheduler
+             *     ticks, so two wait-boundary reads inside one tick return the
+             *     identical stored value and the delta is a hard 0. For a
+             *     we==0 gap (PG says RUNNING, not waiting) a 0 delta is a STALE
+             *     read, NOT "spent no CPU" — trusting it would mislabel a
+             *     fully-on-CPU, finely-fragmented command (e.g. a tight
+             *     executor loop that flips wait_event_info thousands of times a
+             *     second) as ~100% Off-CPU and collapse its CPU* to ~0. A
+             *     genuine partial off-CPU stretch reads a nonzero-but-<dur
+             *     delta and still splits correctly. CPU has no sub-events, so it
+             *     never enters ev_ht. */
+            if (ev->cpu_ns != PGWT_CPU_NS_UNKNOWN && ev->cpu_ns != 0) {
                 double m = (double)ev->cpu_ns;
                 if (m > dur_ns) { cpu_clamped_ns += m - dur_ns; m = dur_ns; }
                 cpu_measured_ns += m;
