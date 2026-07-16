@@ -170,6 +170,13 @@ int main(int argc, char **argv)
 
     double total_sampled_ns = 0, total_exact_ns = 0;
     int n_samples = 0;
+    /* T8 §5.6 self-check: over the exact (v3) intervals, the CPU measured
+     * during WAIT-labeled gaps must be ≈0 — a sleeping task burns no CPU, so
+     * "traces prove their own CPU accounting." Accumulate measured cpu_ns vs
+     * wait time for non-idle wait intervals; only assert when the trace carries
+     * measured cpu_ns (v2/legacy traces stamp the UNKNOWN sentinel). */
+    double wait_gap_cpu_ns = 0, wait_total_ns_sc = 0;
+    int have_measured_cpu = 0;
 
     for (int fi = 0; fi < nfiles; fi++) {
         struct pgwt_event_reader r;
@@ -225,6 +232,15 @@ int main(int argc, char **argv)
                      * sampled side captured with. */
                     if (ev == 0 && !in_cmd)
                         continue;
+                    /* T8 self-check: fold measured cpu_ns of WAIT intervals
+                     * (the ≈0 quantity). Uses full interval values — an edge
+                     * interval partially outside the window barely perturbs a
+                     * ratio that should be ~0 anyway. */
+                    if (ev != 0 && e->cpu_ns != PGWT_CPU_NS_UNKNOWN) {
+                        have_measured_cpu = 1;
+                        wait_gap_cpu_ns += (double)e->cpu_ns;
+                        wait_total_ns_sc += (double)e->duration_ns;
+                    }
                     uint64_t end = pgwt_reader_mono_to_wall(&r, e->timestamp_ns);
                     uint64_t dur = e->duration_ns;
                     uint64_t start = end > dur ? end - dur : 0;
@@ -315,6 +331,23 @@ int main(int argc, char **argv)
     printf("Tolerance: +/- %.1f pp\n", tolerance);
 
     int ok = (max_delta <= tolerance) && (overlap >= (top >= 5 ? 4 : top));
+
+    /* T8 §5.6.2: the trace's own CPU-accounting proof. Measured CPU during
+     * wait-labeled gaps should be a rounding error next to the wait time. */
+    if (have_measured_cpu && wait_total_ns_sc > 0) {
+        double wait_cpu_pct = 100.0 * wait_gap_cpu_ns / wait_total_ns_sc;
+        printf("Wait-gap CPU self-check: %.4f%% of wait time measured as CPU "
+               "(want <= 1.0%%)\n", wait_cpu_pct);
+        if (wait_cpu_pct > 1.0) {
+            printf("  FAIL: a sleeping task should burn ~0 CPU — measured "
+                   "cpu_ns during waits is too high (accounting drift)\n");
+            ok = 0;
+        }
+    } else {
+        printf("Wait-gap CPU self-check: SKIPPED (no measured cpu_ns — "
+               "legacy/v2 trace)\n");
+    }
+
     printf("\nRESULT: %s\n", ok ? "PASS" : "FAIL");
 
     free(table);

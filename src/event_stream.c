@@ -17,6 +17,30 @@
 
 /* duration_to_bucket() moved to map_reader.c as pgwt_duration_to_bucket() */
 
+void pgwt_counters_add_cpu(struct pgwt_daemon *d, uint32_t we,
+                            uint64_t dur_ns, uint64_t cpu_ns)
+{
+    /* Only measured records carry a real cpu_ns; markers and legacy/UNKNOWN
+     * records contribute nothing (T8 §5.6). */
+    if (cpu_ns == PGWT_CPU_NS_UNKNOWN || PGWT_IS_MARKER(we))
+        return;
+    if (we == 0) {
+        /* On-CPU gap: clamp measured CPU to the wall gap (clock skew shows up
+         * as cpu_ns > dur); the remainder is off-CPU/runqueue-unaccounted. */
+        uint64_t cpu = cpu_ns;
+        if (cpu > dur_ns) {
+            d->counters.cpu_clamped_ns_total += cpu - dur_ns;
+            cpu = dur_ns;
+        }
+        d->counters.cpu_ns_total += cpu;
+        d->counters.offcpu_ns_total += dur_ns - cpu;
+    } else {
+        /* Wait-labeled gap: measured CPU here should be ≈0 (a sleeping task
+         * burns none) — the trace's own CPU-accounting self-check. */
+        d->counters.wait_gap_cpu_ns_total += cpu_ns;
+    }
+}
+
 int pgwt_handle_trace_event(void *ctx, void *data, size_t data_sz)
 {
     struct pgwt_daemon *d = ctx;
@@ -47,6 +71,11 @@ int pgwt_handle_trace_event(void *ctx, void *data, size_t data_sz)
     /* Skip accumulation for marker events (duration=0, not real waits) */
     if (PGWT_IS_MARKER(we))
         return 0;
+
+    /* T8: fold the measured CPU of this closed interval into the lifetime
+     * counters (observability + the wait-gap self-check). Display-time CPU
+     * accounting is unchanged — this only reads evt->cpu_ns. */
+    pgwt_counters_add_cpu(d, we, dur, evt->cpu_ns);
 
     /* Per-PID accumulation */
     struct pgwt_pid_accum *pa = pgwt_get_or_create_pid(acc, evt->pid);

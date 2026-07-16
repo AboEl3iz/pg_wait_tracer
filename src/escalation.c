@@ -225,6 +225,11 @@ static void flush_open_intervals(struct pgwt_daemon *d, uint64_t now)
         pgwt_writer_push_event(d->event_writer, &ev);
         if (d->summary_writer)
             pgwt_summary_push_event(d->summary_writer, &ev);
+        /* T8: flush records bypass the ringbuf/event_stream funnel, so fold
+         * their measured CPU into the lifetime counters here — a pure-CPU
+         * command straddling capture end contributes its cpu_ns_total from
+         * exactly this record. */
+        pgwt_counters_add_cpu(d, we, ev.duration_ns, ev.cpu_ns);
     }
 }
 

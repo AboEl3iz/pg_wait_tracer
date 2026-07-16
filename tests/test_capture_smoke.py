@@ -88,6 +88,10 @@ def cleanup_stale_backends():
              "AND backend_type = 'client backend' AND state != 'active'")
         psql("SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
              "WHERE pid != pg_backend_pid() AND query LIKE '%pg_sleep%'")
+        # T8: a still-running pure-CPU DO backend (active, so not caught above)
+        # would keep burning a core and contaminate later phases' CPU — kill it.
+        psql("SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+             "WHERE pid != pg_backend_pid() AND query LIKE 'DO %'")
     except subprocess.TimeoutExpired:
         pass
     time.sleep(1)
@@ -270,6 +274,49 @@ def server_query(trace_dir, cmd, extra=None):
         except subprocess.TimeoutExpired:
             proc.kill()
     return resp
+
+
+def parse_time_model(output):
+    """Parse the tracer's live time_model text output → {row_name: ms}. The
+    last occurrence of each row wins (later display snapshots overwrite
+    earlier), so the returned dict is the most-recent live view."""
+    model = {}
+    for line in STRIP_ANSI.sub('', output).split('\n'):
+        m = re.match(r'^(.+?)\s{2,}([\d.]+)\s+[\d.]+%', line.strip())
+        if m:
+            model[m.group(1).strip()] = float(m.group(2))
+    return model
+
+
+def proc_oncpu_ns(pid):
+    """Total on-CPU nanoseconds (utime+stime) of a pid from /proc/<pid>/stat —
+    the same quantity the tracer measures via se.sum_exec_runtime. utime is the
+    14th field and stime the 15th; the comm field (2nd) may contain spaces and
+    parens, so index from the LAST ')'. Returns None if the backend is gone."""
+    try:
+        with open("/proc/%d/stat" % pid, "rb") as f:
+            data = f.read().decode("latin-1")
+    except (FileNotFoundError, ProcessLookupError, TypeError):
+        return None
+    rp = data.rfind(')')
+    if rp < 0:
+        return None
+    fields = data[rp + 2:].split()
+    try:
+        utime, stime = int(fields[11]), int(fields[12])
+    except (IndexError, ValueError):
+        return None
+    return (utime + stime) * 1_000_000_000 // os.sysconf("SC_CLK_TCK")
+
+
+def find_active_do_backend():
+    """PID of the client backend running the pure-CPU DO block (state=active).
+    None if not found (the loop may not have reached 'active' yet)."""
+    out = psql("SELECT pid FROM pg_stat_activity WHERE state='active' "
+               "AND backend_type='client backend' AND query LIKE 'DO %' "
+               "AND pid <> pg_backend_pid() ORDER BY query_start LIMIT 1")
+    out = (out or "").strip()
+    return int(out) if out.isdigit() else None
 
 
 # ── shared assertions ──────────────────────────────────────────────
@@ -662,6 +709,129 @@ def phase_cpu_straddle(pm_pid, mode):
               f"in-flight command's CPU is counted (--mode {mode}): "
               f"cpu AAS = {cpu_mean:.2f} (edge-vs-level regression; pre-fix ~0)")
 
+
+def phase_pure_cpu_straddle(pm_pid, mode):
+    """T8 (docs/T8_MEASURED_CPU_PLAN.md §5.6.1) — THE measured-CPU acceptance
+    test. A PL/pgSQL loop over NO data fires ZERO wait events for its entire
+    life, so the watchpoint never emits a boundary. Pre-T8 this produced an
+    EMPTY trace in --mode full (the on-CPU stretch was never closed) and 0%
+    live CPU (symptoms #1/#2). Post-T8 the measured se.sum_exec_runtime
+    accumulator makes it visible LIVE (open-interval schedstat delta) and the
+    terminal flush writes its on-CPU stretch to the trace at daemon shutdown.
+
+    Asserted in BOTH tiers: CPU present in the live view AND in the trace, with
+    the magnitude cross-checked against the backend's /proc on-CPU delta over
+    the same [attach, shutdown] window (±20%). The loop count is huge so it
+    straddles capture end on any box; it starts BEFORE the tracer so its
+    command start-edge is already past at attach."""
+    print(f"--- Phase: PURE-CPU straddle, --mode {mode} (no waits — empty-trace "
+          f"repro) ---")
+    trace_dir = tempfile.mkdtemp(prefix="pgwt_smoke_purecpu_")
+    os.chmod(trace_dir, 0o755)
+
+    hog = subprocess.Popen(
+        ["psql", "-U", "postgres", "-d", "postgres"],
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL, text=True)
+    # Nested int4 loops: ~1e11 iterations of pure compute — minutes of runtime,
+    # guaranteed to still be running at daemon shutdown so the terminal flush
+    # has an open on-CPU stretch to close. Both bounds fit int4 (a single
+    # 1..2e10 loop would exceed the int4 loop-variable range and error out
+    # instantly); x resets each outer pass so the bigint accumulator never
+    # overflows. NO trailing pg_sleep: a wait would hand the watchpoint a
+    # boundary and defeat the point (this must be waitless end to end).
+    hog.stdin.write(
+        "DO $$ DECLARE x bigint := 0; BEGIN "
+        "FOR o IN 1..100000 LOOP "
+        "FOR i IN 1..1000000 LOOP x := x + i; END LOOP; x := 0; "
+        "END LOOP; END $$;\n")
+    hog.stdin.flush()
+    time.sleep(2.5)   # the command is in flight; its start-edge is past
+
+    argv = [TRACER, "--mode", mode, "--pid", str(pm_pid),
+            "-T", trace_dir, "--duration", "12", "--interval", "5",
+            "--view", "time_model"]
+    if mode == "tiered":
+        argv += ["--anomaly-aas-factor", "1000000"]   # keep it pure sampled
+
+    be_pid = None
+    oncpu_before = oncpu_after = None
+    win_from = win_shutdown = 0
+    tracer = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        time.sleep(3.0)                 # BPF load + scan/attach seeds the backend
+        be_pid = find_active_do_backend()
+        win_from = time.time_ns()
+        oncpu_before = proc_oncpu_ns(be_pid) if be_pid else None  # ≈ the seed instant
+        # Let the tracer run out its 12s duration and flush its open interval.
+        stdout, stderr = tracer.communicate(timeout=45)
+        win_shutdown = time.time_ns()
+        oncpu_after = proc_oncpu_ns(be_pid) if be_pid else None    # ≈ the flush instant
+    except subprocess.TimeoutExpired:
+        tracer.kill()
+        stdout, stderr = tracer.communicate()
+        win_shutdown = time.time_ns()
+        oncpu_after = proc_oncpu_ns(be_pid) if be_pid else None
+    finally:
+        try:
+            hog.stdin.write("\\q\n"); hog.stdin.flush()
+        except (BrokenPipeError, ValueError):
+            pass
+        hog.terminate()
+        cleanup_stale_backends()
+    out = STRIP_ANSI.sub('', stdout.decode('utf-8', errors='replace'))
+    err = stderr.decode('utf-8', errors='replace')
+
+    # 1) LIVE VIEW: the periodic time_model print must show measured CPU>0.
+    #    Pre-T8 this row was 0.0 for a waitless command (the exact symptom).
+    live = parse_time_model(out)
+    live_cpu = live.get('CPU*', 0.0)
+    check(live_cpu > 0.0,
+          f"pure-CPU straddle live view shows CPU* > 0 (--mode {mode}): "
+          f"CPU* = {live_cpu:.0f}ms (pre-T8 ~0; stderr {err[-160:]!r})")
+
+    # 2) TRACE (terminal flush): whole-trace time_model must carry CPU.
+    #    In --mode full this proves the flush closed the open on-CPU stretch;
+    #    pre-T8 the trace was EMPTY (no wait boundary ever fired).
+    resp = server_query(trace_dir, "time_model")
+    trace_cpu_ms = float(resp.get("cpu_ms", 0.0) or 0.0)
+    check(trace_cpu_ms > 0.0,
+          f"pure-CPU straddle trace carries CPU after terminal flush "
+          f"(--mode {mode}): cpu_ms = {trace_cpu_ms:.0f} "
+          f"(has_measured_cpu={resp.get('has_measured_cpu')})")
+
+    # 3) MAGNITUDE: the DO backend's measured CPU over [win_from, shutdown] must
+    #    match its /proc on-CPU delta over the SAME span (both read the same
+    #    se.sum_exec_runtime counter). Isolate the backend with a pid filter and
+    #    integrate the aas cpu (avg-sessions × window = cpu-seconds): the integral
+    #    is window-length-invariant, so querying THROUGH shutdown+margin includes
+    #    the --mode full flush record (timestamped at shutdown — a sub-window
+    #    ending earlier would time-prune its block) while still measuring only
+    #    the CPU it actually spent. ±20% absorbs attach/seed timing slack and
+    #    sampled-tier estimator noise.
+    if be_pid and oncpu_before is not None and oncpu_after is not None \
+            and oncpu_after > oncpu_before and win_shutdown > win_from:
+        proc_ms = (oncpu_after - oncpu_before) / 1e6
+        win_to = win_shutdown + 3_000_000_000   # margin so the flush block is in range
+        aresp = server_query(trace_dir, "aas",
+                             extra={"from": win_from, "to": win_to,
+                                    "buckets": 12, "filters": {"pid": be_pid}})
+        abuckets = aresp.get("buckets", [])
+        cpu_mean = (sum(b.get("cpu", 0.0) for b in abuckets) / len(abuckets)
+                    if abuckets else 0.0)
+        trace_win_ms = cpu_mean * (win_to - win_from) / 1e9 * 1000.0
+        ratio = trace_win_ms / proc_ms if proc_ms > 0 else 0.0
+        check(0.8 <= ratio <= 1.2,
+              f"pure-CPU straddle measured CPU {trace_win_ms:.0f}ms within ±20% "
+              f"of /proc on-CPU {proc_ms:.0f}ms over [attach,shutdown] "
+              f"(ratio {ratio:.2f}, --mode {mode})")
+    else:
+        # Never silently pass the magnitude gate — record why it could not run.
+        check(be_pid is not None,
+              f"pure-CPU straddle: located the DO backend for the /proc "
+              f"cross-check (pid={be_pid}, before={oncpu_before}, "
+              f"after={oncpu_after})")
+
     subprocess.run(["rm", "-rf", trace_dir])
 
 
@@ -952,6 +1122,9 @@ def main():
         # CPU straddle (command in flight at attach) — both tiers; the fix is
         # per-tick for sampled and preseed-seeded for exact.
         phase_cpu_straddle(pm_pid, args.mode)
+        # T8: PURE-CPU straddle (waitless DO-loop) — the measured-CPU
+        # acceptance test. Live + trace + /proc magnitude cross-check.
+        phase_pure_cpu_straddle(pm_pid, args.mode)
         if args.mode == 'tiered':
             # T2 (AAS semantics): CPU-inclusive sampled AAS vs pg_stat_activity
             # ground truth, and the CPU-storm escalation + tier-switch

@@ -261,19 +261,25 @@ def test_internal_consistency(pm_pid):
     check(cpu_time_ms > 0,
           f"CPU* = {cpu_time_ms:.0f}ms (expected > 0)")
 
-    # Sum wait classes (top-level names without ':')
-    WAIT_CLASSES = {'IO', 'LWLock', 'Lock', 'Client', 'IPC',
-                    'BufferPin', 'Timeout', 'Extension'}
-    wait_sum = sum(v for k, v in model.items() if k in WAIT_CLASSES)
-
-    reconstructed = cpu_time_ms + wait_sum
+    # DB Time decomposes into TOP-LEVEL rows only: CPU*, Off-CPU* (measured,
+    # T8), and each wait-class PARENT. A sub-event row (e.g. "Timeout:PgSleep")
+    # carries ':' and is ALREADY counted inside its parent ("Timeout") — summing
+    # both double-counts and overshoots DB Time (the ~120-130% %DB test bug seen
+    # on EL9). "DB Time" and "Idle" are indent-0 rows, not components of DB Time.
+    # Summing every ':'-free row (rather than a hardcoded class set) is robust to
+    # Off-CPU*, which is a measured sibling of CPU* and part of DB Time — leaving
+    # it out would make the reconstruction fall short by the off-CPU time.
+    EXCLUDE = {'DB Time', 'Idle'}
+    top_level = {k: v for k, v in model.items()
+                 if ':' not in k and k not in EXCLUDE}
+    reconstructed = sum(top_level.values())
 
     if db_time_ms > 0:
         error_pct = abs(reconstructed - db_time_ms) / db_time_ms * 100
         check(error_pct < 2.0,
-              f"DB Time consistency: CPU({cpu_time_ms:.0f}) + "
-              f"Waits({wait_sum:.0f}) = {reconstructed:.0f}ms "
-              f"vs DB Time {db_time_ms:.0f}ms (error {error_pct:.1f}%)")
+              f"DB Time consistency: Σ(top-level rows {sorted(top_level)}) "
+              f"= {reconstructed:.0f}ms vs DB Time {db_time_ms:.0f}ms "
+              f"(error {error_pct:.1f}%)")
 
 
 # ── Test 4: system_event Format ─────────────────────────────

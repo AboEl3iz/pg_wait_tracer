@@ -134,6 +134,8 @@ assert isinstance(r['version'], str) and r['version'], r
 # T4/SMP-1: sampler health must be present and healthy on a working box
 assert r['sampler_healthy'] is True, r
 assert r['sampler_unhealthy_reason'] == '', r
+# T8 (§5.4): measured-CPU capability must be reported, never silent.
+assert r['cpu_accounting'] in ('measured', 'legacy'), r
 "
 check $? "default mode is tiered, tier=sampled (no watchpoints until escalation)"
 
@@ -150,9 +152,15 @@ for k in ('events_total', 'events_per_sec', 'lifecycle_events_total',
           'uptime_s',
           # T4 capture-hardening counters (CAP-1/2/5/6, SMP-1/3)
           'state_map_full_total', 'seen_query_ids_full_total',
-          'invalid_wait_reads_total', 'sampler_ticks_missed_total'):
+          'invalid_wait_reads_total', 'sampler_ticks_missed_total',
+          # T8 measured-CPU counters (§5.6). Present + numeric here; the exact
+          # magnitudes are proven by the pure-CPU straddle acceptance test.
+          'cpu_ns_total', 'offcpu_ns_total', 'cpu_clamped_total',
+          'wait_gap_cpu_ns_total'):
     assert k in r, 'missing ' + k
     assert isinstance(r[k], (int, float)), k
+# T8: capability string mirrors status.
+assert r['cpu_accounting'] in ('measured', 'legacy'), r
 "
 check $? "metrics: all counters present and numeric"
 
