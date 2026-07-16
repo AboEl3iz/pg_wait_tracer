@@ -48,6 +48,8 @@ struct pgwt_counters {
 
     /* T2 decomposed-AAS observability (docs/AAS_SEMANTICS_DECISION.md). */
     uint64_t noncmd_cpu_samples_total; /* client we==0 readings outside a command (not recorded) */
+    uint64_t cmd_gate_recovered_total; /* on-CPU client samples the edge-gate missed, recovered
+                                        * from debug_query_string ground truth (EL9 fix) */
     uint64_t io_worker_samples_total;  /* io_worker readings taken (excluded from AAS) */
     uint64_t io_worker_busy_total;     /* ... of which busy (on-CPU or a real wait) */
     uint64_t prev_io_worker_samples;   /* snapshots at previous display tick */
@@ -111,6 +113,12 @@ struct pgwt_daemon {
     int         pgproc_wait_offset;  /* offsetof(PGPROC, wait_event_info); 0 if N/A */
     bool        wait_offset_validated; /* PG<17: a resolved addr held a sane value */
     uint64_t    my_be_entry_addr; /* address of MyBEEntry (for query_id) */
+    uint64_t    debug_query_string_addr; /* VA of debug_query_string global;
+                                          * non-NULL in a backend == inside a
+                                          * command (same window pg_stat_activity
+                                          * state='active' spans). Read per-pid by
+                                          * the sampler as the race-free command
+                                          * gate (0 = symbol not resolved). */
     int         interval;         /* seconds */
     int         duration;         /* seconds, 0 = unlimited */
     enum pgwt_view view;

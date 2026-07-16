@@ -159,6 +159,20 @@ int pgwt_sampler_build_batch(const struct pgwt_sample_target *targets,
 uint32_t pgwt_backend_type_flag(enum pgwt_backend_type bt);
 int      pgwt_cpu_sample_recordable(enum pgwt_backend_type bt, int cmd_open);
 
+/* T2 (EL9 fix): read a backend's OWN authoritative command state, bypassing
+ * the transition-edge state_map. The on_report_activity/on_report_query_id
+ * uprobes fire only at command START; a command already in flight when the
+ * state_map entry is created loses that single edge and cmd_open/query_id stay
+ * 0 for the whole command (CPU* == 0, no attribution). Reading each tick is
+ * race-free: cmd_open <- (debug_query_string != NULL); query_id <-
+ * PgBackendStatus.st_query_id (only while in a command, when the offset is
+ * known). Reads against the target's own pid (both are process-local globals).
+ * The cmd_open and query_id outputs are untouched on read failure — the caller
+ * keeps its edge-maintained fallback. dqs_addr==0 (symbol unresolved) is a
+ * no-op. */
+void pgwt_read_cmd_gate(pid_t pid, uint64_t dqs_addr, uint64_t be_entry_addr,
+                        int st_query_id_off, int *cmd_open, uint64_t *query_id);
+
 /* SMP-3: effective sample period for the tick at `now_ns`, given the
  * previous tick's timestamp (0 = first tick → nominal). Late/missed ticks
  * yield a longer period so total sample weight tracks wall time; the result

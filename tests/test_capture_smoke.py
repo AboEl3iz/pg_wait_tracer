@@ -596,6 +596,75 @@ def ctl_query(trace_dir, cmd):
     return ctl_request(trace_dir, {"cmd": cmd})
 
 
+def phase_cpu_straddle(pm_pid, mode):
+    """Regression for the edge-vs-level command-gate bug (found in EL9 live
+    validation, latent on ALL platforms, BOTH tiers). The on_report_activity
+    uprobe sets cmd_open only at command START; a command already IN FLIGHT
+    when the tracer first seeds the backend misses that edge, so cmd_open
+    stays 0 for the whole command and every we==0 (CPU) reading is dropped
+    as non-command churn — CPU* collapses to 0 for that command. Ubuntu CI
+    missed it because the other CPU phases fire their work AFTER attach (edge
+    caught) and CpuStorm uses short re-firing statements. This phase does the
+    opposite: ONE long compute statement is already running before the tracer
+    starts. sampled tier is fixed by the per-tick debug_query_string gate;
+    exact tier by seeding cmd_open from debug_query_string at preseed. Pre-fix
+    both asserted CPU ~0."""
+    print(f"--- Phase: CPU straddle, --mode {mode} (command in flight at attach) ---")
+    trace_dir = tempfile.mkdtemp(prefix="pgwt_smoke_straddle_")
+    os.chmod(trace_dir, 0o755)
+
+    # One long, single-statement compute query — starts BEFORE the tracer.
+    hog = subprocess.Popen(
+        ["psql", "-U", "postgres", "-d", "postgres"],
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL, text=True)
+    hog.stdin.write(
+        "SELECT count(*) FROM generate_series(1,600000000) g "
+        "WHERE (g*g) % 7 = 0;\n")
+    hog.stdin.flush()
+    time.sleep(2.5)   # the command is now in flight; its start-edge is past
+
+    argv = [TRACER, "--mode", mode, "--pid", str(pm_pid),
+            "-T", trace_dir, "--duration", "12", "--quiet", "--interval", "5"]
+    if mode == "tiered":
+        argv += ["--anomaly-aas-factor", "1000000"]  # keep it pure sampled
+    tracer = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        time.sleep(3.0)          # BPF load + scan/attach finds the in-flight backend
+        win_from = time.time_ns()
+        time.sleep(7.0)          # window over the straddling command
+        win_to = time.time_ns()
+        _, stderr = tracer.communicate(timeout=40)
+        err = stderr.decode('utf-8', errors='replace')
+    except subprocess.TimeoutExpired:
+        tracer.kill()
+        _, stderr = tracer.communicate()
+        err = stderr.decode('utf-8', errors='replace')
+    finally:
+        try:
+            hog.stdin.write("\\q\n"); hog.stdin.flush()
+        except (BrokenPipeError, ValueError):
+            pass
+        hog.terminate()
+        cleanup_stale_backends()
+
+    resp = server_query(trace_dir, "aas",
+                        extra={"from": win_from, "to": win_to, "buckets": 7})
+    buckets = resp.get("buckets", [])
+    check(len(buckets) > 0,
+          "aas view has buckets over the straddle window" if buckets else
+          f"aas view has buckets (stderr tail: {err[-300:]!r})")
+    if buckets:
+        cpu_mean = sum(b.get("cpu", 0.0) for b in buckets) / len(buckets)
+        # The single straddling backend is ~1 CPU-active session the whole
+        # window. Pre-fix (edge-only gate) this was ~0 — the exact defect.
+        check(cpu_mean >= 0.5,
+              f"in-flight command's CPU is counted (--mode {mode}): "
+              f"cpu AAS = {cpu_mean:.2f} (edge-vs-level regression; pre-fix ~0)")
+
+    subprocess.run(["rm", "-rf", trace_dir])
+
+
 def phase_sampled_aas_truth(pm_pid):
     """T2 (AAS-1) definition-of-done: sampled AAS — now CPU-inclusive —
     must match pg_stat_activity 1s-sampling ground truth. A CPU-bound
@@ -880,6 +949,9 @@ def main():
               "hosted runner + live EL8/EL9 boxes (run_all.sh --require-live).")
     else:
         phase_fork_after_attach(pm_pid, args.mode)
+        # CPU straddle (command in flight at attach) — both tiers; the fix is
+        # per-tick for sampled and preseed-seeded for exact.
+        phase_cpu_straddle(pm_pid, args.mode)
         if args.mode == 'tiered':
             # T2 (AAS semantics): CPU-inclusive sampled AAS vs pg_stat_activity
             # ground truth, and the CPU-storm escalation + tier-switch
