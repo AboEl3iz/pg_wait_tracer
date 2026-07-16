@@ -53,14 +53,10 @@ static uint64_t fnv1a(uint64_t h, const void *data, size_t len)
 static uint64_t mix_u64(uint64_t h, uint64_t v) { return fnv1a(h, &v, sizeof(v)); }
 static uint64_t mix_u32(uint64_t h, uint32_t v) { return fnv1a(h, &v, sizeof(v)); }
 
-/* Committed golden trace directory, relative to this test binary (which lives
- * in tests/). Resolved against the executable's own location so the test works
- * from any CWD — `make -C tests check` runs it from tests/, but run_all.sh
- * invokes it by absolute path from the caller's CWD. */
-#define GOLDEN_REL "fixtures/golden/rev2/trace"
-
-/* Fill `out` with the fixture dir resolved next to argv0's directory. */
-static void golden_dir(const char *argv0, char *out, size_t outsz)
+/* Fill `out` with fixtures/golden/<rev>/trace resolved next to argv0's dir, so
+ * the test works from any CWD (`make -C tests check` runs from tests/;
+ * run_all.sh invokes by absolute path from the caller's CWD). */
+static void golden_dir(const char *argv0, const char *rev, char *out, size_t outsz)
 {
     char buf[600];
     ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
@@ -73,7 +69,66 @@ static void golden_dir(const char *argv0, char *out, size_t outsz)
         snprintf(argv0copy, sizeof(argv0copy), "%s", argv0);
         base = dirname(argv0copy);
     }
-    snprintf(out, outsz, "%s/%s", base, GOLDEN_REL);
+    snprintf(out, outsz, "%s/fixtures/golden/%s/trace", base, rev);
+}
+
+/* Decode every block of the fixture at `dir`, folding the pinned columns into
+ * an FNV-1a checksum. When include_cpu is set the record's cpu_ns joins the
+ * mix (rev3+, where the column exists); rev2's frozen checksum predates that
+ * column and must NOT include it. Returns 0 on open failure. */
+static uint64_t decode_checksum(const char *dir, int expect_version,
+                                int include_cpu, int *out_blocks,
+                                int *out_events)
+{
+    char trace_path[800];
+    snprintf(trace_path, sizeof(trace_path), "%s/current.trace", dir);
+
+    struct pgwt_event_reader r;
+    if (pgwt_reader_open(&r, trace_path) != 0) {
+        printf("  FAIL: cannot open golden trace %s "
+               "(regenerate — see fixtures/golden/README.md)\n", trace_path);
+        return 0;
+    }
+    CHECK(r.header.version == (uint32_t)expect_version,
+          "header version %u == %d", r.header.version, expect_version);
+
+    uint64_t h = 0xcbf29ce484222325ULL;   /* FNV-1a offset basis */
+    int total_events = 0;
+    int v2_cpu_unknown = 1;   /* v2 fallback: every event must surface UNKNOWN */
+    struct pgwt_trace_event evbuf[PGWT_BLOCK_EVENTS];
+    for (int b = 0; b < r.num_blocks; b++) {
+        struct pgwt_block_info info;
+        int n = pgwt_reader_decode_block_info(&r, b, evbuf,
+                                              PGWT_BLOCK_EVENTS, &info);
+        if (n < 0) { printf("  FAIL: decode_block(%d) failed\n", b); continue; }
+        h = mix_u32(h, (uint32_t)info.block_type);
+        h = mix_u64(h, info.sample_period_ns);
+        for (int i = 0; i < n; i++) {
+            const struct pgwt_trace_event *e = &evbuf[i];
+            h = mix_u64(h, e->timestamp_ns);
+            h = mix_u32(h, e->pid);
+            h = mix_u32(h, e->old_event);
+            h = mix_u32(h, e->new_event);
+            h = mix_u64(h, e->duration_ns);
+            h = mix_u64(h, e->query_id);
+            h = mix_u32(h, e->flags);
+            if (include_cpu)
+                h = mix_u64(h, e->cpu_ns);
+            if (e->cpu_ns != PGWT_CPU_NS_UNKNOWN)
+                v2_cpu_unknown = 0;
+        }
+        total_events += n;
+    }
+    if (expect_version < 3)
+        CHECK(v2_cpu_unknown,
+              "v2-file fallback: every decoded event surfaces cpu_ns=UNKNOWN "
+              "(compute then uses gap-inference)");
+    printf("  decoded: blocks=%d events=%d checksum=0x%016llxULL\n",
+           r.num_blocks, total_events, (unsigned long long)h);
+    *out_blocks = r.num_blocks;
+    *out_events = total_events;
+    pgwt_reader_close(&r);
+    return h;
 }
 
 /* Pinned decode of the rev2 golden fixture. Regenerate ONLY when intentionally
@@ -91,75 +146,58 @@ static void golden_dir(const char *argv0, char *out, size_t outsz)
 #define GOLDEN_REV2_EVENTS   14
 #define GOLDEN_REV2_CHECKSUM 0x7d8b576cb43cf60cULL
 
+/* rev3 (T8): trace format v3 with the measured cpu_ns column. Its checksum
+ * INCLUDES cpu_ns (rev2's must not). Pinned from the generator's first run. */
+#define GOLDEN_REV3_BLOCKS   2
+#define GOLDEN_REV3_EVENTS   14
+#define GOLDEN_REV3_CHECKSUM 0x5f3f61f4d87d1185ULL
+
 static void test_golden_rev2(const char *argv0)
 {
     char dir[700];
-    golden_dir(argv0, dir, sizeof(dir));
+    golden_dir(argv0, "rev2", dir, sizeof(dir));
     printf("--- golden rev2 decode + checksum (%s) ---\n", dir);
 
-    char trace_path[800];
-    snprintf(trace_path, sizeof(trace_path), "%s/current.trace", dir);
+    int blocks = 0, events = 0;
+    /* rev2 is a v2 file: no cpu_ns column, checksum excludes cpu_ns so the
+     * frozen value is byte-for-byte the pre-T8 one. A current reader must keep
+     * decoding v2 files identically (their events surface cpu_ns=UNKNOWN). */
+    uint64_t h = decode_checksum(dir, 2, /*include_cpu=*/0, &blocks, &events);
 
-    struct pgwt_event_reader r;
-    if (pgwt_reader_open(&r, trace_path) != 0) {
-        printf("  FAIL: cannot open golden trace %s "
-               "(regenerate — see fixtures/golden/README.md)\n",
-               trace_path);
-        tests_run++;
-        return;
-    }
-
-    CHECK(r.header.version == PGWT_TRACE_VERSION,
-          "header version %u == %u", r.header.version, PGWT_TRACE_VERSION);
-
-    uint64_t h = 0xcbf29ce484222325ULL;   /* FNV-1a offset basis */
-    int total_events = 0;
-
-    struct pgwt_trace_event evbuf[PGWT_BLOCK_EVENTS];
-    for (int b = 0; b < r.num_blocks; b++) {
-        struct pgwt_block_info info;
-        int n = pgwt_reader_decode_block_info(&r, b, evbuf,
-                                              PGWT_BLOCK_EVENTS, &info);
-        if (n < 0) {
-            printf("  FAIL: decode_block(%d) failed\n", b);
-            tests_run++;
-            continue;
-        }
-        h = mix_u32(h, (uint32_t)info.block_type);
-        h = mix_u64(h, info.sample_period_ns);
-        for (int i = 0; i < n; i++) {
-            const struct pgwt_trace_event *e = &evbuf[i];
-            h = mix_u64(h, e->timestamp_ns);
-            h = mix_u32(h, e->pid);
-            h = mix_u32(h, e->old_event);
-            h = mix_u32(h, e->new_event);
-            h = mix_u64(h, e->duration_ns);
-            h = mix_u64(h, e->query_id);
-            h = mix_u32(h, e->flags);
-        }
-        total_events += n;
-    }
-
-    printf("  decoded: blocks=%d events=%d checksum=0x%016llxULL\n",
-           r.num_blocks, total_events, (unsigned long long)h);
-
-    CHECK(r.num_blocks == GOLDEN_REV2_BLOCKS,
-          "block count %d == %d", r.num_blocks, GOLDEN_REV2_BLOCKS);
-    CHECK(total_events == GOLDEN_REV2_EVENTS,
-          "event count %d == %d", total_events, GOLDEN_REV2_EVENTS);
+    CHECK(blocks == GOLDEN_REV2_BLOCKS,
+          "block count %d == %d", blocks, GOLDEN_REV2_BLOCKS);
+    CHECK(events == GOLDEN_REV2_EVENTS,
+          "event count %d == %d", events, GOLDEN_REV2_EVENTS);
     CHECK(h == GOLDEN_REV2_CHECKSUM,
-          "checksum 0x%016llx == 0x%016llx (on-disk decode drifted — if this "
-          "is an INTENTIONAL format change, add a new rev fixture; do NOT edit "
-          "this value)", (unsigned long long)h,
-          (unsigned long long)GOLDEN_REV2_CHECKSUM);
+          "checksum 0x%016llx == 0x%016llx (v2 on-disk decode drifted — do NOT "
+          "edit this value; a mismatch is the regression this guards)",
+          (unsigned long long)h, (unsigned long long)GOLDEN_REV2_CHECKSUM);
+}
 
-    pgwt_reader_close(&r);
+static void test_golden_rev3(const char *argv0)
+{
+    char dir[700];
+    golden_dir(argv0, "rev3", dir, sizeof(dir));
+    printf("--- golden rev3 decode + checksum (%s) ---\n", dir);
+
+    int blocks = 0, events = 0;
+    uint64_t h = decode_checksum(dir, 3, /*include_cpu=*/1, &blocks, &events);
+
+    CHECK(blocks == GOLDEN_REV3_BLOCKS,
+          "block count %d == %d", blocks, GOLDEN_REV3_BLOCKS);
+    CHECK(events == GOLDEN_REV3_EVENTS,
+          "event count %d == %d", events, GOLDEN_REV3_EVENTS);
+    CHECK(h == GOLDEN_REV3_CHECKSUM,
+          "checksum 0x%016llx == 0x%016llx (v3 on-disk decode drifted — do NOT "
+          "edit this value)", (unsigned long long)h,
+          (unsigned long long)GOLDEN_REV3_CHECKSUM);
 }
 
 int main(int argc, char **argv)
 {
     printf("=== test_golden_fixture ===\n");
     test_golden_rev2(argc > 0 ? argv[0] : "");
+    test_golden_rev3(argc > 0 ? argv[0] : "");
     printf("\n%d/%d checks passed\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;
 }

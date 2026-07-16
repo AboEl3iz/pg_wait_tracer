@@ -92,6 +92,12 @@ struct scenario {
     int num_samples;
     uint64_t sample_period_ns;
     int interleave;   /* write events+samples in global ts order */
+    /* T8: emit trace format v3 with MEASURED cpu_ns per event (the per-event
+     * "cpu" field). Default 0 = legacy: the writer stamps every record
+     * PGWT_CPU_NS_UNKNOWN, so existing scenarios keep their gap-inference
+     * behavior unchanged. Set "cpu_measured":1 (top-level) to freeze a v3
+     * measured-CPU fixture. */
+    int cpu_measured;
 
     struct test_backend backends[MAX_TEST_BACKENDS];
     int num_backends;
@@ -234,6 +240,11 @@ static int parse_events(const char *arr, struct scenario *sc)
         if ((v = find_key(p, "old")))  ev->old_event = (uint32_t)strtoull(v, NULL, 10);
         if ((v = find_key(p, "new")))  ev->new_event = (uint32_t)strtoull(v, NULL, 10);
         if ((v = find_key(p, "qid")))  ev->query_id = strtoull(v, NULL, 10);
+        /* T8: measured on-CPU ns for the interval (only meaningful with
+         * top-level "cpu_measured":1). Absent → 0; for we==0 CPU gaps that
+         * makes CPU*=0/OffCPU*=full, so a measured scenario should set it. */
+        ev->cpu_ns = (v = find_key(p, "cpu")) ? strtoull(v, NULL, 10)
+                                              : PGWT_CPU_NS_UNKNOWN;
 
         sc->num_events++;
         p = end + 1;
@@ -290,6 +301,8 @@ static int parse_scenario(const char *json, struct scenario *sc)
         parse_samples(v, sc);
     if ((v = find_key(json, "interleave")))
         sc->interleave = (int)strtol(v, NULL, 10);
+    if ((v = find_key(json, "cpu_measured")))
+        sc->cpu_measured = (int)strtol(v, NULL, 10);
 
     return 0;
 }
@@ -395,6 +408,10 @@ static int write_traces(const char *dir, struct scenario *sc,
         fprintf(stderr, "Failed to init event writer\n");
         return -1;
     }
+    /* T8: measured-CPU scenarios keep their per-event cpu_ns; the default
+     * (legacy) path leaves cpu_measured=false so every record is stamped
+     * UNKNOWN and existing fixtures behave exactly as before. */
+    ew.cpu_measured = sc->cpu_measured;
 
     if (pgwt_summary_writer_init(&sw, dir, 24, NULL) != 0) {
         fprintf(stderr, "Failed to init summary writer\n");

@@ -90,6 +90,15 @@ size_t pgwt_encode_block(const struct pgwt_trace_event *events, int count,
         memcpy(p, &qid, 8); p += 8;
     }
 
+    /* Column 7 (v3, T8): cpu_ns as varint. Measured on-CPU nanoseconds for the
+     * interval, or PGWT_CPU_NS_UNKNOWN (encodes to a 10-byte varint, only on
+     * legacy-capability traces). The daemon's push funnel stamps UNKNOWN when
+     * CPU accounting is off; measured values (incl. genuine 0 for waits) are
+     * written as-is. */
+    for (int i = 0; i < count; i++) {
+        p += pgwt_encode_varint(events[i].cpu_ns, p);
+    }
+
     return (size_t)(p - out);
 }
 
@@ -213,9 +222,13 @@ static void recover_current_trace(struct pgwt_event_writer *w)
                 "(leaving it in place)\n", cur, strerror(errno));
         return;
     }
+    /* Accept any reader-supported version (v2..current): recovery only scans
+     * block headers to rebuild the footer index — it never re-encodes the
+     * columnar payload — so a v2 current.trace left by a pre-T8 daemon is
+     * archived intact and stays readable as v2. */
     if (fread(&hdr, sizeof(hdr), 1, fp) != 1 ||
         hdr.magic != PGWT_TRACE_MAGIC ||
-        hdr.version != PGWT_TRACE_VERSION) {
+        hdr.version < 2 || hdr.version > PGWT_TRACE_VERSION) {
         fclose(fp);
         char aside[600];
         snprintf(aside, sizeof(aside), "%s.corrupt.%lld", cur,
@@ -596,8 +609,9 @@ int pgwt_writer_init(struct pgwt_event_writer *w, const char *trace_dir,
      * daemon left behind — never truncate it. */
     recover_current_trace(w);
 
-    /* Allocate scratch buffers */
-    w->encode_buf_size = PGWT_BLOCK_EVENTS * 36 + PGWT_BLOCK_EVENTS * 10;
+    /* Allocate scratch buffers. Per-event worst case (v3): ts≤10 + pid4 +
+     * old4 + new4 + dur≤10 + qid8 + cpu_ns≤10 = 50 bytes; 56 leaves margin. */
+    w->encode_buf_size = PGWT_BLOCK_EVENTS * 56;
     w->encode_buf = malloc(w->encode_buf_size);
 
     w->compress_buf_size = LZ4_compressBound((int)w->encode_buf_size);
@@ -627,7 +641,15 @@ int pgwt_writer_push_event(struct pgwt_event_writer *w,
         }
     }
 
-    w->events[w->num_events++] = *evt;
+    struct pgwt_trace_event *dst = &w->events[w->num_events++];
+    *dst = *evt;
+    /* T8: on a legacy-capability daemon (no measured CPU), stamp every record
+     * UNKNOWN so the reader/compute fall back to gap-inference rather than
+     * trusting the BPF's 0. When accounting is on, a per-record UNKNOWN set by
+     * a userspace producer (e.g. a flush that could not read schedstat) is
+     * preserved. */
+    if (!w->cpu_measured)
+        dst->cpu_ns = PGWT_CPU_NS_UNKNOWN;
 
     if (w->num_events >= PGWT_BLOCK_EVENTS)
         return flush_block(w);

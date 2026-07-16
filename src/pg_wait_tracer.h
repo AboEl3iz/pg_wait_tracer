@@ -68,6 +68,15 @@ struct pgwt_pid_state {
     u64 last_query_id;  /* query_id set by on_report_query_id uprobe */
     u64 be_entry_ptr;   /* cached PgBackendStatus* (avoids 1 probe_read per event) */
     u64 wait_event_addr; /* direct PGPROC->wait_event_info address (saves 1 probe_read) */
+    /* T8 measured CPU: value of the task's se.sum_exec_runtime accumulator
+     * (nanoseconds of on-CPU time, monotonic) at the last emitted boundary.
+     * The watchpoint handler runs in the backend's task context, so each fire
+     * reads the exact accumulator; cpu_ns of the closing interval is
+     * (now_accumulator - last_cpu_ns). Seeded by preseed (/proc/<pid>/schedstat
+     * field 1 == the same counter) or by the first BPF fire; advanced only on
+     * an emitted transition (NOT on redundant-write suppression, or CPU between
+     * suppressed fires would be lost). 0 = feature off / not yet seeded. */
+    u64 last_cpu_ns;
 };
 
 /* ── Lifecycle Events (ring buffer) ───────────────────────── */
@@ -96,7 +105,19 @@ struct pgwt_trace_event {
     u32 flags;          /* reader-side annotation (PGWT_EVENT_FLAG_*); 0 on the wire */
     u64 duration_ns;    /* time spent in old_event */
     u64 query_id;       /* active query during old_event */
+    /* T8 measured CPU: exact on-CPU nanoseconds consumed during old_event
+     * (the se.sum_exec_runtime delta over the interval). For a wait-labeled
+     * old_event this is ≈0 (the self-check: a sleeping task accrues no CPU);
+     * for an on-CPU gap (old_event==0) it is the measured CPU, and
+     * duration_ns - cpu_ns is the off-CPU / runqueue-unaccounted remainder.
+     * PGWT_CPU_NS_UNKNOWN when not measured (legacy capability, v2 files,
+     * SAMPLES records) — the compute layer then falls back to gap-inference. */
+    u64 cpu_ns;
 };
+
+/* Sentinel for cpu_ns: "not measured" (compute falls back to gap-inference).
+ * A real cpu_ns is a per-interval nanosecond delta, always far below this. */
+#define PGWT_CPU_NS_UNKNOWN  0xFFFFFFFFFFFFFFFFULL
 
 /* flags bits — NEVER persisted to the trace file (neither block layout
  * encodes a flags column). Two producers annotate in memory:
