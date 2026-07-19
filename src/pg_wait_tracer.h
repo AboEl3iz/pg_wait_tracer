@@ -68,14 +68,20 @@ struct pgwt_pid_state {
     u64 last_query_id;  /* query_id set by on_report_query_id uprobe */
     u64 be_entry_ptr;   /* cached PgBackendStatus* (avoids 1 probe_read per event) */
     u64 wait_event_addr; /* direct PGPROC->wait_event_info address (saves 1 probe_read) */
-    /* T8 measured CPU: value of the task's se.sum_exec_runtime accumulator
-     * (nanoseconds of on-CPU time, monotonic) at the last emitted boundary.
-     * The watchpoint handler runs in the backend's task context, so each fire
-     * reads the exact accumulator; cpu_ns of the closing interval is
-     * (now_accumulator - last_cpu_ns). Seeded by preseed (/proc/<pid>/schedstat
-     * field 1 == the same counter) or by the first BPF fire; advanced only on
-     * an emitted transition (NOT on redundant-write suppression, or CPU between
-     * suppressed fires would be lost). 0 = feature off / not yet seeded. */
+    /* S3 exact CPU accounting (docs/S3_SCHED_SWITCH_CPU.md). The
+     * on_sched_switch program maintains, per tracked backend:
+     *   cpu_ns_total — Σ of completed on-CPU stretches (exact ns), and
+     *   on_cpu_ts    — ktime the current on-CPU stretch began (0 = off-CPU).
+     * The exact on-CPU ns AT ANY INSTANT is
+     *   cpu_ns_total + (on_cpu_ts ? now - on_cpu_ts : 0)
+     * — no tick quantization, no sub-tick leak (unlike the dropped
+     * se.sum_exec_runtime read, which was stale between ticks). */
+    u64 cpu_ns_total;
+    u64 on_cpu_ts;
+    /* last_cpu_ns: the exact on-CPU ns (per above) at the last emitted
+     * boundary — the base for the closing interval's cpu_ns delta. Advanced
+     * only on an emitted transition (NOT on redundant-write suppression, or
+     * CPU between suppressed fires would be lost). 0 = feature off. */
     u64 last_cpu_ns;
 };
 

@@ -215,10 +215,14 @@ void pgwt_read_state_map(struct pgwt_daemon *d)
                  * keeps the full gap as CPU, byte-identical to before. */
                 uint64_t cpu_open = open_ns;
                 if (we == 0 && d->cpu_accounting) {
-                    uint64_t sched_now = pgwt_read_sched_cpu_ns(snext);
-                    if (sched_now && sval.last_cpu_ns &&
-                        sched_now >= sval.last_cpu_ns) {
-                        uint64_t m = sched_now - sval.last_cpu_ns;
+                    /* S3: exact on-CPU ns for the open interval = cpu_ns_total +
+                     * current stretch (on_cpu_ts != 0 iff running), minus the
+                     * seeded base. `now` is CLOCK_MONOTONIC == bpf_ktime. */
+                    uint64_t exact = sval.cpu_ns_total;
+                    if (sval.on_cpu_ts && now >= sval.on_cpu_ts)
+                        exact += now - sval.on_cpu_ts;
+                    if (exact >= sval.last_cpu_ns) {
+                        uint64_t m = exact - sval.last_cpu_ns;
                         cpu_open = m < open_ns ? m : open_ns;   /* clamp to wall */
                     }
                 }

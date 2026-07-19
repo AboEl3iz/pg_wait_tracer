@@ -418,19 +418,17 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
      * full measured mode. When absent: legacy gap-inference, reported LOUDLY —
      * never silent. (The S1b perf_event PERF_COUNT_SW_TASK_CLOCK fallback for
      * schedstat-less kernels is deferred; see the PR notes.) */
-    d->schedstat_ok = pgwt_read_sched_cpu_ns(getpid()) > 0;
-    d->cpu_accounting = d->schedstat_ok;
+    d->cpu_accounting = (access("/sys/kernel/btf/vmlinux", R_OK) == 0);
     d->skel->rodata->cpu_accounting = d->cpu_accounting;
-    if (d->cpu_accounting) {
-        if (d->verbose)
-            fprintf(stderr, "INFO: CPU accounting: MEASURED "
-                    "(se.sum_exec_runtime via schedstat)\n");
-    } else {
+    if (!d->cpu_accounting) {
+        /* No BTF → tp_btf/sched_switch can't load: don't try, and fall back
+         * to gap-inference (cpu_ns UNKNOWN, no Off-CPU*). */
+        bpf_program__set_autoload(d->skel->progs.on_sched_switch, false);
         fprintf(stderr, "WARN: CPU accounting: LEGACY gap-inference — "
-                "/proc/self/schedstat unavailable (CONFIG_SCHED_INFO off?). "
-                "Exact-tier CPU is inferred from wait gaps and includes "
-                "runqueue/throttle time; Off-CPU* is unavailable and trace "
-                "cpu_ns carries the UNKNOWN sentinel.\n");
+                "kernel BTF (/sys/kernel/btf/vmlinux) absent, so the "
+                "sched_switch exact-CPU program cannot load. Exact-tier CPU is "
+                "inferred from wait gaps (includes runqueue/throttle time); "
+                "Off-CPU* is unavailable and trace cpu_ns carries UNKNOWN.\n");
     }
 
     /* Load BPF programs (runs verifier) */
@@ -448,6 +446,22 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
         fprintf(stderr, "FATAL: cannot attach on_fork tracepoint: %s\n",
                 strerror(errno));
         goto fail;
+    }
+
+    /* S3: exact CPU accounting via sched_switch (docs/S3_SCHED_SWITCH_CPU.md).
+     * Attached whenever measured CPU is on (BTF present). On the rare failure
+     * (locked-down kernel) drop to gap-inference and say so — never silent. */
+    if (d->cpu_accounting) {
+        d->skel->links.on_sched_switch =
+            bpf_program__attach(d->skel->progs.on_sched_switch);
+        if (!d->skel->links.on_sched_switch) {
+            d->cpu_accounting = 0;
+            fprintf(stderr, "WARN: CPU accounting: could not attach "
+                    "sched_switch (%s) — falling back to gap-inference; "
+                    "Off-CPU* unavailable.\n", strerror(errno));
+        } else if (d->verbose) {
+            fprintf(stderr, "INFO: CPU accounting: MEASURED (sched_switch)\n");
+        }
     }
 
     d->skel->links.on_exit = bpf_program__attach(d->skel->progs.on_exit);

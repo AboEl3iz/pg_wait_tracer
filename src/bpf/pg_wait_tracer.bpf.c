@@ -223,25 +223,52 @@ static __always_inline u32 read_wait_event(u64 *out_addr)
     return val;
 }
 
-/* T8: read the calling task's exact on-CPU accumulator
- * (task_struct->se.sum_exec_runtime, nanoseconds, advances ONLY while the task
- * runs on a CPU). The watchpoint/exit handlers fire in the target backend's
- * task context, so bpf_get_current_task() is that backend and this reads its
- * own counter at the boundary. Gated by the cpu_accounting rodata flag AND a
- * CO-RE field-exists check (a kernel/BTF lacking the field loads fine and
- * yields 0). Returns 0 when the feature is off or the field is absent — the
- * caller then emits cpu_ns 0 and userspace stamps the UNKNOWN sentinel. */
-static __always_inline u64 read_task_cpu_ns(void)
+/* S3 (docs/S3_SCHED_SWITCH_CPU.md): exact on-CPU ns for a backend AT INSTANT
+ * `now`, derived from the sched_switch-maintained accumulator. cpu_ns_total is
+ * the sum of completed on-CPU stretches; if the backend is on-CPU right now
+ * (on_cpu_ts != 0, e.g. it just wrote wait_event_info in the watchpoint
+ * handler) the current stretch `now - on_cpu_ts` is added. No tick
+ * quantization — replaces the stale-between-ticks se.sum_exec_runtime read.
+ * Returns 0 when the feature is off (cpu_accounting=0) so the caller emits
+ * cpu_ns 0 and userspace stamps the UNKNOWN sentinel (→ gap-inference). */
+static __always_inline u64 read_task_cpu_ns_for(struct pgwt_pid_state *st, u64 now)
+{
+    if (!cpu_accounting || !st)
+        return 0;
+    u64 t = st->cpu_ns_total;
+    if (st->on_cpu_ts && now >= st->on_cpu_ts)
+        t += now - st->on_cpu_ts;
+    return t;
+}
+
+/* ── Program: on_sched_switch ─────────────────────────────────
+ * Exact CPU accounting (S3). Fires on EVERY context switch, system-wide;
+ * for the two tasks involved it does a state_map lookup and either closes
+ * (prev, going off-CPU) or opens (next, coming on-CPU) an on-CPU stretch.
+ * Untracked pids miss both lookups and return in ~tens of ns (the overhead
+ * measured within noise at 110-126k switches/s, docs/S3 §7). A given pid is
+ * on at most one CPU, so its entry is touched by one CPU at a time — no
+ * atomics needed. Attached only when the full tier arms cpu_accounting. */
+SEC("tp_btf/sched_switch")
+int BPF_PROG(on_sched_switch, bool preempt,
+             struct task_struct *prev, struct task_struct *next)
 {
     if (!cpu_accounting)
         return 0;
-    struct task_struct *t = (struct task_struct *)bpf_get_current_task();
-    if (!t)
-        return 0;
-    if (!bpf_core_field_exists(t->se.sum_exec_runtime))
-        return 0;
-    /* se is an embedded struct, not a pointer — one accessor step. */
-    return BPF_CORE_READ(t, se.sum_exec_runtime);
+    u64 now = bpf_ktime_get_ns();
+
+    u32 ppid = BPF_CORE_READ(prev, pid);
+    struct pgwt_pid_state *ps = bpf_map_lookup_elem(&state_map, &ppid);
+    if (ps && ps->on_cpu_ts && now >= ps->on_cpu_ts) {
+        ps->cpu_ns_total += now - ps->on_cpu_ts;
+        ps->on_cpu_ts = 0;
+    }
+
+    u32 npid = BPF_CORE_READ(next, pid);
+    struct pgwt_pid_state *ns = bpf_map_lookup_elem(&state_map, &npid);
+    if (ns)
+        ns->on_cpu_ts = now;
+    return 0;
 }
 
 /* Accumulate duration for a wait event into accum_map (PERCPU — no atomics). */
@@ -277,13 +304,14 @@ int on_watchpoint(struct bpf_perf_event_data *ctx)
          * before enable, CAP-8) starts interval tracking without closing a
          * fabricated interval. */
         if (!st->wp_live) {
+            u64 seed_now = bpf_ktime_get_ns();
             st->last_event = new_event;
-            st->last_ts = bpf_ktime_get_ns();
-            /* T8: snapshot the CPU accumulator as this interval's base. This
+            st->last_ts = seed_now;
+            /* S3: snapshot the exact on-CPU ns as this interval's base. This
              * is a pseudo-gap (seed → first real boundary); do NOT emit for
              * it, just establish last_cpu_ns so the next real transition's
              * cpu_ns delta is correct. */
-            st->last_cpu_ns = read_task_cpu_ns();
+            st->last_cpu_ns = read_task_cpu_ns_for(st, seed_now);
             st->wp_live = 1;
             return 0;
         }
@@ -298,10 +326,10 @@ int on_watchpoint(struct bpf_perf_event_data *ctx)
         u64 now = bpf_ktime_get_ns();
         u64 duration = now - st->last_ts;
 
-        /* T8: read the exact on-CPU accumulator ONCE for this fire and derive
-         * the CPU consumed since the last boundary. 0 when the feature is off
-         * or a base was never seeded (userspace then stamps UNKNOWN). */
-        u64 cpu_now = read_task_cpu_ns();
+        /* S3: exact on-CPU ns at this fire; the CPU consumed since the last
+         * boundary is the delta. 0 when the feature is off or a base was never
+         * seeded (userspace then stamps UNKNOWN → gap-inference). */
+        u64 cpu_now = read_task_cpu_ns_for(st, now);
         u64 cpu_delta = (cpu_now && st->last_cpu_ns && cpu_now >= st->last_cpu_ns)
                         ? cpu_now - st->last_cpu_ns : 0;
 
@@ -348,14 +376,20 @@ int on_watchpoint(struct bpf_perf_event_data *ctx)
          * cache the resolved address for future fast-path reads */
         u64 wait_addr = 0;
         u32 new_event = read_wait_event(&wait_addr);
+        u64 init_now = bpf_ktime_get_ns();
         struct pgwt_pid_state new_st = {
             .last_event = new_event,
             .wp_live = 1,   /* created BY a live watchpoint */
-            .last_ts = bpf_ktime_get_ns(),
+            .last_ts = init_now,
             .last_query_id = 0,
             .be_entry_ptr = resolve_be_entry(),
             .wait_event_addr = wait_addr,
-            .last_cpu_ns = read_task_cpu_ns(),  /* T8: seed the CPU base */
+            /* S3: the backend is on-CPU now (it just wrote wait_event_info);
+             * open its on-CPU stretch here so the first interval measures. The
+             * base is 0 — cpu_ns deltas are taken from this attach onward. */
+            .on_cpu_ts = init_now,
+            .cpu_ns_total = 0,
+            .last_cpu_ns = 0,
         };
         /* CAP-1: a failed insert (map full) means this backend will never
          * record a single event — count it so the daemon can scream. */
@@ -443,11 +477,11 @@ int on_exit(struct trace_event_raw_sched_process_template *ctx)
     if (st->wp_live) {
         u64 duration = now - st->last_ts;
 
-        /* T8: sched_process_exit fires in the exiting backend's own context,
-         * so read its final CPU accumulator and close the last interval with
-         * the measured delta — a command computing right up to disconnect
-         * (old_event==0) then records its CPU instead of vanishing. */
-        u64 cpu_now = read_task_cpu_ns();
+        /* S3: close the last interval with the exact on-CPU delta — a command
+         * computing right up to disconnect (old_event==0) records its CPU
+         * instead of vanishing. read_task_cpu_ns_for handles the still-open
+         * on-CPU stretch (the exiting task is on-CPU running the exit path). */
+        u64 cpu_now = read_task_cpu_ns_for(st, now);
         u64 cpu_delta = (cpu_now && st->last_cpu_ns && cpu_now >= st->last_cpu_ns)
                         ? cpu_now - st->last_cpu_ns : 0;
 
