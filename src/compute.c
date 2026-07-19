@@ -408,23 +408,16 @@ void pgwt_compute_aas(const struct pgwt_trace_event *events, int count,
 
         int class_idx = pgwt_wait_class_index(ev->old_event);
 
-        /* T8: for an on-CPU record with measured cpu_ns, the fraction of the
-         * interval actually on a CPU. <0 marks "not a measured CPU record" →
-         * no split, the whole overlap is CPU (gap-inference). That covers a
-         * wait, sampled/v2 CPU (UNKNOWN), AND a measured EXACTLY-0 delta: the
-         * se.sum_exec_runtime accumulator only ticks at scheduler updates, so a
-         * we==0 gap shorter than a tick reads a stale 0 — which is a missing
-         * measurement, not "0% on CPU". Mislabeling a finely-fragmented
-         * on-CPU command as Off-CPU is exactly the CPU*→0 regression this
-         * guards. A genuine partial off-CPU stretch reads 0<cpu_ns<dur and
-         * still splits. (Mirror of the time_model fallback.) */
-        double cpu_frac = -1.0;
-        if (class_idx == PGWT_CLASS_CPU &&
-            ev->cpu_ns != PGWT_CPU_NS_UNKNOWN && ev->cpu_ns != 0 &&
-            ev->duration_ns > 0) {
-            cpu_frac = (double)ev->cpu_ns / (double)ev->duration_ns;
-            if (cpu_frac > 1.0) cpu_frac = 1.0;
-        }
+        /* T8 revision: measured cpu_ns for this interval (per-bucket, split by
+         * overlap fraction). Counted toward CPU* for BOTH we==0 gaps and wait
+         * intervals (a wait's cpu_ns is boundary-leaked pre-wait CPU). Off-CPU*
+         * is a residual, computed per bucket after the loop from exact totals
+         * (leak-immune) — NOT a per-interval dur-cpu split. UNKNOWN records use
+         * gap-inference: a we==0 gap is wholly CPU, a wait contributes 0 CPU.
+         * `buckets[].offcpu_aas` is reused as the per-bucket DB-ns accumulator
+         * during the loop and converted to the residual in the normalize pass. */
+        int is_measured = (ev->cpu_ns != PGWT_CPU_NS_UNKNOWN);
+        double dur_d = (double)ev->duration_ns;
 
         int first_b = (ev_start <= from_ns) ? 0
                      : (int)((ev_start - from_ns) / bucket_ns);
@@ -441,14 +434,16 @@ void pgwt_compute_aas(const struct pgwt_trace_event *events, int count,
             if (o_end > o_start) {
                 double ov = (double)(o_end - o_start);
                 if (!io_worker) {
-                    if (cpu_frac >= 0.0) {
-                        /* Split measured on-CPU vs off-CPU; the two sum to the
-                         * full CPU-class overlap, so max_aas is unchanged. */
-                        buckets[b].class_aas[PGWT_CLASS_CPU] += ov * cpu_frac;
-                        buckets[b].offcpu_aas += ov * (1.0 - cpu_frac);
-                    } else {
+                    buckets[b].offcpu_aas += ov;   /* DB-ns accumulator */
+                    double cpu_c;
+                    if (is_measured)
+                        cpu_c = dur_d > 0 ? (double)ev->cpu_ns * (ov / dur_d) : 0.0;
+                    else
+                        cpu_c = (class_idx == PGWT_CLASS_CPU) ? ov : 0.0;
+                    if (cpu_c > ov) cpu_c = ov;
+                    buckets[b].class_aas[PGWT_CLASS_CPU] += cpu_c;
+                    if (class_idx != PGWT_CLASS_CPU)
                         buckets[b].class_aas[class_idx] += ov;
-                    }
                 }
                 if (cat >= 0)
                     buckets[b].cat_aas[cat] += ov;
@@ -465,15 +460,28 @@ void pgwt_compute_aas(const struct pgwt_trace_event *events, int count,
         }
     }
 
-    /* Convert accumulated ns → AAS (class + category buckets) */
+    /* Convert accumulated ns → AAS (class + category buckets). T8 revision:
+     * offcpu_aas held the per-bucket DB-ns total during accumulation; convert
+     * it to the residual Off-CPU* = max(0, DB - CPU* - Σ waits) from exact
+     * per-bucket totals (leak-immune), then normalize everything by bucket_ns. */
     double max_aas = 0.0;
     for (int i = 0; i < actual_buckets; i++) {
+        double db_ns_bucket = buckets[i].offcpu_aas;
+        double wait_ns_bucket = 0.0;
+        for (int c = 0; c < PGWT_NUM_CLASSES; c++)
+            if (c != PGWT_CLASS_CPU)
+                wait_ns_bucket += buckets[i].class_aas[c];
+        double off_ns = db_ns_bucket - buckets[i].class_aas[PGWT_CLASS_CPU]
+                        - wait_ns_bucket;
+        if (off_ns < 0) off_ns = 0.0;
+        buckets[i].offcpu_aas = off_ns;
+
         double total = 0.0;
         for (int c = 0; c < PGWT_NUM_CLASSES; c++) {
             buckets[i].class_aas[c] /= (double)bucket_ns;
             total += buckets[i].class_aas[c];
         }
-        /* T8: Off-CPU* is part of active DB Time — include it in the total. */
+        /* Off-CPU* is part of active DB Time — include it in the total. */
         buckets[i].offcpu_aas /= (double)bucket_ns;
         total += buckets[i].offcpu_aas;
         for (int c = 0; c < PGWT_NUM_CATS; c++)
@@ -664,28 +672,26 @@ void pgwt_compute_time_model(const struct pgwt_trace_event *events, int count,
         db_time_ns += dur_ns;
         int cls_idx = pgwt_wait_class_index(ev->old_event);
         if (cls_idx == PGWT_CLASS_CPU) {
-            /* On-CPU gap. A MEASURED, nonzero cpu_ns (v3 exact) splits into
-             * CPU* and Off-CPU*. Two cases fall back to gap-inference (the full
-             * gap is CPU*, no Off-CPU split, exactly as pre-T8):
-             *   - UNKNOWN: sampled/v2/legacy — never measured.
-             *   - EXACTLY 0: `se.sum_exec_runtime` only advances at scheduler
-             *     ticks, so two wait-boundary reads inside one tick return the
-             *     identical stored value and the delta is a hard 0. For a
-             *     we==0 gap (PG says RUNNING, not waiting) a 0 delta is a STALE
-             *     read, NOT "spent no CPU" — trusting it would mislabel a
-             *     fully-on-CPU, finely-fragmented command (e.g. a tight
-             *     executor loop that flips wait_event_info thousands of times a
-             *     second) as ~100% Off-CPU and collapse its CPU* to ~0. A
-             *     genuine partial off-CPU stretch reads a nonzero-but-<dur
-             *     delta and still splits correctly. CPU has no sub-events, so it
-             *     never enters ev_ht. */
-            if (ev->cpu_ns != PGWT_CPU_NS_UNKNOWN && ev->cpu_ns != 0) {
+            /* T8 revision (docs/T8_MEASURED_CPU_REVISION.md): CPU* is the SUM
+             * of every interval's measured cpu_ns (conserved = true CPU);
+             * Off-CPU* is a GLOBAL RESIDUAL computed after the loop, never a
+             * per-interval dur-cpu split. `se.sum_exec_runtime` is only current
+             * at a tick (1ms) or a context switch, so a sub-ms CPU burst before
+             * a wait leaks (whole) into the FOLLOWING wait interval's delta; a
+             * per-interval split therefore double-counts that leak. Summing all
+             * cpu_ns (here + the wait branch below) is leak-immune, and the
+             * residual recovers the real runqueue time from exact totals. A
+             * stale-0 on a we==0 gap now correctly adds 0 (its burst is counted
+             * in the interval it leaked to) — no full-gap fallback (which
+             * over-stated CPU* past physical cores, Finding #1). */
+            if (ev->cpu_ns != PGWT_CPU_NS_UNKNOWN) {
                 double m = (double)ev->cpu_ns;
                 if (m > dur_ns) { cpu_clamped_ns += m - dur_ns; m = dur_ns; }
                 cpu_measured_ns += m;
-                offcpu_ns += dur_ns - m;
                 has_measured_cpu = 1;
             } else {
+                /* UNKNOWN: sampled/v2/legacy — never measured. Gap-inference:
+                 * the whole gap is CPU*, and no Off-CPU* for this window. */
                 cpu_measured_ns += dur_ns;
             }
         } else {
@@ -694,15 +700,40 @@ void pgwt_compute_time_model(const struct pgwt_trace_event *events, int count,
             int slot = event_ht_find_or_insert(ev_ht, ev->old_event);
             if (slot >= 0)
                 ev_ht[slot].total_ns += dur_ns;
-            /* Self-check: a wait-labeled gap should carry ≈0 measured CPU (the
-             * task slept). Accumulated, not split into the wait row. */
-            if (ev->cpu_ns != PGWT_CPU_NS_UNKNOWN)
+            /* The wait interval's measured cpu_ns is boundary-leaked pre-wait
+             * CPU (a sleeping task burns none) — count it toward CPU* so the
+             * total conserves. NOT surfaced as in-wait "spin" (that would lie;
+             * real spin/blocked needs sched_switch tracing, §5). Kept as an
+             * observability metric only. */
+            if (ev->cpu_ns != PGWT_CPU_NS_UNKNOWN) {
+                cpu_measured_ns += (double)ev->cpu_ns;
                 wait_gap_cpu_ns += (double)ev->cpu_ns;
+                has_measured_cpu = 1;
+            }
         }
     }
 
     /* The CPU class total is the measured (or legacy-inferred) CPU. */
     classes[PGWT_CLASS_CPU].total_ns = cpu_measured_ns;
+
+    /* T8 revision: Off-CPU* = DB Time - CPU* - Σ wait durations (the residual
+     * runqueue/unaccounted remainder of the on-CPU gaps). Computed from EXACT
+     * totals only (DB Time and wait durations are timestamp-exact; CPU* is a
+     * conserved sum), so it is immune to the per-interval sub-ms CPU leak. Only
+     * meaningful where some cpu_ns was measured; UNKNOWN-only windows show CPU*
+     * alone. Clamp at 0 (a positive clamp = CPU* exceeded DB-waits, a
+     * measurement inconsistency worth counting). */
+    if (has_measured_cpu) {
+        double wait_total_ns = 0.0;
+        for (int c = 0; c < PGWT_NUM_CLASSES; c++)
+            if (c != PGWT_CLASS_CPU)
+                wait_total_ns += classes[c].total_ns;
+        double resid = db_time_ns - cpu_measured_ns - wait_total_ns;
+        if (resid < 0) { cpu_clamped_ns += -resid; resid = 0.0; }
+        offcpu_ns = resid;
+    } else {
+        offcpu_ns = 0.0;
+    }
 
     for (int c = 0; c < PGWT_NUM_CATS; c++)
         out->cat_ms[c] = cat_ns[c] / 1e6;
