@@ -106,24 +106,26 @@ def test_cpu_system_event(pm_pid):
     """Run pure-compute query, verify CPU is dominant in system_event."""
     print("--- Test 1: CPU Dominance (system_event) ---")
 
-    # Start a long CPU-heavy DO block BEFORE the tracer, so the initial scan
-    # finds the backend already on CPU.  The loop runs ~8s of pure computation.
+    # Start the tracer FIRST, then fire the compute AFTER it has attached, so
+    # the backend is caught by the fork tracepoint (reliable) rather than the
+    # initial-scan straddle path (an intermittent connect/scan race for a
+    # pure-compute client backend — see docs/FUTURE_WORK.md; the straddle case
+    # itself is covered by phase_cpu_straddle). The loop is long enough to run
+    # through the whole measured window.
+    tracer = subprocess.Popen(
+        [TRACER, "--mode", "full", "--pid", str(pm_pid),
+         "--interval", "8", "--duration", "12",
+         "--view", "system_event"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    time.sleep(3)  # tracer scans + arms watchpoints before the backend forks
+
     psql_proc = subprocess.Popen(
         ["psql", "-U", "postgres", "-d", "postgres",
          "-c", "DO $$ DECLARE x bigint := 0; BEGIN "
                "FOR i IN 1..3000000000 LOOP x := x + i; END LOOP; END $$",
          "-c", "SELECT pg_sleep(60)"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    )
-
-    time.sleep(2)  # let backend start computing
-
-    # Start tracer — initial scan will see backend on CPU (wait_event_info=0)
-    tracer = subprocess.Popen(
-        [TRACER, "--mode", "full", "--pid", str(pm_pid),
-         "--interval", "8", "--duration", "12",
-         "--view", "system_event"],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE
     )
 
     try:
@@ -166,22 +168,22 @@ def test_cpu_time_model(pm_pid):
     """Run pure-compute query, verify CPU Time > Wait in time_model."""
     print("--- Test 2: CPU Dominance (time_model) ---")
 
-    # Same approach: start workload BEFORE tracer
+    # Tracer first, then fire the compute after attach (fork tracepoint —
+    # reliable; see test_cpu_system_event above).
+    tracer = subprocess.Popen(
+        [TRACER, "--mode", "full", "--pid", str(pm_pid),
+         "--interval", "8", "--duration", "12",
+         "--view", "time_model"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    time.sleep(3)
+
     psql_proc = subprocess.Popen(
         ["psql", "-U", "postgres", "-d", "postgres",
          "-c", "DO $$ DECLARE x bigint := 0; BEGIN "
                "FOR i IN 1..3000000000 LOOP x := x + i; END LOOP; END $$",
          "-c", "SELECT pg_sleep(60)"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    )
-
-    time.sleep(2)
-
-    tracer = subprocess.Popen(
-        [TRACER, "--mode", "full", "--pid", str(pm_pid),
-         "--interval", "8", "--duration", "12",
-         "--view", "time_model"],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE
     )
 
     try:
