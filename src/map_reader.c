@@ -15,6 +15,7 @@
 
 #ifndef PGWT_SERVER
 #include "daemon.h"
+#include "discovery.h"   /* pgwt_read_sched_cpu_ns (T8 live measured CPU) */
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 #include "pg_wait_tracer.skel.h"
@@ -204,46 +205,79 @@ void pgwt_read_state_map(struct pgwt_daemon *d)
             }
 
             if (open_ns > 0 && !has_closed_data) {
+                /* T8 symptom #3: for an on-CPU (we==0) in-progress interval,
+                 * the CPU quantity is the MEASURED schedstat delta since the
+                 * seeded base, not the full wall gap — a backend preempted or
+                 * runqueue-stalled shows only the CPU it actually burned, and
+                 * DB Time carries the wall gap (the off-CPU remainder is the
+                 * DB-Time-minus-CPU unaccounted time). Display-time only: no
+                 * interim trace record is written. Legacy (cpu_accounting off)
+                 * keeps the full gap as CPU, byte-identical to before. */
+                uint64_t cpu_open = open_ns;
+                if (we == 0 && d->cpu_accounting) {
+                    /* S3: exact on-CPU ns for the open interval = cpu_ns_total +
+                     * current stretch (on_cpu_ts != 0 iff running), minus the
+                     * seeded base. `now` is CLOCK_MONOTONIC == bpf_ktime. */
+                    uint64_t exact = sval.cpu_ns_total;
+                    if (sval.on_cpu_ts && now >= sval.on_cpu_ts)
+                        exact += now - sval.on_cpu_ts;
+                    if (exact >= sval.last_cpu_ns) {
+                        uint64_t m = exact - sval.last_cpu_ns;
+                        cpu_open = m < open_ns ? m : open_ns;   /* clamp to wall */
+                    }
+                }
+
                 /* Per-PID accumulation */
                 struct pgwt_pid_accum *pa = pgwt_get_or_create_pid(&d->accum, snext);
                 if (pa) {
+                    /* CPU pseudo-event stats reflect measured CPU; waits use
+                     * wall (they carry no CPU). */
+                    uint64_t stat_ns = (we == 0) ? cpu_open : open_ns;
                     struct pgwt_event_stats *es = pgwt_get_or_create_event(pa, we);
                     if (es) {
                         es->count += 1;
-                        es->total_ns += open_ns;
-                        if (open_ns < es->min_ns) es->min_ns = open_ns;
-                        if (open_ns > es->max_ns) es->max_ns = open_ns;
+                        es->total_ns += stat_ns;
+                        if (stat_ns < es->min_ns) es->min_ns = stat_ns;
+                        if (stat_ns > es->max_ns) es->max_ns = stat_ns;
                     }
                     if (we == 0) {
-                        pa->cpu_time_ns += open_ns;
+                        pa->cpu_time_ns += cpu_open;
                     } else if (!pgwt_is_idle_event(we)) {
                         pa->wait_time_ns += open_ns;
                     }
                     if (!pgwt_is_idle_event(we))
-                        pa->db_time_ns += open_ns;
+                        pa->db_time_ns += open_ns;   /* DB Time = wall gap */
                 }
 
                 /* System-wide accumulation */
                 struct pgwt_event_stats *se = pgwt_get_or_create_system_event(&d->accum, we);
                 if (se) {
+                    uint64_t stat_ns = (we == 0) ? cpu_open : open_ns;
                     se->count += 1;
-                    se->total_ns += open_ns;
-                    if (open_ns < se->min_ns) se->min_ns = open_ns;
-                    if (open_ns > se->max_ns) se->max_ns = open_ns;
+                    se->total_ns += stat_ns;
+                    if (stat_ns < se->min_ns) se->min_ns = stat_ns;
+                    if (stat_ns > se->max_ns) se->max_ns = stat_ns;
                 }
 
-                /* Time model by class */
-                pgwt_update_time_model(&d->accum.tm, we, open_ns);
+                /* Time model by class: on-CPU splits into measured CPU + the
+                 * off-CPU remainder (both inside DB Time). */
+                if (we == 0) {
+                    d->accum.tm.cpu_time_ns += cpu_open;
+                    d->accum.tm.db_time_ns += open_ns;
+                } else {
+                    pgwt_update_time_model(&d->accum.tm, we, open_ns);
+                }
 
                 /* Query-level open interval */
                 if (sval.last_query_id != 0) {
+                    uint64_t stat_ns = (we == 0) ? cpu_open : open_ns;
                     struct pgwt_query_event_stats *qe =
                         pgwt_get_or_create_query_event(&d->accum, sval.last_query_id, we);
                     if (qe) {
                         qe->count += 1;
-                        qe->total_ns += open_ns;
-                        if (open_ns < qe->min_ns) qe->min_ns = open_ns;
-                        if (open_ns > qe->max_ns) qe->max_ns = open_ns;
+                        qe->total_ns += stat_ns;
+                        if (stat_ns < qe->min_ns) qe->min_ns = stat_ns;
+                        if (stat_ns > qe->max_ns) qe->max_ns = stat_ns;
                     }
                 }
             }

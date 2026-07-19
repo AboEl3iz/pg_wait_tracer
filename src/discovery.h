@@ -54,6 +54,14 @@ int pgwt_addr_is_shared(pid_t pid, uint64_t addr);
 /* Read an 8-byte pointer from /proc/<pid>/mem at addr. Returns 0 on error. */
 uint64_t pgwt_read_pointer(pid_t pid, uint64_t addr);
 
+/* T8: read a task's exact on-CPU accumulator (nanoseconds) — field 1 of
+ * /proc/<pid>/schedstat, the same task_struct->se.sum_exec_runtime the BPF
+ * watchpoint reads at wait boundaries. The userspace seed/flush/live paths use
+ * it to establish the per-interval CPU base and to close open CPU stretches.
+ * Returns 0 on any failure (proc gone, or CONFIG_SCHED_INFO absent so the file
+ * does not exist) — callers treat 0 as "no measurement available". */
+uint64_t pgwt_read_sched_cpu_ns(pid_t pid);
+
 /* Detect PostgreSQL major version from the postgres binary.
  * Runs "<binary> --version" and parses "postgres (PostgreSQL) XX.Y".
  * Returns major version (e.g. 14, 15, 16, 17, 18) or 0 on error. */

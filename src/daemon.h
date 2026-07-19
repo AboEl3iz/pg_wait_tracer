@@ -46,6 +46,22 @@ struct pgwt_counters {
     uint64_t invalid_wait_reads_total; /* wait_event_info reads with a garbage class byte (CAP-2/5) */
     uint64_t sampler_ticks_missed_total; /* sampler timer expirations coalesced/missed (SMP-3) */
 
+    /* T8 measured-CPU observability (docs/T8_MEASURED_CPU_PLAN.md §5.6).
+     * Lifetime totals over the exact tier's measured intervals — the closed
+     * ringbuf transitions plus the terminal/de-escalation flush records (open
+     * intervals are display-time only and never counted here). All stay 0 on a
+     * legacy-capability daemon (cpu_ns carries the UNKNOWN sentinel).
+     *  - cpu_ns_total:          measured on-CPU ns of we==0 gaps (clamped to gap)
+     *  - offcpu_ns_total:       the gap−cpu remainder (runqueue/throttle/unacct)
+     *  - cpu_clamped_ns_total:  cpu_ns that EXCEEDED its gap wall (clock skew)
+     *  - wait_gap_cpu_ns_total: cpu measured during WAIT-labeled gaps — the
+     *                           self-check quantity (should stay ≈0: a sleeping
+     *                           task burns no CPU). */
+    uint64_t cpu_ns_total;
+    uint64_t offcpu_ns_total;
+    uint64_t cpu_clamped_ns_total;
+    uint64_t wait_gap_cpu_ns_total;
+
     /* T2 decomposed-AAS observability (docs/AAS_SEMANTICS_DECISION.md). */
     uint64_t noncmd_cpu_samples_total; /* client we==0 readings outside a command (not recorded) */
     uint64_t cmd_gate_recovered_total; /* on-CPU client samples the edge-gate missed, recovered
@@ -173,6 +189,15 @@ struct pgwt_daemon {
      * classification falls back to the pre-T2 behavior (all exact CPU counts
      * as CPU) instead of silently mislabeling everything idle. */
     bool        cmd_gate_active;
+    /* T8 measured CPU (docs/T8_MEASURED_CPU_PLAN.md §5.4). cpu_accounting: the
+     * exact tier measures per-interval CPU (BPF se.sum_exec_runtime deltas) and
+     * the trace carries real cpu_ns; when false the daemon runs legacy
+     * gap-inference and stamps the UNKNOWN sentinel. schedstat_ok: field 1 of
+     * /proc/<pid>/schedstat is readable, so the userspace seed/flush/live paths
+     * can read the same accumulator. The startup probe sets both (and reports
+     * the tier loudly + in control-socket status). */
+    bool        cpu_accounting;
+    bool        schedstat_ok;
     uint32_t    lightweight_mode;        /* 1 = BPF accumulator only (no ringbuf) */
     uint32_t    skip_query_id;          /* 1 = skip query_id reads in BPF */
     uint32_t    skip_usdt;             /* 1 = skip USDT query lifecycle probes */
@@ -254,5 +279,15 @@ int pgwt_daemon_run(struct pgwt_daemon *d);
 
 /* Clean up all resources. */
 void pgwt_daemon_cleanup(struct pgwt_daemon *d);
+
+/* T8: fold one measured interval's cpu_ns into the lifetime CPU counters
+ * (docs/T8_MEASURED_CPU_PLAN.md §5.6). Call once per emitted exact-tier
+ * TRANSITIONS record — the closed ringbuf path (event_stream.c) and the
+ * terminal/de-escalation flush (escalation.c). A marker or an UNKNOWN cpu_ns
+ * is a no-op. we==0 splits into cpu_ns_total (clamped to dur) + offcpu_ns_total
+ * (+ cpu_clamped_ns_total for the overshoot); a wait-labeled gap folds its
+ * cpu_ns into wait_gap_cpu_ns_total (the ≈0 self-check). */
+void pgwt_counters_add_cpu(struct pgwt_daemon *d, uint32_t we,
+                            uint64_t dur_ns, uint64_t cpu_ns);
 
 #endif /* PGWT_DAEMON_H */

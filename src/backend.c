@@ -205,6 +205,14 @@ static int preseed_state_map(struct pgwt_daemon *d, pid_t pid, uint64_t addr,
             .last_ts = attach_ts,
             .last_query_id = current_qid,
             .wait_event_addr = addr,
+            /* S3: exact CPU is accumulated by the sched_switch program into
+             * cpu_ns_total/on_cpu_ts. Seed the base at 0 (deltas count from
+             * attach); open the on-CPU stretch here iff the backend is running
+             * (we==0) so a command straddling attach has its CPU measured from
+             * the seed instant. attach_ts is CLOCK_MONOTONIC == bpf_ktime. */
+            .cpu_ns_total = 0,
+            .on_cpu_ts    = (d->cpu_accounting && current_wei == 0) ? attach_ts : 0,
+            .last_cpu_ns  = 0,
         };
         uint32_t pid_key = pid;
         /* BPF_ANY (not NOEXIST): on first full-mode attach this creates the

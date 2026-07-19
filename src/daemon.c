@@ -408,6 +408,29 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
                     (unsigned long)dqs_addr);
     }
 
+    /* T8 measured-CPU capability probe (docs/T8_MEASURED_CPU_PLAN.md §5.4).
+     * The exact tier already requires kernel BTF (the full-tier gate), so the
+     * BPF read of task_struct->se.sum_exec_runtime is available; the userspace
+     * seed/flush/live paths read the SAME accumulator via /proc/<pid>/schedstat
+     * field 1, which exists whenever CONFIG_SCHED_INFO is set (universal on
+     * RHEL and Ubuntu kernels). Probe it once on the daemon's own pid (it has
+     * accrued CPU by now, so a working schedstat returns > 0). When present:
+     * full measured mode. When absent: legacy gap-inference, reported LOUDLY —
+     * never silent. (The S1b perf_event PERF_COUNT_SW_TASK_CLOCK fallback for
+     * schedstat-less kernels is deferred; see the PR notes.) */
+    d->cpu_accounting = (access("/sys/kernel/btf/vmlinux", R_OK) == 0);
+    d->skel->rodata->cpu_accounting = d->cpu_accounting;
+    if (!d->cpu_accounting) {
+        /* No BTF → tp_btf/sched_switch can't load: don't try, and fall back
+         * to gap-inference (cpu_ns UNKNOWN, no Off-CPU*). */
+        bpf_program__set_autoload(d->skel->progs.on_sched_switch, false);
+        fprintf(stderr, "WARN: CPU accounting: LEGACY gap-inference — "
+                "kernel BTF (/sys/kernel/btf/vmlinux) absent, so the "
+                "sched_switch exact-CPU program cannot load. Exact-tier CPU is "
+                "inferred from wait gaps (includes runqueue/throttle time); "
+                "Off-CPU* is unavailable and trace cpu_ns carries UNKNOWN.\n");
+    }
+
     /* Load BPF programs (runs verifier) */
     err = pg_wait_tracer_bpf__load(d->skel);
     if (err) {
@@ -423,6 +446,22 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
         fprintf(stderr, "FATAL: cannot attach on_fork tracepoint: %s\n",
                 strerror(errno));
         goto fail;
+    }
+
+    /* S3: exact CPU accounting via sched_switch (docs/S3_SCHED_SWITCH_CPU.md).
+     * Attached whenever measured CPU is on (BTF present). On the rare failure
+     * (locked-down kernel) drop to gap-inference and say so — never silent. */
+    if (d->cpu_accounting) {
+        d->skel->links.on_sched_switch =
+            bpf_program__attach(d->skel->progs.on_sched_switch);
+        if (!d->skel->links.on_sched_switch) {
+            d->cpu_accounting = 0;
+            fprintf(stderr, "WARN: CPU accounting: could not attach "
+                    "sched_switch (%s) — falling back to gap-inference; "
+                    "Off-CPU* unavailable.\n", strerror(errno));
+        } else if (d->verbose) {
+            fprintf(stderr, "INFO: CPU accounting: MEASURED (sched_switch)\n");
+        }
     }
 
     d->skel->links.on_exit = bpf_program__attach(d->skel->progs.on_exit);
@@ -625,6 +664,10 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
             goto fail;
         }
         d->event_writer->verbose = d->verbose;
+        /* T8: write real cpu_ns only when the capability probe confirmed
+         * measured CPU; otherwise every TRANSITIONS record is stamped
+         * PGWT_CPU_NS_UNKNOWN so readers fall back to gap-inference. */
+        d->event_writer->cpu_measured = d->cpu_accounting;
         /* DUR-3: optional size cap on top of the hours-based retention. */
         if (d->trace_retention_gb > 0)
             d->event_writer->retention_bytes =
@@ -942,6 +985,13 @@ void pgwt_daemon_cleanup(struct pgwt_daemon *d)
     /* Close any open escalation window (detaches watchpoints, writes the END
      * marker) before the event writer is torn down. */
     pgwt_escalation_cleanup(d);
+
+    /* T8 symptom #2: flush open exact intervals (incl. the on-CPU stretch of a
+     * command straddling capture end) with their measured cpu_ns BEFORE the
+     * provider detaches watchpoints and the writer closes. In full mode this is
+     * the ONLY flush path (no de-escalation); in tiered mode a just-closed
+     * window already flushed+detached, so this is a no-op. */
+    pgwt_flush_open_intervals(d);
 
     /* Stop the active capture provider (detach/free its state). */
     if (d->provider && d->provider->stop)

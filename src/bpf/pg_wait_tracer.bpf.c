@@ -17,6 +17,7 @@
 #include "pg_wait_tracer.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
+#include <bpf/bpf_core_read.h>
 #include <bpf/usdt.bpf.h>
 
 /* ringbuf submit flags (may not be in all header versions) */
@@ -37,6 +38,15 @@ volatile const u32 st_query_id_offset = 0; /* offsetof(PgBackendStatus, st_query
 volatile const u32 lightweight_mode = 0;   /* 0=full trace, 1=lightweight (no ringbuf) */
 volatile const u32 skip_query_id = 0;      /* 1=skip query_id reads (saves 1 probe_read) */
 volatile const u64 debug_query_string_addr = 0; /* VA of debug_query_string global */
+
+/* T8 measured CPU: 1 when the daemon's startup probe confirmed the kernel BTF
+ * carries task_struct->se.sum_exec_runtime (docs/T8_MEASURED_CPU_PLAN.md §5.4).
+ * When set, the watchpoint handler reads that exact accumulator at every wait
+ * boundary and emits the per-interval CPU delta in pgwt_trace_event.cpu_ns; 0
+ * leaves cpu_ns at 0 and userspace stamps the UNKNOWN sentinel (gap-inference
+ * fallback). A CO-RE bpf_core_field_exists() guard makes the read compile and
+ * load even where the field is absent, so this is a belt-and-suspenders gate. */
+volatile const bool cpu_accounting = 0;
 
 /* Command-open gate (T2, docs/AAS_SEMANTICS_DECISION.md): per-PG-version
  * BackendState enum values for the pgstat_report_activity uprobe. PG13-17:
@@ -213,6 +223,54 @@ static __always_inline u32 read_wait_event(u64 *out_addr)
     return val;
 }
 
+/* S3 (docs/S3_SCHED_SWITCH_CPU.md): exact on-CPU ns for a backend AT INSTANT
+ * `now`, derived from the sched_switch-maintained accumulator. cpu_ns_total is
+ * the sum of completed on-CPU stretches; if the backend is on-CPU right now
+ * (on_cpu_ts != 0, e.g. it just wrote wait_event_info in the watchpoint
+ * handler) the current stretch `now - on_cpu_ts` is added. No tick
+ * quantization — replaces the stale-between-ticks se.sum_exec_runtime read.
+ * Returns 0 when the feature is off (cpu_accounting=0) so the caller emits
+ * cpu_ns 0 and userspace stamps the UNKNOWN sentinel (→ gap-inference). */
+static __always_inline u64 read_task_cpu_ns_for(struct pgwt_pid_state *st, u64 now)
+{
+    if (!cpu_accounting || !st)
+        return 0;
+    u64 t = st->cpu_ns_total;
+    if (st->on_cpu_ts && now >= st->on_cpu_ts)
+        t += now - st->on_cpu_ts;
+    return t;
+}
+
+/* ── Program: on_sched_switch ─────────────────────────────────
+ * Exact CPU accounting (S3). Fires on EVERY context switch, system-wide;
+ * for the two tasks involved it does a state_map lookup and either closes
+ * (prev, going off-CPU) or opens (next, coming on-CPU) an on-CPU stretch.
+ * Untracked pids miss both lookups and return in ~tens of ns (the overhead
+ * measured within noise at 110-126k switches/s, docs/S3 §7). A given pid is
+ * on at most one CPU, so its entry is touched by one CPU at a time — no
+ * atomics needed. Attached only when the full tier arms cpu_accounting. */
+SEC("tp_btf/sched_switch")
+int BPF_PROG(on_sched_switch, bool preempt,
+             struct task_struct *prev, struct task_struct *next)
+{
+    if (!cpu_accounting)
+        return 0;
+    u64 now = bpf_ktime_get_ns();
+
+    u32 ppid = BPF_CORE_READ(prev, pid);
+    struct pgwt_pid_state *ps = bpf_map_lookup_elem(&state_map, &ppid);
+    if (ps && ps->on_cpu_ts && now >= ps->on_cpu_ts) {
+        ps->cpu_ns_total += now - ps->on_cpu_ts;
+        ps->on_cpu_ts = 0;
+    }
+
+    u32 npid = BPF_CORE_READ(next, pid);
+    struct pgwt_pid_state *ns = bpf_map_lookup_elem(&state_map, &npid);
+    if (ns)
+        ns->on_cpu_ts = now;
+    return 0;
+}
+
 /* Accumulate duration for a wait event into accum_map (PERCPU — no atomics). */
 static __always_inline void accum_add(u32 event, u64 duration)
 {
@@ -246,18 +304,34 @@ int on_watchpoint(struct bpf_perf_event_data *ctx)
          * before enable, CAP-8) starts interval tracking without closing a
          * fabricated interval. */
         if (!st->wp_live) {
+            u64 seed_now = bpf_ktime_get_ns();
             st->last_event = new_event;
-            st->last_ts = bpf_ktime_get_ns();
+            st->last_ts = seed_now;
+            /* S3: snapshot the exact on-CPU ns as this interval's base. This
+             * is a pseudo-gap (seed → first real boundary); do NOT emit for
+             * it, just establish last_cpu_ns so the next real transition's
+             * cpu_ns delta is correct. */
+            st->last_cpu_ns = read_task_cpu_ns_for(st, seed_now);
             st->wp_live = 1;
             return 0;
         }
 
-        /* Skip redundant writes — watchpoint fires even if value unchanged */
+        /* Skip redundant writes — watchpoint fires even if value unchanged.
+         * Return BEFORE touching last_cpu_ns: the CPU accrued between two
+         * suppressed fires belongs to the next real gap, so the base must not
+         * advance here (T8 §5.1). */
         if (new_event == st->last_event)
             return 0;
 
         u64 now = bpf_ktime_get_ns();
         u64 duration = now - st->last_ts;
+
+        /* S3: exact on-CPU ns at this fire; the CPU consumed since the last
+         * boundary is the delta. 0 when the feature is off or a base was never
+         * seeded (userspace then stamps UNKNOWN → gap-inference). */
+        u64 cpu_now = read_task_cpu_ns_for(st, now);
+        u64 cpu_delta = (cpu_now && st->last_cpu_ns && cpu_now >= st->last_cpu_ns)
+                        ? cpu_now - st->last_cpu_ns : 0;
 
         if (lightweight_mode) {
             /* Lightweight: accumulate in BPF map, no ringbuf */
@@ -278,6 +352,7 @@ int on_watchpoint(struct bpf_perf_event_data *ctx)
                 .flags = st->cmd_open ? PGWT_EVENT_FLAG_CMD_OPEN : 0,
                 .duration_ns = duration,
                 .query_id = st->last_query_id,
+                .cpu_ns = cpu_delta,
             };
             emit_event(&evt);
         }
@@ -285,6 +360,8 @@ int on_watchpoint(struct bpf_perf_event_data *ctx)
         /* Transition to new state */
         st->last_event = new_event;
         st->last_ts = now;
+        /* Advance the CPU base on every emitted transition (T8). */
+        st->last_cpu_ns = cpu_now;
 
         /* Clear query_id when entering Client:ClientRead or any idle event.
          * At this point no query is running — the backend is waiting for
@@ -299,13 +376,20 @@ int on_watchpoint(struct bpf_perf_event_data *ctx)
          * cache the resolved address for future fast-path reads */
         u64 wait_addr = 0;
         u32 new_event = read_wait_event(&wait_addr);
+        u64 init_now = bpf_ktime_get_ns();
         struct pgwt_pid_state new_st = {
             .last_event = new_event,
             .wp_live = 1,   /* created BY a live watchpoint */
-            .last_ts = bpf_ktime_get_ns(),
+            .last_ts = init_now,
             .last_query_id = 0,
             .be_entry_ptr = resolve_be_entry(),
             .wait_event_addr = wait_addr,
+            /* S3: the backend is on-CPU now (it just wrote wait_event_info);
+             * open its on-CPU stretch here so the first interval measures. The
+             * base is 0 — cpu_ns deltas are taken from this attach onward. */
+            .on_cpu_ts = init_now,
+            .cpu_ns_total = 0,
+            .last_cpu_ns = 0,
         };
         /* CAP-1: a failed insert (map full) means this backend will never
          * record a single event — count it so the daemon can scream. */
@@ -393,6 +477,14 @@ int on_exit(struct trace_event_raw_sched_process_template *ctx)
     if (st->wp_live) {
         u64 duration = now - st->last_ts;
 
+        /* S3: close the last interval with the exact on-CPU delta — a command
+         * computing right up to disconnect (old_event==0) records its CPU
+         * instead of vanishing. read_task_cpu_ns_for handles the still-open
+         * on-CPU stretch (the exiting task is on-CPU running the exit path). */
+        u64 cpu_now = read_task_cpu_ns_for(st, now);
+        u64 cpu_delta = (cpu_now && st->last_cpu_ns && cpu_now >= st->last_cpu_ns)
+                        ? cpu_now - st->last_cpu_ns : 0;
+
         if (lightweight_mode) {
             accum_add(st->last_event, duration);
         } else {
@@ -405,6 +497,7 @@ int on_exit(struct trace_event_raw_sched_process_template *ctx)
                 .flags = st->cmd_open ? PGWT_EVENT_FLAG_CMD_OPEN : 0,
                 .duration_ns = duration,
                 .query_id = st->last_query_id,
+                .cpu_ns = cpu_delta,
             };
             emit_event(&evt);
         }

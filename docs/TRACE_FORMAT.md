@@ -1,9 +1,12 @@
-# pg_wait_tracer on-disk trace format (v2)
+# pg_wait_tracer on-disk trace format (v3)
 
-Status: authoritative spec for trace format version 2 (the only version a
-current build reads or writes) and the sidecar files in a trace directory.
+Status: authoritative spec for trace format version 3 (what a current build
+writes) and the sidecar files in a trace directory. v2 files remain
+READABLE (their TRANSITIONS records surface `cpu_ns = PGWT_CPU_NS_UNKNOWN`
+and the compute layer falls back to gap-inference); v1 stays rejected.
 Written for Phase T5 of the Trust Milestone (DUR-5/6: the format and its
-durability guarantees were previously implicit in the code).
+durability guarantees were previously implicit in the code); the v3 cpu_ns
+column was added in Phase T8 (measured CPU, docs/T8_MEASURED_CPU_PLAN.md).
 
 ## Scope and general rules
 
@@ -49,7 +52,7 @@ captured at file creation; readers derive the mono→wall mapping per file
 | off | size | field | value |
 |---|---|---|---|
 | 0 | 4 | magic | `0x54574750` ("PGWT" as LE bytes) |
-| 4 | 2 | version | 2 |
+| 4 | 2 | version | 3 (v2 still read; see the cpu_ns column below) |
 | 6 | 2 | flags | bit 0: LZ4-compressed blocks |
 | 8 | 4 | pg_version | PostgreSQL major version |
 | 12 | 8 | start_time_ns | CLOCK_REALTIME at file creation |
@@ -88,6 +91,19 @@ watchpoint (full/escalated) tier:
 4. new_event: raw u32 × num_events (`0xFFFFFFFF` = process exit)
 5. duration_ns: unsigned LEB128 varint × num_events
 6. query_id: raw u64 × num_events
+7. cpu_ns: unsigned LEB128 varint × num_events **(v3 only)** — measured
+   on-CPU nanoseconds consumed during `old_event` (the task's
+   `se.sum_exec_runtime` delta over the interval, read by the watchpoint
+   BPF in the backend's own task context). For a wait-labeled `old_event`
+   this is ≈0 (a sleeping task burns no CPU — the built-in self-check); for
+   an on-CPU gap (`old_event == 0`) it is the measured CPU, and
+   `duration_ns − cpu_ns` is the off-CPU / runqueue-unaccounted remainder
+   (rendered as **Off-CPU\***). The sentinel `PGWT_CPU_NS_UNKNOWN`
+   (`0xFFFFFFFFFFFFFFFF`) means "not measured" — a legacy-capability daemon
+   (no `/proc/<pid>/schedstat`), or any v2 file (which has no column 7 at
+   all); the reader surfaces the sentinel and the compute layer falls back
+   to gap-inference for those records. v2 files are decoded through columns
+   1–6 exactly as before.
 
 **SAMPLES (type 1)** — point observations from the userspace sampler:
 
@@ -99,7 +115,10 @@ watchpoint (full/escalated) tier:
 A sample means "at time T, pid P was in event E" and is worth ONE
 `sample_period_ns` of estimated time — never an interval measurement. The
 reader surfaces samples with `PGWT_EVENT_FLAG_SAMPLE` set; on-disk records
-carry no flags.
+carry no flags. SAMPLES blocks are UNCHANGED in v3 — they have no cpu_ns
+column (the sampled tier's CPU signal is the `we==0` sample itself, weighted
+by `sample_period_ns`); the reader surfaces `cpu_ns = PGWT_CPU_NS_UNKNOWN`
+for every sample.
 
 **Batching (DUR-8).** The writer buffers sample-type pushes and cuts a
 block roughly once per second (or at 4096 records), instead of one tiny
@@ -122,6 +141,17 @@ duration 0. Escalation markers use pid 0 and pack reason/duration into
 query_id (`PGWT_ESC_PACK`). They are structural — every consumer must
 exclude them from wait aggregation (`pgwt_filter_matches` is the
 chokepoint); only variants/lifecycle stats and coverage read them.
+
+**Flush records (v3, T8).** At de-escalation and at daemon shutdown the
+open exact interval of each still-attached backend is closed with a final
+TRANSITIONS record carrying `old_event == new_event` (the interval's own
+event, NOT a `0xFFFFFFFF` process-exit) and its measured `cpu_ns`. For a
+pure-CPU command straddling capture end (`old_event == 0`, no wait boundary
+ever fired) this is the ONLY record of its on-CPU stretch — without it the
+trace would be empty. A failed schedstat read at flush time leaves
+`cpu_ns = PGWT_CPU_NS_UNKNOWN` so compute infers rather than records a
+false 0. Flush records are ordinary intervals (not markers): they enter
+wait/CPU aggregation normally.
 
 ### Footer
 
@@ -291,8 +321,13 @@ themselves to a lesser degree (query_ids only) and to `backends.jsonl`
 
 ## Versioning
 
-Readers reject unknown trace versions loudly and per-file (skip, never
-crash). v2 is not backward compatible with v1 (no deployed v1 installs
-existed). Additive evolution should use: new block types (the reader skips
-blocks with a type it does not know rather than mis-decoding them), the
-block header's `reserved` field, and header `flags` bits.
+Readers accept versions 2 and 3 (a file newer than the build knows is
+skipped loudly, never mis-decoded); v1 stays rejected (no deployed v1
+installs existed). v3 added column 7 (`cpu_ns`) to TRANSITIONS blocks as a
+STRICTLY APPENDED column — a v2 file simply lacks it and the reader stamps
+`PGWT_CPU_NS_UNKNOWN`, so appending a trailing varint column is itself a
+sanctioned additive-evolution move alongside: new block types (the reader
+skips blocks with a type it does not know rather than mis-decoding them),
+the block header's `reserved` field, and header `flags` bits. When adding
+another such column, bump the version and gate the extra `for` loop on
+`header.version >= N` exactly as the reader does for cpu_ns.

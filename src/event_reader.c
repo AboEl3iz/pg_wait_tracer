@@ -37,13 +37,16 @@ int pgwt_reader_open(struct pgwt_event_reader *r, const char *path)
         fclose(r->fp); r->fp = NULL;
         return -1;
     }
-    if (r->header.version != PGWT_TRACE_VERSION) {
-        /* v2-only: no v1 compatibility (no deployed installs existed).
-         * A version mismatch is a clear, non-fatal-to-the-process error —
-         * the file is simply skipped — never a crash on a stale layout. */
+    if (r->header.version < 2 || r->header.version > PGWT_TRACE_VERSION) {
+        /* v2 and v3 are read; v1 stays rejected (no deployed installs existed).
+         * A v2 file's TRANSITIONS records lack the cpu_ns column — the decoder
+         * surfaces PGWT_CPU_NS_UNKNOWN for them and compute falls back to
+         * gap-inference (T8 §5.3). A newer-than-known version is skipped — its
+         * layout is unknown, and garbage must never surface as data. Non-fatal:
+         * the file is skipped, never a crash on a stale/future layout. */
         fprintf(stderr,
                 "ERROR: unsupported trace version %u in %s "
-                "(this build reads version %u only; regenerate with this build)\n",
+                "(this build reads versions 2-%u; regenerate with this build)\n",
                 r->header.version, path, PGWT_TRACE_VERSION);
         fclose(r->fp); r->fp = NULL;
         return -1;
@@ -334,6 +337,9 @@ int pgwt_reader_decode_block_info(struct pgwt_event_reader *r, int block_idx,
             out[i].old_event = 0;
             out[i].duration_ns = 0;
             out[i].flags = PGWT_EVENT_FLAG_SAMPLE;
+            /* Samples carry no measured CPU — the sampled tier's CPU signal is
+             * the we==0 sample itself, weighted by sample_period. */
+            out[i].cpu_ns = PGWT_CPU_NS_UNKNOWN;
         }
         return count;
     }
@@ -363,6 +369,20 @@ int pgwt_reader_decode_block_info(struct pgwt_event_reader *r, int block_idx,
     for (int i = 0; i < count; i++) {
         if (avail < 8) return -1;
         memcpy(&out[i].query_id, p, 8); p += 8; avail -= 8;
+    }
+
+    /* Column 7 (v3, T8): cpu_ns (varint). v2 files have no such column — their
+     * events surface the UNKNOWN sentinel so the compute layer falls back to
+     * gap-inference (an established, unchanged behavior for old traces). */
+    if (r->header.version >= 3) {
+        for (int i = 0; i < count; i++) {
+            int n = pgwt_decode_varint(p, avail, &out[i].cpu_ns);
+            if (n < 0) return -1;
+            p += n; avail -= n;
+        }
+    } else {
+        for (int i = 0; i < count; i++)
+            out[i].cpu_ns = PGWT_CPU_NS_UNKNOWN;
     }
 
     /* Clear flags (transition records carry no per-record flag) */

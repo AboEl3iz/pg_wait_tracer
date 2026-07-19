@@ -14,7 +14,12 @@
 /* ── On-disk format constants ─────────────────────────────── */
 
 #define PGWT_TRACE_MAGIC      0x54574750   /* "PGWT" little-endian */
-#define PGWT_TRACE_VERSION    2
+/* v3 (T8): TRANSITIONS blocks gain a 7th column, cpu_ns (measured on-CPU
+ * nanoseconds per interval; PGWT_CPU_NS_UNKNOWN sentinel when not measured).
+ * SAMPLES blocks are unchanged. v2 files remain readable — the reader surfaces
+ * cpu_ns = PGWT_CPU_NS_UNKNOWN for their events and the compute layer falls
+ * back to gap-inference. See docs/TRACE_FORMAT.md. */
+#define PGWT_TRACE_VERSION    3
 #define PGWT_FLAG_LZ4         0x0001
 
 #define PGWT_BLOCK_EVENTS     4096         /* events per block */
@@ -108,6 +113,11 @@ struct pgwt_event_writer {
     gid_t         trace_gid;      /* group for trace files, (gid_t)-1 = no chown */
     bool          enabled;
     bool          verbose;
+    /* T8: when false (legacy capability — no measured CPU), every TRANSITIONS
+     * record is written with cpu_ns = PGWT_CPU_NS_UNKNOWN so the compute layer
+     * infers CPU from gaps. The daemon sets it from its startup CPU-accounting
+     * probe (src/daemon.c §5.4). Default false is the safe legacy behavior. */
+    bool          cpu_measured;
 
     /* Current file */
     FILE         *fp;

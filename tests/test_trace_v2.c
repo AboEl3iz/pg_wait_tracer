@@ -56,6 +56,12 @@ static void test_mixed_roundtrip(void)
         trans[i].flags = 0;
         trans[i].duration_ns = 500 + (uint64_t)i * 13;
         trans[i].query_id = (i % 4 == 0) ? 0 : (uint64_t)(9000 + i);
+        /* T8 v3: exercise the measured cpu_ns column across its three shapes —
+         * the UNKNOWN sentinel (10-byte varint), a genuine 0 (waits), and real
+         * values — so the round-trip proves the varint column survives. */
+        trans[i].cpu_ns = (i % 5 == 0) ? PGWT_CPU_NS_UNKNOWN
+                        : (i % 5 == 1) ? 0
+                        : (uint64_t)i * 100000;
     }
 
     struct pgwt_trace_event samp[40];
@@ -79,6 +85,7 @@ static void test_mixed_roundtrip(void)
     /* Write: a transition block, then a sample block. */
     struct pgwt_event_writer w;
     CHECK(pgwt_writer_init(&w, TEST_DIR, 18, 24, NULL) == 0, "writer_init");
+    w.cpu_measured = true;   /* keep the per-event cpu_ns (do not stamp UNKNOWN) */
     for (int i = 0; i < NT; i++)
         CHECK(pgwt_writer_push_event(&w, &trans[i]) == 0, "push_event %d", i);
     CHECK(pgwt_writer_push_samples(&w, samp, NS, SAMPLE_PERIOD) == 0,
@@ -93,7 +100,7 @@ static void test_mixed_roundtrip(void)
     struct pgwt_event_reader r;
     CHECK(pgwt_reader_open(&r, path) == 0, "reader_open");
     CHECK(r.header.version == PGWT_TRACE_VERSION, "version=%u", r.header.version);
-    CHECK(r.header.version == 2, "version is 2");
+    CHECK(r.header.version == 3, "version is 3 (T8 cpu_ns column)");
     CHECK(r.num_blocks == 2, "num_blocks=%d (expected 2)", r.num_blocks);
 
     struct pgwt_trace_event out[PGWT_BLOCK_EVENTS];
@@ -112,6 +119,7 @@ static void test_mixed_roundtrip(void)
             out[i].new_event != trans[i].new_event ||
             out[i].duration_ns != trans[i].duration_ns ||
             out[i].query_id != trans[i].query_id ||
+            out[i].cpu_ns != trans[i].cpu_ns ||   /* T8 v3 column */
             out[i].flags != 0)
             tmiss++;
     }
@@ -133,6 +141,7 @@ static void test_mixed_roundtrip(void)
             out[i].query_id != samp[i].query_id ||
             out[i].old_event != 0 ||                    /* cleared */
             out[i].duration_ns != 0 ||                  /* cleared */
+            out[i].cpu_ns != PGWT_CPU_NS_UNKNOWN ||     /* samples carry no CPU */
             (out[i].flags & PGWT_EVENT_FLAG_SAMPLE) == 0)  /* flagged */
             smiss++;
     }
@@ -237,7 +246,7 @@ static void test_v1_rejected(void)
     if (fp) {
         struct pgwt_trace_file_header hdr;
         CHECK(fread(&hdr, sizeof(hdr), 1, fp) == 1, "read header");
-        CHECK(hdr.version == 2, "was v2");
+        CHECK(hdr.version == PGWT_TRACE_VERSION, "was current version");
         hdr.version = 1;
         fseek(fp, 0, SEEK_SET);
         CHECK(fwrite(&hdr, sizeof(hdr), 1, fp) == 1, "write v1 header");

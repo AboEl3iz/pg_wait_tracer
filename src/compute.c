@@ -408,6 +408,17 @@ void pgwt_compute_aas(const struct pgwt_trace_event *events, int count,
 
         int class_idx = pgwt_wait_class_index(ev->old_event);
 
+        /* T8 revision: measured cpu_ns for this interval (per-bucket, split by
+         * overlap fraction). Counted toward CPU* for BOTH we==0 gaps and wait
+         * intervals (a wait's cpu_ns is boundary-leaked pre-wait CPU). Off-CPU*
+         * is a residual, computed per bucket after the loop from exact totals
+         * (leak-immune) — NOT a per-interval dur-cpu split. UNKNOWN records use
+         * gap-inference: a we==0 gap is wholly CPU, a wait contributes 0 CPU.
+         * `buckets[].offcpu_aas` is reused as the per-bucket DB-ns accumulator
+         * during the loop and converted to the residual in the normalize pass. */
+        int is_measured = (ev->cpu_ns != PGWT_CPU_NS_UNKNOWN);
+        double dur_d = (double)ev->duration_ns;
+
         int first_b = (ev_start <= from_ns) ? 0
                      : (int)((ev_start - from_ns) / bucket_ns);
         int last_b  = (ev_end >= to_ns) ? actual_buckets - 1
@@ -421,10 +432,21 @@ void pgwt_compute_aas(const struct pgwt_trace_event *events, int count,
             uint64_t o_start = ev_start > b_start ? ev_start : b_start;
             uint64_t o_end   = ev_end < b_end ? ev_end : b_end;
             if (o_end > o_start) {
-                if (!io_worker)
-                    buckets[b].class_aas[class_idx] += (double)(o_end - o_start);
+                double ov = (double)(o_end - o_start);
+                if (!io_worker) {
+                    buckets[b].offcpu_aas += ov;   /* DB-ns accumulator */
+                    double cpu_c;
+                    if (is_measured)
+                        cpu_c = dur_d > 0 ? (double)ev->cpu_ns * (ov / dur_d) : 0.0;
+                    else
+                        cpu_c = (class_idx == PGWT_CLASS_CPU) ? ov : 0.0;
+                    if (cpu_c > ov) cpu_c = ov;
+                    buckets[b].class_aas[PGWT_CLASS_CPU] += cpu_c;
+                    if (class_idx != PGWT_CLASS_CPU)
+                        buckets[b].class_aas[class_idx] += ov;
+                }
                 if (cat >= 0)
-                    buckets[b].cat_aas[cat] += (double)(o_end - o_start);
+                    buckets[b].cat_aas[cat] += ov;
             }
         }
 
@@ -438,14 +460,30 @@ void pgwt_compute_aas(const struct pgwt_trace_event *events, int count,
         }
     }
 
-    /* Convert accumulated ns → AAS (class + category buckets) */
+    /* Convert accumulated ns → AAS (class + category buckets). T8 revision:
+     * offcpu_aas held the per-bucket DB-ns total during accumulation; convert
+     * it to the residual Off-CPU* = max(0, DB - CPU* - Σ waits) from exact
+     * per-bucket totals (leak-immune), then normalize everything by bucket_ns. */
     double max_aas = 0.0;
     for (int i = 0; i < actual_buckets; i++) {
+        double db_ns_bucket = buckets[i].offcpu_aas;
+        double wait_ns_bucket = 0.0;
+        for (int c = 0; c < PGWT_NUM_CLASSES; c++)
+            if (c != PGWT_CLASS_CPU)
+                wait_ns_bucket += buckets[i].class_aas[c];
+        double off_ns = db_ns_bucket - buckets[i].class_aas[PGWT_CLASS_CPU]
+                        - wait_ns_bucket;
+        if (off_ns < 0) off_ns = 0.0;
+        buckets[i].offcpu_aas = off_ns;
+
         double total = 0.0;
         for (int c = 0; c < PGWT_NUM_CLASSES; c++) {
             buckets[i].class_aas[c] /= (double)bucket_ns;
             total += buckets[i].class_aas[c];
         }
+        /* Off-CPU* is part of active DB Time — include it in the total. */
+        buckets[i].offcpu_aas /= (double)bucket_ns;
+        total += buckets[i].offcpu_aas;
         for (int c = 0; c < PGWT_NUM_CATS; c++)
             buckets[i].cat_aas[c] /= (double)bucket_ns;
         if (total > max_aas)
@@ -588,6 +626,13 @@ void pgwt_compute_time_model(const struct pgwt_trace_event *events, int count,
 
     double db_time_ns  = 0.0;
     double idle_time_ns = 0.0;
+    /* T8 measured-CPU accumulators. cpu_measured_ns is the CPU* total (measured
+     * where v3 cpu_ns exists, else the legacy full gap); offcpu_ns its off-CPU
+     * sibling; the two sum to the old full CPU-class total, so DB Time is
+     * unchanged. cpu_clamped/wait_gap are the self-checks (5.6). */
+    double cpu_measured_ns = 0.0, offcpu_ns = 0.0;
+    double cpu_clamped_ns = 0.0, wait_gap_cpu_ns = 0.0;
+    int    has_measured_cpu = 0;
     double cat_ns[PGWT_NUM_CATS] = {0};
     /* io_worker busy%% needs the worker-pool size: count distinct io_worker
      * pids seen in the window (a handful — io_workers defaults to 3). */
@@ -626,12 +671,68 @@ void pgwt_compute_time_model(const struct pgwt_trace_event *events, int count,
 
         db_time_ns += dur_ns;
         int cls_idx = pgwt_wait_class_index(ev->old_event);
-        classes[cls_idx].total_ns += dur_ns;
+        if (cls_idx == PGWT_CLASS_CPU) {
+            /* T8 revision (docs/T8_MEASURED_CPU_REVISION.md): CPU* is the SUM
+             * of every interval's measured cpu_ns (conserved = true CPU);
+             * Off-CPU* is a GLOBAL RESIDUAL computed after the loop, never a
+             * per-interval dur-cpu split. `se.sum_exec_runtime` is only current
+             * at a tick (1ms) or a context switch, so a sub-ms CPU burst before
+             * a wait leaks (whole) into the FOLLOWING wait interval's delta; a
+             * per-interval split therefore double-counts that leak. Summing all
+             * cpu_ns (here + the wait branch below) is leak-immune, and the
+             * residual recovers the real runqueue time from exact totals. A
+             * stale-0 on a we==0 gap now correctly adds 0 (its burst is counted
+             * in the interval it leaked to) — no full-gap fallback (which
+             * over-stated CPU* past physical cores, Finding #1). */
+            if (ev->cpu_ns != PGWT_CPU_NS_UNKNOWN) {
+                double m = (double)ev->cpu_ns;
+                if (m > dur_ns) { cpu_clamped_ns += m - dur_ns; m = dur_ns; }
+                cpu_measured_ns += m;
+                has_measured_cpu = 1;
+            } else {
+                /* UNKNOWN: sampled/v2/legacy — never measured. Gap-inference:
+                 * the whole gap is CPU*, and no Off-CPU* for this window. */
+                cpu_measured_ns += dur_ns;
+            }
+        } else {
+            classes[cls_idx].total_ns += dur_ns;
+            /* O(1) hash lookup for per-event accumulation */
+            int slot = event_ht_find_or_insert(ev_ht, ev->old_event);
+            if (slot >= 0)
+                ev_ht[slot].total_ns += dur_ns;
+            /* The wait interval's measured cpu_ns is boundary-leaked pre-wait
+             * CPU (a sleeping task burns none) — count it toward CPU* so the
+             * total conserves. NOT surfaced as in-wait "spin" (that would lie;
+             * real spin/blocked needs sched_switch tracing, §5). Kept as an
+             * observability metric only. */
+            if (ev->cpu_ns != PGWT_CPU_NS_UNKNOWN) {
+                cpu_measured_ns += (double)ev->cpu_ns;
+                wait_gap_cpu_ns += (double)ev->cpu_ns;
+                has_measured_cpu = 1;
+            }
+        }
+    }
 
-        /* O(1) hash lookup for per-event accumulation */
-        int slot = event_ht_find_or_insert(ev_ht, ev->old_event);
-        if (slot >= 0)
-            ev_ht[slot].total_ns += dur_ns;
+    /* The CPU class total is the measured (or legacy-inferred) CPU. */
+    classes[PGWT_CLASS_CPU].total_ns = cpu_measured_ns;
+
+    /* T8 revision: Off-CPU* = DB Time - CPU* - Σ wait durations (the residual
+     * runqueue/unaccounted remainder of the on-CPU gaps). Computed from EXACT
+     * totals only (DB Time and wait durations are timestamp-exact; CPU* is a
+     * conserved sum), so it is immune to the per-interval sub-ms CPU leak. Only
+     * meaningful where some cpu_ns was measured; UNKNOWN-only windows show CPU*
+     * alone. Clamp at 0 (a positive clamp = CPU* exceeded DB-waits, a
+     * measurement inconsistency worth counting). */
+    if (has_measured_cpu) {
+        double wait_total_ns = 0.0;
+        for (int c = 0; c < PGWT_NUM_CLASSES; c++)
+            if (c != PGWT_CLASS_CPU)
+                wait_total_ns += classes[c].total_ns;
+        double resid = db_time_ns - cpu_measured_ns - wait_total_ns;
+        if (resid < 0) { cpu_clamped_ns += -resid; resid = 0.0; }
+        offcpu_ns = resid;
+    } else {
+        offcpu_ns = 0.0;
     }
 
     for (int c = 0; c < PGWT_NUM_CATS; c++)
@@ -646,8 +747,8 @@ void pgwt_compute_time_model(const struct pgwt_trace_event *events, int count,
     double idle_ms     = idle_time_ns / 1e6;
 
     /* Phase 2: build result rows */
-    /* Max rows: 1 (DB Time) + NUM_CLASSES * (1 class + 5 sub-events) = ~67 */
-    int max_rows = 1 + PGWT_NUM_CLASSES * 6;
+    /* Max rows: 1 (DB Time) + 1 (Off-CPU*) + NUM_CLASSES * (1 class + 5 sub) */
+    int max_rows = 2 + PGWT_NUM_CLASSES * 6;
     struct pgwt_tm_row *rows = calloc(max_rows, sizeof(*rows));
     int nr = 0;
 
@@ -704,6 +805,20 @@ void pgwt_compute_time_model(const struct pgwt_trace_event *events, int count,
         rows[nr].indent      = 1;
         nr++;
 
+        /* T8: Off-CPU* is a sibling of CPU* (the measured off-CPU/runqueue-
+         * unaccounted remainder of on-CPU gaps). Emitted only where measured
+         * cpu_ns existed (v3 exact data) — sampled/v2 windows show CPU* alone
+         * (Off-CPU is unavailable, not zero). It is part of DB Time. */
+        if (strcasecmp(classes[c].name, "cpu") == 0 && has_measured_cpu) {
+            double off_ms = offcpu_ns / 1e6;
+            snprintf(rows[nr].name, sizeof(rows[nr].name), "Off-CPU*");
+            rows[nr].time_ms     = off_ms;
+            rows[nr].pct_db_time = db_time_ms > 0 ? off_ms / db_time_ms * 100.0 : 0;
+            rows[nr].aas         = wall_ms > 0 ? off_ms / wall_ms : 0;
+            rows[nr].indent      = 1;
+            nr++;
+        }
+
         /* Top 5 sub-events for this class (skip CPU — no meaningful sub-events) */
         if (strcasecmp(classes[c].name, "cpu") == 0)
             continue;
@@ -735,6 +850,12 @@ void pgwt_compute_time_model(const struct pgwt_trace_event *events, int count,
     out->db_time_ms  = db_time_ms;
     out->idle_time_ms = idle_ms;
     out->aas         = wall_ms > 0 ? db_time_ms / wall_ms : 0;
+    /* T8 measured-CPU decomposition + self-checks. */
+    out->cpu_ms          = cpu_measured_ns / 1e6;
+    out->offcpu_ms       = offcpu_ns / 1e6;
+    out->has_measured_cpu = has_measured_cpu;
+    out->cpu_clamped_ms  = cpu_clamped_ns / 1e6;
+    out->wait_gap_cpu_ms = wait_gap_cpu_ns / 1e6;
 }
 
 /* ── Top Events ───────────────────────────────────────────── */

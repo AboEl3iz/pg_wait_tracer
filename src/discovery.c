@@ -379,6 +379,25 @@ uint64_t pgwt_read_pointer(pid_t pid, uint64_t addr)
     return val;
 }
 
+uint64_t pgwt_read_sched_cpu_ns(pid_t pid)
+{
+    /* /proc/<pid>/schedstat is "<sum_exec_runtime> <run_delay> <pcount>\n"
+     * (see kernel proc_pid_schedstat). Field 1 is exactly the
+     * task_struct->se.sum_exec_runtime the BPF watchpoint reads, in ns — so a
+     * userspace read here and a BPF read at a wait boundary sample the same
+     * monotonic accumulator. The file exists only with CONFIG_SCHED_INFO; a
+     * missing/short file means schedstat is unavailable → return 0. */
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/schedstat", pid);
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return 0;
+    unsigned long long run_ns = 0;
+    int got = fscanf(f, "%llu", &run_ns);
+    fclose(f);
+    return got == 1 ? (uint64_t)run_ns : 0;
+}
+
 /* ── PG<17 MyProc-based wait_event_info resolution ────────────
  *
  * PG17 added the `my_wait_event_info` global (a uint32* that points directly

@@ -138,6 +138,15 @@ static cJSON *build_status(const struct pgwt_daemon *d)
     }
     cJSON_AddBoolToObject(root, "sampler_healthy", sampler_healthy);
     cJSON_AddStringToObject(root, "sampler_unhealthy_reason", reason);
+
+    /* T8 measured-CPU capability (docs/T8_MEASURED_CPU_PLAN.md §5.4), reported
+     * as loudly here as in the startup log — never silent. "measured": the
+     * exact tier reads task se.sum_exec_runtime deltas and the trace carries
+     * real cpu_ns + Off-CPU*. "legacy": /proc schedstat was unavailable
+     * (CONFIG_SCHED_INFO off), so CPU is inferred from wait gaps (includes
+     * runqueue/throttle time) and cpu_ns carries the UNKNOWN sentinel. */
+    cJSON_AddStringToObject(root, "cpu_accounting",
+                            d->cpu_accounting ? "measured" : "legacy");
     return root;
 }
 
@@ -196,6 +205,18 @@ static cJSON *build_metrics(const struct pgwt_daemon *d)
      * command — observed but deliberately not recorded as activity. */
     cJSON_AddNumberToObject(root, "io_worker_busy_pct",
                             ctr->io_worker_busy_pct);
+
+    /* T8 measured-CPU counters (docs/T8_MEASURED_CPU_PLAN.md §5.6). Lifetime
+     * totals over exact-tier measured intervals; all 0 on a legacy daemon.
+     * cpu_accounting mirrors status so a metrics scrape alone reveals the tier.
+     * wait_gap_cpu_ns_total is the self-check (should stay ≈0 vs total wait). */
+    cJSON_AddStringToObject(root, "cpu_accounting",
+                            d->cpu_accounting ? "measured" : "legacy");
+    cjson_add_uint64(root, "cpu_ns_total", ctr->cpu_ns_total);
+    cjson_add_uint64(root, "offcpu_ns_total", ctr->offcpu_ns_total);
+    cjson_add_uint64(root, "cpu_clamped_total", ctr->cpu_clamped_ns_total);
+    cjson_add_uint64(root, "wait_gap_cpu_ns_total", ctr->wait_gap_cpu_ns_total);
+
     cjson_add_uint64(root, "io_worker_samples_total",
                      ctr->io_worker_samples_total);
     cjson_add_uint64(root, "io_worker_busy_total",

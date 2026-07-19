@@ -88,6 +88,12 @@ def _make_aas_buckets():
         buckets.append({
             "t": t,
             "cpu": round(1.2 + 0.3 * (i % 5), 4),
+            # T8 (§5.5, additive): measured off-CPU AAS — a stacked sibling of
+            # "cpu" (the on-CPU share). The real server always emits it; 0 where
+            # no measured cpu_ns exists. Kept small/nonzero here so the mirror is
+            # faithful without perturbing the aas snapshot (aas.js renders a
+            # fixed WAIT_CLASSES list and does not pick up this key).
+            "offcpu": round(0.1 + 0.02 * (i % 4), 4),
             "io":  round(0.8 + 0.2 * (i % 3), 4),
             "lock": round(0.1 + 0.05 * (i % 7), 4),
             "lwlock": round(0.3 + 0.1 * (i % 4), 4),
@@ -169,6 +175,20 @@ _CANNED["time_model"] = {
         {"name": "io_worker",   "ms": 2400,  "aas": 0.67},
     ],
     "io_worker_busy_pct": 22.2,
+    # T8 (§5.5, additive): measured-CPU decomposition + self-checks. The real
+    # server always emits these on time_model. has_measured_cpu gates the
+    # Off-CPU* row (present on v3 exact data, absent on sampled/v2). cpu_ms is
+    # the measured CPU* total, offcpu_ms its off-CPU sibling (both in DB Time).
+    # wait_gap_cpu_ms / cpu_clamped_ms are the accounting self-checks. NOTE: no
+    # Off-CPU* row is added to `rows` below — the visual-snapshot baselines are
+    # keyed to this exact table layout (see the top_events note) and the row
+    # schema is identical to any other, so protocol-drift is satisfied by the
+    # top-level keys alone.
+    "has_measured_cpu": True,
+    "cpu_ms": 4800,
+    "offcpu_ms": 260,
+    "wait_gap_cpu_ms": 0.003,
+    "cpu_clamped_ms": 0.0,
     "rows": [
         {"indent": 0, "name": "DB Time",  "ms": 12500, "pct": 100.0, "aas": 3.47},
         {"indent": 1, "name": "CPU*",     "ms": 4800,  "pct": 38.4,  "aas": 1.33},
@@ -457,6 +477,9 @@ class DaemonState:
             # cannot read backend memory — "blind", not "idle".
             "sampler_healthy": True,
             "sampler_unhealthy_reason": "",
+            # T8 (§5.4): measured-CPU capability. "measured" = schedstat present
+            # (exact tier reads se.sum_exec_runtime); "legacy" = gap-inference.
+            "cpu_accounting": "measured",
         }
 
     def metrics(self):
@@ -496,6 +519,13 @@ class DaemonState:
             "anomaly_baseline_aas": 1.85,
             # T2 decomposed-AAS observability
             "io_worker_busy_pct": 22.2,
+            # T8 measured-CPU counters (§5.6). Lifetime ns totals over exact-tier
+            # measured intervals; wait_gap_cpu_ns_total is the ≈0 self-check.
+            "cpu_accounting": "measured",
+            "cpu_ns_total": 480_000_000_000,
+            "offcpu_ns_total": 12_000_000_000,
+            "cpu_clamped_total": 0,
+            "wait_gap_cpu_ns_total": 3_000_000,
             "io_worker_samples_total": 18000,
             "io_worker_busy_total": 4000,
             "noncmd_cpu_samples_total": 120000,
