@@ -227,7 +227,12 @@ def test_daemon_server(pm_pid):
                         'BufferPin', 'Timeout', 'Extension'}
         wait_sum = sum(row['ms'] for row in tm_resp['rows']
                       if row['name'] in WAIT_CLASSES)
-        reconstructed = srv_cpu_time + wait_sum
+        # DB Time = CPU* + Off-CPU* + Σ wait classes (S3: Off-CPU* is the
+        # measured runqueue/unaccounted remainder of the on-CPU gaps, a
+        # first-class component of DB Time — must be in the partition).
+        off_cpu = sum(row['ms'] for row in tm_resp['rows']
+                      if row['name'] == 'Off-CPU*')
+        reconstructed = srv_cpu_time + wait_sum + off_cpu
         if srv_db_time > 0:
             error_pct = abs(reconstructed - srv_db_time) / srv_db_time * 100
             check(error_pct < 1.0,

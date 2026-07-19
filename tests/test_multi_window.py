@@ -486,11 +486,20 @@ def test_system_event_data(pm_pid):
     # %DB, so summing both double-counts (that overshoot to ~150% is a test
     # bug, not a tracer bug: DB Time == CPU* + Σ class parents holds — the
     # reconstruction check above passes).
+    # Sum only TOP-LEVEL class rows (a child like Timeout:PgSleep drills down
+    # its parent's %DB — summing both double-counts). The parents that carry a
+    # numeric %DB (CPU* + the wait classes present) should sum to at most 100%;
+    # the remainder up to 100% is Off-CPU* (the measured runqueue residual),
+    # which varies with box load and is not always a distinct %DB row in this
+    # multi-window view. Authoritative conservation (CPU* + Off-CPU* + Σwaits ==
+    # DB Time) is checked exactly by test_data_offcpu_identity and live by
+    # test_daemon_server; here we only sanity-bound the visible parents.
     non_idle = [e for e in events
                 if not e['pct_is_dash'] and ':' not in e['name']]
     pct_sum = sum(e['pct'] for e in non_idle)
-    check(80 < pct_sum < 120,
-          f"Non-idle top-level %DB sums to {pct_sum:.1f}% (expected ~100%)")
+    check(50 < pct_sum <= 101,
+          f"Non-idle top-level %DB sums to {pct_sum:.1f}% "
+          f"(≤100%; remainder is Off-CPU*)")
 
     # Idle-but-visible events must render "—" (not a number) for %DB.
     idle_rows = [e for e in events if e['name'] == 'Client:ClientRead']
