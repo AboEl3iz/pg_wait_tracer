@@ -107,6 +107,7 @@ done 3< "$SCRIPT_DIR/unit_tests.list"
 # Step 2.5: Synthetic data correctness tests (no root needed, needs pgwt-server)
 if [[ -x "$PROJECT_DIR/pgwt-server" ]] && [[ -x "$SCRIPT_DIR/gen_test_traces" ]]; then
     run_test "test_data_time_model" python3 "$SCRIPT_DIR/test_data_time_model.py"
+    run_test "test_data_offcpu_identity" python3 "$SCRIPT_DIR/test_data_offcpu_identity.py"
     run_test "test_data_aas" python3 "$SCRIPT_DIR/test_data_aas.py"
     run_test "test_data_events" python3 "$SCRIPT_DIR/test_data_events.py"
     run_test "test_data_sessions" python3 "$SCRIPT_DIR/test_data_sessions.py"
