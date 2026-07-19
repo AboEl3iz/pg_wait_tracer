@@ -111,7 +111,7 @@ def test_cpu_system_event(pm_pid):
     psql_proc = subprocess.Popen(
         ["psql", "-U", "postgres", "-d", "postgres",
          "-c", "DO $$ DECLARE x bigint := 0; BEGIN "
-               "FOR i IN 1..200000000 LOOP x := x + i; END LOOP; END $$",
+               "FOR i IN 1..3000000000 LOOP x := x + i; END LOOP; END $$",
          "-c", "SELECT pg_sleep(60)"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
@@ -170,7 +170,7 @@ def test_cpu_time_model(pm_pid):
     psql_proc = subprocess.Popen(
         ["psql", "-U", "postgres", "-d", "postgres",
          "-c", "DO $$ DECLARE x bigint := 0; BEGIN "
-               "FOR i IN 1..200000000 LOOP x := x + i; END LOOP; END $$",
+               "FOR i IN 1..3000000000 LOOP x := x + i; END LOOP; END $$",
          "-c", "SELECT pg_sleep(60)"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )

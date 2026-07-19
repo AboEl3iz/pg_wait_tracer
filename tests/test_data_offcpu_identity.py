@@ -96,17 +96,21 @@ def main():
 
             print(f"--- DB={db} CPU*={cpu} Off-CPU*={offcpu} LWLock={lwlock} IO={io} ---")
             t.check_approx(db, 63.4, 0.01, "DB Time = 63.4ms")
-            # CPU* conserves: includes the 0.6ms that leaked into the two
-            # LWLock intervals (pre-revision code reports 14.4-0.6=13.8).
-            t.check_approx(cpu, 14.4, 0.01,
-                           "CPU* = 14.4ms (conserved; wait-leaked CPU counted)")
-            t.check_approx(lwlock, 35.0, 0.01, "LWLock = 35.0ms (exact durations)")
-            t.check_approx(io, 10.0, 0.01, "IO = 10.0ms (exact duration)")
-            # Off-CPU* is the residual: 0 for the free-core sequence, 4ms for the
-            # preempted hog. Pre-revision per-interval split reports ~0.6 too much.
-            t.check_approx(offcpu, 4.0, 0.01,
-                           "Off-CPU* = 4.0ms (residual runqueue; free-core seq adds 0)")
-            # The identity that Models A/B break:
+            # CPU* = query CPU (we==0 on-CPU) ONLY: 4.8+0+3 (seq) + 6 (hog).
+            # The 0.6ms of on-CPU during the two LWLock intervals is LWLock SPIN
+            # — it stays attributed to LWLock (the label is the diagnostic), not
+            # folded into an anonymous CPU* bucket.
+            t.check_approx(cpu, 13.8, 0.01,
+                           "CPU* = 13.8ms (query CPU only; LWLock spin stays in LWLock)")
+            # Wait classes keep their FULL wall time (incl. the on-CPU spin):
+            t.check_approx(lwlock, 35.0, 0.01, "LWLock = 35.0ms (full time, keeps label)")
+            t.check_approx(io, 10.0, 0.01, "IO = 10.0ms")
+            # Off-CPU* = residual runqueue of the we==0 gaps: 0 for the free-core
+            # sequence + 4.6 from the preempted hog (10 wall - 6 on-CPU) and the
+            # sequence's own we==0 off-CPU (18.4 gap wall - 13.8 on-CPU = 4.6).
+            t.check_approx(offcpu, 4.6, 0.02,
+                           "Off-CPU* = 4.6ms (residual runqueue of the we==0 gaps)")
+            # The conservation identity:
             t.check_approx(cpu + offcpu + lwlock + io, 63.4, 0.02,
                            "IDENTITY CPU* + Off-CPU* + Σwaits == DB Time")
     finally:

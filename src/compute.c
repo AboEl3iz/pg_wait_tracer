@@ -435,15 +435,21 @@ void pgwt_compute_aas(const struct pgwt_trace_event *events, int count,
                 double ov = (double)(o_end - o_start);
                 if (!io_worker) {
                     buckets[b].offcpu_aas += ov;   /* DB-ns accumulator */
-                    double cpu_c;
-                    if (is_measured)
-                        cpu_c = dur_d > 0 ? (double)ev->cpu_ns * (ov / dur_d) : 0.0;
-                    else
-                        cpu_c = (class_idx == PGWT_CLASS_CPU) ? ov : 0.0;
-                    if (cpu_c > ov) cpu_c = ov;
-                    buckets[b].class_aas[PGWT_CLASS_CPU] += cpu_c;
-                    if (class_idx != PGWT_CLASS_CPU)
+                    if (class_idx == PGWT_CLASS_CPU) {
+                        /* we==0 gap: measured on-CPU → CPU*, the rest is the
+                         * Off-CPU* residual (computed in the normalize pass). */
+                        double cpu_c;
+                        if (is_measured)
+                            cpu_c = dur_d > 0 ? (double)ev->cpu_ns * (ov/dur_d) : 0.0;
+                        else
+                            cpu_c = ov;   /* UNKNOWN → gap-inference */
+                        if (cpu_c > ov) cpu_c = ov;
+                        buckets[b].class_aas[PGWT_CLASS_CPU] += cpu_c;
+                    } else {
+                        /* wait: full wall time under its own label (any on-CPU
+                         * spin stays here, not in CPU* — see time_model). */
                         buckets[b].class_aas[class_idx] += ov;
+                    }
                 }
                 if (cat >= 0)
                     buckets[b].cat_aas[cat] += ov;
@@ -695,19 +701,21 @@ void pgwt_compute_time_model(const struct pgwt_trace_event *events, int count,
                 cpu_measured_ns += dur_ns;
             }
         } else {
+            /* The wait keeps its FULL wall time and its LABEL. With S3, a
+             * backend that spins on-CPU during e.g. an LWLock has that spin
+             * measured (ev->cpu_ns > 0), but it stays attributed to the wait
+             * class — the label is the diagnostic ("LWLock:LockManager" tells
+             * you it's lock contention; folding that CPU into an anonymous CPU*
+             * bucket would hide the cause). So CPU* excludes wait spin; the
+             * spin is tracked only as an observability sum (a future release
+             * can sub-split each wait class into on-CPU-spin vs off-CPU-blocked
+             * WITHIN the label — docs/S3 §9). */
             classes[cls_idx].total_ns += dur_ns;
-            /* O(1) hash lookup for per-event accumulation */
             int slot = event_ht_find_or_insert(ev_ht, ev->old_event);
             if (slot >= 0)
                 ev_ht[slot].total_ns += dur_ns;
-            /* The wait interval's measured cpu_ns is boundary-leaked pre-wait
-             * CPU (a sleeping task burns none) — count it toward CPU* so the
-             * total conserves. NOT surfaced as in-wait "spin" (that would lie;
-             * real spin/blocked needs sched_switch tracing, §5). Kept as an
-             * observability metric only. */
             if (ev->cpu_ns != PGWT_CPU_NS_UNKNOWN) {
-                cpu_measured_ns += (double)ev->cpu_ns;
-                wait_gap_cpu_ns += (double)ev->cpu_ns;
+                wait_gap_cpu_ns += (double)ev->cpu_ns;   /* observability only */
                 has_measured_cpu = 1;
             }
         }

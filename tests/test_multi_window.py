@@ -481,10 +481,16 @@ def test_system_event_data(pm_pid):
     # Idle-but-visible events (Client:ClientRead) are listed (they have time)
     # but render "—" for %DB, not a number — counting them would overshoot the
     # column past 100%. Sum must be ~100% across the NON-IDLE rows.
-    non_idle = [e for e in events if not e['pct_is_dash']]
+    # Sum only TOP-LEVEL class rows (CPU*, Off-CPU*, Timeout, IO, LWLock, …) —
+    # a child row (Timeout:PgSleep, IO:WalSync) is a drill-down of its parent's
+    # %DB, so summing both double-counts (that overshoot to ~150% is a test
+    # bug, not a tracer bug: DB Time == CPU* + Σ class parents holds — the
+    # reconstruction check above passes).
+    non_idle = [e for e in events
+                if not e['pct_is_dash'] and ':' not in e['name']]
     pct_sum = sum(e['pct'] for e in non_idle)
     check(80 < pct_sum < 120,
-          f"Non-idle %DB sums to {pct_sum:.1f}% (expected ~100%)")
+          f"Non-idle top-level %DB sums to {pct_sum:.1f}% (expected ~100%)")
 
     # Idle-but-visible events must render "—" (not a number) for %DB.
     idle_rows = [e for e in events if e['name'] == 'Client:ClientRead']
