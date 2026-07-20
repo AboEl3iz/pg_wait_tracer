@@ -3,6 +3,46 @@
 Ideas deferred with rationale, so they aren't lost. Add to this list;
 don't delete an entry until it ships (then move it to a CHANGELOG).
 
+## Multi-window %DB: windowed-delta drift of measured-CPU vs wall
+
+The multi-window `--view` (Last 1s / Last 3s) differences two cumulative
+ring snapshots. CPU* carries MEASURED on-CPU ns; DB Time carries WALL.
+Per a single snapshot the visible parents sum to ≤100% (Off-CPU* is the
+non-negative remainder), but across a window edge where CPU intervals
+CLOSE, the closed-interval accounting uses wall (`event_stream.c` →
+`evt->duration_ns`) while the open interval uses measured (`map_reader.c`
+`cpu_open`), so the two cumulative curves drift and the delta's
+visible-parent %DB sum can sit a few % over 100% (observed 106-110% under
+pgbench load, varying with sched_switch timing; worst when Off-CPU* ≈ 0). Cosmetic — the authoritative
+conservation holds exactly (test_data_offcpu_identity, test_daemon_server,
+and test_multi_window Test 3). Amplified (not caused) by the map_reader
+open-on-CPU fix, which correctly restored fork-caught backends' CPU
+magnitude. Proper fix: make the windowed delta clamp CPU* to its wall
+share per window, or render Off-CPU* as an explicit parent so the column
+sums to 100% by construction. Related: the LIVE display accounts a CLOSED
+on-CPU segment at WALL, not measured (measured cpu_ns is folded only into
+lifetime counters) — reconcile both when this is picked up.
+
+## Live view: account the OPEN interval of a repeated WAIT
+
+`pgwt_read_state_map` (src/map_reader.c) skips a backend's current OPEN
+interval when d->accum already holds a CLOSED segment for the same
+(pid, wait_event) — the `has_closed_data` guard. That guard was made
+CPU-only (2026-07-19): on-CPU (we==0) always accounts its open stretch,
+which the measured-CPU feature (S3) requires — a fork-caught compute
+backend passes through a startup we==0 segment, so the guard used to
+suppress its entire ongoing on-CPU LOOP (pinned query read ~0 CPU live).
+The analogous WAIT case is still guarded: a backend that already
+completed one LWLock/Lock/IO wait and is CURRENTLY in another of the SAME
+class has that in-progress wait suppressed in the live `--view` until it
+closes. It is real ongoing wait time and should show. Deferred because
+the guard is load-bearing for existing wait accounting (asserted by
+test_deterministic, whose pg_sleep keep-alive would otherwise count as a
+6th in-progress PgSleep) and removing it safely needs the recorded-trace
+path checked for the same double-count invariant. Scope: additive; make
+the open-wait read symmetric with the open-CPU read, then re-baseline
+test_deterministic's keep-alive to an idle (ClientRead) hold.
+
 ## On-CPU-spin vs off-CPU-blocked, *within* each wait class
 
 **What.** Sub-split every wait class into the time the backend spent

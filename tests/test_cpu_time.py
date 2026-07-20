@@ -38,10 +38,10 @@ def check(cond, msg):
         print(f"  FAIL: {msg}")
 
 
-def psql(sql):
+def psql(sql, timeout=10):
     result = subprocess.run(
         ["psql", "-U", "postgres", "-d", "postgres", "-tAc", sql],
-        capture_output=True, text=True, timeout=10
+        capture_output=True, text=True, timeout=timeout
     )
     return result.stdout.strip()
 
@@ -87,16 +87,28 @@ def parse_time_model(output):
     return model
 
 
+# Background-maintenance waits that are NOT user query work: the checkpointer
+# throttling between write batches (CheckpointWriteDelay) and autovacuum's
+# cost-based delay (VacuumDelay). Under run_all.sh these run for seconds after
+# the heavy write tests (test_accuracy/test_deterministic) and can exceed the
+# compute backend's CPU, but they are idle background sleeps — excluded from the
+# "compute dominates" comparison so the assertion tracks real query activity.
+BACKGROUND_WAITS = ('Timeout:CheckpointWriteDelay', 'Timeout:VacuumDelay')
+
+
 def cleanup():
-    """Terminate any leftover backends from this test."""
+    """Terminate leftover backends and quiet the box before measuring."""
+    for pat in ('%generate_series%', '%pg_sleep%', '%LOOP%'):
+        try:
+            psql("SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                 f"WHERE pid != pg_backend_pid() AND query LIKE '{pat}'")
+        except (subprocess.TimeoutExpired, Exception):
+            pass
+    # Flush pending dirty pages now (waits for any in-progress checkpoint, then
+    # runs an immediate one) so no spread checkpoint throttles during the trace
+    # window. The compute query writes no WAL, so nothing re-triggers one.
     try:
-        psql("SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-             "WHERE pid != pg_backend_pid() AND query LIKE '%generate_series%'")
-    except (subprocess.TimeoutExpired, Exception):
-        pass
-    try:
-        psql("SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-             "WHERE pid != pg_backend_pid() AND query LIKE '%pg_sleep%'")
+        psql("CHECKPOINT", timeout=30)
     except (subprocess.TimeoutExpired, Exception):
         pass
     time.sleep(1)
@@ -110,8 +122,8 @@ def test_cpu_system_event(pm_pid):
     # the backend is caught by the fork tracepoint (reliable) rather than the
     # initial-scan straddle path (an intermittent connect/scan race for a
     # pure-compute client backend — see docs/FUTURE_WORK.md; the straddle case
-    # itself is covered by phase_cpu_straddle). The loop is long enough to run
-    # through the whole measured window.
+    # itself is covered by phase_cpu_straddle). The loop must outlast the whole
+    # measured window so the backend is pinned on-CPU for every interval.
     tracer = subprocess.Popen(
         [TRACER, "--mode", "full", "--pid", str(pm_pid),
          "--interval", "8", "--duration", "12",
@@ -120,11 +132,20 @@ def test_cpu_system_event(pm_pid):
     )
     time.sleep(3)  # tracer scans + arms watchpoints before the backend forks
 
+    # NESTED loop: a plpgsql integer FOR loop binds its counter to int4, so a
+    # single `1..3000000000` bound raises "integer out of range" INSTANTLY
+    # (3e9 > INT_MAX) — the loop never runs and the backend is pure-idle. The
+    # nested form keeps both bounds well under INT_MAX while doing billions of
+    # iterations (~minutes of CPU), so the backend stays pinned for the whole
+    # window and is killed below. No pg_sleep tail: if the compute ever breaks
+    # again, the trace shows ~0 CPU and this test FAILS loudly instead of
+    # silently measuring the sleep.
     psql_proc = subprocess.Popen(
         ["psql", "-U", "postgres", "-d", "postgres",
          "-c", "DO $$ DECLARE x bigint := 0; BEGIN "
-               "FOR i IN 1..3000000000 LOOP x := x + i; END LOOP; END $$",
-         "-c", "SELECT pg_sleep(60)"],
+               "FOR i IN 1..100000 LOOP "
+               "FOR j IN 1..100000 LOOP x := x + 1; END LOOP; "
+               "END LOOP; END $$"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
 
@@ -151,20 +172,25 @@ def test_cpu_system_event(pm_pid):
 
     if cpu_ev:
         ev = cpu_ev[0]
-        check(ev['total_ms'] > 1000,
-              f"CPU total = {ev['total_ms']:.1f}ms > 1000ms")
+        # The backend is pinned on-CPU for the whole window; the first report
+        # covers ~5s of compute (fired at t=3, first interval ends at t=8), so
+        # a correctly-measured CPU* is several thousand ms. >3000ms clears the
+        # shared-box floor while still failing hard on the ~0 regression.
+        check(ev['total_ms'] > 3000,
+              f"CPU total = {ev['total_ms']:.1f}ms > 3000ms")
 
-        # CPU should be a SIGNIFICANT event. On a shared box the top event may
-        # be a background wait (checkpointer WAL, autovacuum, other clients), so
-        # the compute query need not dominate — but it must be a real fraction
-        # (≥20% of the top event), which the ~0 regression never is.
-        non_idle = [e for e in events
-                    if not e['name'].startswith('Activity:')]
-        if non_idle:
-            top_ms = max(e['total_ms'] for e in non_idle)
-            check(ev['total_ms'] >= top_ms * 0.2,
-                  f"CPU {ev['total_ms']:.1f}ms >= 20% of top event "
-                  f"{top_ms:.1f}ms (significant on a shared box)")
+        # A pure-compute backend must make CPU the DOMINANT event among real
+        # query activity — background maintenance sleeps (checkpointer,
+        # autovacuum) are excluded (see BACKGROUND_WAITS) since they are idle
+        # throttling, not work, and can run for seconds under suite load.
+        competing = [e for e in events
+                     if not e['name'].startswith('Activity:')
+                     and e['name'] not in BACKGROUND_WAITS]
+        if competing:
+            top_ms = max(e['total_ms'] for e in competing)
+            check(ev['total_ms'] >= top_ms * 0.8,
+                  f"CPU {ev['total_ms']:.1f}ms is the dominant event "
+                  f"(>=80% of top {top_ms:.1f}ms, excl. background maintenance)")
 
 
 def test_cpu_time_model(pm_pid):
@@ -172,7 +198,8 @@ def test_cpu_time_model(pm_pid):
     print("--- Test 2: CPU Dominance (time_model) ---")
 
     # Tracer first, then fire the compute after attach (fork tracepoint —
-    # reliable; see test_cpu_system_event above).
+    # reliable; see test_cpu_system_event above). Nested int4-safe loop, no
+    # pg_sleep tail — same rationale as test_cpu_system_event.
     tracer = subprocess.Popen(
         [TRACER, "--mode", "full", "--pid", str(pm_pid),
          "--interval", "8", "--duration", "12",
@@ -184,8 +211,9 @@ def test_cpu_time_model(pm_pid):
     psql_proc = subprocess.Popen(
         ["psql", "-U", "postgres", "-d", "postgres",
          "-c", "DO $$ DECLARE x bigint := 0; BEGIN "
-               "FOR i IN 1..3000000000 LOOP x := x + i; END LOOP; END $$",
-         "-c", "SELECT pg_sleep(60)"],
+               "FOR i IN 1..100000 LOOP "
+               "FOR j IN 1..100000 LOOP x := x + 1; END LOOP; "
+               "END LOOP; END $$"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
 
@@ -210,24 +238,29 @@ def test_cpu_time_model(pm_pid):
     check(cpu_ms > 0,
           f"CPU = {cpu_ms:.1f}ms > 0")
 
-    # CPU must be substantially captured for the compute-heavy query — the
-    # regression this guards is CPU reading ~0 (see docs/FUTURE_WORK.md). The
-    # backend is fired fork-after-attach and observed over a partial display
-    # interval on a SHARED box (other clients + background procs also active),
-    # so the absolute figure is well below one-full-core-for-the-whole-window;
-    # >1000ms reliably distinguishes "captured" from the ~0 regression.
-    check(cpu_ms > 1000,
-          f"CPU {cpu_ms:.1f}ms > 1000ms (compute-heavy query captured)")
+    # The backend is pinned on-CPU for the whole window (fork-after-attach); the
+    # first report covers ~5s of compute, so a correctly-measured CPU* is
+    # several thousand ms. >3000ms fails hard on the ~0 regression (the class
+    # this guards: a fork-caught compute backend whose ongoing on-CPU interval
+    # was suppressed in the live view — the has_closed_data bug, fixed in
+    # map_reader.c) while clearing the shared-box floor.
+    check(cpu_ms > 3000,
+          f"CPU {cpu_ms:.1f}ms > 3000ms (compute-heavy query captured)")
 
-    # CPU should be a visible component of DB Time. Threshold is low because
-    # system-wide time_model includes background processes (checkpointer, etc.),
-    # other client backends, and Off-CPU*/extension time, all diluting CPU%.
+    # CPU must DOMINATE real DB Time: the only sustained query work on the box
+    # is this pure-compute backend. Background maintenance sleeps (checkpointer,
+    # autovacuum — see BACKGROUND_WAITS) are subtracted from the denominator
+    # since they are idle throttling, not work; under suite load they can add
+    # seconds of DB Time. Off-CPU* and minor IO still dilute, so require >40%.
     db_time = model.get('DB Time', 0)
-    if db_time > 0:
-        cpu_pct = cpu_ms / db_time * 100
-        check(cpu_pct > 6,
-              f"CPU is {cpu_pct:.1f}% of DB Time "
-              f"(compute query is a significant DB-Time component)")
+    background = sum(model.get(w, 0) for w in BACKGROUND_WAITS)
+    real_db = db_time - background
+    if real_db > 0:
+        cpu_pct = cpu_ms / real_db * 100
+        check(cpu_pct > 40,
+              f"CPU is {cpu_pct:.1f}% of real DB Time "
+              f"(DB {db_time:.0f}ms - background {background:.0f}ms; "
+              f"compute dominates)")
 
 
 def main():

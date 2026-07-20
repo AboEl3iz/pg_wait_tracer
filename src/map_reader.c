@@ -191,10 +191,29 @@ void pgwt_read_state_map(struct pgwt_daemon *d)
                 pa_cur->current_wait_ns = open_ns;
             }
 
-            /* Check if d->accum already has closed-interval data for this
-             * (PID, event). If so, skip the open interval to avoid double-counting. */
+            /* Skip the open interval if d->accum already has closed data for
+             * this (PID, event) — EXCEPT for on-CPU (we==0), see below.
+             *
+             * The guard exists to avoid double-counting a WAIT that the live
+             * open-interval read and a same-window closed record could both
+             * represent; wait accounting has shipped on it and is asserted by
+             * test_deterministic, so it is preserved unchanged.
+             *
+             * On-CPU (we==0) MUST bypass it. The open [last_ts, now] stretch is
+             * the backend's current, not-yet-closed on-CPU run; last_ts is
+             * stamped by BPF on every transition, and event_accum holds only
+             * CLOSED transitions, so the two are disjoint and the open on-CPU
+             * segment is purely additive. With the guard applied to we==0, a
+             * compute backend caught via FORK (client backends pass through
+             * startup ClientRead → a brief on-CPU stretch → the query, leaving a
+             * CLOSED we==0 segment) had its entire ongoing on-CPU LOOP
+             * suppressed — the pinned query read ~0 CPU live, while a
+             * scan-caught backend (no prior we==0) read the full amount. The
+             * measured-CPU feature (S3) depends on this open on-CPU read, so
+             * we==0 is always accounted. (The analogous ongoing-repeated-WAIT
+             * under-count is tracked in docs/FUTURE_WORK.md.) */
             bool has_closed_data = false;
-            if (pa_cur) {
+            if (we != 0 && pa_cur) {
                 for (int i = 0; i < pa_cur->num_events; i++) {
                     if (pa_cur->events[i].wait_event == we &&
                         pa_cur->events[i].count > 0) {
