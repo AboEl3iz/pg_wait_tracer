@@ -835,6 +835,75 @@ def phase_pure_cpu_straddle(pm_pid, mode):
     subprocess.run(["rm", "-rf", trace_dir])
 
 
+def phase_straddle_recovery(pm_pid, mode):
+    """DETERMINISTIC regression for the initial-scan straddle race
+    (pgwt_recover_unattached_backends, docs/FUTURE_WORK.md). phase_pure_cpu_
+    straddle above exercises the same edge but the miss is a TIMING race — it
+    reproduced only intermittently on 2-CPU CI runners (PG13), never on a real
+    box. PGWT_TEST_STRADDLE_SKIP forces the one-shot scan to skip the in-flight
+    backend, reproducing that transient-resolve miss ON EVERY RUN. The
+    level-triggered recovery (startup settle + per-tick backstop) must attach it
+    anyway, so a waitless pure-CPU straddler that the scan lost still reads
+    CPU*>0. Without the recovery (PGWT_TEST_NO_RECOVERY) this reads ~0 — that is
+    the exact CI failure. Runs -v so the scan-skip WARN and the recovery INFO
+    are both visible and asserted."""
+    print(f"--- Phase: straddle recovery, --mode {mode} (scan forced to miss "
+          f"the in-flight backend) ---")
+    trace_dir = tempfile.mkdtemp(prefix="pgwt_smoke_recover_")
+    os.chmod(trace_dir, 0o755)
+
+    hog = subprocess.Popen(
+        ["psql", "-U", "postgres", "-d", "postgres"],
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL, text=True)
+    hog.stdin.write(
+        "DO $$ DECLARE x bigint := 0; BEGIN "
+        "FOR o IN 1..100000 LOOP "
+        "FOR i IN 1..1000000 LOOP x := x + i; END LOOP; x := 0; "
+        "END LOOP; END $$;\n")
+    hog.stdin.flush()
+    time.sleep(2.5)   # the command is in flight; its start-edge is past
+
+    argv = [TRACER, "--mode", mode, "--pid", str(pm_pid),
+            "-T", trace_dir, "--duration", "12", "--interval", "5",
+            "--view", "time_model", "-v"]
+    if mode == "tiered":
+        argv += ["--anomaly-aas-factor", "1000000"]
+    env = {**os.environ, "PGWT_TEST_STRADDLE_SKIP": "1"}
+    tracer = subprocess.Popen(argv, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, env=env)
+    try:
+        stdout, stderr = tracer.communicate(timeout=45)
+    except subprocess.TimeoutExpired:
+        tracer.kill()
+        stdout, stderr = tracer.communicate()
+    finally:
+        try:
+            hog.stdin.write("\\q\n"); hog.stdin.flush()
+        except (BrokenPipeError, ValueError):
+            pass
+        hog.terminate()
+        cleanup_stale_backends()
+    out = STRIP_ANSI.sub('', stdout.decode('utf-8', errors='replace'))
+    err = stderr.decode('utf-8', errors='replace')
+
+    # The hook must actually have fired (else the test proves nothing).
+    check("PGWT_TEST_STRADDLE_SKIP" in err,
+          "scan was forced to skip the in-flight backend (test hook active)")
+    # The recovery — not the scan — must have attached it.
+    check("recovered unattached backend" in err,
+          "pgwt_recover_unattached_backends attached the scan-missed straddler "
+          f"(stderr {err[-200:]!r})")
+    # And the payoff: its CPU is visible despite the scan miss.
+    live = parse_time_model(out)
+    live_cpu = live.get('CPU*', 0.0)
+    check(live_cpu > 0.0,
+          f"scan-missed pure-CPU straddler still shows CPU* > 0 via recovery "
+          f"(--mode {mode}): CPU* = {live_cpu:.0f}ms")
+
+    subprocess.run(["rm", "-rf", trace_dir])
+
+
 def phase_sampled_aas_truth(pm_pid):
     """T2 (AAS-1) definition-of-done: sampled AAS — now CPU-inclusive —
     must match pg_stat_activity 1s-sampling ground truth. A CPU-bound
@@ -1125,6 +1194,13 @@ def main():
         # T8: PURE-CPU straddle (waitless DO-loop) — the measured-CPU
         # acceptance test. Live + trace + /proc magnitude cross-check.
         phase_pure_cpu_straddle(pm_pid, args.mode)
+        # Deterministic straddle-recovery guard: force the scan to miss the
+        # in-flight backend; the level-triggered recovery must attach it anyway.
+        # Full mode only — the recovery is a watchpoint-mode feature; in
+        # sampled/tiered the straddler is found by the sampler's lazy discovery
+        # (covered by phase_pure_cpu_straddle above), not this recovery.
+        if args.mode == 'full':
+            phase_straddle_recovery(pm_pid, args.mode)
         if args.mode == 'tiered':
             # T2 (AAS semantics): CPU-inclusive sampled AAS vs pg_stat_activity
             # ground truth, and the CPU-storm escalation + tier-switch

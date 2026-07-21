@@ -43,6 +43,12 @@ void pgwt_backend_init(struct pgwt_backend_table *bt);
  * (skips bootstrap — they are already initialized). */
 int pgwt_scan_existing_backends(struct pgwt_daemon *d);
 
+/* Periodic level-triggered recovery for the initial-scan straddle race: attach
+ * any postmaster child that still lacks a live watchpoint but is now resolvable
+ * + initialized (the one-shot scan may have missed/limbo'd it under load).
+ * Idempotent; safe to call every tick. Returns the count recovered. */
+int pgwt_recover_unattached_backends(struct pgwt_daemon *d);
+
 /* Handle a new fork from postmaster. Attaches bootstrap watchpoint. */
 int pgwt_handle_fork(struct pgwt_daemon *d, pid_t child_pid);
 
