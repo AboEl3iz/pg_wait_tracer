@@ -10,6 +10,8 @@ The format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.13] — 2026-07-21
+
 The **Trust Milestone** (Track T, `docs/TRUST_MILESTONE_PLAN.md`) — a
 correctness-and-honesty hardening pass after a five-perspective adversarial
 review found that every one of the tool's honesty guarantees was violated by at
@@ -62,10 +64,33 @@ field escapes lived. Merged so far:
   version + protocol in `info`; the client warns loudly, never refuses). Added
   `RELEASING.md` and this changelog; removed stale build artifacts from git.
 
-In flight (not yet merged): **T3 — escalation budget & trigger quality**
-(ESC-1..12): committed-remainder-aware extension charging with a mid-window
-budget clamp, de-escalation flushing open intervals, live-accumulator dedup
-during escalation, and a minimum-activity guard on the lock rule.
+- **T3 — escalation budget & trigger quality** (ESC-1..12).
+  Committed-remainder-aware extension charging with a mid-window budget clamp;
+  de-escalation flushes open intervals as exact end-of-window records;
+  live-accumulator dedup during escalation; a minimum-activity guard on the
+  lock rule.
+- **T8 — exact measured CPU.** Per-backend on-CPU time is now measured exactly
+  from a `tp_btf/sched_switch` accumulator (replacing tick-quantized
+  `sum_exec_runtime` and wait-gap inference), gated on kernel BTF with a loud
+  gap-inference fallback when it is absent. The time model decomposes into
+  `CPU*` (query on-CPU), `Off-CPU*` (the measured runqueue/unaccounted
+  residual — the 10046 "unaccounted-for time" analogue), and Σ waits, which
+  conserve to DB Time exactly (asserted by `test_data_offcpu_identity`).
+  On-CPU spin *during* a wait stays labeled under its wait class (LWLock etc.)
+  rather than folded into an anonymous CPU bucket, so lock-contention burn
+  stays diagnosable. Measured CPU is cross-checked against `/proc` on-CPU
+  within ±20%; the sched_switch program's overhead is within measurement noise
+  (110-126k ctx-switches/s). Two live-view capture holes found in OS/PG matrix
+  validation are fixed: a fork-caught compute backend's *ongoing* on-CPU
+  interval was suppressed by a stale double-count guard (pinned query read ~0
+  CPU, `%DB` nonsense), and a pre-existing backend the one-shot startup scan
+  missed was never recovered (`pgwt_recover_unattached_backends`) — both
+  waitless pure-CPU commands that read `CPU* = 0`. Specs in
+  `docs/S3_SCHED_SWITCH_CPU.md`, `docs/T8_MEASURED_CPU_REVISION.md`,
+  `docs/AAS_SEMANTICS_DECISION.md`.
+
+Validated live on the EL9 / EL8 / Ubuntu 24.04 matrix (PG 13/16/17/18):
+`run_all.sh --require-live` 64/0/3 on each, plus the containerized nightly.
 
 ## [0.12] — 2026-06-21
 
