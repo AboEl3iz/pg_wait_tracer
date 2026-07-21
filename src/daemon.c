@@ -417,7 +417,7 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
                     (unsigned long)dqs_addr);
     }
 
-    /* T8 measured-CPU capability probe (docs/T8_MEASURED_CPU_PLAN.md §5.4).
+    /* T8 measured-CPU capability probe (docs/ROADMAP_AND_STATUS.md).
      * The exact tier already requires kernel BTF (the full-tier gate), so the
      * BPF read of task_struct->se.sum_exec_runtime is available; the userspace
      * seed/flush/live paths read the SAME accumulator via /proc/<pid>/schedstat

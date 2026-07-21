@@ -397,7 +397,7 @@ pgwt-server --dump /var/lib/pgwt/traces | grep "IO:"
 ```
 
 See [INSTALL.md](INSTALL.md) for build instructions and
-[docs/ROADMAP.md](docs/ROADMAP.md) for the development roadmap.
+[docs/ROADMAP_AND_STATUS.md](docs/ROADMAP_AND_STATUS.md) for the development roadmap.
 
 **Planned features** (see roadmap for details):
 - Query text capture from `st_activity` in shared memory

@@ -2,7 +2,7 @@
 
 Status: COMPLETE (T2 decision-gate input). Do not merge as-is.
 
-Decision gate for Phase T2 (TRUST_MILESTONE_PLAN.md) and REWORK_PLAN.md
+Decision gate for Phase T2 (docs/ROADMAP_AND_STATUS.md) and docs/ROADMAP_AND_STATUS.md
 "Risks and open questions" #6: how should pg_wait_tracer's AAS treat PG18
 `io_method=worker` io_workers, and should on-CPU sessions be sampled as
 active (finding AAS-1)?

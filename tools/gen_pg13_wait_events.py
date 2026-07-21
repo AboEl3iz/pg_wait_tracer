@@ -14,7 +14,7 @@ Inputs (from postgresql13-devel, /usr/pgsql-13/include/server):
 
 Why headers and not debuginfo: PG13 is EOL (2025-11); no debuginfo package
 exists anywhere and the binary is stripped. The -devel headers are the only
-authoritative offset/enum source. See docs/REWORK_PLAN.md Track D3.
+authoritative offset/enum source. See docs/ROADMAP_AND_STATUS.md.
 
 The enum-constant -> display-string transformation mirrors what PG's
 pgstat_get_wait_*() switch statements emit: split on '_', TitleCase each

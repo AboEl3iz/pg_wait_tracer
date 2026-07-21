@@ -211,7 +211,7 @@ void pgwt_read_state_map(struct pgwt_daemon *d)
              * scan-caught backend (no prior we==0) read the full amount. The
              * measured-CPU feature (S3) depends on this open on-CPU read, so
              * we==0 is always accounted. (The analogous ongoing-repeated-WAIT
-             * under-count is tracked in docs/FUTURE_WORK.md.) */
+             * under-count is tracked in docs/ROADMAP_AND_STATUS.md.) */
             bool has_closed_data = false;
             if (we != 0 && pa_cur) {
                 for (int i = 0; i < pa_cur->num_events; i++) {

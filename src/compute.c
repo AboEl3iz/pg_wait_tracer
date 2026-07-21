@@ -678,7 +678,7 @@ void pgwt_compute_time_model(const struct pgwt_trace_event *events, int count,
         db_time_ns += dur_ns;
         int cls_idx = pgwt_wait_class_index(ev->old_event);
         if (cls_idx == PGWT_CLASS_CPU) {
-            /* T8 revision (docs/T8_MEASURED_CPU_REVISION.md): CPU* is the SUM
+            /* T8 revision (docs/ROADMAP_AND_STATUS.md): CPU* is the SUM
              * of every interval's measured cpu_ns (conserved = true CPU);
              * Off-CPU* is a GLOBAL RESIDUAL computed after the loop, never a
              * per-interval dur-cpu split. `se.sum_exec_runtime` is only current

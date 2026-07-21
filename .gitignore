@@ -54,3 +54,4 @@ web/web
 # Cross-compiled Go binaries
 pgwt-darwin-amd64
 pgwt-darwin-arm64
+.claude/
