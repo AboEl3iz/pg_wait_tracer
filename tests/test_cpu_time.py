@@ -87,13 +87,16 @@ def parse_time_model(output):
     return model
 
 
-# Background-maintenance waits that are NOT user query work: the checkpointer
-# throttling between write batches (CheckpointWriteDelay) and autovacuum's
-# cost-based delay (VacuumDelay). Under run_all.sh these run for seconds after
-# the heavy write tests (test_accuracy/test_deterministic) and can exceed the
-# compute backend's CPU, but they are idle background sleeps — excluded from the
-# "compute dominates" comparison so the assertion tracks real query activity.
-BACKGROUND_WAITS = ('Timeout:CheckpointWriteDelay', 'Timeout:VacuumDelay')
+# Waits by BACKGROUND processes that are NOT user query work: the checkpointer
+# throttling between write batches (CheckpointWriteDelay), autovacuum's
+# cost-based delay (VacuumDelay), and the pg_wait_sampling collector's
+# background worker parked on its latch (Extension:Extension — seen for
+# seconds on boxes where that extension is loaded, e.g. EL8). These are idle
+# background sleeps that inflate system-wide DB Time; excluded from the "compute
+# dominates" comparison so the assertion tracks real query activity, not which
+# background worker happened to be waiting during the window.
+BACKGROUND_WAITS = ('Timeout:CheckpointWriteDelay', 'Timeout:VacuumDelay',
+                    'Extension:Extension')
 
 
 def cleanup():

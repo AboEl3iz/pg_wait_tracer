@@ -505,12 +505,17 @@ def test_system_event_data(pm_pid):
     # ~150%+ (Timeout:PgSleep atop Timeout, IO:* atop IO, …). A tighter net is
     # not possible here: the same delta drift can push a single class (CPU*,
     # measured vs wall) a few % over 100%, so any per-row bound near 100% flakes.
+    # Lower bound is loose too: the visible parents are 100% MINUS Off-CPU*,
+    # and Off-CPU* (measured runqueue residual) can be MOST of DB Time under
+    # oversubscription (observed 44.7% parents on a 4-vCPU EL8 box under suite
+    # load — the rest was off-CPU). The floor only catches a degenerate
+    # all-zero/broken view; exact conservation is Test 3 above.
     non_idle = [e for e in events
                 if not e['pct_is_dash'] and ':' not in e['name']]
     pct_sum = sum(e['pct'] for e in non_idle)
-    check(50 < pct_sum <= 125,
+    check(15 < pct_sum <= 125,
           f"Non-idle top-level %DB sums to {pct_sum:.1f}% "
-          f"(≤125%; ≤100% per snapshot + windowed-delta noise)")
+          f"(15-125%; = 100% - Off-CPU* per snapshot ± windowed-delta noise)")
 
     # Idle-but-visible events must render "—" (not a number) for %DB.
     idle_rows = [e for e in events if e['name'] == 'Client:ClientRead']
