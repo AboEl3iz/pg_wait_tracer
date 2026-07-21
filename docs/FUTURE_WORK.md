@@ -102,22 +102,6 @@ CPU\* toward exact, without changing the sampled tier's ~0-overhead
 character (the read is one map lookup per backend per tick, already done
 for query_id).
 
-## Investigate: pure-compute straddling CLIENT backend intermittently untracked
-
-Found in EL9 validation (2026-07-19) via test_cpu_time. A client backend
-running a pure-compute DO block (no waits) that STRADDLES attach was
-sometimes NOT in the tracer's initial-scan set (only aux processes
-attached), so its CPU showed as DB≈0 in the live `--view`. The recorded
-TRACE path and the fork-after-attach path capture it correctly, and
-phase_pure_cpu_straddle (CI, all PG versions) validates the capability —
-so this is an intermittent initial-scan/connect race for a specific
-setup (kill+restart the client backend, then attach quickly), not a
-systematic gap. Root-cause the scan timing (does the scan run before the
-client backend's PGPROC is resolvable / does address-validation skip it
-silently?). Related: the live `--view time_model` of a genuinely on-CPU
-backend must never render it as idle — verify the map_reader open-
-interval classification once the scan issue is understood.
-
 ## Parallel-worker CPU roll-up to the leader's query
 
 T2 counts parallel workers' CPU under their own query_id in

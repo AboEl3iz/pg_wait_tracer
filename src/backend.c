@@ -271,6 +271,13 @@ int pgwt_scan_existing_backends(struct pgwt_daemon *d)
         return -1;
     }
 
+    /* TEST HOOK (PGWT_TEST_STRADDLE_SKIP): deterministically reproduce the
+     * initial-scan straddle race by skipping any backend that is inside a
+     * command at scan time (debug_query_string set) — exactly the pre-existing
+     * pure-CPU straddler the race loses. pgwt_recover_unattached_backends must
+     * then pick it up on a later tick. Never set in production. */
+    int skip_straddle = getenv("PGWT_TEST_STRADDLE_SKIP") != NULL;
+
     int count = 0;
     struct dirent *ent;
     while ((ent = readdir(proc)) != NULL) {
@@ -298,6 +305,26 @@ int pgwt_scan_existing_backends(struct pgwt_daemon *d)
 
         if (ppid != d->postmaster_pid)
             continue;
+
+        /* TEST HOOK: skip a straddling in-command backend (see top of fn) so
+         * pgwt_recover_unattached_backends must attach it later. */
+        if (skip_straddle && d->debug_query_string_addr) {
+            char mp[64];
+            snprintf(mp, sizeof(mp), "/proc/%d/mem", pid);
+            int mf = open(mp, O_RDONLY);
+            if (mf >= 0) {
+                uint64_t dqs = 0;
+                ssize_t got = pread(mf, &dqs, sizeof(dqs),
+                                    (off_t)d->debug_query_string_addr);
+                close(mf);
+                if (got == (ssize_t)sizeof(dqs) && dqs) {
+                    fprintf(stderr, "WARN: PGWT_TEST_STRADDLE_SKIP — skipping "
+                            "in-command PID %d at scan (recovery must attach)\n",
+                            pid);
+                    continue;
+                }
+            }
+        }
 
         /* This is a postgres child. Resolve its wait_event_info address
          * (PG17+ my_wait_event_info global; PG<17 MyProc + offset).
@@ -415,6 +442,86 @@ int pgwt_scan_existing_backends(struct pgwt_daemon *d)
     }
     closedir(proc);
     return count;
+}
+
+/* Periodic recovery for the initial-scan straddle race (docs/FUTURE_WORK.md).
+ *
+ * pgwt_scan_existing_backends runs ONCE at startup. A pre-existing backend
+ * whose wait_event_info was transiently unresolvable at that single instant
+ * (a /proc read race under load — much likelier on a 2-CPU CI runner, and on
+ * PG13 where the address is *MyProc + offset, an extra indirection) is either
+ * skipped outright (its /proc/stat read failed) or routed to the bootstrap
+ * path. The bootstrap watchpoint fires only on a wait_event_info WRITE, which
+ * a backend already past InitProcess never does again — so a WAITLESS command
+ * (pure compute: no wait boundaries, so the trace stays empty and only the
+ * live open-interval read would show its CPU) stays untraced for its whole
+ * life and reads CPU* = 0. There was no recovery: the timer GC only reaps DEAD
+ * backends, never re-attaches a missed live one.
+ *
+ * This re-scans /proc each tick and attaches any postmaster child that still
+ * lacks a live watchpoint but is now resolvable AND initialized (its PGPROC is
+ * in shared memory — the same predicate handle_fork uses to attach directly).
+ * Idempotent: a backend already holding a live watchpoint (wp_fd >= 0) is
+ * skipped cheaply. A freshly-forked backend still in InitProcess points at its
+ * process-LOCAL dummy (addr_is_shared != 1) and is left to its bootstrap
+ * watchpoint, which WILL fire for it. Cheap: one /proc pass, the same
+ * resolution the scan uses. Returns the number of backends recovered. */
+int pgwt_recover_unattached_backends(struct pgwt_daemon *d)
+{
+    if (!pgwt_mode_uses_watchpoints(d))
+        return 0;
+
+    DIR *proc = opendir("/proc");
+    if (!proc)
+        return 0;
+
+    int recovered = 0;
+    struct dirent *ent;
+    while ((ent = readdir(proc)) != NULL) {
+        pid_t pid = atoi(ent->d_name);
+        if (pid <= 0)
+            continue;
+
+        /* Already attached with a live watchpoint — nothing to recover. This
+         * is the common case (every healthy backend), kept cheap. */
+        struct pgwt_backend *be = pgwt_find_backend(&d->backends, pid);
+        if (be && be->wp_fd >= 0)
+            continue;
+
+        /* Postmaster child? (ppid == postmaster, field 4 of /proc/pid/stat). */
+        char stat_path[64];
+        snprintf(stat_path, sizeof(stat_path), "/proc/%d/stat", pid);
+        FILE *f = fopen(stat_path, "r");
+        if (!f)
+            continue;
+        char stat_line[512];
+        if (!fgets(stat_line, sizeof(stat_line), f)) { fclose(f); continue; }
+        fclose(f);
+        char *last_paren = strrchr(stat_line, ')');
+        if (!last_paren)
+            continue;
+        char state;
+        int ppid;
+        if (sscanf(last_paren + 1, " %c %d", &state, &ppid) != 2)
+            continue;
+        if (ppid != d->postmaster_pid)
+            continue;
+
+        /* Resolvable AND initialized (PGPROC in shm)? Attach directly — the
+         * level-triggered version of handle_fork's direct-attach fast path. A
+         * still-initializing backend (local dummy) is left to bootstrap. */
+        uint64_t ptr = pgwt_resolve_backend_wait_addr(d, pid);
+        if (ptr != 0 && pgwt_addr_is_shared(pid, ptr) == 1) {
+            if (pgwt_handle_init(d, pid, ptr) == 0) {
+                recovered++;
+                if (d->verbose)
+                    fprintf(stderr, "INFO: recovered unattached backend PID %d "
+                            "(initial-scan straddle race)\n", pid);
+            }
+        }
+    }
+    closedir(proc);
+    return recovered;
 }
 
 /* CAP-2/3: post-scan offset confirmation. Only reached when the initial scan

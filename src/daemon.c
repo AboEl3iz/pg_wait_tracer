@@ -76,6 +76,15 @@ static void handle_timer(struct pgwt_daemon *d)
         }
     }
 
+    /* Straddle-race recovery: re-attach any pre-existing backend the one-shot
+     * startup scan missed or left in bootstrap limbo (a transient resolve race,
+     * fatal for a waitless pure-CPU command whose bootstrap watchpoint never
+     * fires). Level-triggered and idempotent — runs before the state_map read
+     * so a recovery this tick is reflected in this tick's view. Full/tiered
+     * only (no-op in sampled/lightweight, which resolve lazily). */
+    if (!d->lightweight_mode && !getenv("PGWT_TEST_NO_RECOVERY"))
+        pgwt_recover_unattached_backends(d);
+
     /* ESC-1: enforce the escalation budget mid-window (cheap no-op unless a
      * budget-limited window is open and has reached its cap). */
     pgwt_escalation_check_budget(d);
@@ -743,6 +752,22 @@ int pgwt_daemon_init(struct pgwt_daemon *d)
      * it would trace garbage (or nothing) labeled as real. */
     if (pgwt_confirm_wait_offset(d) != 0)
         goto fail;
+
+    /* Straddle-race recovery at startup. The one-shot scan above can miss a
+     * pre-existing backend (its /proc read raced) or leave it in bootstrap
+     * limbo (its wait_event_info resolve returned 0 transiently) — fatal for a
+     * pure-CPU straddler whose bootstrap watchpoint never fires. Re-attempt a
+     * few times over the first ~600ms: the transient that caused the miss is
+     * gone by now, so the re-resolve succeeds and the backend is attached
+     * BEFORE any measurement window opens (not one display interval later, as
+     * the per-tick backstop in handle_timer would). Cheap no-op when the scan
+     * already attached everything. */
+    if (pgwt_mode_uses_watchpoints(d) && !getenv("PGWT_TEST_NO_RECOVERY")) {
+        for (int i = 0; i < 3; i++) {
+            pgwt_recover_unattached_backends(d);
+            usleep(200000);   /* 200ms between passes */
+        }
+    }
 
     /* Create timer fd */
     d->timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC);
