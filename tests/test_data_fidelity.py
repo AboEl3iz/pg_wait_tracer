@@ -2,7 +2,7 @@
 """test_data_fidelity.py — A3: fidelity-aware compute (sampled estimators,
 exact-wins merge, unavailable for exact-only views).
 
-Covers design decision D3 of docs/REWORK_PLAN.md:
+Covers design decision D3 of docs/ROADMAP_AND_STATUS.md:
 
   1. Sampled-only trace with a KNOWN sample stream → exact expected
      time_model / system_event / AAS estimates (ASH math: N samples of

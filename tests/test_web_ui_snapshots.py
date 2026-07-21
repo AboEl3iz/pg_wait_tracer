@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """test_web_ui_snapshots.py -- visual-regression snapshots for the pgwt web UI.
 
-Phase B4 of docs/REWORK_PLAN.md. DOM/getOption() assertions (test_web_ui.py)
+Phase B4 of docs/ROADMAP_AND_STATUS.md. DOM/getOption() assertions (test_web_ui.py)
 prove "it renders and the data is present"; they cannot see the
 "renders without errors but looks WRONG" class — a dropped series color, a
 broken layout, a heatmap that lost its legend. This suite catches that by

@@ -124,7 +124,7 @@ def test_cpu_system_event(pm_pid):
     # Start the tracer FIRST, then fire the compute AFTER it has attached, so
     # the backend is caught by the fork tracepoint (reliable) rather than the
     # initial-scan straddle path (an intermittent connect/scan race for a
-    # pure-compute client backend — see docs/FUTURE_WORK.md; the straddle case
+    # pure-compute client backend — see docs/ROADMAP_AND_STATUS.md; the straddle case
     # itself is covered by phase_cpu_straddle). The loop must outlast the whole
     # measured window so the backend is pinned on-CPU for every interval.
     tracer = subprocess.Popen(

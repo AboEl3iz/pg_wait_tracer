@@ -2,7 +2,7 @@
 """test_data_offcpu_identity.py — T8 revision: conserved CPU* + residual Off-CPU*.
 
 The regression that the rejected per-interval Off-CPU* models fail. Encodes
-the mixed CPU/LWLock/IO sequence from docs/T8_MEASURED_CPU_REVISION.md §1 with
+the mixed CPU/LWLock/IO sequence from docs/ROADMAP_AND_STATUS.md with
 a KNOWN sub-millisecond CPU burst whose measured cpu_ns leaks into the
 following wait interval (sum_exec_runtime is only current at a tick / context
 switch). Asserts:

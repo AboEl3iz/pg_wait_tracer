@@ -12,7 +12,7 @@ The format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [0.13] — 2026-07-21
 
-The **Trust Milestone** (Track T, `docs/TRUST_MILESTONE_PLAN.md`) — a
+The **Trust Milestone** (Track T, `docs/ROADMAP_AND_STATUS.md`) — a
 correctness-and-honesty hardening pass after a five-perspective adversarial
 review found that every one of the tool's honesty guarantees was violated by at
 least one code path, and that CI never executed the capture slice where all four
@@ -86,7 +86,7 @@ field escapes lived. Merged so far:
   CPU, `%DB` nonsense), and a pre-existing backend the one-shot startup scan
   missed was never recovered (`pgwt_recover_unattached_backends`) — both
   waitless pure-CPU commands that read `CPU* = 0`. Specs in
-  `docs/S3_SCHED_SWITCH_CPU.md`, `docs/T8_MEASURED_CPU_REVISION.md`,
+  `docs/S3_SCHED_SWITCH_CPU.md`, `docs/ROADMAP_AND_STATUS.md`,
   `docs/AAS_SEMANTICS_DECISION.md`.
 
 Validated live on the EL9 / EL8 / Ubuntu 24.04 matrix (PG 13/16/17/18):

@@ -444,7 +444,7 @@ int pgwt_scan_existing_backends(struct pgwt_daemon *d)
     return count;
 }
 
-/* Periodic recovery for the initial-scan straddle race (docs/FUTURE_WORK.md).
+/* Periodic recovery for the initial-scan straddle race (docs/ROADMAP_AND_STATUS.md).
  *
  * pgwt_scan_existing_backends runs ONCE at startup. A pre-existing backend
  * whose wait_event_info was transiently unresolvable at that single instant

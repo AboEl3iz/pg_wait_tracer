@@ -1,7 +1,7 @@
 # Decision: AAS semantics — the full decomposed model
 
 Date: 2026-07-12
-Status: DECIDED (T2 gate of docs/TRUST_MILESTONE_PLAN.md)
+Status: DECIDED (T2 gate of docs/ROADMAP_AND_STATUS.md)
 Evidence: docs/T2_IOWORKER_STUDY.md (empirical study, PG 18.4)
 Companion decision: Client:ClientRead = idle-but-visible (unchanged).
 

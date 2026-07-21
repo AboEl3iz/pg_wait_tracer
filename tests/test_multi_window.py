@@ -498,7 +498,7 @@ def test_system_event_data(pm_pid):
     # NOT a conservation error — the exact identity CPU* + Off-CPU* + Σwaits ==
     # DB Time is asserted by test_data_offcpu_identity and live by
     # test_daemon_server, and by Test 3 above (Σ top-level rows == DB Time, 0%
-    # error). Tracked in docs/FUTURE_WORK.md. Observed 106-110% under pgbench
+    # error). Tracked in docs/ROADMAP_AND_STATUS.md. Observed 106-110% under pgbench
     # load and it varies with sched_switch timing (so the bound must survive the
     # EL8/EL9/Ubuntu matrix); ≤125% absorbs that while still failing hard on the
     # real thing this guards — accidentally summing child rows too, which is

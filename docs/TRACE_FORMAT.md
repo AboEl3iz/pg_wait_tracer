@@ -6,7 +6,7 @@ READABLE (their TRANSITIONS records surface `cpu_ns = PGWT_CPU_NS_UNKNOWN`
 and the compute layer falls back to gap-inference); v1 stays rejected.
 Written for Phase T5 of the Trust Milestone (DUR-5/6: the format and its
 durability guarantees were previously implicit in the code); the v3 cpu_ns
-column was added in Phase T8 (measured CPU, docs/T8_MEASURED_CPU_PLAN.md).
+column was added in Phase T8 (measured CPU, docs/ROADMAP_AND_STATUS.md).
 
 ## Scope and general rules
 
@@ -34,7 +34,7 @@ portable to big-endian writers/readers (none are supported).
 Each file header records one (`CLOCK_REALTIME`, `CLOCK_MONOTONIC`) pair
 captured at file creation; readers derive the mono→wall mapping per file
 (and re-anchor across files per clock generation — see FID-7 in
-`TRUST_MILESTONE_PLAN.md`). Summary block timestamps are wall-clock.
+`docs/ROADMAP_AND_STATUS.md`). Summary block timestamps are wall-clock.
 
 ## Trace file layout
 

@@ -1,4 +1,4 @@
-# CI safety net (Phase B1 of docs/REWORK_PLAN.md)
+# CI safety net (Phase B1 of docs/ROADMAP_AND_STATUS.md)
 #
 # Three jobs:
 #   build-and-unit  — full build (BPF tracer + pgwt-server), C unit tests,

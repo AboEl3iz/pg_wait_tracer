@@ -40,7 +40,7 @@ volatile const u32 skip_query_id = 0;      /* 1=skip query_id reads (saves 1 pro
 volatile const u64 debug_query_string_addr = 0; /* VA of debug_query_string global */
 
 /* T8 measured CPU: 1 when the daemon's startup probe confirmed the kernel BTF
- * carries task_struct->se.sum_exec_runtime (docs/T8_MEASURED_CPU_PLAN.md §5.4).
+ * carries task_struct->se.sum_exec_runtime (docs/ROADMAP_AND_STATUS.md).
  * When set, the watchpoint handler reads that exact accumulator at every wait
  * boundary and emits the per-interval CPU delta in pgwt_trace_event.cpu_ns; 0
  * leaves cpu_ns at 0 and userspace stamps the UNKNOWN sentinel (gap-inference

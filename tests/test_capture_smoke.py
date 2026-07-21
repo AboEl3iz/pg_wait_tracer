@@ -711,7 +711,7 @@ def phase_cpu_straddle(pm_pid, mode):
 
 
 def phase_pure_cpu_straddle(pm_pid, mode):
-    """T8 (docs/T8_MEASURED_CPU_PLAN.md §5.6.1) — THE measured-CPU acceptance
+    """T8 (docs/ROADMAP_AND_STATUS.md) — THE measured-CPU acceptance
     test. A PL/pgSQL loop over NO data fires ZERO wait events for its entire
     life, so the watchpoint never emits a boundary. Pre-T8 this produced an
     EMPTY trace in --mode full (the on-CPU stretch was never closed) and 0%
@@ -837,7 +837,7 @@ def phase_pure_cpu_straddle(pm_pid, mode):
 
 def phase_straddle_recovery(pm_pid, mode):
     """DETERMINISTIC regression for the initial-scan straddle race
-    (pgwt_recover_unattached_backends, docs/FUTURE_WORK.md). phase_pure_cpu_
+    (pgwt_recover_unattached_backends, docs/ROADMAP_AND_STATUS.md). phase_pure_cpu_
     straddle above exercises the same edge but the miss is a TIMING race — it
     reproduced only intermittently on 2-CPU CI runners (PG13), never on a real
     box. PGWT_TEST_STRADDLE_SKIP forces the one-shot scan to skip the in-flight
